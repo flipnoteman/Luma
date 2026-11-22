@@ -27,7 +27,7 @@ use crate::context::RawArg;
 use crate::image::{gaussian_kernel_1d_on, ConvSpec};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
-use crate::vision::{invalid, plane, scan_counts, tile_grid, to_u32, Kernel as Any, Keypoints};
+use crate::vision::{invalid, plane, tile_grid, to_u32, Kernel as Any, Keypoints};
 
 /// Pixels of a FAST tile along axis 0 and axis 1.
 const TX: u32 = 32;
@@ -39,18 +39,16 @@ const EDGE: u32 = 22;
 const BINS: u32 = 4096;
 /// The fraction of the pixels of a level that may be corners (ArrayFire's CUDA backend).
 const FAST_RATIO: f32 = 0.14;
+/// Workgroups of the selection and ranking launches (they loop over the candidates).
+const SELECT_GROUPS: u32 = 128;
 
 /// One kernel of ORB.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Kernel {
-    /// FAST corners and Harris responses: counting pass or scatter pass.
-    Fast { scatter: bool },
-    /// Histogram of the Harris responses.
-    Hist,
-    /// The cut bin of the ranking.
-    Cut,
-    /// Compaction of the candidates at or above the cut.
-    Compact,
+    /// FAST corners with their Harris responses, appended to a list.
+    Fast,
+    /// The cut of the Harris ranking and the compaction of the candidates above it.
+    Select,
     /// Exact ranking of the compacted candidates.
     Rank,
     /// Orientation and descriptors; `blur` has a second (blurred) image for the tests.
@@ -59,10 +57,8 @@ pub(crate) enum Kernel {
 
 pub(crate) fn source(k: Kernel) -> String {
     match k {
-        Kernel::Fast { scatter } => fast_source(scatter),
-        Kernel::Hist => hist_source(),
-        Kernel::Cut => cut_source(),
-        Kernel::Compact => compact_source(),
+        Kernel::Fast => fast_source(),
+        Kernel::Select => select_source(),
         Kernel::Rank => rank_source(),
         Kernel::Describe { blur } => describe_source(blur),
     }
@@ -85,31 +81,26 @@ const KEY_FN: &str = "fn key(h: f32) -> u32 {
 }
 ";
 
-/// FAST, arc 9, with the Harris response of the corners (arguments of the counting kernel: image,
-/// counts, uniform; of the scatter: image, offsets, positions, responses, uniform).
-fn fast_source(scatter: bool) -> String {
+/// FAST, arc 9, with the Harris response of the corners. The corners of a tile are appended to
+/// the list with one atomic add per tile (the order of the list is not deterministic) and counted
+/// in the histogram of the keys of their responses. Arguments: image, positions, responses,
+/// histogram, counters, uniform `{h, w, thr, edge, tiles_x, cap, level, 0}`.
+fn fast_source() -> String {
     let (halo_in, halo_sc) = (4u32, 1u32);
     let (iw, ih) = (TX + 2 * halo_in, TY + 2 * halo_in);
     let (sw, sh) = (TX + 2 * halo_sc, TY + 2 * halo_sc);
     let mut s = String::new();
-    s.push_str("struct Params { h: u32, w: u32, thr: f32, edge: u32, tiles_x: u32, cap: u32, a: u32, b: u32 }\n");
+    s.push_str("struct Params { h: u32, w: u32, thr: f32, edge: u32, tiles_x: u32, cap: u32, level: u32, c: u32 }\n");
     s.push_str("@group(1) @binding(0) var<storage, read> src: array<f32>;\n");
-    if scatter {
-        s.push_str("@group(1) @binding(1) var<storage, read> offs: array<u32>;\n");
-        s.push_str("@group(1) @binding(2) var<storage, read_write> out_pos: array<u32>;\n");
-        s.push_str("@group(1) @binding(3) var<storage, read_write> out_h: array<f32>;\n");
-        s.push_str("@group(1) @binding(4) var<uniform> p: Params;\n");
-    } else {
-        s.push_str("@group(1) @binding(1) var<storage, read_write> counts: array<u32>;\n");
-        s.push_str("@group(1) @binding(2) var<uniform> p: Params;\n");
-    }
+    s.push_str("@group(1) @binding(1) var<storage, read_write> out_pos: array<u32>;\n");
+    s.push_str("@group(1) @binding(2) var<storage, read_write> out_h: array<f32>;\n");
+    s.push_str("@group(1) @binding(3) var<storage, read_write> hist: array<atomic<u32>>;\n");
+    s.push_str("@group(1) @binding(4) var<storage, read_write> counters: array<atomic<u32>>;\n");
+    s.push_str("@group(1) @binding(5) var<uniform> p: Params;\n");
+    s.push_str(KEY_FN);
     let _ = writeln!(s, "var<workgroup> tile: array<f32, {}>;", iw * ih);
     let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", sw * sh);
-    if scatter {
-        s.push_str("var<workgroup> rank: array<u32, 256>;\nvar<workgroup> tot: u32;\n");
-    } else {
-        s.push_str("var<workgroup> cnt: atomic<u32>;\n");
-    }
+    s.push_str("var<workgroup> rank: array<u32, 256>;\nvar<workgroup> base: u32;\n");
     let off = |v: &str, d: i32| if d >= 0 { format!("{v} + {d}u") } else { format!("{v} - {}u", -d) };
     let at = |d0: i32, d1: i32| format!("tile[({}) * {iw}u + {}]", off("cy", d1), off("cx", d0));
     let _ = write!(
@@ -151,11 +142,10 @@ fn fast_source(scatter: bool) -> String {
         let _ = writeln!(s, "    tb &= b2 >> {i}u; td &= d2 >> {i}u;");
     }
     s.push_str("    var out = 0.0;\n    if ((tb & 65535u) != 0u) { out = sb; }\n    if ((td & 65535u) != 0u) { out = max(out, sd); }\n    return out;\n}\n");
-    if scatter {
-        // ArrayFire's Harris response of a corner: 7 x 7 block of central differences.
-        let _ = write!(
-            s,
-            "fn harris(row: i32, col: i32) -> f32 {{
+    // ArrayFire's Harris response of a corner: 7 x 7 block of central differences.
+    let _ = write!(
+        s,
+        "fn harris(row: i32, col: i32) -> f32 {{
     var ixx = 0.0; var iyy = 0.0; var ixy = 0.0;
     let h = p.h;
     for (var k = 0u; k < 49u; k++) {{
@@ -170,28 +160,17 @@ fn fast_source(scatter: bool) -> String {
     return (det - 0.04 * (tr * tr)) * {scale:?};
 }}
 ",
-            scale = harris_scale()
-        );
-    }
+        scale = harris_scale()
+    );
     let _ = write!(
         s,
         "@compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
-    let tile_id = wid.x + wid.y * p.tiles_x;
     let o0 = i32(wid.x) * {TX} - {halo_in};
     let o1 = i32(wid.y) * {TY} - {halo_in};
     let h = i32(p.h);
     let w = i32(p.w);
-"
-    );
-    if scatter {
-        s.push_str("    if (t == 0u) { tot = offs[tile_id + 1u] - offs[tile_id]; }\n    workgroupBarrier();\n    if (workgroupUniformLoad(&tot) == 0u) { return; }\n");
-    } else {
-        s.push_str("    if (t == 0u) { atomicStore(&cnt, 0u); }\n");
-    }
-    let _ = write!(
-        s,
-        "    for (var i = t; i < {total}u; i += 256u) {{
+    for (var i = t; i < {total}u; i += 256u) {{
         let cx = i % {iw}u;
         let cy = i / {iw}u;
         let a0 = o0 + i32(cx);
@@ -220,124 +199,95 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     let s0 = sc[(ty + 1u) * {sw}u + tx + 1u];
     var keep = s0 > 0.0 && row >= r2 && row <= h - r2 && col >= r2 && col <= w - r2;
     if (keep) {{
-        let base = ty * {sw}u + tx;
-        keep = s0 > sc[base] && s0 > sc[base + 1u] && s0 > sc[base + 2u]
-            && s0 > sc[base + {sw}u] && s0 > sc[base + {sw}u + 2u]
-            && s0 > sc[base + 2u * {sw}u] && s0 > sc[base + 2u * {sw}u + 1u] && s0 > sc[base + 2u * {sw}u + 2u];
+        let b = ty * {sw}u + tx;
+        keep = s0 > sc[b] && s0 > sc[b + 1u] && s0 > sc[b + 2u]
+            && s0 > sc[b + {sw}u] && s0 > sc[b + {sw}u + 2u]
+            && s0 > sc[b + 2u * {sw}u] && s0 > sc[b + 2u * {sw}u + 1u] && s0 > sc[b + 2u * {sw}u + 2u];
     }}
+    rank[t] = select(0u, 1u, keep);
+    workgroupBarrier();
+    for (var d = 1u; d < 256u; d = d << 1u) {{
+        var add = 0u;
+        if (t >= d) {{ add = rank[t - d]; }}
+        workgroupBarrier();
+        rank[t] = rank[t] + add;
+        workgroupBarrier();
+    }}
+    if (t == 255u && rank[255] != 0u) {{ base = atomicAdd(&counters[p.level * 4u], rank[255]); }}
+    workgroupBarrier();
+    if (keep) {{
+        let k = base + rank[t] - 1u;
+        if (k < p.cap) {{
+            let hv = harris(row, col);
+            out_pos[k] = u32(row) + p.h * u32(col);
+            out_h[k] = hv;
+            atomicAdd(&hist[p.level * {BINS}u + (key(hv) >> 20u)], 1u);
+        }}
+    }}
+}}
 ",
         total = iw * ih,
         sc_total = sw * sh,
         d = halo_in - halo_sc
     );
-    if scatter {
-        s.push_str(
-            "    rank[t] = select(0u, 1u, keep);
-    workgroupBarrier();
-    for (var d = 1u; d < 256u; d = d << 1u) {
-        var add = 0u;
-        if (t >= d) { add = rank[t - d]; }
-        workgroupBarrier();
-        rank[t] = rank[t] + add;
-        workgroupBarrier();
-    }
-    if (keep) {
-        let k = offs[tile_id] + rank[t] - 1u;
-        if (k < p.cap) {
-            out_pos[k] = u32(row) + p.h * u32(col);
-            out_h[k] = harris(row, col);
-        }
-    }
-}
-",
-        );
-    } else {
-        s.push_str(
-            "    if (keep) { atomicAdd(&cnt, 1u); }
-    workgroupBarrier();
-    if (t == 0u) { counts[tile_id] = atomicLoad(&cnt); }
-}
-",
-        );
-    }
     s
 }
 
-/// Histogram of the keys of the responses. Arguments: responses, counts, histogram, uniform
-/// `{tiles, cap, best, level}`.
-fn hist_source() -> String {
+/// The cut of the ranking (the highest bin from which the bins above hold at least `best`
+/// responses, 0 if there are fewer candidates) and the compaction of the candidates with a key
+/// at or above it, by a grid-stride loop; the first invocation also stores the number of kept
+/// features of the level. Arguments: positions, responses, counters, histogram, compacted
+/// positions, responses and candidate indices, kept counts, uniform `{cap, best, level, 0}`.
+fn select_source() -> String {
     format!(
-        "struct Params {{ tiles: u32, cap: u32, best: u32, level: u32 }}
-@group(1) @binding(0) var<storage, read> cand_h: array<f32>;
-@group(1) @binding(1) var<storage, read> counts: array<u32>;
-@group(1) @binding(2) var<storage, read_write> hist: array<atomic<u32>>;
-@group(1) @binding(3) var<uniform> p: Params;
-{KEY_FN}
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
-    let g = (wid.x + wid.y * nwg.x) * 256u + t;
-    let n = min(counts[p.tiles], p.cap);
-    if (g < n) {{
-        atomicAdd(&hist[p.level * {BINS}u + (key(cand_h[g]) >> 20u)], 1u);
-    }}
-}}
-"
-    )
-}
-
-/// The cut bin: the highest bin from which the bins above hold at least `best` responses (0 if
-/// there are fewer candidates); the number of kept features of the level. Arguments: counts,
-/// histogram, info `{cut, compacted}`, kept counts, uniform.
-fn cut_source() -> String {
-    format!(
-        "struct Params {{ tiles: u32, cap: u32, best: u32, level: u32 }}
-@group(1) @binding(0) var<storage, read> counts: array<u32>;
-@group(1) @binding(1) var<storage, read> hist: array<u32>;
-@group(1) @binding(2) var<storage, read_write> info: array<u32>;
-@group(1) @binding(3) var<storage, read_write> kept: array<u32>;
-@group(1) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(1)
-fn main() {{
-    let n = min(counts[p.tiles], p.cap);
-    kept[p.level] = min(n, p.best);
-    var cut = 0u;
-    if (n > p.best) {{
-        var acc = 0u;
-        for (var i = 0u; i < {BINS}u; i++) {{
-            let b = {BINS}u - 1u - i;
-            acc += hist[p.level * {BINS}u + b];
-            if (acc >= p.best) {{ cut = b; break; }}
-        }}
-    }}
-    info[0] = cut;
-    info[1] = 0u;
-}}
-"
-    )
-}
-
-/// Compaction of the candidates with a key at or above the cut. Arguments: positions, responses,
-/// counts, info, compacted positions, responses and candidate indices, uniform.
-fn compact_source() -> String {
-    format!(
-        "struct Params {{ tiles: u32, cap: u32, best: u32, level: u32 }}
+        "struct Params {{ cap: u32, best: u32, level: u32, c: u32 }}
 @group(1) @binding(0) var<storage, read> cand_pos: array<u32>;
 @group(1) @binding(1) var<storage, read> cand_h: array<f32>;
-@group(1) @binding(2) var<storage, read> counts: array<u32>;
-@group(1) @binding(3) var<storage, read_write> info: array<atomic<u32>>;
+@group(1) @binding(2) var<storage, read_write> counters: array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read> hist: array<u32>;
 @group(1) @binding(4) var<storage, read_write> sel_pos: array<u32>;
 @group(1) @binding(5) var<storage, read_write> sel_h: array<f32>;
 @group(1) @binding(6) var<storage, read_write> sel_g: array<u32>;
-@group(1) @binding(7) var<uniform> p: Params;
+@group(1) @binding(7) var<storage, read_write> kept: array<u32>;
+@group(1) @binding(8) var<uniform> p: Params;
 {KEY_FN}
+var<workgroup> part: array<u32, 256>;
+var<workgroup> cutv: u32;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
-    let g = (wid.x + wid.y * nwg.x) * 256u + t;
-    let n = min(counts[p.tiles], p.cap);
-    if (g < n) {{
+    let n = min(atomicLoad(&counters[p.level * 4u]), p.cap);
+    let hb = p.level * {BINS}u;
+    var sum = 0u;
+    for (var k = 0u; k < 16u; k++) {{ sum += hist[hb + t * 16u + k]; }}
+    part[t] = sum;
+    workgroupBarrier();
+    if (t == 0u) {{
+        var cut = 0u;
+        if (n > p.best) {{
+            var acc = 0u;
+            for (var c = 0u; c < 256u; c++) {{
+                let ci = 255u - c;
+                if (acc + part[ci] >= p.best) {{
+                    for (var b = 0u; b < 16u; b++) {{
+                        let bi = ci * 16u + 15u - b;
+                        acc += hist[hb + bi];
+                        if (acc >= p.best) {{ cut = bi; break; }}
+                    }}
+                    break;
+                }}
+                acc += part[ci];
+            }}
+        }}
+        cutv = cut;
+        if (wid.x == 0u && wid.y == 0u) {{ kept[p.level] = min(n, p.best); }}
+    }}
+    workgroupBarrier();
+    let cut = workgroupUniformLoad(&cutv);
+    let stride = nwg.x * nwg.y * 256u;
+    for (var g = (wid.x + wid.y * nwg.x) * 256u + t; g < n; g += stride) {{
         let h = cand_h[g];
-        if ((key(h) >> 20u) >= atomicLoad(&info[0])) {{
-            let k = atomicAdd(&info[1], 1u);
+        if ((key(h) >> 20u) >= cut) {{
+            let k = atomicAdd(&counters[p.level * 4u + 1u], 1u);
             sel_pos[k] = cand_pos[g];
             sel_h[k] = h;
             sel_g[k] = g;
@@ -349,34 +299,35 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 }
 
 /// Exact ranking of the compacted candidates: the first `best` by response, ties by candidate
-/// index. Arguments: compacted positions, responses, indices, info, kept positions and
-/// responses, uniform.
+/// index. Arguments: compacted positions, responses, indices, counters, kept positions and
+/// responses, uniform `{cap, best, level, 0}`.
 fn rank_source() -> String {
     format!(
-        "struct Params {{ tiles: u32, cap: u32, best: u32, level: u32 }}
+        "struct Params {{ cap: u32, best: u32, level: u32, c: u32 }}
 @group(1) @binding(0) var<storage, read> sel_pos: array<u32>;
 @group(1) @binding(1) var<storage, read> sel_h: array<f32>;
 @group(1) @binding(2) var<storage, read> sel_g: array<u32>;
-@group(1) @binding(3) var<storage, read> info: array<u32>;
+@group(1) @binding(3) var<storage, read> counters: array<u32>;
 @group(1) @binding(4) var<storage, read_write> kept_pos: array<u32>;
 @group(1) @binding(5) var<storage, read_write> kept_h: array<f32>;
 @group(1) @binding(6) var<uniform> p: Params;
 {KEY_FN}
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
-    let g = (wid.x + wid.y * nwg.x) * 256u + t;
-    let m = info[1];
-    if (g >= m) {{ return; }}
-    let ke = key(sel_h[g]);
-    let ge = sel_g[g];
-    var rank = 0u;
-    for (var f = 0u; f < m; f++) {{
-        let kf = key(sel_h[f]);
-        rank += select(0u, 1u, kf > ke || (kf == ke && sel_g[f] < ge));
-    }}
-    if (rank < p.best) {{
-        kept_pos[rank] = sel_pos[g];
-        kept_h[rank] = sel_h[g];
+    let m = counters[p.level * 4u + 1u];
+    let stride = nwg.x * nwg.y * 256u;
+    for (var g = (wid.x + wid.y * nwg.x) * 256u + t; g < m; g += stride) {{
+        let ke = key(sel_h[g]);
+        let ge = sel_g[g];
+        var rank = 0u;
+        for (var f = 0u; f < m; f++) {{
+            let kf = key(sel_h[f]);
+            rank += select(0u, 1u, kf > ke || (kf == ke && sel_g[f] < ge));
+        }}
+        if (rank < p.best) {{
+            kept_pos[rank] = sel_pos[g];
+            kept_h[rank] = sel_h[g];
+        }}
     }}
 }}
 "
@@ -563,8 +514,6 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
     }
     let max_cap = *caps.iter().max().unwrap();
     let max_keep = *keep.iter().max().unwrap();
-    let max_tiles = to_u32(lv.dims[0][0].div_ceil(TX as usize), "tiles")? as usize * to_u32(lv.dims[0][1].div_ceil(TY as usize), "tiles")? as usize;
-    let counts = Array::<u32>::alloc(ctx, Shape::from(max_tiles + 1))?;
     let cand_pos = Array::<u32>::alloc(ctx, Shape::from(max_cap))?;
     let cand_h = Array::<f32>::alloc(ctx, Shape::from(max_cap))?;
     let sel_pos = Array::<u32>::alloc(ctx, Shape::from(max_cap))?;
@@ -573,7 +522,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
     let kept_pos = Array::<u32>::alloc(ctx, Shape::from(max_keep))?;
     let kept_h = Array::<f32>::alloc(ctx, Shape::from(max_keep))?;
     let hist = Array::<u32>::zeros_on(ctx, Shape::from(n_levels * BINS as usize))?;
-    let info = Array::<u32>::alloc(ctx, Shape::from(2))?;
+    let counters = Array::<u32>::zeros_on(ctx, Shape::from(4 * n_levels))?;
     let kept = Array::<u32>::zeros_on(ctx, Shape::from(n_levels))?;
     let pattern = Array::<i32>::from_slice_on(ctx, &PATTERN, Shape::from(PATTERN.len()))?;
     let out_x = Array::<f32>::alloc(ctx, Shape::from(out_cap))?;
@@ -583,7 +532,6 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
     let out_z = Array::<f32>::alloc(ctx, Shape::from(out_cap))?;
     let out_d = Array::<u32>::alloc(ctx, Shape::from([8, out_cap]))?;
     {
-        let counts_pin = counts.ready()?;
         let (cp_pin, cp_bytes) = cand_pos.ready()?;
         let (ch_pin, ch_bytes) = cand_h.ready()?;
         let (sp_pin, sp_bytes) = sel_pos.ready()?;
@@ -592,7 +540,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
         let (kp_pin, kp_bytes) = kept_pos.ready()?;
         let (kh_pin, kh_bytes) = kept_h.ready()?;
         let (hist_pin, hist_bytes) = hist.ready()?;
-        let (info_pin, info_bytes) = info.ready()?;
+        let (ct_pin, ct_bytes) = counters.ready()?;
         let (kept_pin, kept_bytes) = kept.ready()?;
         let (pat_pin, pat_bytes) = pattern.ready()?;
         let (ox_pin, ox_bytes) = out_x.ready()?;
@@ -610,68 +558,47 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
             let (img_pin, img_bytes) = imgs[i].ready()?;
             let tiles_x = to_u32(lh.div_ceil(TX as usize), "tiles")?;
             let tiles_y = to_u32(lw.div_ceil(TY as usize), "tiles")?;
-            let tiles = tiles_x * tiles_y;
             let cap = to_u32(caps[i], "feature limit")?;
+            let best = lv.best[i].min(cap);
             let grid = tile_grid(ctx, tiles_x, tiles_y)?;
-            let fast_params = [to_u32(lh, "height")?, to_u32(lw, "width")?, fast_thr.to_bits(), EDGE, tiles_x, cap, 0, 0];
-            let size = [lh as u32, lw as u32, 1];
-            let kernel = launch(Kernel::Fast { scatter: false })?;
-            let args = [RawArg::read(img_pin.buffer(), img_bytes), RawArg::write(counts_pin.0.buffer(), counts_pin.1), RawArg::Uniform(bytemuck::bytes_of(&fast_params))];
-            ctx.launch(&kernel, grid, size, &args)?;
-            scan_counts(ctx, &counts_pin, tiles)?;
-            let kernel = launch(Kernel::Fast { scatter: true })?;
+            let fast_params = [to_u32(lh, "height")?, to_u32(lw, "width")?, fast_thr.to_bits(), EDGE, tiles_x, cap, i as u32, 0];
+            let kernel = launch(Kernel::Fast)?;
             let args = [
                 RawArg::read(img_pin.buffer(), img_bytes),
-                RawArg::read(counts_pin.0.buffer(), counts_pin.1),
                 RawArg::write(cp_pin.buffer(), cp_bytes),
                 RawArg::write(ch_pin.buffer(), ch_bytes),
+                RawArg::write(hist_pin.buffer(), hist_bytes),
+                RawArg::write(ct_pin.buffer(), ct_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&fast_params)),
             ];
-            ctx.launch(&kernel, grid, size, &args)?;
+            ctx.launch(&kernel, grid, [lh as u32, lw as u32, 1], &args)?;
             // The ranking.
-            let best = lv.best[i].min(cap);
-            let p = [tiles, cap, best, i as u32];
-            let groups = fold_workgroups(ctx, cap.div_ceil(256))?;
-            let kernel = launch(Kernel::Hist)?;
-            let args = [
-                RawArg::read(ch_pin.buffer(), ch_bytes),
-                RawArg::read(counts_pin.0.buffer(), counts_pin.1),
-                RawArg::write(hist_pin.buffer(), hist_bytes),
-                RawArg::Uniform(bytemuck::bytes_of(&p)),
-            ];
-            ctx.launch(&kernel, groups, [cap, 1, 1], &args)?;
-            let kernel = launch(Kernel::Cut)?;
-            let args = [
-                RawArg::read(counts_pin.0.buffer(), counts_pin.1),
-                RawArg::read(hist_pin.buffer(), hist_bytes),
-                RawArg::write(info_pin.buffer(), info_bytes),
-                RawArg::write(kept_pin.buffer(), kept_bytes),
-                RawArg::Uniform(bytemuck::bytes_of(&p)),
-            ];
-            ctx.launch(&kernel, [1, 1, 1], [1, 1, 1], &args)?;
-            let kernel = launch(Kernel::Compact)?;
+            let p = [cap, best, i as u32, 0];
+            let groups = cap.div_ceil(256).min(SELECT_GROUPS);
+            let kernel = launch(Kernel::Select)?;
             let args = [
                 RawArg::read(cp_pin.buffer(), cp_bytes),
                 RawArg::read(ch_pin.buffer(), ch_bytes),
-                RawArg::read(counts_pin.0.buffer(), counts_pin.1),
-                RawArg::write(info_pin.buffer(), info_bytes),
+                RawArg::write(ct_pin.buffer(), ct_bytes),
+                RawArg::read(hist_pin.buffer(), hist_bytes),
                 RawArg::write(sp_pin.buffer(), sp_bytes),
                 RawArg::write(sh_pin.buffer(), sh_bytes),
                 RawArg::write(sg_pin.buffer(), sg_bytes),
+                RawArg::write(kept_pin.buffer(), kept_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&p)),
             ];
-            ctx.launch(&kernel, groups, [cap, 1, 1], &args)?;
+            ctx.launch(&kernel, [groups, 1, 1], [groups * 256, 1, 1], &args)?;
             let kernel = launch(Kernel::Rank)?;
             let args = [
                 RawArg::read(sp_pin.buffer(), sp_bytes),
                 RawArg::read(sh_pin.buffer(), sh_bytes),
                 RawArg::read(sg_pin.buffer(), sg_bytes),
-                RawArg::read(info_pin.buffer(), info_bytes),
+                RawArg::read(ct_pin.buffer(), ct_bytes),
                 RawArg::write(kp_pin.buffer(), kp_bytes),
                 RawArg::write(kh_pin.buffer(), kh_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&p)),
             ];
-            ctx.launch(&kernel, groups, [cap, 1, 1], &args)?;
+            ctx.launch(&kernel, [groups, 1, 1], [groups * 256, 1, 1], &args)?;
             // Orientation and descriptors.
             let blurred_pin = blurred[i].as_ref().map(|b| b.ready()).transpose()?;
             let kernel = launch(Kernel::Describe { blur })?;
