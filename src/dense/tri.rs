@@ -5,7 +5,7 @@
 //! copy the kernels make of their operands. A triangle of more than [`BASE`] rows is solved in
 //! blocks of rows (left-looking): the solved rows above a block contribute one `matmul_f32`, and
 //! one launch solves the block's own triangle for the whole right-hand side, an invocation per
-//! row holding a few columns of it. Below [`BASE`] rows (or for a batch of small matrices) a kernel
+//! row holding a few columns of it (on CUDA devices up to 32 columns are one launch of [`super::trsv`] instead). Below [`BASE`] rows (or for a batch of small matrices) a kernel
 //! solves by substitution, one invocation per right-hand-side column and the whole batch in one
 //! launch; the entries of `L` it reads are the same for every invocation of a workgroup.
 

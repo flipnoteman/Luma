@@ -59,8 +59,8 @@ assert!((back.to_vec()?[0] - 0.25).abs() < 1e-5);
   or fences), and solves its own block. The factorisations' solves take the diagonal blocks as explicit
   inverses (computed while the workgroup waits; the blocks are well-conditioned triangles of a
   factorisation, a Cholesky factor or a unit `L` with bounded multipliers); `solve_triangular` of an
-  arbitrary triangle substitutes. Many right-hand sides are blocks of 64 rows multiplied by their inverses
-  inside the recursion of halves with `matmul_f32` (every backend).
+  arbitrary triangle substitutes. More right-hand sides, and every other backend, solve in blocks of rows
+  with `matmul_f32` products.
 * Numerical failure never poisons or raises: a matrix that is not positive definite leaves `NaN`
   on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of `U` (the
   solve then gives `Inf`/`NaN`, the determinant 0). Shape errors poison the result as usual.
