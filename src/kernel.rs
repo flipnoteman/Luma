@@ -506,11 +506,6 @@ impl Kernel {
         &self.core.bindings
     }
 
-    /// The context the kernel was built on.
-    pub(crate) fn context(&self) -> &Context {
-        &self.ctx
-    }
-
     /// The kernel's workgroup size.
     pub fn workgroup(&self) -> [u32; 3] {
         self.core.workgroup

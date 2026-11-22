@@ -87,32 +87,14 @@ pub(crate) fn per_matrix(ctx: &Context, count: usize) -> [u32; 3] {
     [x as u32, count.div_ceil(x) as u32, 1]
 }
 
-/// Kernels built so far, by the key of their source: the sources of the register kernels are tens of
-/// kilobytes, and generating, copying and hashing one per launch cost more host time than the
-/// launch. Each entry lists the contexts it was built on.
-static KERNELS: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<crate::Kernel>>>> = std::sync::Mutex::new(None);
-
-/// The kernel of source `make()` named by `key` (which must determine the source) on `ctx`,
-/// built once per context.
-fn kernel(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel, LumaError> {
-    let mut guard = KERNELS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(Default::default);
-    if let Some(kernel) = map.get(key).and_then(|list| list.iter().find(|k| k.context().same_as(ctx))) {
-        return Ok(kernel.clone());
-    }
-    let kernel = ctx.kernel(&make()).label(label).build()?;
-    let list = map.entry(key.to_owned()).or_default();
-    // A few contexts at most stay alive through this cache.
-    if list.len() >= 8 {
-        list.remove(0);
-    }
-    list.push(kernel.clone());
-    Ok(kernel)
-}
-
-/// Records the launch over `groups` workgroups of the kernel `make()` names by `key` (see [`kernel`]).
+/// Records the launch over `groups` workgroups of the kernel `make()` names by `key` (which must
+/// determine the source) on `ctx`; the kernel is built once per context: the sources of the
+/// register kernels are tens of kilobytes, and generating, copying and hashing one per launch cost
+/// more host time than the launch. The kernels are cached in the context itself
+/// ([`Context::keyed_kernel`]), never in a process-wide table: such a table (a kernel holds its
+/// context) would keep contexts, and so their GPU devices, alive after their users finished.
 pub(crate) fn launch(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
-    kernel(ctx, key, label, make)?.launch_raw(groups, args)
+    ctx.keyed_kernel(key, label, make)?.launch_raw(groups, args)
 }
 
 /// The NaN a failed pivot leaves, as WGSL.

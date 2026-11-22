@@ -2,7 +2,7 @@
 //! its worker threads: the `[vk..]` ones and the compiler workers it starts while a device or a
 //! pipeline is created (they keep the name of the thread that started them). This handler,
 //! registered later and so run first, waits until the GPU and those workers are idle; it
-//! destroys nothing (see `IDLE` in `device.rs`). The compiler workers keep going after the
+//! destroys nothing (see `Pool` in `device.rs`). The compiler workers keep going after the
 //! pipelines they were started for were created (a backlog of recompiles of cached pipelines);
 //! when one is still busy after [`DRIVER_WAIT`] the driver's handler would hang (it waits for a
 //! lock the worker holds) or free memory the worker uses, so the process ends with `_exit`, with
