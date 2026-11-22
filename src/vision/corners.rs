@@ -15,6 +15,7 @@
 mod detect;
 mod dog;
 mod harris;
+mod select;
 mod susan;
 
 /// One kernel of this group (part of the key of its cache entry in the context).
@@ -28,6 +29,8 @@ pub(crate) enum Kernel {
     Gather(detect::Gather),
     /// The difference of Gaussians, see [`Array::dog`].
     Dog(dog::Kernel),
+    /// The strongest corners of a list, see [`Array::harris`].
+    Select(select::Kernel),
 }
 
 /// The WGSL of a kernel of this group.
@@ -37,5 +40,6 @@ pub(crate) fn source(kernel: Kernel) -> String {
         Kernel::Susan(k) => susan::source(k),
         Kernel::Gather(k) => detect::gather_source(k),
         Kernel::Dog(k) => dog::source(k),
+        Kernel::Select(k) => select::source(k),
     }
 }

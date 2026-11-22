@@ -292,6 +292,9 @@ fn run(image: &Array<f32>, max_corners: usize, min_response: f32, sigma: f32, bl
     };
     let count = found.len();
     if max_corners > 0 && count > max_corners {
+        if let Some((x, y, score)) = super::select::strongest(&found.x, &found.y, &found.score, max_corners)? {
+            return Ok(Some(Keypoints::plain(ctx, &x, &y, &score, max_corners)?));
+        }
         let (score, order) = found.score.topk(max_corners);
         let (x, y) = (found.x.take(&order), found.y.take(&order));
         return Ok(Some(Keypoints::plain(ctx, &x, &y, &score, max_corners)?));

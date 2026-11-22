@@ -353,3 +353,54 @@ fn dog_batches_planes() {
         assert_close(&got[p * h * w..(p + 1) * h * w], &want, 1e-4, 2e-3);
     }
 }
+
+#[test]
+fn harris_ranking_handles_ties_and_large_limits() {
+    let ctx = ctx();
+    // Squares of equal size on a grid: the corners come in groups of equal responses, and a
+    // limit in the middle of a group keeps some of it.
+    let (h, w) = (96, 120);
+    let mut data = vec![0.0f32; h * w];
+    for j in 0..w {
+        for i in 0..h {
+            if (i % 12) < 6 && (j % 12) < 6 {
+                data[i + h * j] = 100.0;
+            }
+        }
+    }
+    // A few of different brightness so that the groups differ.
+    for j in 0..w {
+        for i in 0..h {
+            if (i / 12 + j / 12) % 5 == 0 && (i % 12) < 6 && (j % 12) < 6 {
+                data[i + h * j] = 160.0;
+            }
+        }
+    }
+    let img = Array::from_slice_on(&ctx, &data, [h, w]).unwrap();
+    let all = img.harris(0, 1e-20, 1.0, 0, 0.04).unwrap().unwrap();
+    let mut scores = all.score.to_vec().unwrap();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    assert!(scores.len() > 100);
+    let valid: std::collections::HashSet<(u32, u32)> = points(&all).iter().map(|p| (p.0, p.1)).collect();
+    for k in [1usize, 2, 7, 50, 63, 64, 100, scores.len() - 1] {
+        let top = img.harris(k, 0.0, 1.0, 0, 0.04).unwrap().unwrap();
+        assert_eq!(top.count(), k);
+        // The scores are the k largest, in descending order.
+        assert_eq!(top.score.to_vec().unwrap(), scores[..k].to_vec(), "k = {k}");
+        // Distinct corners of the detector.
+        let p: Vec<(u32, u32)> = points(&top).iter().map(|p| (p.0, p.1)).collect();
+        let set: std::collections::HashSet<_> = p.iter().copied().collect();
+        assert_eq!(set.len(), k);
+        assert!(set.is_subset(&valid));
+    }
+    // A limit beyond the corners of the kernel's range goes through `topk`: same answer.
+    let big = Array::from_slice_on(&ctx, &scene(200, 200, 3, 60.0), [200, 200]).unwrap();
+    let want = big.harris(0, 1e-20, 0.5, 0, 0.04).unwrap().unwrap();
+    let mut s = want.score.to_vec().unwrap();
+    s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    assert!(s.len() > 1100, "{}", s.len());
+    for k in [1000usize, 1024, 1025, 1100] {
+        let top = big.harris(k, 0.0, 0.5, 0, 0.04).unwrap().unwrap();
+        assert_eq!(top.score.to_vec().unwrap(), s[..k].to_vec(), "k = {k}");
+    }
+}
