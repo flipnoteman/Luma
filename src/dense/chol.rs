@@ -1,10 +1,11 @@
 //! Cholesky factorisation and SPD solves.
 //!
-//! A big matrix is factored recursively, `A = [A11 A21ᵀ; A21 A22]`: `L11 = chol(A11)`,
-//! `L21ᵀ = L11⁻¹ A21ᵀ` (a triangular solve, see [`tri`](super::tri)), `L22 = chol(A22 - L21 L21ᵀ)`
-//! with the update one [`matmul_f32`]; the big update happens once at the top, so the elementwise
-//! passes over the trailing matrix stay `O(n²)` in all. Up to 64 rows, and for every matrix of a
-//! batch, one workgroup factors a matrix in workgroup memory.
+//! A big matrix is factored left-looking in blocks of 128 columns (64 where a workgroup has less
+//! than 33 KiB of memory): per block one product of everything finished so far ([`matmul_f32`], the
+//! only big flops), one workgroup that factors the diagonal block in workgroup memory and one
+//! launch of warps that solve the rows below it, all of them writing into the one output, so a
+//! matrix takes about four launches per 128 columns. Up to 64 rows, and for every matrix of a batch,
+//! one workgroup factors a matrix in workgroup memory.
 
 use std::panic::Location;
 
@@ -13,7 +14,7 @@ use super::{block, fail, launch, launch_unchecked, nth, per_matrix, stack_batch,
 use crate::array::Array;
 use crate::context::Context;
 use crate::kernel::{uniform, view, KernelArg};
-use crate::matmul::matmul_nt;
+use crate::matmul::matmul_f32;
 use crate::shape::Shape;
 
 /// Rows of the matrix a workgroup factors in workgroup memory, at most: 64 where the device has the
@@ -199,6 +200,19 @@ fn diag_source(nb: usize) -> String {
         );
     }
     let lds = (0..8).map(|r| format!("            let l{r} = s[ri + c0 + {r}u];\n")).collect::<String>();
+    // The trailing columns four at a step (two apart: the other invocation of the row takes the ones
+    // between): all their loads are issued before the first multiply-add.
+    let mut quad_loads = String::new();
+    let mut quad_fmas = String::new();
+    let mut quad_stores = String::new();
+    for w in 0..4 {
+        quad_loads += &format!("                let rq{w} = off(q + {}u);\n                var acc{w} = s[ri + q + {}u];\n", 2 * w, 2 * w);
+        for r in 0..8 {
+            quad_loads += &format!("                let m{w}_{r} = s[rq{w} + c0 + {r}u];\n");
+            quad_fmas += &format!("                acc{w} = fma(-l{r}, m{w}_{r}, acc{w});\n");
+        }
+        quad_stores += &format!("                s[ri + q + {}u] = acc{w};\n", 2 * w);
+    }
     let fmas = (0..8).map(|r| format!("                acc = fma(-l{r}, s[rq + c0 + {r}u], acc);\n")).collect::<String>();
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
@@ -232,7 +246,10 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     let ri = off(i);
     for (var c0 = 0u; c0 < nbw; c0 = c0 + 8u) {{
 {cols}        if (i < nbw && i >= c0 + 8u) {{
-{lds}            for (var q = c0 + 8u + h; q <= i; q = q + 2u) {{
+{lds}            var q = c0 + 8u + h;
+            for (; q + 6u <= i; q = q + 8u) {{
+{quad_loads}{quad_fmas}{quad_stores}            }}
+            for (; q <= i; q = q + 2u) {{
                 let rq = off(q);
                 var acc = s[ri + q];
 {fmas}                s[ri + q] = acc;
@@ -259,41 +276,71 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 fn panel_source(nb: usize) -> String {
     let half = nb.min(64);
     let h4 = half / 4;
-    let mut acc = String::new();
-    let mut upd = String::new();
-    let mut ld = String::new();
-    let mut diag = String::new();
-    let mut put = String::new();
     let comp = ["x", "y", "z", "w"];
+    // One step of the product loops over four columns of the block and four of the solved ones; `t`
+    // tells the copies apart when two steps are issued together.
+    let step = |t: &str, col0: &str, rect: bool| -> String {
+        let mut out = String::new();
+        let base = if rect { "pc" } else { "c0" };
+        for v in 0..4 {
+            out += &format!("                    let x{t}{v} = tile[({base} + {col0} * 4u + {v}u) * 33u + lane];\n");
+        }
+        for u in 0..4 {
+            out += &format!("                    let l{t}{u} = lb[(j + {u}u) * {h4}u + {col0}];\n");
+        }
+        for u in 0..4 {
+            for v in 0..4 {
+                out += &format!("                    s{u} = fma(-l{t}{u}.{c}, x{t}{v}, s{u});\n", c = comp[v]);
+            }
+        }
+        out
+    };
+    let mut acc = String::new();
+    let mut put = String::new();
     for u in 0..4 {
         acc += &format!("                var s{u} = tile[(c0 + j + {u}u) * 33u + lane];\n");
-        ld += &format!("                    let l{u} = lb[(j + {u}u) * {h4}u + q4];\n");
-        for v in 0..4 {
-            upd += &format!("                    s{u} = fma(-l{u}.{c}, x{v}, s{u});\n", c = comp[v]);
-        }
         put += &format!("                if (j + {u}u < cw) {{ tile[(c0 + j + {u}u) * 33u + lane] = s{u}; }}\n");
     }
     let dld = (0..4).map(|u| format!("                let d{u} = lb[(j + {u}u) * {h4}u + j / 4u];\n")).collect::<String>();
+    let mut diag = String::new();
     for u in 0..4 {
         for v in 0..u {
             diag += &format!("                s{u} = fma(-d{u}.{c}, s{v}, s{u});\n", c = comp[v]);
         }
         diag += &format!("                s{u} = s{u} / d{u}.{c};\n", c = comp[u]);
     }
-    let xs_rect = (0..4).map(|v| format!("                    let x{v} = tile[(pc + q4 * 4u + {v}u) * 33u + lane];\n")).collect::<String>();
-    let xs_diag = (0..4).map(|v| format!("                    let x{v} = tile[(c0 + q4 * 4u + {v}u) * 33u + lane];\n")).collect::<String>();
+    let rect_body = format!("{}{}", step("a", "q4", true), step("b", "(q4 + 1u)", true));
+    let diag_pair = format!("{}{}", step("a", "q4", false), step("b", "(q4 + 1u)", false));
+    let diag_one = step("a", "q4", false);
+    let colblocks = nb / 32;
     let mut loads = String::new();
     let mut stores = String::new();
-    for u in 0..8 {
-        loads += &format!(
-            "            var v{u} = 0.0;
-            if (rr + {u}u < rows && c < nbw) {{
-                v{u} = a[luma_view_idx3(av, k + c, r0 + rr + {u}u, 0u)];
-                if (p.has_t != 0u) {{ v{u} = v{u} - tm[(r0 + rr + {u}u - k) * nbw + c]; }}
-            }}
+    for u in 0..4 {
+        for cb in 0..colblocks {
+            loads += &format!(
+                "        var v{u}_{cb} = 0.0;
+        if (rr + {u}u < rows && {cb}u * 32u + lane < nbw) {{
+            v{u}_{cb} = a[luma_view_idx3(av, k + {cb}u * 32u + lane, r0 + rr + {u}u, 0u)];
+            if (p.has_t != 0u) {{ v{u}_{cb} = v{u}_{cb} - tm[(r0 + rr + {u}u - k) * nbw + {cb}u * 32u + lane]; }}
+        }}
 "
+            );
+            stores += &format!("        if (rr + {u}u < rows && {cb}u * 32u + lane < nbw) {{ tile[({cb}u * 32u + lane) * 33u + rr + {u}u] = v{u}_{cb}; }}\n");
+        }
+    }
+    // Staging: four vec4s of a row of `L_kk` per lane and step, the loads issued together.
+    let mut sl = String::new();
+    let mut ss = String::new();
+    for w in 0..4 {
+        sl += &format!(
+            "        let i{w} = idx + {}u;
+        let b{w} = (c0 + i{w} / {h4}u) * {nb}u + pc + (i{w} % {h4}u) * 4u;
+        var w{w} = vec4<f32>(0.0);
+        if (i{w} < total) {{ w{w} = vec4<f32>(dk[b{w}], dk[b{w} + 1u], dk[b{w} + 2u], dk[b{w} + 3u]); }}
+",
+            32 * w
         );
-        stores += &format!("            if (rr + {u}u < rows && c < nbw) {{ tile[c * 33u + rr + {u}u] = v{u}; }}\n");
+        ss += &format!("        if (i{w} < total) {{ lb[i{w}] = w{w}; }}\n");
     }
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
@@ -308,11 +355,9 @@ var<workgroup> tile: array<f32, {tsize}>;
 var<workgroup> lb: array<vec4<f32>, {lsize}>;
 
 fn stage(lane: u32, c0: u32, cw: u32, pc: u32) {{
-    for (var idx = lane; idx < cw * {h4}u; idx = idx + 32u) {{
-        let r = idx / {h4}u;
-        let base = (c0 + r) * {nb}u + pc + (idx % {h4}u) * 4u;
-        lb[idx] = vec4<f32>(dk[base], dk[base + 1u], dk[base + 2u], dk[base + 3u]);
-    }}
+    let total = cw * {h4}u;
+    for (var idx = lane; idx < total; idx = idx + 128u) {{
+{sl}{ss}    }}
 }}
 
 @compute @workgroup_size(32)
@@ -322,11 +367,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let n = p.n;
     let r0 = k + nbw + wid.x * 32u;
     let rows = min(32u, n - r0);
-    for (var rr = 0u; rr < rows; rr = rr + 8u) {{
-        for (var cb = 0u; cb < nbw; cb = cb + 32u) {{
-            let c = cb + lane;
-{loads}{stores}        }}
-    }}
+    for (var rr = 0u; rr < rows; rr = rr + 4u) {{
+{loads}{stores}    }}
     workgroupBarrier();
     let blocks = (nbw + {half}u - 1u) / {half}u;
     for (var b = 0u; b < blocks; b = b + 1u) {{
@@ -338,8 +380,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             workgroupBarrier();
             if (lane < rows) {{
                 for (var j = 0u; j < cw; j = j + 4u) {{
-{acc}                    for (var q4 = 0u; q4 < {h4}u; q4 = q4 + 1u) {{
-{xs_rect}{ld}{upd}                    }}
+{acc}                    for (var q4 = 0u; q4 < {h4}u; q4 = q4 + 2u) {{
+{rect_body}                    }}
 {put}                }}
             }}
             workgroupBarrier();
@@ -348,8 +390,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         workgroupBarrier();
         if (lane < rows) {{
             for (var j = 0u; j < cw; j = j + 4u) {{
-{acc}                for (var q4 = 0u; q4 < j / 4u; q4 = q4 + 1u) {{
-{xs_diag}{ld}{upd}                }}
+{acc}                var q4 = 0u;
+                for (; q4 + 2u <= j / 4u; q4 = q4 + 2u) {{
+{diag_pair}                }}
+                if (q4 < j / 4u) {{
+{diag_one}                }}
 {dld}{diag}{put}            }}
         }}
         workgroupBarrier();
@@ -367,7 +412,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /// The lower Cholesky factor of one `[n, n]` matrix, left-looking in blocks of `nb` columns. Per
-/// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one [`matmul_nt`] over everything finished so far, the
+/// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one [`matmul_f32`] over everything finished so far, the
 /// only big flops: `n³/3` in all, in `n / nb` products), the diagonal block `A_kk - T` factored by
 /// one workgroup ([`diag_source`]) and the rows below it by a launch of one warp per 32 rows
 /// ([`panel_source`]): three launches a block, every one of them writing into the one output.
@@ -384,7 +429,11 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let mut k = 0;
     while k < n {
         let nbw = nb.min(n - k);
-        let t = (k > 0).then(|| matmul_nt(&block(&out, k..n, 0..k), &block(&out, k..k + nbw, 0..k)));
+        // The rows of the block are the first rows of the operand: one copy of the finished columns.
+        let t = (k > 0).then(|| {
+            let done = block(&out, k..n, 0..k).cache();
+            matmul_f32(&done, &done.slice(1, 0..nbw).transpose())
+        });
         let params = BlockParams { n: n as u32, k: k as u32, nbw: nbw as u32, has_t: u32::from(k > 0) };
         let tref = t.as_ref().unwrap_or(&dummy);
         let diag: [KernelArg<'_>; 5] = [view(a), tref.into(), (&mut dk).into(), (&mut out).into(), uniform(&params)];
@@ -429,7 +478,7 @@ impl Array<f32> {
     /// A matrix that is not positive definite (a pivot that is not positive, or `NaN`) leaves a
     /// `NaN` on the diagonal of its factor from the failing column on; nothing is checked or
     /// raised. Matrices of up to 64 rows (and every matrix of a batch) are factored by one
-    /// workgroup each in one launch; bigger ones recursively with [`matmul_f32`] products.
+    /// workgroup each in one launch; bigger ones in blocks of 128 columns with [`matmul_f32`] products.
     ///
     /// ```
     /// # use luma::*;

@@ -2,9 +2,10 @@
 //!
 //! Every variant (upper or lower, transposed or not) is turned into one canonical solve,
 //! `L X = B` with `L` lower triangular, by flipping and transposing views; those fuse into the
-//! copy the kernels make of their operands. The canonical solve is recursive: split `L` in
-//! halves, solve the top block, update the bottom right-hand side with a [`matmul_f32`] and
-//! solve the bottom block. Below [`BASE`] rows (or for a batch of small matrices) a kernel
+//! copy the kernels make of their operands. A triangle of more than [`BASE`] rows is solved in
+//! blocks of rows (left-looking): the solved rows above a block contribute one [`matmul_f32`], and
+//! one launch solves the block's own triangle for the whole right-hand side, an invocation per
+//! row holding a few columns of it. Below [`BASE`] rows (or for a batch of small matrices) a kernel
 //! solves by substitution, one invocation per right-hand-side column and the whole batch in one
 //! launch; the entries of `L` it reads are the same for every invocation of a workgroup.
 
@@ -17,7 +18,7 @@ use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::shape::Shape;
 
-/// Largest triangle a substitution kernel solves; bigger ones recurse.
+/// Largest triangle a substitution kernel solves; bigger ones go in blocks.
 pub(crate) const BASE: usize = 64;
 
 #[derive(encase::ShaderType)]
@@ -179,7 +180,7 @@ fn block_source(nb: usize) -> String {
     }}\n"
         );
         solve += &format!(
-            "            let x{c} = a{c} / dv;\n            xs[buf * {COLS}u + {c}u] = x{c};\n            if (col0 + {c}u < k) {{ o[(j0 + q) * k + col0 + {c}u] = x{c}; }}\n"
+            "            let x{c} = a{c} * dv;\n            xs[buf * {COLS}u + {c}u] = x{c};\n            if (col0 + {c}u < k) {{ o[(j0 + q) * k + col0 + {c}u] = x{c}; }}\n"
         );
         upd += &format!("            a{c} = fma(-lq, xs[buf * {COLS}u + {c}u], a{c});\n");
     }
@@ -203,7 +204,7 @@ fn block_source(nb: usize) -> String {
 @group(1) @binding(6) var<uniform> p: Params;
 
 var<workgroup> ls: array<f32, {size}>;
-var<workgroup> xs: array<f32, {xsize}>;
+var<workgroup> xs: array<f32, {xsize}>;\nvar<workgroup> dinv: array<f32, {nb}>;
 
 fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
 
@@ -215,11 +216,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let col0 = wid.x * {COLS}u;
     for (var i0 = 0u; i0 < nbw; i0 = i0 + 8u) {{
 {lload}{lstore}    }}
+    if (ii < nbw) {{ dinv[ii] = select(1.0 / ls[off(ii) + ii], 1.0, p.unit != 0u); }}
 {init}    workgroupBarrier();
     for (var q = 0u; q < nbw; q = q + 1u) {{
         let buf = q & 1u;
         if (ii == q) {{
-            let dv = select(ls[off(q) + q], 1.0, p.unit != 0u);
+            let dv = dinv[q];
 {solve}        }}
         workgroupBarrier();
         if (ii > q && ii < nbw) {{
@@ -273,7 +275,7 @@ impl Array<f32> {
     /// `transpose` solves with `Aᵀ`, `unit_diag` takes the diagonal as ones without reading it.
     ///
     /// A zero on the diagonal (not `unit_diag`) gives `Inf` / `NaN` entries; it is not checked.
-    /// Big triangles are solved recursively with [`matmul_f32`] products, small ones and
+    /// Big triangles are solved in blocks of rows with [`matmul_f32`] products, small ones and
     /// batches in one kernel with one invocation per column of `b`. Matrices are `[cols, rows]`, as in
     /// [`matmul`](crate::matmul).
     ///
