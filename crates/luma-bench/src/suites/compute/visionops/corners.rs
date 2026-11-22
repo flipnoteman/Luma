@@ -172,7 +172,7 @@ pub fn run(h: &mut Harness) {
                 img.susan(3, 32.0, 10.0, 0.05, 3).unwrap();
             });
             h.case("visionops/corners_susan_r5", &tag, pix(dims), &mut || {
-                img.susan(5, 32.0, 20.0, 0.05, 5).unwrap();
+                img.susan(5, 32.0, 30.0, 0.05, 5).unwrap();
             });
             for (r1, r2) in [(1usize, 2usize), (3, 5), (8, 8 + 4)] {
                 h.case(&format!("visionops/corners_dog_{r1}_{r2}"), &tag, pix(dims), &mut || img.dog(r1, r2).eval().unwrap());

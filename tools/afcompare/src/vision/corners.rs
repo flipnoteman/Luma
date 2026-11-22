@@ -107,7 +107,7 @@ pub fn rows(b: &mut Bench) {
                 b.run(&format!("14 {name}"), &size, v, note, &mut lr(&ctx, l), &mut ar(a));
             }
             // SUSAN.
-            for (name, r, t, g, edge) in [("susan r3", 3usize, 32.0f32, 10.0f32, 3usize), ("susan r5", 5, 32.0, 20.0, 5)] {
+            for (name, r, t, g, edge) in [("susan r3", 3usize, 32.0f32, 10.0f32, 3usize), ("susan r5", 5, 32.0, 30.0, 5)] {
                 let l = || xl.susan(r, t, g, 0.05, edge).unwrap();
                 let a = || af::susan(&xa, r as u32, t, g, 0.05, edge as u32);
                 let v = sets(&luma_points(&l()), &af_points(&a(), true));
