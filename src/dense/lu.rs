@@ -288,36 +288,21 @@ fn calu_parts(rows: usize) -> usize {
     if rows <= 256 { 16 } else { 32 }
 }
 
-/// The largest of `n` keys (the first of equals) and its index as statements declaring `bv` and
-/// `bi`: `key` and `index` are the expressions of entry `{k}`. The loads come first and the
-/// comparisons are a tree of branch-free steps (pairs, then pairs of pairs: the lower index is
-/// always the left operand and wins a tie), so that the chain of dependent instructions is
-/// short.
-fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, indent: &str) -> String {
+/// The largest of `n` keys and its index as statements declaring `bv` and `bi`: `key` and `index`
+/// are the expressions of entry `{k}`. The loads come first, the comparisons are branch-free. Of
+/// equal keys the lowest index wins (`by_index`) or the first entry, which has a lower index than
+/// the later ones.
+fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, by_index: bool, indent: &str) -> String {
     let mut text = String::new();
     for k in 0..n {
-        text += &format!("{indent}let v0_{k} = {};\n", key.replace("{k}", &k.to_string()));
-        text += &format!("{indent}let j0_{k} = {};\n", index.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let v{k} = {};\n", key.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let j{k} = {};\n", index.replace("{k}", &k.to_string()));
     }
-    let (mut level, mut count) = (0, n);
-    while count > 1 {
-        let next = count.div_ceil(2);
-        for k in 0..next {
-            let (l, r) = (2 * k, 2 * k + 1);
-            if r < count {
-                text += &format!(
-                    "{indent}let j{n}_{k} = select(j{lv}_{l}, j{lv}_{r}, v{lv}_{r} > v{lv}_{l});\n{indent}let v{n}_{k} = max(v{lv}_{l}, v{lv}_{r});\n",
-                    n = level + 1,
-                    lv = level
-                );
-            } else {
-                text += &format!("{indent}let j{n}_{k} = j{lv}_{l};\n{indent}let v{n}_{k} = v{lv}_{l};\n", n = level + 1, lv = level);
-            }
-        }
-        level += 1;
-        count = next;
+    text += &format!("{indent}var {bv} = v0;\n{indent}var {bi} = j0;\n");
+    for k in 1..n {
+        let better = if by_index { format!("(v{k} > {bv} || (v{k} == {bv} && j{k} < {bi}))") } else { format!("v{k} > {bv}") };
+        text += &format!("{indent}{bi} = select({bi}, j{k}, {better});\n{indent}{bv} = max({bv}, v{k});\n");
     }
-    text += &format!("{indent}let {bv} = v{level}_0;\n{indent}let {bi} = j{level}_0;\n");
     text
 }
 
@@ -349,7 +334,6 @@ fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
 
 fn stage1(t: u32) {{
     if (t < NP) {{
-        let b = t * PER;
 {stage1}        s1v[t] = bv;
         s1i[t] = bi;
     }}
@@ -357,7 +341,7 @@ fn stage1(t: u32) {{
 ",
         per = rows / parts,
         size = wp * wp,
-        stage1 = reduce_text("cv[b + {k}u]", "b + {k}u", rows / parts, "bv", "bi", "        ")
+        stage1 = reduce_text(&format!("cv[t + {{k}}u * {parts}u]"), &format!("t + {{k}}u * {parts}u"), rows / parts, "bv", "bi", false, "        ")
     )
 }
 
@@ -382,7 +366,7 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
         done = true;
         piv[{j}] = {row};
 ",
-            reduce = if abl & 1 != 0 { String::new() } else { reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "        ") },
+            reduce = if abl & 1 != 0 { String::new() } else { reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", true, "        ") },
             bi = if abl & 1 != 0 { format!("{j}u") } else { "bi".to_string() }
         );
         for c in 0..wp {
