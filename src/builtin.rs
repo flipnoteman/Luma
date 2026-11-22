@@ -439,9 +439,9 @@ pub(crate) enum ReduceOp {
     Max,
     /// Sum of squares of the input; the later passes over its partial results are sums.
     SumSquares,
-    /// The product of the input, identity 1 (a NaN stays one, integers wrap); the later passes
-    /// over its partial results are products. Its kernels combine in workgroup memory (there is
-    /// no subgroup product).
+    /// The product of the input, identity 1 (a NaN gives NaN, integers wrap); the later passes
+    /// over its partial results are products. There is no subgroup product: the kernels combine
+    /// lanes with shuffles (`f32`, `u32`, `i32`) or in workgroup memory.
     Prod,
     /// The index of the first largest element of a line (a NaN is the largest); the partial results
     /// of a pass are (value, index) pairs. Only the axis passes of [`crate::arg`] run it, alone in
