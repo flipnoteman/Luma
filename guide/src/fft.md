@@ -59,6 +59,31 @@ ArrayFire does (output `i` is element `i + k / 2` of the full convolution); `Ful
 axes (2 and 3 for `fft_convolve2`). `conv1d_fft` is the one-dimensional full convolution with its
 own, convolution-specific passes.
 
+## Performance
+
+Per call on an RTX 3090 (CUDA), against ArrayFire 3.10.1 (cuFFT) in `tools/afcompare` (interleaved,
+warm, synchronised; ratio = ArrayFire / luma, above 1 is faster):
+
+| transform | size | luma ms | ArrayFire ms | ratio |
+| --- | --- | ---: | ---: | ---: |
+| `fft` | 1,000,000 | 0.072 | 0.084 | 1.17 |
+| `fft` | 16,000,000 | 1.07 | 1.36 | 1.27 |
+| `fft` | 2^20 / 2^24 | 0.066 / 1.00 | 0.079 / 1.49 | 1.20 / 1.50 |
+| `fft` (prime, Bluestein) | 1,000,003 | 0.30 | 0.39 | 1.30 |
+| `ifft` | 1,000,000 / 16,000,000 | 0.071 / 1.08 | 0.107 / 1.71 | 1.52 / 1.59 |
+| `rfft` | 1,000,000 / 16,000,000 | 0.043 / 0.59 | 0.047 / 0.73 | 1.09 / 1.24 |
+| `rfft` | 2^20 / 2^24 | 0.037 / 0.55 | 0.037 / 0.71 | 0.98 / 1.29 |
+| `fft2` / `ifft2` | 2048 x 2048 | 0.239 / 0.236 | 0.281 / 0.372 | 1.18 / 1.57 |
+| `fft3` | 256^3 | 0.985 | 1.38 | 1.40 |
+| `fft_convolve2` | 2048^2 with 15^2 | 0.75 | 1.94 | 2.60 |
+| `fft_convolve2` | 4096^2 with 31^2 | 4.9 | 9.7 | 1.98 |
+| `fft_convolve3` | 256^3 with 9^3 | 3.1 | 16.4 | 5.3 |
+
+A one-pass transform moves the array once in and once out; a transform of up to about 4096 points
+per line is one pass, up to about 16 million two or three. Results are accurate to a few `f32`
+roundings: against an `f64` reference the rms error is 3e-7 to 8e-7 of the rms of the spectrum (up to
+about 2e-6 at the worst point), a little above cuFFT's.
+
 ## Notes
 
 * The transforms are computed when called (they are not fused with surrounding lazy operations);
