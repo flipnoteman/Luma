@@ -955,3 +955,71 @@ fn bytes_of_every_accumulator_survive_a_second_trip() {
     let again = Accumulator::<Df32>::from_bytes(&empty.to_bytes().unwrap()).unwrap();
     assert!(again.is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Threads and fusion
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn one_accumulator_shared_by_threads() {
+    // Four threads push their own batches into one accumulator and into one of their own that is
+    // merged at the end: the same statistics, in whatever order the pushes fold.
+    let data = f32s(&normal(8000, 70));
+    let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+    let shared = Accumulator::<Df32>::builder(Fold::all()).moments(2).sum().min_max().build().unwrap();
+    let merged = Accumulator::<Df32>::builder(Fold::all()).moments(2).sum().min_max().build().unwrap();
+    std::thread::scope(|scope| {
+        for part in data.chunks(2000) {
+            let (shared, merged) = (&shared, &merged);
+            scope.spawn(move || {
+                let own = Accumulator::<Df32>::builder(Fold::all()).moments(2).sum().min_max().build().unwrap();
+                for chunk in part.chunks(250) {
+                    let batch = Array::from_slice(chunk, chunk.len()).unwrap();
+                    shared.push(&batch).unwrap();
+                    own.push(&batch).unwrap();
+                }
+                merged.merge(&own).unwrap();
+            });
+        }
+    });
+    let want = reference(&host);
+    for acc in [&shared, &merged] {
+        close(read(acc.count())[0], want.n, 0.0, 0.0, "count");
+        close(read(acc.mean())[0], want.mean, 1e-5, 1e-6, "mean");
+        close(read(acc.var())[0], want.m2 / want.n, 1e-5, 0.0, "var");
+        close(read(acc.min())[0], want.min, 1e-6, 0.0, "min");
+        close(read(acc.max())[0], want.max, 1e-6, 0.0, "max");
+    }
+}
+
+#[test]
+fn a_pushed_expression_is_computed_inside_the_reduction() {
+    let ctx = luma::default_context().unwrap();
+    if !ctx.profiling_supported() {
+        return;
+    }
+    let x = Array::from_slice(&f32s(&normal(1 << 16, 71)), [256, 256]).unwrap();
+    let y = Array::from_slice(&f32s(&normal(1 << 16, 72)), [256, 256]).unwrap();
+    x.eval().unwrap();
+    y.eval().unwrap();
+    ctx.sync().unwrap();
+    let acc = Accumulator::<Df32>::builder(Fold::axis(1)).moments(2).flush_every(1).build().unwrap();
+    // The first push settles the first epoch; the profiled one is the second.
+    acc.push(&(&x - &y).abs()).unwrap();
+    let ((), profile) = ctx
+        .profile(|| {
+            acc.push(&(&x - &y).abs()).unwrap();
+            acc.flush().unwrap();
+            ctx.sync().unwrap();
+        })
+        .unwrap();
+    // No kernel computes `abs(x - y)` into a buffer of its own: the one that mentions it reduces.
+    for kernel in &profile.kernels {
+        if kernel.label.contains("Abs") {
+            assert!(kernel.label.contains("Reduce"), "the expression is computed outside the reduction: {}", kernel.label);
+        }
+    }
+    // (Profiling records every reduction of a call separately and every state array's merge as
+    // it is; unprofiled, the reductions of a push share a kernel.)
+    assert!(profile.launches() <= 12, "a push is a few small launches, not {}", profile.launches());
+}
