@@ -26,7 +26,10 @@
 //! close to the cut, as random square `f32` matrices of 4096 columns at the default tolerance, or
 //! rows that are not cut off from the bottom) the caller computes the singular values. The
 //! decision is also left to the singular values when the tolerance is so small that the rounding
-//! errors of the factorisations would matter.
+//! errors of the factorisations would matter: the first row below the rank of a rank-deficient
+//! matrix, which the rounding errors fill, has a norm of about `3 sqrt(n) eps ||A||_F` after an
+//! unpivoted Householder QR factorisation (4096 and 1024 columns), as big as the default cut
+//! `max(m, n) eps s_max`; at the default tolerance only matrices of full rank are decided here.
 
 use super::super::Triangle;
 use crate::array::Array;
@@ -78,13 +81,18 @@ pub(super) fn certified(a: &Array<f32>, tol: f32) -> Result<Option<u32>, LumaErr
     let s_lo = est.max(1.0);
     let s_hi = (est * POWER_MARGIN).min(frob).max(s_lo);
     let (cut_lo, cut_hi) = (tol * s_lo, tol * s_hi);
-    // Rounding errors of the factorisations: a few eps ||A||_F.
+    // Rounding errors of the factorisations of a matrix of full rank: a few eps ||A||_F.
     if cut_lo.is_nan() || cut_lo <= 8.0 * f32::EPSILON * frob {
         return Ok(None);
     }
     // The rows cut off from the bottom: only rows of a norm within the cut can go, and the
     // trailing triangle of those is a matrix of the rounding errors to bound by `cut_lo`.
     let small = row2.iter().rev().take_while(|&&v| v <= cut_lo * cut_lo).count();
+    // The first row below the rank of a rank-deficient matrix has a norm of about 3 sqrt(n) eps
+    // ||A||_F (measured, 4096 and 1024 columns): a cut below twice that cannot be certified.
+    if small > 0 && cut_lo <= 6.0 * (n as f32).sqrt() * f32::EPSILON * frob {
+        return Ok(None);
+    }
     let tail = |t: usize| -> Result<f32, LumaError> { spectral(&r1.slice(1, n - t..n).slice(0, n - t..n).cache(), TAIL_STEPS) };
     let mut cut_rows = 0;
     if small > 0 {
