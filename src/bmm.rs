@@ -177,7 +177,8 @@ impl Array<f32> {
     /// batches are `[B]` or `[B2, B3]` (axes 2 and 3) and otherwise must be equal.
     ///
     /// The whole batch is one launch when the products are up to 128 on a side (and `K` up to
-    /// 1024); bigger ones are one [`matmul`](Array::matmul) each. The operands are evaluated
+    /// 1024); bigger ones are one [`matmul_f32`](Array::matmul_f32) each: batched products are always in full `f32`
+    /// precision, whatever the context's [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says. The operands are evaluated
     /// first, and the product is recorded when this is called, like [`Array::matmul`]'s.
     ///
     /// # Errors
@@ -221,17 +222,17 @@ pub fn matmul_batched(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
     }
 }
 
-/// The product as one [`Array::matmul`] per matrix of the batch, stacked along axis 2.
+/// The product as one [`Array::matmul_f32`] per matrix of the batch, stacked along axis 2.
 #[track_caller]
 fn looped(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Array<f32> {
     let batch = g.batch();
     if batch == 1 {
-        return lhs.matmul(rhs);
+        return lhs.matmul_f32(rhs);
     }
     let a = lhs.reshape([g.k, g.m, if g.lhs_batched { batch } else { 1 }]);
     let b = rhs.reshape([g.n, g.k, if g.rhs_batched { batch } else { 1 }]);
     let pick = |x: &Array<f32>, batched: bool, i: usize| if batched { x.slice(2, i..=i) } else { x.clone() };
-    let products: Vec<Array<f32>> = (0..batch).map(|i| pick(&a, g.lhs_batched, i).matmul(&pick(&b, g.rhs_batched, i))).collect();
+    let products: Vec<Array<f32>> = (0..batch).map(|i| pick(&a, g.lhs_batched, i).matmul_f32(&pick(&b, g.rhs_batched, i))).collect();
     crate::concat_slice(2, &products).reshape(g.out_shape())
 }
 

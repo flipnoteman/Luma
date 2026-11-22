@@ -870,11 +870,11 @@ fn matmul_with_a_fused_transpose_matches_the_host() {
             let lhs = Array::from_slice_on(&ctx, &a_t, [m, k]).unwrap();
             let rhs = Array::from_slice_on(&ctx, &b, [n, k]).unwrap();
             // The transpose is read by the kernel's loads, not evaluated first.
-            let got = lhs.transpose().matmul(&rhs).to_vec().unwrap();
+            let got = lhs.transpose().matmul_f32(&rhs).to_vec().unwrap();
             must(who, &format!("{m}x{k}x{n}"), first_far(&got, &matmul_host(&a_t, &b, m, k, n), 1e-4, abs));
             // Lazy operands are fused into the loads too.
             let scaled = (&lhs * 0.5).transpose();
-            let lazy = scaled.matmul(&(&rhs * 1.5)).to_vec().unwrap();
+            let lazy = scaled.matmul_f32(&(&rhs * 1.5)).to_vec().unwrap();
             let half: Vec<f32> = a_t.iter().map(|v| v * 0.5).collect();
             let wide: Vec<f32> = b.iter().map(|v| v * 1.5).collect();
             must(who, &format!("{m}x{k}x{n} lazy"), first_far(&lazy, &matmul_host(&half, &wide, m, k, n), 1e-4, abs));

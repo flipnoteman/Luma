@@ -140,9 +140,9 @@ fn both_operands_without_a_batch_are_one_product() {
     let c = case.lhs().matmul_batched(&case.rhs());
     assert_eq!(c.shape().dims(), [17, 20, 1, 1]);
     close(&c.to_vec().unwrap(), &host(&case.a, &case.b, 33, 20, 17), 33, "single product");
-    // 2-D operands are the same as `matmul`.
+    // 2-D operands are the same as `matmul_f32`.
     let (a, b) = (Array::from_slice_on(&case.ctx, &case.a, [33, 20]).unwrap(), Array::from_slice_on(&case.ctx, &case.b, [17, 33]).unwrap());
-    assert_eq!(a.matmul_batched(&b).to_vec().unwrap(), a.matmul(&b).to_vec().unwrap());
+    assert_eq!(a.matmul_batched(&b).to_vec().unwrap(), a.matmul_f32(&b).to_vec().unwrap());
 }
 
 #[test]

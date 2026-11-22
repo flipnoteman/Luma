@@ -21,7 +21,7 @@ fn product_at(a: &[f32], b: &[f32], k: usize, n: usize, bt: bool, at: &[(usize, 
 
 /// Verifies the `[n_cols, m_rows]` product `c` at every entry (small) or at a sample of them.
 #[allow(clippy::too_many_arguments)]
-fn verify(name: &str, c: &[f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize, bt: bool) {
+fn verify(name: &str, c: &[f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize, bt: bool, tf32: bool) {
     let entries: Vec<(usize, usize)> = if m * n <= 256 * 256 {
         (0..m).flat_map(|r| (0..n).map(move |j| (r, j))).collect()
     } else {
@@ -34,7 +34,12 @@ fn verify(name: &str, c: &[f32], a: &[f32], b: &[f32], m: usize, k: usize, n: us
     let want = product_at(a, b, k, n, bt, &entries);
     let got: Vec<f32> = entries.iter().map(|&(r, j)| c[r * n + j]).collect();
     // Operands are uniform in [-1, 1): the products have standard deviation sqrt(k / 9).
-    check64(name, &got, &want, 1e-3, 2e-4 * k as f64 + 1e-3);
+    if tf32 {
+        // Tensor cores round the operands to TF32: up to 2^-10 of the sum of |a b|, 0.25 k here.
+        check64(name, &got, &want, 0.0, 3e-4 * k as f64 + 1e-3);
+    } else {
+        check64(name, &got, &want, 1e-3, 2e-4 * k as f64 + 1e-3);
+    }
 }
 
 /// `f32` and TF32 products of the same shapes (`m x k` times `k x n`, `layout` 0 = plain, 1 = the
@@ -47,9 +52,9 @@ fn tf32_pair(h: &mut Harness, m: usize, k: usize, n: usize, layout: u8) {
     let (a, b, at, bt) = (upload(h, &ad, [k, m]), upload(h, &bd, [n, k]), upload(h, &transpose(&ad, m, k), [m, k]), upload(h, &transpose(&bd, k, n), [k, n]));
     type Product<'a> = Box<dyn Fn() -> luma::Array<f32> + 'a>;
     let (f32_run, tf32_run): (Product, Product) = match layout {
-        0 => (Box::new(|| a.matmul(&b)), Box::new(|| a.matmul_tf32(&b))),
-        1 => (Box::new(|| a.matmul(&bt.transpose())), Box::new(|| a.matmul_tf32(&bt.transpose()))),
-        _ => (Box::new(|| at.transpose().matmul(&b)), Box::new(|| at.transpose().matmul_tf32(&b))),
+        0 => (Box::new(|| a.matmul_f32(&b)), Box::new(|| a.matmul_tf32(&b))),
+        1 => (Box::new(|| a.matmul_f32(&bt.transpose())), Box::new(|| a.matmul_tf32(&bt.transpose()))),
+        _ => (Box::new(|| at.transpose().matmul_f32(&b)), Box::new(|| at.transpose().matmul_tf32(&b))),
     };
     // Error of both against the f64 product at a sample of entries.
     let rows = ints(48, 71, m as u32);
@@ -112,7 +117,7 @@ pub fn run(h: &mut Harness) {
         for &n in sizes {
             let (ad, bd) = (values(n * n, 41, -1.0, 1.0), values(n * n, 42, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [n, n]), upload(h, &bd, [n, n]));
-            verify("matmul/square", &host(&a.matmul(&b)), &ad, &bd, n, n, n, false);
+            verify("matmul/square", &host(&a.matmul(&b)), &ad, &bd, n, n, n, false, h.ctx.tf32_matmul());
             h.case("matmul/square", &format!("{n}"), Work::Flops(2.0 * (n as f64).powi(3)), &mut || a.matmul(&b).eval().unwrap());
         }
 
@@ -122,7 +127,7 @@ pub fn run(h: &mut Harness) {
             let (k, n) = (64usize, 64usize);
             let (ad, bd) = (values(m * k, 43, -1.0, 1.0), values(k * n, 44, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [k, m]), upload(h, &bd, [n, k]));
-            verify("matmul/skinny", &host(&a.matmul(&b)), &ad, &bd, m, k, n, false);
+            verify("matmul/skinny", &host(&a.matmul(&b)), &ad, &bd, m, k, n, false, h.ctx.tf32_matmul());
             h.case("matmul/skinny", &format!("{m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || a.matmul(&b).eval().unwrap());
         }
 
@@ -144,7 +149,7 @@ pub fn run(h: &mut Harness) {
         for n in sizes {
             let (ad, bd) = (values(n * n, 47, -1.0, 1.0), values(n * n, 48, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [n, n]), upload(h, &bd, [n, n]));
-            verify("matmul/transposed_rhs", &host(&a.matmul(&b.transpose())), &ad, &bd, n, n, n, true);
+            verify("matmul/transposed_rhs", &host(&a.matmul(&b.transpose())), &ad, &bd, n, n, n, true, h.ctx.tf32_matmul());
             h.case("matmul/transposed_rhs", &format!("{n}"), Work::Flops(2.0 * (n as f64).powi(3)), &mut || a.matmul(&b.transpose()).eval().unwrap());
         }
     });

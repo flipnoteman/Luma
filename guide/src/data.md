@@ -72,21 +72,24 @@ assert_eq!(c.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
 ### Tensor cores (TF32)
 
-`a.matmul_tf32(&b)` is `matmul` on the tensor cores of a CUDA device (compute capability 8.0 and
-up: Ampere, Ada, Hopper). The operands are rounded to TF32, which keeps the 8-bit exponent of `f32`
-but only 10 bits of mantissa, and the products are accumulated in `f32`: each entry differs from
-the `f32` product by up to `2^-10` of the sum of the absolute values of its terms (about 3e-4 of
-the entries' RMS for operands of random sign), the precision of PyTorch's `allow_tf32`. It is opt-in
-because of that: `matmul` itself never rounds its operands. On an RTX 3090 a 4096 x 4096 x 4096
+On a CUDA device with tensor cores (compute capability 8.0 and up: Ampere, Ada, Hopper) `matmul`
+runs on them by default, in TF32: the operands are rounded to TF32, which keeps the 8-bit exponent
+of `f32` but only 10 bits of mantissa, and the products are accumulated in `f32`. Each entry
+differs from the `f32` product by up to 1.5e-3 of the sum of the absolute values of its terms
+(about 2e-4 of the entries' RMS for operands of random sign), the precision of PyTorch's
+`allow_tf32`; infinities and NaNs go through as in `f32`. On an RTX 3090 a 4096 x 4096 x 4096
 product runs at 34 TFLOP/s instead of 20 (the card's `f32` peak is 35.6), a 1024 x 1024 x 1024 one
 at 21 instead of 13, and the small and skinny products of a network (a 256-row batch through a
 1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.
 
-Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other backend
-(wgpu, Metal, the CPU), compute the plain `f32` product, so the same program runs everywhere and
-differs only by the rounding where tensor cores are used. `ContextOptions::tf32_matmul(true)`
-(`LUMA_TF32_MATMUL=1`) makes every `matmul` of a context a `matmul_tf32`, for code you do not
-want to touch. Transposed operands are read in place; other lazy operands are evaluated first.
+Where the precision matters, ask for `f32`: `a.matmul_f32(&b)` is the full-precision product of
+one call (a chain of fused multiply-adds in a fixed order per entry), and
+`ContextOptions::tf32_matmul(false)` (`LUMA_TF32_MATMUL=0`) makes every `matmul` of a context
+that product. `matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always
+`f32`. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
+backend (wgpu, Metal, the CPU), compute the `f32` product, so the same program runs everywhere
+and differs only by the rounding where tensor cores are used. Transposed operands are read in
+place; other lazy operands are evaluated first, where the `f32` kernels fuse them.
 
 An operand that is a pending expression is not stored first: its expression is evaluated inside
 the product's loads, once per use. A standardised Gram (correlation-style) matrix of a table with

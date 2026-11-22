@@ -111,7 +111,7 @@ pub(crate) fn ptx(config: &Config) -> String {
     w.text.push_str(".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n    .param .align 16 .b8 pu[16]\n)\n");
     w.text.push_str(&format!(".maxntid {threads}, 1, 1\n{{\n"));
     w.text.push_str(
-        "    .reg .pred %p<16>;\n    .reg .b32 %r<64>;\n    .reg .b64 %rd<64>;\n",
+        "    .reg .pred %p<16>;\n    .reg .b32 %r<64>;\n    .reg .b64 %rd<64>;\n    .reg .f32 %f<2>;\n",
     );
     // Accumulators, fragments, per-thread copy state.
     w.text.push_str(&format!("    .reg .f32 %c<{}>;\n", mt * nt * 4));
@@ -346,12 +346,18 @@ pub(crate) fn ptx(config: &Config) -> String {
                 p!(w, "ld.shared.b32 %fb{}, [%r22+{off}];", j * 2 + q as u32);
             }
         }
-        // Round to nearest TF32 (ties away from zero) by adding half a unit of the last place the
-        // tensor core keeps: it drops the low 13 bits itself, and the addition costs one integer
-        // instruction per register where `cvt.rna.tf32.f32` costs 12 % of the product at 1024^3.
-        // An infinity becomes a NaN.
+        // Bring the operands to TF32 (the tensor core drops the low 13 bits): multiplying by
+        // `1 + 0.7 * 2^-11` before the truncation rounds to within 0.7 ulp, unbiased, with an RMS
+        // error of 2.1e-4 (0.7 is the best factor; round to nearest has 2.0e-4, truncation 4.0e-4
+        // and a bias of -3.4e-4). One multiplication per register, where adding half an ulp to
+        // the bits (round to nearest) turns an infinity into a NaN and needs a guard that costs
+        // 5 % of the product, and converting in shared memory exposes the latency of the copy.
+        // Infinities and NaNs stay what they are; a magnitude within 3.4e-4 of the largest `f32`
+        // overflows to an infinity.
         for reg in (0..mt * 4).map(|i| format!("%fa{i}")).chain((0..nt * 2).map(|j| format!("%fb{j}"))) {
-            p!(w, "add.u32 {reg}, {reg}, 4096;");
+            p!(w, "mov.b32 %f0, {reg};");
+            p!(w, "mul.f32 %f1, %f0, 0f3F800B33;");
+            p!(w, "mov.b32 {reg}, %f1;");
         }
         for i in 0..mt {
             for j in 0..nt {

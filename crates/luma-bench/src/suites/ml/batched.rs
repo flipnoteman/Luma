@@ -50,7 +50,7 @@ fn looped(h: &mut Harness, batch: usize, m: usize) {
         let b = values(batch * k * n, 84, -1.0, 1.0);
         let aa: Vec<Array<f32>> = (0..batch).map(|i| arr(h, &a[i * m * k..][..m * k], [k, m])).collect();
         let bb: Vec<Array<f32>> = (0..batch).map(|i| arr(h, &b[i * k * n..][..k * n], [n, k])).collect();
-        let run = || -> Vec<Array<f32>> { aa.iter().zip(&bb).map(|(x, w)| matmul(x, w)).collect() };
+        let run = || -> Vec<Array<f32>> { aa.iter().zip(&bb).map(|(x, w)| x.matmul_f32(w)).collect() };
         let outs = run();
         for i in sample(batch, 4) {
             let want = gemm(&a[i * m * k..][..m * k], &b[i * k * n..][..k * n], m, k, n);
