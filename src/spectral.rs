@@ -214,7 +214,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
     for i in 0..passes.saturating_sub(1) {
         // Pass `i`'s result, counted back from the last pass.
         let back = passes - 2 - i;
-        let buffer = if back % 2 == 0 {
+        let buffer = if back.is_multiple_of(2) {
             temp_a.as_ref().expect("temporary exists")
         } else if reuse_out {
             job.dst.0

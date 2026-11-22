@@ -57,7 +57,7 @@ fn shared_bytes(n: u32, tile: Tile) -> u64 {
 /// The window length for a Gaussian of standard deviation `sigma`: `floor(6 sigma)`, made odd.
 fn window_of_sigma(sigma: f32) -> usize {
     let n = (6.0f32 * sigma).floor() as usize;
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         n - 1
     } else {
         n

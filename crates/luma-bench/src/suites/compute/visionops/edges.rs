@@ -31,7 +31,7 @@ fn scene(h: usize, w: usize, planes: usize, seed: u64) -> Vec<f32> {
         .map(|k| {
             let (i, j, p) = ((k % h) as f32, ((k / h) % w) as f32, (k / (h * w)) as f32);
             let a = ((i * 0.021 + p).sin() + (j * 0.017 - p).cos() + ((i + j) * 0.009).sin()) * 70.0 + 128.0;
-            let b = if ((i as usize / 130 + j as usize / 170 + p as usize) % 2) == 0 { 60.0 } else { 0.0 };
+            let b = if (i as usize / 130 + j as usize / 170 + p as usize).is_multiple_of(2) { 60.0 } else { 0.0 };
             (a * 0.6 + b + noise[k]).floor()
         })
         .collect()
