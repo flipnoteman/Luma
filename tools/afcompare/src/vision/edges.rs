@@ -45,6 +45,20 @@ fn compare_edges(luma: &[bool], af: &[bool]) -> Verdict {
     }
 }
 
+/// One diffusion step against ArrayFire's: compared on the leading columns ArrayFire's CUDA kernel
+/// updated (it leaves the others unchanged, a bug that depends on the image size); the verdict
+/// says how many that is and how well luma agrees there.
+fn diffusion_verdict(luma: &[f32], af: &[f32], input: &[f32], h: usize) -> Verdict {
+    let w = input.len() / h;
+    let updated = (0..w).rev().find(|&j| (0..h).any(|i| af[i + h * j] != input[i + h * j])).map_or(0, |j| j + 1);
+    if updated == 0 {
+        return Verdict::no("ArrayFire changed nothing");
+    }
+    let n = h * updated;
+    let v = compare(&luma[..n], &af[..n], 1e-3, 0.05);
+    Verdict { ok: v.ok, text: format!("one step, first {updated} of {w} columns (ArrayFire's CUDA kernel updates only those): {}", v.text) }
+}
+
 pub fn rows(b: &mut Bench) {
     b.guarded("vision-edges", |b| {
         let ctx = b.ctx.clone();
@@ -89,12 +103,15 @@ pub fn rows(b: &mut Bench) {
             ] {
                 let l = || xl.anisotropic_diffusion(0.1, 5.0, 5, flux, eq);
                 let a = || af::anisotropic_diffusion(&xa, 0.1, 5.0, 5, aflux, aeq);
-                let v = compare(&lumax::host(&l()), &afx::host(&a()), 1e-3, 0.05);
+                // ArrayFire's CUDA kernel leaves the columns past a size-dependent limit (72 of 128,
+                // 96 of 300, ...) unchanged, and later steps feed on the half-updated image, so the
+                // verdict is taken on one step (equal normalisation) over the columns it updated.
+                let v = diffusion_verdict(&lumax::host(&xl.anisotropic_diffusion(0.1, 5.0, 1, flux, eq)), &afx::host(&af::anisotropic_diffusion(&xa, 0.1, 5.0, 1, aflux, aeq)), &data, h);
                 b.run(
                     &format!("13 {name}"),
                     &size,
                     v,
-                    "luma ping-pongs two images; ArrayFire updates in place (tile edges differ slightly)",
+                    "timed: 5 steps; luma ping-pongs two images, ArrayFire updates in place and its CUDA kernel skips the trailing columns (see the verdict)",
                     &mut || {
                         l().eval().unwrap();
                         ctx.sync().unwrap();

@@ -260,7 +260,11 @@ impl Array<f32> {
     ///
     /// Differences from ArrayFire: a step reads one image and writes another, so the result does
     /// not depend on the order of the pixels (ArrayFire's CPU backend updates in place, pixel by
-    /// pixel, and its CUDA backend updates in place tile by tile, racing at the tile edges).
+    /// pixel). ArrayFire's CUDA kernel has a bug: on images with more than about 70 columns it
+    /// updates only the first few columns along axis 1 (72 of 128, 80 of 130, 88 of 200, 96 of
+    /// 300 in the sizes probed) and leaves the others as they were. luma updates every pixel; on
+    /// the columns ArrayFire does update, one step agrees with it to `f32` rounding (about
+    /// `1e-5`).
     /// Poisons the result for `iterations == 0` or a conductance of 0 (as ArrayFire errors), and
     /// for non-finite arguments.
     ///
