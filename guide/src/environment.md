@@ -62,3 +62,4 @@ These only affect the crate's own test suite: the first three the differential f
 | `LUMA_FUZZ_VERBOSE` | Set to anything: print a line for each program that ends early on a documented limit |
 | `LUMA_TEST_CACHE` | `1`: the process uses a cache directory under the system temporary directory (`luma-test-cache`) instead of the user's, unless `LUMA_CACHE` or `LUMA_CACHE_DIR` is set (unit tests always do) |
 | `LUMA_LINALG_FENCE` | `1` / `0`: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on for wgpu and Metal, off on CUDA and the CPU backend, where a workgroup barrier orders storage accesses) |
+| `LUMA_LINALG_PANEL` | `8`, `16` or `32` (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop |
