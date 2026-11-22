@@ -25,6 +25,8 @@ use super::{DistType, Neighbour};
 const BQ: u32 = 64;
 const BT: u32 = 64;
 const KL: u32 = 16;
+/// The most neighbours the fused kernel keeps in registers.
+pub(crate) const FUSED_MAX: u32 = 8;
 
 /// The element type of the features (and with it of the distances).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -48,20 +50,53 @@ impl Elem {
 pub(crate) enum Kernel {
     /// The distances of a block of queries to all train features.
     Distances { elem: Elem, metric: DistType, along: bool },
+    /// The `k` smallest distances of every train range, as partial lists (`k` is at most [`FUSED_MAX`]).
+    Fused { elem: Elem, metric: DistType, along: bool, k: u32 },
+    /// The `k` smallest of the partial lists of a query.
+    Merge { elem: Elem },
     /// The `cap` smallest distances of every query (`cap` a power of two, at least `k`).
     Select { elem: Elem, cap: u32 },
 }
 
 pub(crate) fn source(kernel: Kernel) -> String {
     match kernel {
-        Kernel::Distances { elem, metric, along } => distances_source(elem, metric, along),
+        Kernel::Distances { elem, metric, along } => distances_source(elem, metric, along, None),
+        Kernel::Fused { elem, metric, along, k } => distances_source(elem, metric, along, Some(k)),
+        Kernel::Merge { elem } => merge_source(elem),
         Kernel::Select { elem, cap } => select_source(elem, cap),
     }
 }
 
-/// Arguments: query, train, the distances (`[train, query]` of the chunk, as words), uniform
-/// `{nq, nt, len, q0, qend}`. `along`: the elements of a feature are contiguous (`dist_dim` 0).
-fn distances_source(elem: Elem, metric: DistType, along: bool) -> String {
+/// The sort key of an accumulated distance `acc` (`u32` bits that order like the distance; NaN
+/// distances sort last).
+fn key_of(elem: Elem, acc: &str) -> String {
+    match elem {
+        Elem::F32 => format!("select(bitcast<u32>({acc}), 0xffffffffu, {acc} != {acc})"),
+        Elem::U32 => acc.to_string(),
+        Elem::I32 => format!("({acc} ^ 0x80000000u)"),
+    }
+}
+
+/// The distance words of the keys of `key_of`.
+fn word_of(elem: Elem, key: &str) -> String {
+    match elem {
+        Elem::I32 => format!("({key} ^ 0x80000000u)"),
+        _ => key.to_string(),
+    }
+}
+
+/// The kernels that compute blocks of 64 queries x 64 train features of distances with 4 x 4 per
+/// invocation. With `fused` of `Some(k)` they keep the `k` smallest distances per query instead
+/// of writing them: every invocation holds the sorted list of its train features (lane `tx`
+/// sees the features `tx + 16 i` of every block) and writes it, without merging, to the scratch
+/// partial lists.
+///
+/// Distances kernel arguments: query, train, the distances (`[train, query]` of the chunk, as
+/// words), uniform `{nq, nt, len, q0, qend}`. Fused kernel: query, train, keys and indices of the
+/// partial lists (`[query][list][k]`, a list per `split * 16 + lane`), uniform `{nq, nt, len, 0,
+/// nq, blocks per split, stride (words per query)}`. `along`: the elements of a feature are
+/// contiguous (`dist_dim` 0).
+fn distances_source(elem: Elem, metric: DistType, along: bool, fused: Option<u32>) -> String {
     let ty = elem.wgsl();
     let (zero, acc_zero) = match elem {
         Elem::F32 => ("0.0", "0.0"),
@@ -82,11 +117,18 @@ fn distances_source(elem: Elem, metric: DistType, along: bool) -> String {
         }
     };
     let mut s = String::new();
-    s.push_str("struct P { nq: u32, nt: u32, len: u32, q0: u32, qend: u32, a: u32, b: u32, c: u32 }\n");
+    s.push_str("struct P { nq: u32, nt: u32, len: u32, q0: u32, qend: u32, per: u32, stride: u32, c: u32 }\n");
     let _ = writeln!(s, "@group(1) @binding(0) var<storage, read> qv: array<{ty}>;");
     let _ = writeln!(s, "@group(1) @binding(1) var<storage, read> tv: array<{ty}>;");
-    s.push_str("@group(1) @binding(2) var<storage, read_write> dm: array<u32>;\n");
-    s.push_str("@group(1) @binding(3) var<uniform> p: P;\n");
+    if fused.is_some() {
+        s.push_str("@group(1) @binding(2) var<storage, read_write> pk: array<u32>;\n");
+        s.push_str("@group(1) @binding(3) var<storage, read_write> pi: array<u32>;\n");
+        s.push_str("@group(1) @binding(4) var<uniform> p: P;\n");
+        s.push_str("fn lt(k1: u32, i1: u32, k2: u32, i2: u32) -> bool { return k1 < k2 || (k1 == k2 && i1 < i2); }\n");
+    } else {
+        s.push_str("@group(1) @binding(2) var<storage, read_write> dm: array<u32>;\n");
+        s.push_str("@group(1) @binding(3) var<uniform> p: P;\n");
+    }
     let _ = writeln!(s, "var<workgroup> qs: array<{ty}, {}>;", KL * BQ);
     let _ = writeln!(s, "var<workgroup> ts: array<{ty}, {}>;", KL * BT);
     let (qidx, tidx, f, e) = if along {
@@ -100,10 +142,27 @@ fn distances_source(elem: Elem, metric: DistType, along: bool) -> String {
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
     let tx = t & 15u;
     let ty = t >> 4u;
-    let t0 = wid.x * {BT}u;
     let qb = p.q0 + wid.y * {BQ}u;
 "
     );
+    if let Some(k) = fused {
+        for j in 0..4 {
+            for r in 0..k {
+                let _ = writeln!(s, "    var bk{j}_{r} = 0xffffffffu;\n    var bi{j}_{r} = 0xffffffffu;");
+            }
+        }
+        let _ = write!(
+            s,
+            "    let blocks = (p.nt + {BT}u - 1u) / {BT}u;
+    let first = wid.x * p.per;
+    let last = min(first + p.per, blocks);
+    for (var tb = first; tb < last; tb++) {{
+    let t0 = tb * {BT}u;
+"
+        );
+    } else {
+        let _ = writeln!(s, "    let t0 = wid.x * {BT}u;");
+    }
     for j in 0..4 {
         for i in 0..4 {
             let _ = writeln!(s, "    var acc{j}_{i} = {acc_zero};");
@@ -143,16 +202,80 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
         }
     }
     s.push_str("        }\n    }\n");
-    let word = |v: String| if elem == Elem::F32 { format!("bitcast<u32>({v})") } else { v };
-    for j in 0..4 {
-        let _ = writeln!(s, "    {{\n        let gq = qb + ty * 4u + {j}u;");
+    if let Some(k) = fused {
+        // Insert the 16 distances of the block into the lists.
         for i in 0..4 {
-            let _ = writeln!(s, "        {{ let gt = t0 + tx + {}u; if (gq < p.qend && gt < p.nt) {{ dm[gt + p.nt * (gq - p.q0)] = {}; }} }}", 16 * i, word(format!("acc{j}_{i}")));
+            let _ = writeln!(s, "    let gt{i} = t0 + tx + {}u;", 16 * i);
+        }
+        for j in 0..4 {
+            for i in 0..4 {
+                let _ = writeln!(s, "    if (gt{i} < p.nt) {{");
+                let _ = writeln!(s, "        var ck = {};\n        var ci = gt{i};", key_of(elem, &format!("acc{j}_{i}")));
+                let _ = writeln!(s, "        if (lt(ck, ci, bk{j}_{}, bi{j}_{})) {{", k - 1, k - 1);
+                for r in 0..k {
+                    let _ = writeln!(s, "            if (lt(ck, ci, bk{j}_{r}, bi{j}_{r})) {{ let tk = bk{j}_{r}; let ti = bi{j}_{r}; bk{j}_{r} = ck; bi{j}_{r} = ci; ck = tk; ci = ti; }}");
+                }
+                s.push_str("        }\n    }\n");
+            }
         }
         s.push_str("    }\n");
+        // The lists, `lane` the position of this invocation's list among the query's.
+        for j in 0..4 {
+            let _ = writeln!(s, "    {{\n        let gq = qb + ty * 4u + {j}u;\n        if (gq < p.nq) {{\n            let o = gq * p.stride + (wid.x * 16u + tx) * {k}u;");
+            for r in 0..k {
+                let _ = writeln!(s, "            pk[o + {r}u] = bk{j}_{r};\n            pi[o + {r}u] = bi{j}_{r};");
+            }
+            s.push_str("        }\n    }\n");
+        }
+    } else {
+        let word = |v: String| if elem == Elem::F32 { format!("bitcast<u32>({v})") } else { v };
+        for j in 0..4 {
+            let _ = writeln!(s, "    {{\n        let gq = qb + ty * 4u + {j}u;");
+            for i in 0..4 {
+                let _ = writeln!(s, "        {{ let gt = t0 + tx + {}u; if (gq < p.qend && gt < p.nt) {{ dm[gt + p.nt * (gq - p.q0)] = {}; }} }}", 16 * i, word(format!("acc{j}_{i}")));
+            }
+            s.push_str("    }\n");
+        }
     }
     s.push_str("}\n");
     s
+}
+
+/// Merges the partial lists of the fused kernel: a thread per query takes the `k` smallest of
+/// its `stride` entries one after the other. Arguments: keys, indices (both consumed), indices
+/// out, distances out (`[k, query]`), uniform `{nq, k, stride}`.
+fn merge_source(elem: Elem) -> String {
+    let out = word_of(elem, "bk");
+    format!(
+        "struct P {{ nq: u32, k: u32, stride: u32, a: u32 }}
+@group(1) @binding(0) var<storage, read_write> pk: array<u32>;
+@group(1) @binding(1) var<storage, read_write> pi: array<u32>;
+@group(1) @binding(2) var<storage, read_write> oi: array<u32>;
+@group(1) @binding(3) var<storage, read_write> od: array<u32>;
+@group(1) @binding(4) var<uniform> p: P;
+fn lt(k1: u32, i1: u32, k2: u32, i2: u32) -> bool {{ return k1 < k2 || (k1 == k2 && i1 < i2); }}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let q = gid.x;
+    if (q >= p.nq) {{ return; }}
+    let base = q * p.stride;
+    for (var r = 0u; r < p.k; r++) {{
+        var bk = 0xffffffffu;
+        var bi = 0xffffffffu;
+        var pos = 0u;
+        for (var c = 0u; c < p.stride; c++) {{
+            let kk = pk[base + c];
+            let ii = pi[base + c];
+            if (lt(kk, ii, bk, bi)) {{ bk = kk; bi = ii; pos = c; }}
+        }}
+        oi[q * p.k + r] = bi;
+        od[q * p.k + r] = {out};
+        pk[base + pos] = 0xffffffffu;
+        pi[base + pos] = 0xffffffffu;
+    }}
+}}
+"
+    )
 }
 
 /// Arguments: distances (`[train, query]` words), indices out, distances out (`[k, query]`),
@@ -242,6 +365,12 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     s
 }
 
+/// Workgroups the fused kernel aims for (it splits the train features over workgroups to reach
+/// them), the most splits, and the most bytes of partial lists.
+const FUSED_GROUPS: u32 = 384;
+const MAX_SPLITS: u32 = 64;
+const PARTIAL_BYTES: u64 = 256 << 20;
+
 /// The most words of the distance matrix a chunk of queries may take.
 const MATRIX_WORDS: u64 = 64 << 20;
 
@@ -277,6 +406,47 @@ pub(crate) fn run<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_dim: us
     let (t_pin, t_bytes) = train.ready().map_err(crate::array::Failure::into_error)?;
     let (idx_pin, idx_bytes) = idx.ready().map_err(crate::array::Failure::into_error)?;
     let (dist_pin, dist_bytes) = dist.ready().map_err(crate::array::Failure::into_error)?;
+    let elem = T::ELEM;
+    let along = dist_dim == 0;
+    let kernel_of = |kernel: Kernel| ctx.builtin(Builtin::Vision(Any::Matching(super::Kernel::Neighbours(kernel))), T::NAME);
+    if k32 <= FUSED_MAX {
+        // Distances never leave the registers: every workgroup keeps lists of the smallest ones of
+        // a range of train blocks (ranges only when there are too few blocks of queries to fill
+        // the device), a thread per query merges the lists.
+        let qblocks = nq32.div_ceil(BQ);
+        let blocks = nt32.div_ceil(BT);
+        let per = blocks.div_ceil(FUSED_GROUPS.div_ceil(qblocks).clamp(1, blocks.min(MAX_SPLITS)));
+        let splits = blocks.div_ceil(per);
+        let stride = splits * 16 * k32;
+        let partial_bytes = u64::from(nq32) * u64::from(stride) * 4;
+        let max_groups = ctx.max_workgroups_per_dimension();
+        if partial_bytes <= PARTIAL_BYTES.min(ctx.max_buffer_bytes()) && splits <= max_groups && qblocks <= max_groups {
+            let mut scratch = Scratch::new(ctx);
+            let keys = scratch.take(partial_bytes)?;
+            let ids = scratch.take(partial_bytes)?;
+            let fused = kernel_of(Kernel::Fused { elem, metric, along, k: k32 })?;
+            let params = [nq32, nt32, len32, 0, nq32, per, stride, 0];
+            let args = [
+                RawArg::read(q_pin.buffer(), q_bytes),
+                RawArg::read(t_pin.buffer(), t_bytes),
+                RawArg::write(&keys, partial_bytes),
+                RawArg::write(&ids, partial_bytes),
+                RawArg::Uniform(bytemuck::bytes_of(&params)),
+            ];
+            ctx.launch(&fused, [splits, qblocks, 1], [nt32, nq32, 1], &args)?;
+            let merge = kernel_of(Kernel::Merge { elem })?;
+            let params = [nq32, k32, stride, 0];
+            let args = [
+                RawArg::write(&keys, partial_bytes),
+                RawArg::write(&ids, partial_bytes),
+                RawArg::write(idx_pin.buffer(), idx_bytes),
+                RawArg::write(dist_pin.buffer(), dist_bytes),
+                RawArg::Uniform(bytemuck::bytes_of(&params)),
+            ];
+            ctx.launch(&merge, [nq32.div_ceil(64), 1, 1], [nq32, 1, 1], &args)?;
+            return Ok((idx, dist));
+        }
+    }
     // Queries per chunk: the distance matrix of a chunk is `nt` words per query.
     let budget = (MATRIX_WORDS.min(ctx.max_buffer_bytes() / 4)) / u64::from(nt32);
     let max_groups = u64::from(ctx.max_workgroups_per_dimension());
@@ -285,13 +455,12 @@ pub(crate) fn run<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_dim: us
     if per_chunk == 0 || u64::from(nt32).div_ceil(u64::from(BT)) > max_groups {
         return Err(LumaError::Unsupported(format!("nearest_neighbour: {nt} train features are too many for one launch")));
     }
-    let elem = T::ELEM;
     let cap = k32.next_power_of_two();
     let mut scratch = Scratch::new(ctx);
     let matrix_bytes = per_chunk * u64::from(nt32) * 4;
     let matrix = scratch.take(matrix_bytes)?;
-    let dist_kernel = ctx.builtin(Builtin::Vision(Any::Matching(super::Kernel::Neighbours(Kernel::Distances { elem, metric, along: dist_dim == 0 }))), T::NAME)?;
-    let select_kernel = ctx.builtin(Builtin::Vision(Any::Matching(super::Kernel::Neighbours(Kernel::Select { elem, cap }))), T::NAME)?;
+    let dist_kernel = kernel_of(Kernel::Distances { elem, metric, along })?;
+    let select_kernel = kernel_of(Kernel::Select { elem, cap })?;
     let mut q0 = 0u64;
     while q0 < nq as u64 {
         let qc = per_chunk.min(nq as u64 - q0);
