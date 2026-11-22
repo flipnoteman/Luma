@@ -168,9 +168,9 @@ fn run(image: &Array<f32>, radius: usize, diff_thr: f32, geom_thr: f32, ratio: f
         return Err(invalid(format!("susan: feature_ratio {ratio} is not in (0, 1]")));
     }
     image.storage()?;
-    let lo = edge + 1;
+    let lo = edge.saturating_add(1);
     let limit = ((h * w) as f64 * f64::from(ratio)).floor() as usize;
-    if h <= 2 * lo || w <= 2 * lo || limit == 0 {
+    if h / 2 < lo || w / 2 < lo || h <= 2 * lo || w <= 2 * lo || limit == 0 {
         return Ok(None);
     }
     let tile = detect::plan_tile(ctx.tuning().workgroup_storage, |t| shared_bytes(radius as u32, t), "a SUSAN disc")?;

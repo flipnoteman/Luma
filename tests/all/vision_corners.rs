@@ -132,6 +132,10 @@ fn harris_matches_the_definition() {
         (48, 48, 1.0, 6, 6, true),
         (70, 33, 1.5, 0, 9, true),
         (50, 50, 0.1, 9, 9, false),
+        (90, 100, 5.0, 0, 29, true),
+        (80, 85, 0.1, 32, 32, false),
+        (80, 85, 3.0, 31, 31, true),
+        (30, 30, 0.5, 1, 1, true),
     ] {
         let data = scene(h, w, (h * w) as u64, 60.0);
         let img = Array::from_slice_on(&ctx, &data, [h, w]).unwrap();
