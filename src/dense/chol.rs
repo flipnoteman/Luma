@@ -9,7 +9,7 @@
 use std::panic::Location;
 
 use super::tri::{block_size, lower_left, rhs_matrix};
-use super::{block, fail, launch, nth, per_matrix, stack_batch, Dims, NAN};
+use super::{block, fail, launch, launch_unchecked, nth, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
 use crate::kernel::{uniform, view, KernelArg};
@@ -132,33 +132,64 @@ struct BlockParams {
 /// The kernel that factors the diagonal block of columns `k..k + nbw`: `A_kk - T[..nbw]` (`T` the
 /// product of the finished columns, see [`blocked`]) in workgroup memory as a packed lower
 /// triangle (row `i` at `i (i + 1) / 2`, so that the 32 rows of a warp read one column without bank
-/// conflicts), two invocations per row. Panels of 8 columns: each column of a panel takes one
-/// barrier, the row's multipliers coming from the (at most 8) columns of the panel so far; then a
-/// rank-8 update of the rest of the triangle, the two invocations of a row sharing its columns.
-/// The factor goes to `dk` (the panel kernel reads it) and into its place in the output.
+/// conflicts). Right-looking in panels of 8 columns. The invocation of row `i` takes its entries
+/// of a column from the columns of the panel done so far (at most 8 products, one barrier per
+/// column; every invocation also takes `l_jj` from row `j` so that the column needs no second
+/// barrier, and the pivots go to `dg`: row `j` itself is read as it was by the others while it is
+/// computed). Then a rank-8 update of the rest of the triangle: two invocations share a row (every
+/// other column each), and the warps of the second one take the row groups in reverse order, so that
+/// the four schedulers of a multiprocessor get the same number of columns. The block's
+/// loads and stores go sixteen rows at a step with the loads issued together (a load that waits for
+/// its store before the next one is issued costs a full memory latency per row). The factor goes to
+/// `dk` (the panel kernel reads it) and into its place in the output.
 fn diag_source(nb: usize) -> String {
-    let t = 2 * nb;
     let size = nb * (nb + 1) / 2;
+    let threads = 2 * nb;
+    let groups = nb / 32;
+    let mut loads = String::new();
+    let mut stores = String::new();
+    let mut outs = String::new();
+    for u in 0..8 {
+        loads += &format!(
+            "        var v{u} = 0.0;
+        let live{u} = cid < nbw && cid <= i0 + {u}u && i0 + {u}u < nbw;
+        if (live{u}) {{
+            v{u} = a[luma_view_idx3(av, k + cid, k + i0 + {u}u, 0u)];
+            if (p.has_t != 0u) {{ v{u} = v{u} - tm[(i0 + {u}u) * nbw + cid]; }}
+        }}
+"
+        );
+        stores += &format!("        if (live{u}) {{ s[off(i0 + {u}u) + cid] = v{u}; }}\n");
+        outs += &format!(
+            "        if (cid < nbw && i0 + {u}u < nbw) {{
+            let w{u} = select(select(0.0, s[off(i0 + {u}u) + cid], cid < i0 + {u}u), dg[cid], cid == i0 + {u}u);
+            dk[(i0 + {u}u) * {nb}u + cid] = w{u};
+            o[(k + i0 + {u}u) * n + k + cid] = w{u};
+        }}
+"
+        );
+    }
     let mut cols = String::new();
     for q in 0..8 {
         let mut dsum = String::new();
         let mut vsum = String::new();
         for r in 0..q {
-            dsum += &format!("            {{ let lj = s[off(j) + c0 + {r}u]; d = fma(-lj, lj, d); }}\n");
-            vsum += &format!("                v = fma(-s[off(i) + c0 + {r}u], s[off(j) + c0 + {r}u], v);\n");
+            dsum += &format!("                    {{ let lj = s[rj + c0 + {r}u]; d = fma(-lj, lj, d); }}\n");
+            vsum += &format!("                        v = fma(-s[ri + c0 + {r}u], s[rj + c0 + {r}u], v);\n");
         }
         cols += &format!(
             "        {{
             let j = c0 + {q}u;
             if (j < nbw) {{
                 if (h == 0u && i >= j && i < nbw) {{
-                    var d = s[off(j) + j];
+                    let rj = off(j);
+                    var d = s[rj + j];
 {dsum}                    let r = select({NAN}, sqrt(d), d > 0.0);
                     if (i == j) {{
                         dg[j] = r;
                     }} else {{
-                        var v = s[off(i) + j];
-{vsum}                        s[off(i) + j] = v / r;
+                        var v = s[ri + j];
+{vsum}                        s[ri + j] = v / r;
                     }}
                 }}
                 workgroupBarrier();
@@ -167,8 +198,8 @@ fn diag_source(nb: usize) -> String {
 "
         );
     }
-    let loads = (0..8).map(|r| format!("            let l{r} = s[off(i) + c0 + {r}u];\n")).collect::<String>();
-    let fmas = (0..8).map(|r| format!("                acc = fma(-l{r}, s[off(q) + c0 + {r}u], acc);\n")).collect::<String>();
+    let lds = (0..8).map(|r| format!("            let l{r} = s[ri + c0 + {r}u];\n")).collect::<String>();
+    let fmas = (0..8).map(|r| format!("                acc = fma(-l{r}, s[rq + c0 + {r}u], acc);\n")).collect::<String>();
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -183,64 +214,87 @@ var<workgroup> dg: array<f32, {nb}>;
 
 fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
 
-@compute @workgroup_size({t})
+@compute @workgroup_size({threads})
 fn main(@builtin(local_invocation_index) t: u32) {{
     let nbw = p.nbw;
     let k = p.k;
     let n = p.n;
-    for (var idx = t; idx < nbw * nbw; idx = idx + {t}u) {{
-        let i = idx / nbw;
-        let j = idx - i * nbw;
-        if (j <= i) {{
-            var v = a[luma_view_idx3(av, k + j, k + i, 0u)];
-            if (p.has_t != 0u) {{ v = v - tm[idx]; }}
-            s[off(i) + j] = v;
-        }}
-    }}
+    let cid = t % {nb}u;
+    let hh = t / {nb}u;
+    for (var r0 = 0u; r0 < nbw; r0 = r0 + 16u) {{
+        let i0 = r0 + 8u * hh;
+{loads}{stores}    }}
     workgroupBarrier();
-    let i = t % {nb}u;
-    let h = t / {nb}u;
+    let wp = t / 32u;
+    let rg = select({last}u - (wp - {groups}u), wp, wp < {groups}u);
+    let h = select(1u, 0u, wp < {groups}u);
+    let i = rg * 32u + t % 32u;
+    let ri = off(i);
     for (var c0 = 0u; c0 < nbw; c0 = c0 + 8u) {{
 {cols}        if (i < nbw && i >= c0 + 8u) {{
-{loads}            for (var q = c0 + 8u + h; q <= i; q = q + 2u) {{
-                var acc = s[off(i) + q];
-{fmas}                s[off(i) + q] = acc;
+{lds}            for (var q = c0 + 8u + h; q <= i; q = q + 2u) {{
+                let rq = off(q);
+                var acc = s[ri + q];
+{fmas}                s[ri + q] = acc;
             }}
         }}
         workgroupBarrier();
     }}
-    for (var idx = t; idx < nbw * nbw; idx = idx + {t}u) {{
-        let i = idx / nbw;
-        let j = idx - i * nbw;
-        let v = select(select(0.0, s[off(i) + j], j < i), dg[i], i == j);
-        dk[i * {nb}u + j] = v;
-        o[(k + i) * n + k + j] = v;
-    }}
+    for (var r0 = 0u; r0 < nbw; r0 = r0 + 16u) {{
+        let i0 = r0 + 8u * hh;
+{outs}    }}
 }}
-"
+",
+        last = groups - 1,
     )
 }
 
 /// The kernel that solves the rows below a diagonal block: `X = (A_panel - T) L_kkᵀ⁻¹` by forward
 /// substitution along each row, a warp (workgroup) taking 32 rows, a lane a row. The rows live in
-/// workgroup memory column by column (pitch 33, no bank conflicts); `L_kk` is read from `dk`, the
-/// same entry by every lane. Four columns at a step share the loads of the solved ones.
+/// workgroup memory column by column (pitch 33, no bank conflicts). `L_kk` is staged through workgroup
+/// memory (as `vec4`s: four entries of a row of it per load) in squares of at most 64 columns: for
+/// each block of 64 columns, first the products with the solved blocks before it (the square of
+/// `L_kk` below-left), then its own triangle. Four columns at a step share the loads of the solved
+/// ones: 16 multiply-adds for 4 loads of the row and 4 of `L_kk`.
 fn panel_source(nb: usize) -> String {
+    let half = nb.min(64);
+    let h4 = half / 4;
     let mut acc = String::new();
     let mut upd = String::new();
+    let mut ld = String::new();
     let mut diag = String::new();
+    let mut put = String::new();
+    let comp = ["x", "y", "z", "w"];
     for u in 0..4 {
-        acc += &format!("        var s{u} = tile[(j + {u}u) * 33u + lane];\n");
+        acc += &format!("                var s{u} = tile[(c0 + j + {u}u) * 33u + lane];\n");
+        ld += &format!("                    let l{u} = lb[(j + {u}u) * {h4}u + q4];\n");
         for v in 0..4 {
-            upd += &format!("            s{u} = fma(-dk[(j + {u}u) * {nb}u + q + {v}u], x{v}, s{u});\n");
+            upd += &format!("                    s{u} = fma(-l{u}.{c}, x{v}, s{u});\n", c = comp[v]);
         }
-        for v in 0..u {
-            diag += &format!("        s{u} = fma(-dk[(j + {u}u) * {nb}u + j + {v}u], s{v}, s{u});\n");
-        }
-        diag += &format!("        s{u} = s{u} / dk[(j + {u}u) * {nb}u + j + {u}u];\n        tile[(j + {u}u) * 33u + lane] = s{u};\n");
+        put += &format!("                if (j + {u}u < cw) {{ tile[(c0 + j + {u}u) * 33u + lane] = s{u}; }}\n");
     }
-    let xs = (0..4).map(|v| format!("            let x{v} = tile[(q + {v}u) * 33u + lane];\n")).collect::<String>();
-    // The last block of columns may be short: the columns past `nbw` are never read or written.
+    let dld = (0..4).map(|u| format!("                let d{u} = lb[(j + {u}u) * {h4}u + j / 4u];\n")).collect::<String>();
+    for u in 0..4 {
+        for v in 0..u {
+            diag += &format!("                s{u} = fma(-d{u}.{c}, s{v}, s{u});\n", c = comp[v]);
+        }
+        diag += &format!("                s{u} = s{u} / d{u}.{c};\n", c = comp[u]);
+    }
+    let xs_rect = (0..4).map(|v| format!("                    let x{v} = tile[(pc + q4 * 4u + {v}u) * 33u + lane];\n")).collect::<String>();
+    let xs_diag = (0..4).map(|v| format!("                    let x{v} = tile[(c0 + q4 * 4u + {v}u) * 33u + lane];\n")).collect::<String>();
+    let mut loads = String::new();
+    let mut stores = String::new();
+    for u in 0..8 {
+        loads += &format!(
+            "            var v{u} = 0.0;
+            if (rr + {u}u < rows && c < nbw) {{
+                v{u} = a[luma_view_idx3(av, k + c, r0 + rr + {u}u, 0u)];
+                if (p.has_t != 0u) {{ v{u} = v{u} - tm[(r0 + rr + {u}u - k) * nbw + c]; }}
+            }}
+"
+        );
+        stores += &format!("            if (rr + {u}u < rows && c < nbw) {{ tile[c * 33u + rr + {u}u] = v{u}; }}\n");
+    }
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -250,7 +304,16 @@ fn panel_source(nb: usize) -> String {
 @group(1) @binding(4) var<storage, read_write> o: array<f32>;
 @group(1) @binding(5) var<uniform> p: Params;
 
-var<workgroup> tile: array<f32, {size}>;
+var<workgroup> tile: array<f32, {tsize}>;
+var<workgroup> lb: array<vec4<f32>, {lsize}>;
+
+fn stage(lane: u32, c0: u32, cw: u32, pc: u32) {{
+    for (var idx = lane; idx < cw * {h4}u; idx = idx + 32u) {{
+        let r = idx / {h4}u;
+        let base = (c0 + r) * {nb}u + pc + (idx % {h4}u) * 4u;
+        lb[idx] = vec4<f32>(dk[base], dk[base + 1u], dk[base + 2u], dk[base + 3u]);
+    }}
+}}
 
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {{
@@ -259,29 +322,38 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let n = p.n;
     let r0 = k + nbw + wid.x * 32u;
     let rows = min(32u, n - r0);
-    for (var rr = 0u; rr < rows; rr = rr + 1u) {{
-        for (var c = lane; c < nbw; c = c + 32u) {{
-            var v = a[luma_view_idx3(av, k + c, r0 + rr, 0u)];
-            if (p.has_t != 0u) {{ v = v - tm[(r0 + rr - k) * nbw + c]; }}
-            tile[c * 33u + rr] = v;
-        }}
+    for (var rr = 0u; rr < rows; rr = rr + 8u) {{
+        for (var cb = 0u; cb < nbw; cb = cb + 32u) {{
+            let c = cb + lane;
+{loads}{stores}        }}
     }}
     workgroupBarrier();
-    if (lane < rows) {{
-        for (var j = 0u; j + 4u <= nbw; j = j + 4u) {{
-{acc}            for (var q = 0u; q < j; q = q + 4u) {{
-{xs}{upd}            }}
-{diag}        }}
-        // The columns of a block short of a multiple of four, one at a time.
-        for (var j = nbw - nbw % 4u; j < nbw; j = j + 1u) {{
-            var s0 = tile[j * 33u + lane];
-            for (var q = 0u; q < j; q = q + 1u) {{
-                s0 = fma(-dk[j * {nb}u + q], tile[q * 33u + lane], s0);
+    let blocks = (nbw + {half}u - 1u) / {half}u;
+    for (var b = 0u; b < blocks; b = b + 1u) {{
+        let c0 = b * {half}u;
+        let cw = min({half}u, nbw - c0);
+        for (var pb = 0u; pb < b; pb = pb + 1u) {{
+            let pc = pb * {half}u;
+            stage(lane, c0, cw, pc);
+            workgroupBarrier();
+            if (lane < rows) {{
+                for (var j = 0u; j < cw; j = j + 4u) {{
+{acc}                    for (var q4 = 0u; q4 < {h4}u; q4 = q4 + 1u) {{
+{xs_rect}{ld}{upd}                    }}
+{put}                }}
             }}
-            tile[j * 33u + lane] = s0 / dk[j * {nb}u + j];
+            workgroupBarrier();
         }}
+        stage(lane, c0, cw, c0);
+        workgroupBarrier();
+        if (lane < rows) {{
+            for (var j = 0u; j < cw; j = j + 4u) {{
+{acc}                for (var q4 = 0u; q4 < j / 4u; q4 = q4 + 1u) {{
+{xs_diag}{ld}{upd}                }}
+{dld}{diag}{put}            }}
+        }}
+        workgroupBarrier();
     }}
-    workgroupBarrier();
     for (var rr = 0u; rr < rows; rr = rr + 1u) {{
         for (var c = lane; c < nbw; c = c + 32u) {{
             o[(r0 + rr) * n + k + c] = tile[c * 33u + rr];
@@ -289,7 +361,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }}
 }}
 ",
-        size = nb * 33
+        tsize = nb * 33,
+        lsize = half * h4,
     )
 }
 
@@ -316,14 +389,14 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
         let tref = t.as_ref().unwrap_or(&dummy);
         let diag: [KernelArg<'_>; 5] = [view(a), tref.into(), (&mut dk).into(), (&mut out).into(), uniform(&params)];
         let key = format!("chol_diag/{nb}");
-        if let Err(e) = launch(ctx, &key, "chol_diag", || diag_source(nb), [1, 1, 1], &diag) {
+        if let Err(e) = launch_unchecked(ctx, &key, "chol_diag", || diag_source(nb), [1, 1, 1], &diag) {
             return fail(ctx, a.shape(), e, "cholesky", loc);
         }
         let rows = n - k - nbw;
         if rows > 0 {
             let panel: [KernelArg<'_>; 5] = [view(a), tref.into(), (&dk).into(), (&mut out).into(), uniform(&params)];
             let key = format!("chol_panel/{nb}");
-            if let Err(e) = launch(ctx, &key, "chol_panel", || panel_source(nb), [rows.div_ceil(32) as u32, 1, 1], &panel) {
+            if let Err(e) = launch_unchecked(ctx, &key, "chol_panel", || panel_source(nb), [rows.div_ceil(32) as u32, 1, 1], &panel) {
                 return fail(ctx, a.shape(), e, "cholesky", loc);
             }
         }

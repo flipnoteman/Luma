@@ -110,6 +110,31 @@ fn kernel(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String) 
     Ok(kernel)
 }
 
+/// Like [`launch`], for a kernel whose every access to workgroup and storage memory is in bounds by
+/// construction (its sizes come from the launching code, which allocates and indexes to them; the
+/// tests run it on every backend): built without the per-access bounds checks, which in the
+/// column loops of the small factorisation kernels are most of their instructions.
+pub(crate) fn launch_unchecked(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
+    let key = format!("unchecked/{key}");
+    let mut guard = KERNELS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    let kernel = match map.get(&key).and_then(|list| list.iter().find(|k| k.context().same_as(ctx))) {
+        Some(kernel) => kernel.clone(),
+        None => {
+            // SAFETY: the caller vouches for the bounds of every access of the kernel.
+            let kernel = unsafe { ctx.kernel(&make()).label(label).unchecked_bounds() }.build()?;
+            let list = map.entry(key).or_default();
+            if list.len() >= 8 {
+                list.remove(0);
+            }
+            list.push(kernel.clone());
+            kernel
+        }
+    };
+    drop(guard);
+    kernel.launch_raw(groups, args)
+}
+
 /// Records the launch over `groups` workgroups of the kernel `make()` names by `key` (see [`kernel`]).
 pub(crate) fn launch(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
     kernel(ctx, key, label, make)?.launch_raw(groups, args)

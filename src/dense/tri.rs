@@ -10,7 +10,7 @@
 
 use std::panic::Location;
 
-use super::{fail, grid, launch, nth, stack_batch, Dims, Triangle};
+use super::{fail, grid, launch, launch_unchecked, nth, stack_batch, Dims, Triangle};
 use crate::array::Array;
 use crate::error::LumaError;
 use crate::kernel::{uniform, view, KernelArg};
@@ -183,6 +183,15 @@ fn block_source(nb: usize) -> String {
         );
         upd += &format!("            a{c} = fma(-lq, xs[buf * {COLS}u + {c}u], a{c});\n");
     }
+    // The triangle is read eight rows at a step, the loads issued together (see `chol::diag_source`).
+    let mut lload = String::new();
+    let mut lstore = String::new();
+    for u in 0..8 {
+        lload += &format!(
+            "        var v{u} = 0.0;\n        let live{u} = ii < nbw && ii <= i0 + {u}u && i0 + {u}u < nbw;\n        if (live{u}) {{ v{u} = l[luma_view_idx3(lv, j0 + ii, j0 + i0 + {u}u, 0u)]; }}\n"
+        );
+        lstore += &format!("        if (live{u}) {{ ls[off(i0 + {u}u) + ii] = v{u}; }}\n");
+    }
     format!(
         "struct Params {{ n: u32, k: u32, j0: u32, nbw: u32, has_t: u32, unit: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
@@ -204,11 +213,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let j0 = p.j0;
     let nbw = p.nbw;
     let col0 = wid.x * {COLS}u;
-    for (var idx = ii; idx < nbw * nbw; idx = idx + {nb}u) {{
-        let i = idx / nbw;
-        let j = idx - i * nbw;
-        if (j <= i) {{ ls[off(i) + j] = l[luma_view_idx3(lv, j0 + j, j0 + i, 0u)]; }}
-    }}
+    for (var i0 = 0u; i0 < nbw; i0 = i0 + 8u) {{
+{lload}{lstore}    }}
 {init}    workgroupBarrier();
     for (var q = 0u; q < nbw; q = q + 1u) {{
         let buf = q & 1u;
@@ -246,7 +252,7 @@ fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'
         let params = BlockParams { n: n as u32, k: k as u32, j0: j0 as u32, nbw: nbw as u32, has_t: u32::from(j0 > 0), unit: u32::from(unit) };
         let args: [KernelArg<'_>; 5] = [view(l), view(b), t.as_ref().unwrap_or(&dummy).into(), (&mut out).into(), uniform(&params)];
         let key = format!("trsm_block/{nb}");
-        if let Err(e) = launch(ctx, &key, "trsm_block", || block_source(nb), [k.div_ceil(COLS) as u32, 1, 1], &args) {
+        if let Err(e) = launch_unchecked(ctx, &key, "trsm_block", || block_source(nb), [k.div_ceil(COLS) as u32, 1, 1], &args) {
             return fail(ctx, b.shape(), e, op, loc);
         }
         j0 += nbw;
