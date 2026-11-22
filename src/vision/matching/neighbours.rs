@@ -35,7 +35,7 @@ const BQ: u32 = 64;
 const BT: u32 = 64;
 const KL: u32 = 16;
 /// The most neighbours the fused kernel keeps in registers.
-pub(crate) const FUSED_MAX: u32 = 8;
+pub(crate) const FUSED_MAX: u32 = 16;
 
 /// The element type of the features (and with it of the distances).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -386,9 +386,9 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
 }
 
 /// Workgroups the fused kernel aims for (it splits the train features over workgroups to reach
-/// them), the most splits, and the most bytes of partial lists.
+/// them), the most entries of partial lists per query, and the most bytes of partial lists.
 const FUSED_GROUPS: u32 = 384;
-const MAX_SPLITS: u32 = 64;
+const MERGE_ENTRIES: u32 = 512;
 const PARTIAL_BYTES: u64 = 256 << 20;
 
 /// The most words of the distance matrix a chunk of queries may take.
@@ -435,7 +435,8 @@ pub(crate) fn run<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_dim: us
         // the device), a thread per query merges the lists.
         let qblocks = nq32.div_ceil(BQ);
         let blocks = nt32.div_ceil(BT);
-        let per = blocks.div_ceil(FUSED_GROUPS.div_ceil(qblocks).clamp(1, blocks.min(MAX_SPLITS)));
+        let max_splits = blocks.min((MERGE_ENTRIES / (16 * k32)).max(1));
+        let per = blocks.div_ceil(FUSED_GROUPS.div_ceil(qblocks).clamp(1, max_splits));
         let splits = blocks.div_ceil(per);
         let stride = splits * 16 * k32;
         let partial_bytes = u64::from(nq32) * u64::from(stride) * 4;

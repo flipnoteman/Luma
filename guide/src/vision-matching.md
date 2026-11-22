@@ -87,7 +87,7 @@ differences, sums wrap) or `i32` (`i32` distances). Differences from ArrayFire:
   The two arrays are lazy like every other result (nothing waits for the GPU, the number of
   neighbours is known beforehand).
 
-For `n_dist <= 8` one kernel does everything: a workgroup takes 64 queries and a range of train
+For `n_dist <= 16` one kernel does everything: a workgroup takes 64 queries and a range of train
 blocks (the ranges split over workgroups when there are few queries), computes the distances 64 x
 64 at a time (operands staged 16 elements at a time in workgroup memory, 4 x 4 distances per
 invocation in registers, like a small matrix product) and keeps the sorted list of the smallest

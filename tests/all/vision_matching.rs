@@ -306,8 +306,8 @@ fn lazy_and_view_inputs() {
 fn neighbours_nan_last() {
     // A train feature with a NaN has a NaN distance, which sorts after every other one (both
     // paths: the fused kernel and the selection of many neighbours).
-    for k in [2usize, 9] {
-        let nt = 12;
+    for k in [2usize, 9, 17] {
+        let nt = 24;
         let mut train = vec![0.0f32; nt * 2];
         for j in 0..nt {
             train[2 * j] = j as f32;
