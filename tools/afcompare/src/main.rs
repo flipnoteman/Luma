@@ -72,6 +72,7 @@ fn main() {
         ("gather", cases::gathers),
         ("stencil", cases::stencil),
         ("filter", cases::filters),
+        ("data", cases::data_ops),
         ("mlp", mlp::mlp),
         ("math", smallops::math),
         ("end", |_| ()),

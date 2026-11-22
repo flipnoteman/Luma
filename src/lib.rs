@@ -120,6 +120,7 @@ mod segsort;
 mod scalar;
 mod shape;
 mod sort;
+mod structure;
 mod tuning;
 mod until;
 mod view;
