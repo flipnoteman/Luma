@@ -47,3 +47,7 @@ src/sparse.rs has two TEMPORARY env knobs (XP_ROWS forces the rows kernel for Sp
    pointer(): bincount uses atomics (145us): can be replaced by searchsorted on the sorted keys / scatter of boundaries after the sort.
    Verify identical arrays vs cuSPARSE (afcompare checks `same_parts`).
 4. Gates (CPU clippy+nextest; per-host gpuq cuda+wgpu cargo test), CHANGELOG additive entry, README/afcompare results rows per GPU, report before/after per GPU.
+
+## Job ids (cancelled at stop)
+- 0-20261122-105436-12599 (local, sp-xp1-local): xp1 binary, loop over XP_NONE / XP_ROWS=1 XP_LANES=1..5, printing powerlaw/uniform CSR A x rows. Had finished XP_NONE and LANES=1 (see log in ~/.cache/bowshock-gpuq/done/ if it survives).
+- 0-20261122-105437-17366 (remote, sp-xp1-remote): same sweep on the laptop; died at start (ssh 255). Resubmit.
