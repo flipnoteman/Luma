@@ -500,7 +500,7 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let nb = block_size(ctx);
     // The columns an outer step brings up to date together with one product: a product of 128 columns
     // only fills a fifth of the multiprocessors, one of 512 runs about twice as fast.
-    let wide = std::env::var("LUMA_CHOL_WIDE").ok().and_then(|v| v.parse().ok()).filter(|w: &usize| w % nb == 0 && *w >= nb).unwrap_or(4 * nb);
+    let wide = std::env::var("LUMA_CHOL_WIDE").ok().and_then(|v| v.parse().ok()).filter(|w: &usize| w.is_multiple_of(nb) && *w >= nb).unwrap_or(4 * nb);
     let shape = Shape::from([n, n]);
     let setup = (Array::<f32>::zeros_on(ctx, shape), Array::<f32>::alloc(ctx, Shape::from([nb, nb])), Array::<f32>::alloc(ctx, Shape::from(1)));
     let (mut out, mut dk, dummy) = match setup {
