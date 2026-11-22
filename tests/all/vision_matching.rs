@@ -301,3 +301,23 @@ fn lazy_and_view_inputs() {
     assert_eq!(gi.to_vec().unwrap(), wi);
     assert_eq!(gd.to_vec().unwrap(), wd.iter().map(|&d| d as f32).collect::<Vec<_>>());
 }
+
+#[test]
+fn neighbours_nan_last() {
+    // A train feature with a NaN has a NaN distance, which sorts after every other one (both
+    // paths: the fused kernel and the selection of many neighbours).
+    for k in [2usize, 9] {
+        let nt = 12;
+        let mut train = vec![0.0f32; nt * 2];
+        for j in 0..nt {
+            train[2 * j] = j as f32;
+        }
+        train[0] = f32::NAN; // feature 0
+        let t = Array::from_slice(&train, [2, nt]).unwrap();
+        let q = Array::from_slice(&[0.0f32, 0.0], [2, 1]).unwrap();
+        let (idx, dist) = nearest_neighbour(&q, &t, 0, k, DistType::Ssd).unwrap();
+        let (idx, dist) = (idx.to_vec().unwrap(), dist.to_vec().unwrap());
+        assert_eq!(idx, (1..=k as u32).collect::<Vec<_>>(), "k {k}");
+        assert_eq!(dist, (1..=k).map(|j| (j * j) as f32).collect::<Vec<_>>(), "k {k}");
+    }
+}
