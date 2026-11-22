@@ -758,15 +758,15 @@ const NEXT_CHUNK: u32 = 2;
 const BLOCK_MIN: usize = 128;
 
 /// Whether a big matrix of `rr >= cc` is decomposed through the QR factorisation of its tall form
-/// (see [`preconditioned`]): from 2048 columns on, and from [`BLOCK_MIN`] columns on when it is
+/// (see [`preconditioned`]): from 1024 columns on, and from [`BLOCK_MIN`] columns on when it is
 /// three times taller than wide (the Jacobi sweeps then work on the square `R` instead of on
-/// columns of all the rows). `LUMA_SVD_PRECOND=off` turns it off, a number changes the 2048.
+/// columns of all the rows). `LUMA_SVD_PRECOND=off` turns it off, a number changes the 1024.
 fn precondition(rr: usize, cc: usize) -> bool {
     let setting = std::env::var("LUMA_SVD_PRECOND").ok();
     if setting.as_deref() == Some("off") {
         return false;
     }
-    let min = setting.and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let min = setting.and_then(|v| v.parse().ok()).unwrap_or(1024);
     cc >= min || (cc >= BLOCK_MIN && rr >= 3 * cc)
 }
 
@@ -1071,12 +1071,13 @@ impl Array<f32> {
     }
 
     /// The numerical rank of every matrix, `[1, 1]` (`[1, 1, batch]`) as `u32`: the number of
-    /// singular values above `max(m, n) * eps * s_max`. Matrices that fit workgroup memory
-    /// (up to 96 columns) are decided by their singular values, lazily, on the device; a bigger
-    /// matrix is bounded from both sides by QR factorisations when that is possible (see the notes
-    /// of the `rank` module of the source: a rank that is not within the rounding errors of the
-    /// factorisations of the cut costs a QR factorisation, not a Jacobi iteration) and by the
-    /// singular values otherwise, with the same decision; that path waits for the device.
+    /// singular values above `max(m, n) * eps * s_max`. A matrix that fits workgroup memory (up to
+    /// 96 columns) is decided by its singular values, lazily, on the device. A bigger one waits
+    /// for the device: two QR factorisations decide it when their rounding errors are well below
+    /// the cut (a matrix of full rank that is not nearly singular, or a looser tolerance with
+    /// [`Array::rank_tol`]), the singular values otherwise (a rank-deficient matrix at the default
+    /// tolerance, where the rounding errors of a QR factorisation are as big as the cut); the
+    /// decision is the one of the singular values in both cases.
     ///
     /// ```
     /// # use luma::*;
@@ -1177,7 +1178,7 @@ mod tests {
         x.abs().max().item().unwrap()
     }
 
-    /// The decomposition through the QR factorisation (used from 2048 columns on) of tall, wide,
+    /// The decomposition through the QR factorisation (used from 1024 columns on) of tall, wide,
     /// square and rank-deficient matrices: backward error, orthogonality, the values of the
     /// decomposition without vectors.
     #[test]
