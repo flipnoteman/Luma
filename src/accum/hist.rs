@@ -19,6 +19,9 @@ const KIND_HIST2: u8 = 5;
 const EPOCH_ELEMENTS: u64 = 1 << 31;
 const FLUSH_EVERY: usize = 16;
 
+/// Pushes counted by one scatter (`LUMA_ACCUM_HGROUP`, an experiment).
+static SCATTER_GROUP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("LUMA_ACCUM_HGROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+
 /// A table of counts: a wide state and the `u32` counts of the pushes since the last merge, which
 /// the scatter-add of every push adds to in place.
 struct Table<W: Wide> {
@@ -29,6 +32,8 @@ struct Table<W: Wide> {
     /// summed from the `u32` counts of every epoch (`Df32` arrays have no axis sums).
     marginals: Option<Marginals<W>>,
     epoch: Array<u32>,
+    /// Slots of pushes not counted into `epoch` yet.
+    waiting: Vec<Array<u32>>,
     pushes: usize,
     elements: u64,
 }
@@ -41,7 +46,7 @@ struct Marginals<W: Wide> {
 
 impl<W: Wide> Table<W> {
     fn new(ctx: &Context, shape: Shape) -> Result<Table<W>> {
-        Ok(Table { ctx: ctx.clone(), shape, state: V::zeros(ctx, shape)?, marginals: None, epoch: Array::zeros_on(ctx, shape)?, pushes: 0, elements: 0 })
+        Ok(Table { ctx: ctx.clone(), shape, state: V::zeros(ctx, shape)?, marginals: None, epoch: Array::zeros_on(ctx, shape)?, waiting: Vec::new(), pushes: 0, elements: 0 })
     }
 
     /// A table of `bins[0] x bins[1]` joint cells and one for the outside, with marginals.
@@ -51,18 +56,40 @@ impl<W: Wide> Table<W> {
         Ok(table)
     }
 
-    /// Counts the elements whose flat slot is `idx` (slots of the table's length or more are skipped).
+    /// Counts the elements whose flat slot is `idx` (slots of the table's length or more are
+    /// skipped). The slots of up to `SCATTER_GROUP` pushes are counted by one scatter: their
+    /// expressions are joined (a join of lazy parts is computed inside the kernel).
     fn add(&mut self, idx: &Array<u32>, elements: u64) -> Result<()> {
-        self.epoch.put_add(idx, 1u32)?;
+        self.waiting.push(idx.clone());
         self.pushes += 1;
         self.elements += elements;
+        if self.waiting.len() >= *SCATTER_GROUP {
+            self.scatter_waiting()?;
+        }
         if self.pushes >= FLUSH_EVERY || self.elements >= EPOCH_ELEMENTS {
             self.merge()?;
         }
         Ok(())
     }
 
+    fn scatter_waiting(&mut self) -> Result<()> {
+        let parts = std::mem::take(&mut self.waiting);
+        let Some(first) = parts.first() else { return Ok(()) };
+        let dims = first.shape().dims();
+        let joinable = parts.len() > 1 && parts.iter().all(|p| p.shape().dims()[1..] == dims[1..]) && parts.len() * dims[0] < u32::MAX as usize / dims[1..].iter().product::<usize>();
+        if joinable {
+            let joined = crate::view::concat_slice(0, &parts);
+            self.epoch.put_add(&joined, 1u32)?;
+        } else {
+            for part in &parts {
+                self.epoch.put_add(part, 1u32)?;
+            }
+        }
+        Ok(())
+    }
+
     fn merge(&mut self) -> Result<()> {
+        self.scatter_waiting()?;
         if self.pushes == 0 {
             return Ok(());
         }
