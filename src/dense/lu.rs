@@ -289,20 +289,35 @@ fn calu_parts(rows: usize) -> usize {
 }
 
 /// The largest of `n` keys (the first of equals) and its index as statements declaring `bv` and
-/// `bi`: `key` and `index` are the expressions of entry `{k}`. The loads come first, the
-/// comparisons are branch-free, so that no load waits for the comparison before it.
+/// `bi`: `key` and `index` are the expressions of entry `{k}`. The loads come first and the
+/// comparisons are a tree of branch-free steps (pairs, then pairs of pairs: the lower index is
+/// always the left operand and wins a tie), so that the chain of dependent instructions is
+/// short.
 fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, indent: &str) -> String {
     let mut text = String::new();
     for k in 0..n {
-        text += &format!("{indent}let k{k} = {};\n", key.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let v0_{k} = {};\n", key.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let j0_{k} = {};\n", index.replace("{k}", &k.to_string()));
     }
-    for k in 0..n {
-        text += &format!("{indent}let i{k} = {};\n", index.replace("{k}", &k.to_string()));
+    let (mut level, mut count) = (0, n);
+    while count > 1 {
+        let next = count.div_ceil(2);
+        for k in 0..next {
+            let (l, r) = (2 * k, 2 * k + 1);
+            if r < count {
+                text += &format!(
+                    "{indent}let j{n}_{k} = select(j{lv}_{l}, j{lv}_{r}, v{lv}_{r} > v{lv}_{l});\n{indent}let v{n}_{k} = max(v{lv}_{l}, v{lv}_{r});\n",
+                    n = level + 1,
+                    lv = level
+                );
+            } else {
+                text += &format!("{indent}let j{n}_{k} = j{lv}_{l};\n{indent}let v{n}_{k} = v{lv}_{l};\n", n = level + 1, lv = level);
+            }
+        }
+        level += 1;
+        count = next;
     }
-    text += &format!("{indent}var {bv} = k0;\n{indent}var {bi} = i0;\n");
-    for k in 1..n {
-        text += &format!("{indent}{bi} = select({bi}, i{k}, k{k} > {bv});\n{indent}{bv} = max({bv}, k{k});\n");
-    }
+    text += &format!("{indent}let {bv} = v{level}_0;\n{indent}let {bi} = j{level}_0;\n");
     text
 }
 
@@ -533,8 +548,9 @@ fn calu_tail_source(wp: usize) -> String {
         );
     }
     let mut body = String::new();
+    let mut xload = String::new();
     for j in 0..wp {
-        body += &format!("    var acc{j} = 0.0;\n    if ({j}u < w) {{ acc{j} = ld(orig, {j}u); }}\n");
+        xload += &format!("    var acc{j} = 0.0;\n    if ({j}u < w) {{ acc{j} = ld(orig, {j}u); }}\n");
     }
     for k in 0..wp {
         body += &format!("    let y{k} = acc{k} * ru[{k}];\n");
@@ -560,17 +576,19 @@ var<workgroup> ru: array<f32, {wp}>;
 @compute @workgroup_size({CALU_TAIL})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let w = p.w;
-{load}    if (t < {wp}u) {{
+    // The loads that need nothing from workgroup memory are issued before the barrier.
+    let i = w + wid.x * {CALU_TAIL}u + t;
+    let orig = perm[min(i, p.m - 1u)];
+{xload}{load}    if (t < {wp}u) {{
         let d = f[select(0u, t * w + t, t < w)];
         ru[t] = select(0.0, 1.0 / d, t < w && d != 0.0);
     }}
     workgroupBarrier();
-    let i = w + wid.x * {CALU_TAIL}u + t;
     if (i >= p.m) {{ return; }}
-    let orig = perm[i];
 {body}}}
 ",
-        usize = wp * q
+        usize = wp * q,
+        xload = xload
     )
 }
 
