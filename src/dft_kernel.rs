@@ -103,12 +103,13 @@ impl DftPass {
         self.radices[..self.stages as usize].iter().map(|&r| u32::from(r)).product()
     }
 
+    /// Whether `src` is an array of `f32` (a pair of reals is a `vec2` when the inner batch is 1).
     fn real_in(&self) -> bool {
-        matches!(self.load, LoadKind::Real | LoadKind::RealPair)
+        self.load == LoadKind::Real || (self.load == LoadKind::RealPair && !self.unit_inner)
     }
 
     fn real_out(&self) -> bool {
-        matches!(self.store, StoreKind::Real | StoreKind::RealPair)
+        self.store == StoreKind::Real || (self.store == StoreKind::RealPair && !self.unit_inner)
     }
 }
 
@@ -317,6 +318,7 @@ fn load_value(pass: &DftPass) -> String {
     let raw = match pass.load {
         LoadKind::Complex => "v = src[gi];".to_string(),
         LoadKind::Real => "v = vec2<f32>(src[gi], 0.0);".to_string(),
+        LoadKind::RealPair if pass.unit_inner => "v = src[gi];".to_string(),
         LoadKind::RealPair => {
             "let u = gi - ob * p.in_os; let ii = u % INNER;\nlet i0 = 2u * ob * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + INNER]);".to_string()
         }
@@ -363,6 +365,7 @@ fn store_value(pass: &DftPass) -> String {
     let write = match pass.store {
         StoreKind::Complex => "dst[go] = v;".to_string(),
         StoreKind::Real => "dst[go] = v.x;".to_string(),
+        StoreKind::RealPair if pass.unit_inner => "dst[go] = v;".to_string(),
         StoreKind::RealPair => {
             "let u = go - ob * p.out_os; let i0 = 2u * ob * p.out_os + 2u * u - ii;\ndst[i0] = v.x; dst[i0 + INNER] = v.y;".to_string()
         }
