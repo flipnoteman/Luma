@@ -603,7 +603,7 @@ struct CovState<W: Wide> {
     pivot: V<W>,
     /// The `f32` pivot of the pushes recorded since the last merge, `[features, 1]`.
     epoch: Option<(Array<f32>, V<W>)>,
-    pending: Vec<(f64, V<W>, V<W>)>,
+    pending: Vec<(usize, Array<f32>)>,
     merged_once: bool,
 }
 
@@ -665,10 +665,7 @@ impl<W: Wide> Covariance<W> {
         }
         let k = &state.epoch.as_ref().expect("opened").0;
         let d = batch - k;
-        // The product `d d^T`, as the transpose of `d` times `d` in full `f32`.
-        let gram = matmul_f32(&d.transpose(), &d);
-        let s = d.sum_axis(1);
-        state.pending.push((samples as f64, V::from_f32(&s), V::from_f32(&gram)));
+        state.pending.push((samples, d));
         let limit = if state.merged_once { self.flush_every } else { 1 };
         if state.pending.len() >= limit {
             state.merge_pending()?;
@@ -860,20 +857,12 @@ impl<W: Wide> CovState<W> {
         let ctx = self.ctx.clone();
         let pending = std::mem::take(&mut self.pending);
         let k = self.epoch.as_ref().expect("a push opened the epoch").1.clone();
-        let n_b: f64 = pending.iter().map(|p| p.0).sum();
-        let mut s: Option<V<W>> = None;
-        let mut g: Option<V<W>> = None;
-        for (_, si, gi) in &pending {
-            s = Some(match s {
-                Some(a) => &a + si,
-                None => si.clone(),
-            });
-            g = Some(match g {
-                Some(a) => &a + gi,
-                None => gi.clone(),
-            });
-        }
-        let (s, g) = (s.expect("a pending push"), g.expect("a pending push"));
+        let n_b: f64 = pending.iter().map(|p| p.0 as f64).sum();
+        // The centered batches of the epoch are one matrix (a join of lazy parts is computed
+        // where it is read): one product of a long `K` is cheaper than a product per push.
+        let d = if pending.len() == 1 { pending[0].1.clone() } else { crate::view::concat_slice(1, &pending.iter().map(|p| p.1.clone()).collect::<Vec<_>>()) };
+        let gram = matmul_f32(&d.transpose(), &d);
+        let (s, g) = (V::from_f32(&d.sum_axis(1)), V::from_f32(&gram));
         let m = &s * (1.0 / n_b);
         let mean_b = &k + &m;
         // The centered sums of products of the pushes: G - s s^T / n.
