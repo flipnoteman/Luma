@@ -1015,8 +1015,10 @@ impl Array<f32> {
     /// radians like [`Array::orb`]), sorts the points of an octave by position (luma removes
     /// duplicates with a hash table and leaves the order open), and its descriptor histograms
     /// are accumulated in floating point where luma uses integer atomics scaled by
-    /// `65536 * intensity_scale` (descriptor entries can differ by one in rare cases; an image
-    /// whose range is far from `1 / intensity_scale` can overflow them).
+    /// `65536 * intensity_scale` (against ArrayFire's CUDA backend the mean difference of the
+    /// entries is below 1 of 255; a point whose position or radius sits on a rounding boundary can
+    /// differ in a few entries by more; an image whose range is far from `1 / intensity_scale`
+    /// can overflow the integers).
     ///
     /// Every octave is recorded without a readback; the number of points is read back once, so
     /// this **synchronizes** once. Fails for images smaller than 15 x 15 or with parameters

@@ -77,9 +77,10 @@ assert_eq!(sift.shape().dims()[1], points.count());
 
 ## Differences from ArrayFire
 
-Where ArrayFire's CPU and CUDA backends differ, luma follows CUDA. The points of luma agree with
-ArrayFire's (the same points with the same orientations and descriptors up to rounding), the
-following differs on purpose or by construction:
+Where ArrayFire's CPU and CUDA backends differ, luma follows CUDA. On natural-like 1080p and 4K images luma
+finds every point ArrayFire's CUDA backend finds (ORB: identical descriptors, SIFT and GLOH: the same
+points with the same orientations and descriptors up to rounding); the following differs on purpose
+or by construction:
 
 * **Order.** ArrayFire's order depends on its CUDA blocks (atomics) and on a sort. luma returns the
   levels (`orb`) or octaves (`sift`, `gloh`) finest first. Within an ORB level the points are sorted by
@@ -96,9 +97,10 @@ following differs on purpose or by construction:
   its layer), the cross derivative `d2D/dy ds` mixes in the pixel `(x - 1, y - 1)`, the first
   extremum threshold is applied to the unscaled image. Duplicates (two extrema that refine to the
   same location) are removed with a hash table, not a sort. Descriptor histograms are accumulated with
-  integer atomics scaled by `65536 * intensity_scale` instead of float atomics: entries can differ
-  by one from ArrayFire's, and an image whose range is far above `1 / intensity_scale` can overflow
-  them.
+  integer atomics scaled by `65536 * intensity_scale` instead of float atomics: against ArrayFire's
+  CUDA backend the mean difference of the descriptor entries is below 1 (of 255), a point on a
+  rounding boundary of its position can differ in a few entries by more, and an image whose range is
+  far above `1 / intensity_scale` can overflow them.
 * **Errors.** Invalid arguments (`levels == 0`, `scale_factor <= 1`, `n_layers == 0`, images smaller
   than 7 x 7 for ORB and 15 x 15 for SIFT) are `LumaError`s, not ArrayFire exceptions. Only `f32`
   images are supported (ArrayFire also takes `f64`).
