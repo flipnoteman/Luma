@@ -22,9 +22,7 @@ mod matching;
 mod regions;
 
 // Public items of the groups.
-pub use corners::*;
 pub use homography::*;
-pub use descriptors::*;
 pub use edges::*;
 pub use matching::*;
 pub use regions::*;
