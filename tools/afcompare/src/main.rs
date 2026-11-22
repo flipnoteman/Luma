@@ -48,7 +48,7 @@ fn main() {
             "--only" => only = args.next(),
             "--out" => out = args.next().expect("--out DIR"),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).expect("--reps N"),
-            "cold" | "child" | "diag" | "sweep" | "sparse-probe" => mode = a,
+            "cold" | "child" | "diag" | "sweep" | "sparse-probe" | "sparse-diag" => mode = a,
             _ => rest.push(a),
         }
     }
@@ -57,6 +57,7 @@ fn main() {
         "diag" => return diag::run(),
         "sweep" => return diag::sweep(),
         "sparse-probe" => return sparse::probe(&rest[0]),
+        "sparse-diag" => return sparse::diag(&rest[0]),
         "cold" => {
             std::fs::create_dir_all(&out).unwrap();
             let md = cold::orchestrate(reps, only.as_deref());
