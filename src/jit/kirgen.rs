@@ -21,7 +21,7 @@ use luma_core::kir::{
     KirType, LocalId, ModuleBuilder, ScalarTy, Val,
 };
 
-use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, UnOp, df_library};
+use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, UnOp, df_library, special_helpers};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
 use crate::gpu::lower::{Library, finish, library};
@@ -358,7 +358,35 @@ impl<'a> Lower<'a> {
             };
         }
         let float = |op: IrUnOp| fb.unary(op, x);
+        let wide = ty == ElemTy::F64;
+        // The functions without a WGSL built-in: `f32` ones are the helpers of the library, `f64`
+        // ones the operation itself (CUDA and the CPU lower it).
+        let special = |name: &str, op: IrUnOp| if wide { fb.unary(op, x) } else { self.call(fb, name, &[x]) };
         match op {
+            UnOp::Asin => float(IrUnOp::Asin),
+            UnOp::Acos => float(IrUnOp::Acos),
+            UnOp::Atan => float(IrUnOp::Atan),
+            UnOp::Sinh => float(IrUnOp::Sinh),
+            UnOp::Cosh => float(IrUnOp::Cosh),
+            UnOp::Asinh => float(IrUnOp::Asinh),
+            UnOp::Acosh => float(IrUnOp::Acosh),
+            UnOp::Atanh => float(IrUnOp::Atanh),
+            UnOp::Exp2 => float(IrUnOp::Exp2),
+            UnOp::Log2 => float(IrUnOp::Log2),
+            UnOp::Rsqrt => float(IrUnOp::InverseSqrt),
+            UnOp::Log10 if wide => float(IrUnOp::Log10),
+            UnOp::Log10 => fb.unary(IrUnOp::Log2, x) * fb.lit_f32(std::f32::consts::LOG10_2),
+            UnOp::Cbrt => special("luma_cbrt", IrUnOp::Cbrt),
+            UnOp::Erf => special("luma_erf", IrUnOp::Erf),
+            UnOp::Erfc => special("luma_erfc", IrUnOp::Erfc),
+            UnOp::Lgamma => special("luma_lgamma", IrUnOp::Lgamma),
+            UnOp::Tgamma => special("luma_tgamma", IrUnOp::Tgamma),
+            UnOp::Sigmoid => {
+                let one = if wide { fb.lit_f64(1.0) } else { fb.lit_f32(1.0) };
+                one / (one + fb.unary(IrUnOp::Exp, fb.neg(x)))
+            }
+            UnOp::Log1p if wide => float(IrUnOp::Log1p),
+            UnOp::Expm1 if wide => float(IrUnOp::Expm1),
             UnOp::Id => x,
             UnOp::BitNot => fb.bit_not(x),
             UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0) => x,
@@ -415,7 +443,15 @@ impl<'a> Lower<'a> {
             BinOp::Min => fb.binary(IrBinOp::Min, x, y),
             BinOp::Max => fb.binary(IrBinOp::Max, x, y),
             BinOp::Atan2 => fb.binary(IrBinOp::Atan2, x, y),
+            BinOp::Hypot if ty == ElemTy::F64 => self.call(fb, "luma_hypotd", &[x, y]),
             BinOp::Hypot => self.call(fb, "luma_hypot", &[x, y]),
+            BinOp::Mod => match ty {
+                ElemTy::F32 => self.call(fb, "luma_modf", &[x, y]),
+                ElemTy::F64 => self.call(fb, "luma_modd", &[x, y]),
+                ElemTy::I32 => self.call(fb, "luma_modi", &[x, y]),
+                _ => x % y,
+            },
+            BinOp::Copysign if ty == ElemTy::F64 => self.call(fb, "luma_copysignd", &[x, y]),
             BinOp::Copysign => {
                 let (xb, yb) = (fb.bitcast(x, KirType::U32), fb.bitcast(y, KirType::U32));
                 let bits = fb.bit_or(fb.bit_and(xb, lu(fb, 0x7fff_ffff)), fb.bit_and(yb, lu(fb, 0x8000_0000)));
@@ -608,7 +644,8 @@ impl<'a> Lower<'a> {
             OpKind::Compare(c) => self.compare(fb, c, ty, x, y),
             OpKind::Classify(class) => self.classify(fb, class, ty, x),
             OpKind::Powf if ty == ElemTy::Df32 => self.call(fb, "df_pow", &[x, y]),
-            OpKind::Powf => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf if ty == ElemTy::F64 => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf => self.call(fb, "luma_powf", &[x, y]),
             OpKind::Clamp if ty == ElemTy::Df32 => {
                 let above = self.call(fb, "df_max", &[x, y]);
                 self.call(fb, "df_min", &[above, z])
@@ -1708,6 +1745,17 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
     if instrs().any(|instr| matches!(instr.op.kind, OpKind::Binary(BinOp::Hypot)) && instr.op.ty == ElemTy::F32) {
         text.push_str(&format!("fn luma_hypot(x: f32, y: f32) -> f32 {{ return {}; }}\n", BinOp::Hypot.expr()));
     }
+    // The expressions of the operations name the helpers they call (`luma_erf(x)`); `f64` ones
+    // are built in place.
+    text.push_str(&special_helpers(|needle| {
+        needle != "luma_ir_"
+            && instrs().any(|instr| match instr.op.kind {
+                OpKind::Powf => needle == "luma_powf(" && instr.op.ty == ElemTy::F32,
+                OpKind::Unary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                OpKind::Binary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                _ => false,
+            })
+    }));
     if text.is_empty() { Ok(None) } else { library(&text).map(Some) }
 }
 

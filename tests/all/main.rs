@@ -64,3 +64,6 @@ mod tridiagonal;
 mod vector_reductions;
 mod views;
 mod image;
+mod small_math;
+mod structure;
+mod stats;

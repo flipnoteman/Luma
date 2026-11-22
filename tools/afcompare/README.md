@@ -34,7 +34,7 @@ the same ArrayFire install.)
 
 * `afcompare [--only SUBSTR] [--quick] [--out DIR]`: steady-state table
   (`DIR/results.md`, `DIR/results.jsonl`). `--only` selects case groups by name
-  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter mlp`).
+  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter data mlp`).
 * `afcompare cold [--reps N] [--only CASE] [--out DIR]`: first-call (cold) times, each
   measurement in a fresh process (`DIR/cold.md`).
 * `AFCOMPARE_KERNELS=1` prints luma's per-kernel GPU time of every timed luma call (a profiled call).

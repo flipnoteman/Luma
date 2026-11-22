@@ -343,6 +343,25 @@ pub enum IrUnOp {
     Asin,
     Acos,
     Atan,
+    Sinh,
+    Cosh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Log10,
+    Cbrt,
+    /// The error function.
+    Erf,
+    /// `1 - erf(x)`, accurate for large `x`.
+    Erfc,
+    /// `ln |gamma(x)|`.
+    Lgamma,
+    /// The gamma function.
+    Tgamma,
+    /// `ln(1 + x)`, accurate for small `x`.
+    Log1p,
+    /// `e^x - 1`, accurate for small `x`.
+    Expm1,
     FirstLeadingBit,
     CountLeadingZeros,
     CountTrailingZeros,

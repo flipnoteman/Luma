@@ -291,6 +291,7 @@ pub fn reductions(b: &mut Bench) {
             },
         );
     });
+    crate::stats::reductions_extra(b);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1089,5 +1090,195 @@ pub fn filters(b: &mut Bench) {
                 afx::sync();
             },
         );
+    });
+}
+
+// ------------------------------------------------------------------------------------------
+// Data movement and generators: tile, diag, identity, lower / upper, iota, replace, diff1 / diff2
+// ------------------------------------------------------------------------------------------
+
+/// One row of the `data` group: `luma_op` and `af_op` build the result from inputs that stay on
+/// the device; both are evaluated in full and synchronised every call. `want` is the host
+/// reference (checked against both sides, which must also agree with each other exactly).
+fn data_row(b: &mut Bench, name: &str, size: &str, note: &str, want: &[f32], luma_op: &dyn Fn() -> L, af_op: &dyn Fn() -> A) {
+    let ctx = b.ctx.clone();
+    let (lo, ao) = (lumax::host(&luma_op()), afx::host(&af_op()));
+    let v = exact(&lo, &ao).and(exact(&lo, want));
+    drop((lo, ao));
+    b.run(
+        name,
+        size,
+        v,
+        note,
+        &mut || {
+            luma_op().eval().unwrap();
+            ctx.sync().unwrap();
+        },
+        &mut || {
+            af_op().eval();
+            afx::sync();
+        },
+    );
+}
+
+pub fn data_ops(b: &mut Bench) {
+    b.guarded("data", |b| {
+        let ctx = b.ctx.clone();
+        let side = 4096usize;
+        let n = side * side;
+        let side64 = side as u64;
+
+        // tile: a [1024, 1024] matrix repeated 4 x 4, and a 1000-vector repeated 16384 times.
+        let src = uniform(1024 * 1024, 301, -1.0, 1.0);
+        let (sl, sa) = (lumax::arr(&ctx, &src, [1024, 1024]), afx::arr(&src, &[1024, 1024]));
+        let want: Vec<f32> = (0..n).map(|i| src[(i % side) % 1024 + 1024 * ((i / side) % 1024)]).collect();
+        data_row(b, "20 tile (4x4 of a matrix)", "[1024,1024] -> [4096,4096]", "", &want, &|| sl.tile([4, 4]), &|| af::tile(&sa, afx::dims(&[4, 4])));
+        drop((sl, sa, src, want));
+        let vec = uniform(1000, 302, -1.0, 1.0);
+        let (vl, va) = (lumax::arr(&ctx, &vec, 1000), afx::arr(&vec, &[1000]));
+        let want: Vec<f32> = (0..16_384_000).map(|i| vec[i % 1000]).collect();
+        data_row(b, "20b tile (vector repeated)", "1000 x 16384 = 16.4M", "", &want, &|| vl.tile(16384), &|| af::tile(&va, afx::dims(&[16384])));
+        drop((vl, va, want));
+
+        // diag: extract from a big matrix (tiny output), a batch, and create a matrix from a vector.
+        let m = 8192usize;
+        let mat = uniform(m * m, 303, -1.0, 1.0);
+        let (ml, ma) = (lumax::arr(&ctx, &mat, [m, m]), afx::arr(&mat, &[m as u64, m as u64]));
+        let want: Vec<f32> = (0..m - 100).map(|i| mat[i + m * (i + 100)]).collect();
+        data_row(b, "21 diag extract (k = 100)", "[8192,8192] -> 8092", "", &want, &|| ml.diag(100), &|| af::diag_extract(&ma, 100));
+        let want: Vec<f32> = (0..m).map(|i| mat[i + m * i]).collect();
+        data_row(b, "21b diag extract (k = 0)", "[8192,8192] -> 8192", "", &want, &|| ml.diag(0), &|| af::diag_extract(&ma, 0));
+        drop((ml, ma, mat, want));
+        let bm = 1024usize;
+        let batch = uniform(bm * bm * 16, 304, -1.0, 1.0);
+        let (bl, ba) = (lumax::arr(&ctx, &batch, [bm, bm, 16]), afx::arr(&batch, &[bm as u64, bm as u64, 16]));
+        let want: Vec<f32> = (0..16 * bm).map(|o| batch[(o % bm) + bm * (o % bm) + bm * bm * (o / bm)]).collect();
+        // ArrayFire: the batched diagonal is dims [1024, 1, 16] too.
+        match attempt(|| afx::host(&af::diag_extract(&ba, 0))) {
+            Some(_) => data_row(b, "21c diag extract (batch of 16)", "[1024,1024,16] -> [1024,1,16]", "", &want, &|| bl.diag(0), &|| af::diag_extract(&ba, 0)),
+            None => println!("ArrayFire diag_extract of a batch failed (see message above); no row"),
+        }
+        drop((bl, ba, batch, want));
+        let diag_in = uniform(side, 305, -1.0, 1.0);
+        let (dl, da) = (lumax::arr(&ctx, &diag_in, side), afx::arr(&diag_in, &[side64]));
+        let want: Vec<f32> = (0..n).map(|i| if i % side == i / side { diag_in[i % side] } else { 0.0 }).collect();
+        data_row(b, "22 diag create (vector -> matrix)", "4096 -> [4096,4096]", "", &want, &|| dl.diag_matrix(0), &|| af::diag_create(&da, 0));
+        drop((dl, da, diag_in, want));
+
+        // identity
+        let want: Vec<f32> = (0..n).map(|i| if i % side == i / side { 1.0 } else { 0.0 }).collect();
+        data_row(
+            b,
+            "23 identity",
+            "[4096,4096]",
+            "",
+            &want,
+            &|| L::identity_on(&ctx, [side, side]).unwrap(),
+            &|| af::identity::<f32>(afx::dims(&[side64, side64])),
+        );
+        drop(want);
+
+        // lower / upper triangles of a matrix input
+        let mat = uniform(n, 306, 0.5, 1.5);
+        let (tl, ta) = (lumax::arr(&ctx, &mat, [side, side]), afx::arr(&mat, &[side64, side64]));
+        let want: Vec<f32> = (0..n).map(|i| if i / side > i % side { 0.0 } else { mat[i] }).collect();
+        data_row(b, "24 lower", "[4096,4096]", "", &want, &|| tl.lower(false), &|| af::lower(&ta, false));
+        let want: Vec<f32> = (0..n).map(|i| if i / side == i % side { 1.0 } else if i / side < i % side { 0.0 } else { mat[i] }).collect();
+        data_row(b, "25 upper, unit diagonal", "[4096,4096]", "", &want, &|| tl.upper(true), &|| af::upper(&ta, true));
+        drop((tl, ta, want));
+
+        // iota
+        let want: Vec<f32> = (0..n).map(|i| ((i % side) % 1024 + 1024 * ((i / side) % 1024)) as f32).collect();
+        data_row(
+            b,
+            "26 iota (tiled)",
+            "[1024,1024] x 4x4",
+            "values up to 2^20: exact in f32",
+            &want,
+            &|| LA::<f32>::iota_on(&ctx, [1024, 1024], [4, 4]).unwrap(),
+            &|| af::iota::<f32>(afx::dims(&[1024, 1024]), afx::dims(&[4, 4])),
+        );
+        let want: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        data_row(
+            b,
+            "26b iota (untiled)",
+            "16.8M",
+            "ramp 0..2^24: exact in f32",
+            &want,
+            &|| LA::<f32>::iota_on(&ctx, n, 1).unwrap(),
+            &|| af::iota::<f32>(afx::dims(&[n as u64]), afx::dims(&[1])),
+        );
+        drop(want);
+
+        // replace: a where cond else b. ArrayFire's replace works in place; luma returns a new array.
+        let (ad, bd) = (uniform(n, 307, -1.0, 1.0), uniform(n, 308, 10.0, 11.0));
+        let (xl, xa) = (lumax::arr(&ctx, &ad, n), afx::arr(&ad, &[n as u64]));
+        let (yl, ya) = (lumax::arr(&ctx, &bd, n), afx::arr(&bd, &[n as u64]));
+        let (cl, ca) = (xl.gt(0.0), af::gt(&xa, &0.0f32, false));
+        cl.eval().unwrap();
+        ca.eval();
+        ctx.sync().unwrap();
+        afx::sync();
+        let want: Vec<f32> = (0..n).map(|i| if ad[i] > 0.0 { ad[i] } else { bd[i] }).collect();
+        let work = std::cell::RefCell::new(xa.copy());
+        data_row(
+            b,
+            "27 replace (array)",
+            "16.8M",
+            "luma: new array; AF: in place on its own array (the condition does not change, so repeats are idempotent)",
+            &want,
+            &|| xl.replace(&cl, &yl),
+            &|| {
+                af::replace(&mut work.borrow_mut(), &ca, &ya);
+                work.borrow().clone()
+            },
+        );
+        let want: Vec<f32> = (0..n).map(|i| if ad[i] > 0.0 { ad[i] } else { 0.5 }).collect();
+        let work = std::cell::RefCell::new(xa.copy());
+        data_row(
+            b,
+            "27b replace (scalar)",
+            "16.8M",
+            "luma: new array; AF: replace_scalar in place",
+            &want,
+            &|| xl.replace(&cl, 0.5),
+            &|| {
+                af::replace_scalar(&mut work.borrow_mut(), &ca, 0.5);
+                work.borrow().clone()
+            },
+        );
+        drop((xl, xa, yl, ya, cl, ca, ad, bd, want, work));
+
+        // diff1 / diff2
+        let d = uniform(n, 309, 0.0, 1.0);
+        let (dl, da) = (lumax::arr(&ctx, &d, n), afx::arr(&d, &[n as u64]));
+        let want: Vec<f32> = (0..n - 1).map(|i| d[i + 1] - d[i]).collect();
+        data_row(b, "28 diff1 (vector)", "16.8M", "", &want, &|| dl.diff1(0), &|| af::diff1(&da, 0));
+        let want: Vec<f32> = (0..n - 2).map(|i| (d[i + 2] - d[i + 1]) - (d[i + 1] - d[i])).collect();
+        // ArrayFire's diff2 is diff(diff(x)) too, but its kernel may associate the three terms differently: compare closely.
+        let (lo, ao) = (lumax::host(&dl.diff2(0)), afx::host(&af::diff2(&da, 0)));
+        let v = compare(&lo, &ao, 1e-5, 1e-6).and(compare(&lo, &want, 0.0, 0.0));
+        drop((lo, ao));
+        b.run(
+            "29 diff2 (vector)",
+            "16.8M",
+            v,
+            "",
+            &mut || {
+                dl.diff2(0).eval().unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                af::diff2(&da, 0).eval();
+                afx::sync();
+            },
+        );
+        drop((dl, da, want));
+        let mat = uniform(n, 310, 0.0, 1.0);
+        let (ml, ma) = (lumax::arr(&ctx, &mat, [side, side]), afx::arr(&mat, &[side64, side64]));
+        let want: Vec<f32> = (0..side * (side - 1)).map(|i| mat[i + side] - mat[i]).collect();
+        data_row(b, "28b diff1 along dim 1", "[4096,4096] -> [4096,4095]", "", &want, &|| ml.diff1(1), &|| af::diff1(&ma, 1));
+        let want: Vec<f32> = (0..(side - 1) * side).map(|i| mat[i + i / (side - 1) + 1] - mat[i + i / (side - 1)]).collect();
+        data_row(b, "28c diff1 along dim 0", "[4096,4096] -> [4095,4096]", "", &want, &|| ml.diff1(0), &|| af::diff1(&ma, 0));
     });
 }

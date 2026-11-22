@@ -12,7 +12,9 @@
 //!   shifts, slices, scans and gathers;
 //! * `imageops`: the image operations of `luma` (convolutions, rank and morphological filters,
 //!   Sobel, bilateral, summed-area tables, colour conversions, `unwrap`) at 1080p and 4K, 3-D filters;
-//! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`).
+//! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`);
+//! * `structure`: `tile`, `diag`, `identity`, `lower`/`upper`, `iota`, `replace` and `diff1`/`diff2` as
+//!   kernels of their own (the structural half of ArrayFire's array API).
 //!
 //! Every case is checked against a host reference (`f64` where precision matters) before it is
 //! timed. Sizes shrink under `--quick` and on the CPU backend.
@@ -24,6 +26,8 @@ mod linalg;
 mod physics;
 mod scans;
 mod signal;
+mod special;
+mod structure;
 
 use std::time::{Duration, Instant};
 
@@ -98,4 +102,6 @@ pub fn run(h: &mut Harness) {
     signal::run(h);
     imageops::run(h);
     crypto::run(h);
+    special::run(h);
+    structure::run(h);
 }

@@ -122,6 +122,8 @@ mod segsort;
 mod scalar;
 mod shape;
 mod sort;
+mod structure;
+mod stats;
 mod tuning;
 mod until;
 mod view;
@@ -151,6 +153,7 @@ pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
+pub use stats::{Bias, Norm};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 

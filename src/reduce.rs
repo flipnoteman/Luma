@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
+use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
@@ -469,6 +469,23 @@ impl<T: Numeric> Array<T> {
         self.reduce_at([Reduction::Max], "max", Location::caller())
     }
 
+    /// The product of all elements, as a lazy one-element array (see [`Array::sum`]): NaN if any
+    /// element is NaN, and (as for the sum) `u32` and `i32` products wrap around. Float products combine in trees like sums do, so the rounding error stays that
+    /// of `n` multiplications; a partial product that leaves the range of the type becomes
+    /// infinity (or 0) even where later factors would bring it back, and which partial products
+    /// there are depends on the grouping. Fuses with the expression behind it
+    /// (`(&x + 1.0).prod()` is one pass) and with scalar operations on the result.
+    #[track_caller]
+    pub fn prod(&self) -> Array<T> {
+        self.reduce_at([Reduction::Product], "prod", Location::caller())
+    }
+
+    /// The product of all elements: the same as [`Array::prod`] (ArrayFire's name).
+    #[track_caller]
+    pub fn product(&self) -> Array<T> {
+        self.reduce_at([Reduction::Product], "product", Location::caller())
+    }
+
     /// Several reductions of the array in one pass over it (up to four), as an array of `N`
     /// elements: `let [lo, hi] = x.reduce([Reduction::Min, Reduction::Max]).to_array()?;`.
     /// Reading the data once instead of once per reduction is what makes it faster than
@@ -678,6 +695,13 @@ impl<T: ScalarType> Array<T> {
         if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
             return None;
         }
+        let helper = match step {
+            EpilogueStep::Unary(op) => op.needs_helper(),
+            EpilogueStep::Binary { op, .. } => op.needs_helper() || op == BinOp::Mod,
+        };
+        if helper {
+            return None;
+        }
         let mut finish = reduced.finish;
         let at = finish.epilogue.steps().count();
         finish.epilogue = finish.epilogue.then(step)?;
@@ -760,6 +784,8 @@ pub enum Reduction {
     Max,
     /// The sum of the squared elements.
     SumOfSquares,
+    /// The product of the elements (a NaN anywhere gives NaN, integers wrap around).
+    Product,
 }
 
 impl Reduction {
@@ -769,6 +795,7 @@ impl Reduction {
             Reduction::Min => ReduceOp::Min,
             Reduction::Max => ReduceOp::Max,
             Reduction::SumOfSquares => ReduceOp::SumSquares,
+            Reduction::Product => ReduceOp::Prod,
         }
     }
 }

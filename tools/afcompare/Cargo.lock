@@ -678,6 +678,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-native",
  "libc",
+ "libm",
  "log",
  "luma-hal-core",
  "matrixmultiply",

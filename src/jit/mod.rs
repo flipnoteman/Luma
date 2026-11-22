@@ -1902,7 +1902,7 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 }
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
-/// no transcendental functions or `powf` (and needs a device with 64-bit shader floats), `Df32`
+/// the math functions and `powf` only on the CUDA and CPU backends (and needs a device with 64-bit shader floats), `Df32`
 /// only the operations of its library, and neither has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
@@ -1913,7 +1913,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
         OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool),
-        OpKind::Powf => op.ty != ElemTy::F64,
+        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };
@@ -1922,6 +1922,16 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
     }
     if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
+    }
+    // WGSL has no `f64` math functions: they exist where the backend lowers them itself.
+    let math = match op.kind {
+        OpKind::Unary(unary) => unary.wide_math(),
+        OpKind::Binary(binary) => binary.wide_math(),
+        OpKind::Powf => true,
+        _ => false,
+    };
+    if op.ty == ElemTy::F64 && math && !matches!(ctx.backend(), luma_core::BackendKind::Cuda | luma_core::BackendKind::Cpu) {
+        return Err(LumaError::Unsupported(format!("{name} of f64 arrays needs the CUDA or the CPU backend")));
     }
     Ok(())
 }

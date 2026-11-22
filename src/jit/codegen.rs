@@ -135,7 +135,8 @@ fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
         OpKind::Powf if ty == ElemTy::Df32 => format!("df_pow({a}, {b})"),
-        OpKind::Powf => format!("pow({a}, {b})"),
+        OpKind::Powf if ty == ElemTy::F64 => format!("pow({a}, {b})"),
+        OpKind::Powf => format!("luma_powf({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
@@ -617,6 +618,8 @@ fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lo
     if src.contains("luma_udiv") || src.contains("luma_urem") {
         src.push_str(DIV_HELPERS);
     }
+    let helpers = crate::builtin::special_helpers(|needle| src.contains(needle));
+    src.push_str(&helpers);
     src
 }
 
