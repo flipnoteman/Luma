@@ -62,7 +62,7 @@ widening of `x.sum()` and `x.mean_axis(1)`, which therefore never store a widene
   indices as for any array.
 * `mean()`, `mean_axis()`, `var_axis()`, `std_axis()`: `f32`, accumulated in `f32` like those of an
   `f32` array (every 8-bit and 16-bit value is exact in `f32`).
-* `sort()`, `sort_descending()`, `argsort()`, `sort_axis()`: a stable radix sort of the widened keys.
+* `sort()`, `sort_descending()`, `argsort()`: a stable radix sort over the bits of the elements (one pass for 8-bit types, two for 16-bit ones, where `u32` takes four), the first pass reading the elements as stored; `sort_axis()` sorts the widened lines.
 * `bincount(bins)` of `u8` and `u16`, and `histogram()` (256 or 65536 bins): the counts as a `u32` array,
   computed in one kernel that reads the elements at their own size.
 

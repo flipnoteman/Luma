@@ -17,6 +17,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("views", view_cases);
     h.guarded("colstats", colstats_cases);
     h.guarded("hist", hist_cases);
+    h.guarded("sort", sort_cases);
 }
 
 /// The elements of the big arrays: 64M on a GPU in a full run, 8M on the CPU backend, 4M with `--quick`.
@@ -248,6 +249,32 @@ fn hist_cases(h: &mut Harness) {
     hs.iter().for_each(|&v| want[v as usize] += 1);
     assert_eq!(xs.bincount(16384).to_vec().unwrap(), want);
     case_trim(h, "hist/u16_16384", &sz, Work::Bytes(2.0 * n as f64), &mut || xs.bincount(16384).eval().unwrap());
+}
+
+fn sort_cases(h: &mut Harness) {
+    let n = elems(h) / 4;
+    let sz = n.to_string();
+    let hu: Vec<u8> = lcg(n, 14).map(|v| v as u8).collect();
+    let hs: Vec<i16> = lcg(n, 15).map(|v| v as i16).collect();
+    let hw: Vec<u32> = hs.iter().map(|&v| (i32::from(v) + 32768) as u32).collect();
+    let (xu, xs, xw) = (
+        Array::from_slice_on(&h.ctx, &hu, n).unwrap(),
+        Array::from_slice_on(&h.ctx, &hs, n).unwrap(),
+        Array::from_slice_on(&h.ctx, &hw, n).unwrap(),
+    );
+    let mut want = hu.clone();
+    want.sort();
+    assert_eq!(xu.sort().to_vec().unwrap(), want);
+    let mut want = hs.clone();
+    want.sort();
+    assert_eq!(xs.sort().to_vec().unwrap(), want);
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by_key(|&i| hs[i as usize]);
+    assert_eq!(xs.argsort().to_vec().unwrap(), idx);
+    case_trim(h, "sort/u8", &sz, Work::Items(n as f64, "Mkey/s"), &mut || xu.sort().eval().unwrap());
+    case_trim(h, "sort/i16", &sz, Work::Items(n as f64, "Mkey/s"), &mut || xs.sort().eval().unwrap());
+    case_trim(h, "sort/u32_of_i16", &sz, Work::Items(n as f64, "Mkey/s"), &mut || xw.sort().eval().unwrap());
+    case_trim(h, "sort/argsort_i16", &sz, Work::Items(n as f64, "Mkey/s"), &mut || xs.argsort().eval().unwrap());
 }
 
 /// [`Harness::case`] after releasing the pooled idle buffers of the earlier cases.
