@@ -86,7 +86,6 @@ pub(super) const PARAM_WORDS: usize = 12;
 pub(super) const NONE_WORD: &str = NONE;
 pub(super) const GROUP_SIZE: u32 = GROUP;
 pub(super) const CHUNK_PIXELS: u32 = CHUNK;
-pub(super) const TILE: [u32; 2] = [TX, TY];
 
 pub(crate) fn source(k: Kernel) -> String {
     let mut s = String::from(PARAMS);
