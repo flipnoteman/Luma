@@ -55,6 +55,8 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/sparse.md")]
+    pub mod sparse {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -132,6 +134,7 @@ mod sort;
 mod structure;
 mod stats;
 mod spectral;
+mod sparse;
 mod tuning;
 mod until;
 mod view;
@@ -164,6 +167,7 @@ pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
 pub use stats::{Bias, Norm};
+pub use sparse::{sparse, Sparse, SparseElem, SparseFormat, SparseInfo};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 

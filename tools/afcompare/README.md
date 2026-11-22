@@ -34,7 +34,7 @@ the same ArrayFire install.)
 
 * `afcompare [--only SUBSTR] [--quick] [--out DIR]`: steady-state table
   (`DIR/results.md`, `DIR/results.jsonl`). `--only` selects case groups by name
-  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter data mlp`).
+  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter data mlp sparse`).
 * `afcompare cold [--reps N] [--only CASE] [--out DIR]`: first-call (cold) times, each
   measurement in a fresh process (`DIR/cold.md`).
 * `AFCOMPARE_KERNELS=1` prints luma's per-kernel GPU time of every timed luma call (a profiled call).
@@ -67,3 +67,18 @@ the same ArrayFire install.)
   per-kernel times.
 * ArrayFire has no scatter-add; the weighted case uses `sort_by_key` + `sum_by_key`, the unweighted
   count uses `histogram`; both are labelled as different algorithms.
+
+## Sparse group
+
+`--only sparse` compares luma's `Sparse` with ArrayFire's sparse arrays (`src/sparse.rs`): CSR
+products with a vector and 16 dense columns (plain and transposed) on banded and power-law
+matrices of 1M and 10M entries, conversions, construction from triplets and from a dense matrix,
+`to_dense` and elementwise operations with a dense matrix. ArrayFire 3.10.1's sparse entry points
+(`matmul`, `sparseConvertTo`, `sparse(dense)`, `dense(sparse)`) **segfault** on the machines this was
+measured on (in `cusparseCreateSpMatDescr`, a call into the cuSPARSE the build ships), which
+`catch_unwind` cannot survive, so each ArrayFire operation is probed first in a child process
+(`afcompare sparse-probe OP`) and an operation that crashes has no ArrayFire side. For the
+products and the CSR -> CSC conversion the reference is then **cuSPARSE called directly**
+(`src/cusparse.rs`: `cusparseSpMV` / `cusparseSpMM` with the default algorithms, the workspace
+allocated once, and `cusparseCsr2cscEx2`), which is what ArrayFire's wrappers call; the row's note
+says which one it is. Rows with no reference are luma-only.

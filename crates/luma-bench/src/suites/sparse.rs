@@ -21,6 +21,10 @@
 //! * `spmm`: sparse times a few dense columns (atomic and ELL), against a dense `matmul` of the
 //!   same matrix, and a graph-convolution layer (`matmul` then SpMM).
 //!
+//! * `matrix`: the `Sparse` type: products with a vector and with dense columns in CSR, CSC and COO
+//!   (plain and transposed), conversions between formats, construction from triplets and from a
+//!   dense matrix, `to_dense` and elementwise operations with a dense matrix.
+//!
 //! Every case is checked against a host reference (`f64` where sums matter) before it is timed.
 //! Sizes: the large size is about 2M rows (10M-30M entries) on a GPU, 256K on the CPU backend and
 //! 64K with `--quick`.
@@ -28,6 +32,7 @@
 mod convert;
 mod data;
 mod graph;
+mod matrix;
 mod solve;
 mod spmm;
 mod spmv;
@@ -43,6 +48,7 @@ pub fn run(h: &mut Harness) {
     convert::run(h);
     graph::run(h);
     spmm::run(h);
+    matrix::run(h);
 }
 
 /// `quick` in `--quick` runs, `cpu` on the CPU backend, else `gpu`.

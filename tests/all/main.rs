@@ -60,6 +60,7 @@ mod scatter_add;
 mod search;
 mod segments;
 mod sort;
+mod sparse;
 mod spill;
 mod threads;
 mod transfer;

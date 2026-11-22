@@ -5,11 +5,13 @@ mod bench;
 mod bykey;
 mod cases;
 mod cold;
+mod cusparse;
 mod diag;
 mod image;
 mod lumax;
 mod mlp;
 mod smallops;
+mod sparse;
 mod stats;
 mod util;
 
@@ -40,7 +42,7 @@ fn main() {
             "--only" => only = args.next(),
             "--out" => out = args.next().expect("--out DIR"),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).expect("--reps N"),
-            "cold" | "child" | "diag" | "sweep" => mode = a,
+            "cold" | "child" | "diag" | "sweep" | "sparse-probe" => mode = a,
             _ => rest.push(a),
         }
     }
@@ -48,6 +50,7 @@ fn main() {
         "child" => return cold::child(&rest[0], &rest[1]),
         "diag" => return diag::run(),
         "sweep" => return diag::sweep(),
+        "sparse-probe" => return sparse::probe(&rest[0]),
         "cold" => {
             std::fs::create_dir_all(&out).unwrap();
             let md = cold::orchestrate(reps, only.as_deref());
@@ -65,7 +68,7 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let mut b = bench::Bench::new(ctx.clone(), only, quick, Some(&format!("{out}/results.jsonl")));
     wake(&ctx);
-    let groups: [(&str, fn(&mut bench::Bench)); 18] = [
+    let groups: [(&str, fn(&mut bench::Bench)); 19] = [
         ("ew", cases::elementwise),
         ("small", cases::small_ops),
         ("reduce", cases::reductions),
@@ -83,6 +86,7 @@ fn main() {
         ("mlp", mlp::mlp),
         ("image", image::images),
         ("math", smallops::math),
+        ("sparse", sparse::sparse),
         ("end", |_| ()),
     ];
     for (_, g) in groups {

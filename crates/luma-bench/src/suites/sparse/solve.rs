@@ -77,8 +77,8 @@ fn flops(a: &Csr) -> f64 {
 #[derive(Clone, Copy)]
 enum Layout {
     Csr,
-    /// CSR with `sum_segments`.
-    Segments,
+    /// The `Sparse` type (CSR, `sum_segments` over the row pointer).
+    Sparse,
     Ell,
     Grid,
 }
@@ -86,7 +86,7 @@ enum Layout {
 impl Layout {
     fn shape(self, g: usize) -> [usize; 2] {
         match self {
-            Layout::Csr | Layout::Segments => [g * g, 1],
+            Layout::Csr | Layout::Sparse => [g * g, 1],
             Layout::Ell => [1, g * g],
             Layout::Grid => [g, g],
         }
@@ -95,7 +95,7 @@ impl Layout {
     fn name(self) -> &'static str {
         match self {
             Layout::Csr => "csr",
-            Layout::Segments => "segments",
+            Layout::Sparse => "sparse",
             Layout::Ell => "ell",
             Layout::Grid => "stencil",
         }
@@ -112,6 +112,7 @@ struct Problem {
     b: Vec<f32>,
     dev: spmv::Dev,
     ell: spmv::DevEll,
+    csr: Sparse,
 }
 
 impl Problem {
@@ -119,13 +120,14 @@ impl Problem {
         let a = data::poisson2d(g);
         let b = values(a.rows, 41, 0.0, 1.0);
         let (dev, ell) = (spmv::upload(h, &a), spmv::upload_ell(h, &a));
-        Problem { g, a, b, dev, ell }
+        let csr = Sparse::from_csr(a.rows, a.cols, &dev.ptr, &dev.col, &dev.val);
+        Problem { g, a, b, dev, ell, csr }
     }
 
     fn apply(&self, layout: Layout) -> Box<dyn Fn(&A) -> A + '_> {
         match layout {
             Layout::Csr => Box::new(|p| spmv::atomic(&self.dev, p)),
-            Layout::Segments => Box::new(|p| spmv::segments(&self.dev, p)),
+            Layout::Sparse => Box::new(|p| self.csr.matmul(p)),
             Layout::Ell => Box::new(|p| spmv::ell(&self.ell, p)),
             Layout::Grid => Box::new(stencil),
         }
@@ -166,7 +168,7 @@ fn fixed_cases(h: &mut Harness, g: usize) {
     let (host_x, _) = cg_host(&p.a, &p.b, iters, 0.0);
     let want = residual(&p.a, &p.b, &host_x);
     let size = format!("{}x{} grid {} nnz x{iters}", g, g, label(p.a.nnz()));
-    for layout in [Layout::Csr, Layout::Segments, Layout::Ell, Layout::Grid] {
+    for layout in [Layout::Csr, Layout::Sparse, Layout::Ell, Layout::Grid] {
         let name = format!("cg/fixed_{}", layout.name());
         if !h.want(&name) {
             continue;
