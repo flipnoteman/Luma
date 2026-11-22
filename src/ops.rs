@@ -10,9 +10,10 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, UnOp};
+use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, Part, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
+use crate::complex::C32;
 use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
@@ -84,6 +85,7 @@ impl_value_operand!(u32);
 impl_value_operand!(i32);
 impl_value_operand!(bool);
 impl_value_operand!(Df32);
+impl_value_operand!(C32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
 // literals to go by infer `f64` instead of `f32`. The operators (`&x * 2.0`) take `f64`
@@ -980,6 +982,9 @@ wide_unary_methods! { i32;
     sign => UnOp::Sign;
 }
 
+wide_unary_methods! { C32;
+}
+
 wide_unary_methods! { Df32;
     /// Elementwise square root (accurate to about 44 bits).
     sqrt => UnOp::Sqrt;
@@ -1190,6 +1195,7 @@ impl_operators!(u32);
 impl_operators!(i32);
 impl_operators!(f64);
 impl_operators!(Df32);
+impl_operators!(C32);
 impl_scalar_operators!(f32);
 impl_scalar_operators!(u32);
 impl_scalar_operators!(i32);
@@ -1540,11 +1546,13 @@ impl_promotions!(u32);
 impl_promotions!(i32);
 impl_promotions!(f64);
 impl_promotions!(Df32);
+impl_promotions!(C32);
 // No `f64` scalar: with two float types among the scalars, `bool_array * 2.0` would infer `f64`.
 impl_promotions_scalar!(f32);
 impl_promotions_scalar!(u32);
 impl_promotions_scalar!(i32);
 impl_promotions_scalar!(Df32);
+impl_promotions_scalar!(C32);
 
 impl Array<i32> {
     /// Elementwise `self << amount`, with an array of the same shape or a single `i32` as the
@@ -1634,6 +1642,227 @@ impl Array<u32> {
         }
     }
 }
+
+// -- Complex arrays --
+
+impl Array<C32> {
+    /// The real quantity `part` of every element, reporting failures at `location`.
+    fn part_at(&self, part: Part, location: &'static Location<'static>) -> Array<f32> {
+        let result = self.src().and_then(|operand| {
+            lazy(self.context(), self.shape(), Op::new(OpKind::Part(part), ElemTy::C32), [operand, Src::unused(), Src::unused()], part.name(), location)
+        });
+        Array::resolve(self.context(), self.shape(), result, part.name(), location)
+    }
+
+    /// Elementwise real part, an `Array<f32>`. Lazy and fused like every elementwise operation.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let z = Array::from_slice(&[C32::new(1.0, 2.0), C32::new(-3.0, 4.0)], 2)?;
+    /// assert_eq!(z.real().to_vec()?, [1.0, -3.0]);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn real(&self) -> Array<f32> {
+        self.part_at(Part::Real, Location::caller())
+    }
+
+    /// Elementwise imaginary part, an `Array<f32>`.
+    #[track_caller]
+    pub fn imag(&self) -> Array<f32> {
+        self.part_at(Part::Imag, Location::caller())
+    }
+
+    /// Elementwise modulus `sqrt(re^2 + im^2)`, an `Array<f32>`. Scaled by the larger component,
+    /// so it neither overflows nor underflows where the result is representable (`|3e30 + 4e30 i|`
+    /// is `5e30`); infinite if a component is infinite, `NaN` if one is and none is infinite.
+    #[track_caller]
+    pub fn abs(&self) -> Array<f32> {
+        self.part_at(Part::Abs, Location::caller())
+    }
+
+    /// Elementwise argument (phase) `atan2(im, re)` in `[-pi, pi]`, an `Array<f32>`.
+    #[track_caller]
+    pub fn arg(&self) -> Array<f32> {
+        self.part_at(Part::Arg, Location::caller())
+    }
+
+    /// Elementwise squared modulus `re^2 + im^2`, an `Array<f32>` (cheaper than [`Array::abs`]
+    /// and without its scaling: it overflows above `|z| = 1.8e19`).
+    #[track_caller]
+    pub fn norm_sqr(&self) -> Array<f32> {
+        self.part_at(Part::NormSqr, Location::caller())
+    }
+
+    /// Elementwise complex conjugate `re - im i`.
+    #[track_caller]
+    pub fn conj(&self) -> Array<C32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::Conj, location);
+        Array::resolve(self.context(), self.shape(), result, "conj", location)
+    }
+
+    /// Elementwise `e^z = e^re (cos im + i sin im)`.
+    #[track_caller]
+    pub fn exp(&self) -> Array<C32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::Exp, location);
+        Array::resolve(self.context(), self.shape(), result, "exp", location)
+    }
+
+    /// Elementwise principal square root (non-negative real part; the sign of the imaginary part
+    /// follows that of `im`, also of a zero).
+    #[track_caller]
+    pub fn sqrt(&self) -> Array<C32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::Sqrt, location);
+        Array::resolve(self.context(), self.shape(), result, "sqrt", location)
+    }
+
+    /// `re + im i` elementwise from two real arrays of the same shape (or shapes that broadcast,
+    /// see [`Array::broadcast_to`]); a mismatch poisons the result like an operator does. The
+    /// inverse of [`Array::real`] and [`Array::imag`]; a `from_parts` of the parts of one array is
+    /// that array.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let re = Array::from_slice(&[1.0f32, 2.0], 2)?;
+    /// let im = Array::from_slice(&[-1.0f32, 0.5], 2)?;
+    /// let z = Array::from_parts(&re, &im);
+    /// assert_eq!(z.to_vec()?, [C32::new(1.0, -1.0), C32::new(2.0, 0.5)]);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn from_parts(re: &Array<f32>, im: &Array<f32>) -> Array<C32> {
+        Self::from_parts_at(re, im, Location::caller())
+    }
+
+    fn from_parts_at(re: &Array<f32>, im: &Array<f32>, location: &'static Location<'static>) -> Array<C32> {
+        let result = re.run_binary::<C32>(Rhs::Array(im), false, OpKind::Make, "from_parts", location);
+        let shape = result.as_ref().map_or(re.shape(), |array| array.shape());
+        Array::resolve(re.context(), shape, result, "from_parts", location)
+    }
+
+    /// `r (cos theta + i sin theta)` elementwise from the moduli `r` and the arguments `theta`
+    /// (two real arrays of the same shape).
+    #[track_caller]
+    pub fn from_polar(r: &Array<f32>, theta: &Array<f32>) -> Array<C32> {
+        let location = Location::caller();
+        let (c, s) = (theta.cos(), theta.sin());
+        let re = r.binary_at(Rhs::Array(&c), BinOp::Mul, false, "from_polar", location);
+        let im = r.binary_at(Rhs::Array(&s), BinOp::Mul, false, "from_polar", location);
+        Self::from_parts_at(&re, &im, location)
+    }
+
+    /// `self op s` (`s op self` if `scalar_left`) with the real number `s` as `s + 0i`, computed
+    /// on the parts (so that no `0 * inf` appears where the real number has no imaginary part to
+    /// multiply). `op` is `Add`, `Sub`, `Mul` or `Div`.
+    fn with_real(&self, s: f32, op: BinOp, scalar_left: bool, location: &'static Location<'static>) -> Array<C32> {
+        let (re, im) = (self.part_at(Part::Real, location), self.part_at(Part::Imag, location));
+        let name = match op {
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::Mul => "mul",
+            _ => "div",
+        };
+        match (op, scalar_left) {
+            (BinOp::Add | BinOp::Sub, false) => Self::from_parts_at(&re.binary_at(Rhs::Scalar(s), op, false, name, location), &im, location),
+            (BinOp::Add, true) => Self::from_parts_at(&re.binary_at(Rhs::Scalar(s), op, true, name, location), &im, location),
+            (BinOp::Sub, true) => {
+                let (re, im) = (re.binary_at(Rhs::Scalar(s), op, true, name, location), im.neg_at(location));
+                Self::from_parts_at(&re, &im, location)
+            }
+            (BinOp::Mul, _) | (BinOp::Div, false) => {
+                let (re, im) = (re.binary_at(Rhs::Scalar(s), op, false, name, location), im.binary_at(Rhs::Scalar(s), op, false, name, location));
+                Self::from_parts_at(&re, &im, location)
+            }
+            // `s / z` is a complex quotient.
+            _ => self.binary_at(Rhs::Scalar(C32::from(s)), BinOp::Div, true, name, location),
+        }
+    }
+
+    /// The sum of all elements, as a lazy one-element array (see [`Array::sum`]): the sums of the
+    /// real and of the imaginary parts.
+    #[track_caller]
+    pub fn sum(&self) -> Array<C32> {
+        let location = Location::caller();
+        Self::from_parts_at(&self.part_at(Part::Real, location).sum(), &self.part_at(Part::Imag, location).sum(), location)
+    }
+
+    /// The mean of all elements, as a lazy one-element array: the sum divided by the length.
+    #[track_caller]
+    pub fn mean(&self) -> Array<C32> {
+        let location = Location::caller();
+        self.sum().with_real(self.len() as f32, BinOp::Div, false, location)
+    }
+
+    /// The sum along `axis`; the result has extent 1 along it (see [`Array::sum_axis`]).
+    #[track_caller]
+    pub fn sum_axis(&self, axis: usize) -> Array<C32> {
+        let location = Location::caller();
+        Self::from_parts_at(&self.part_at(Part::Real, location).sum_axis(axis), &self.part_at(Part::Imag, location).sum_axis(axis), location)
+    }
+
+    /// The mean along `axis`; the result has extent 1 along it.
+    #[track_caller]
+    pub fn mean_axis(&self, axis: usize) -> Array<C32> {
+        let location = Location::caller();
+        let n = self.shape().dims().get(axis).copied().unwrap_or(1);
+        self.sum_axis(axis).with_real(n as f32, BinOp::Div, false, location)
+    }
+}
+
+impl Array<f32> {
+    /// The array as complex numbers with zero imaginary parts, an `Array<C32>`.
+    #[track_caller]
+    pub fn to_complex(&self) -> Array<C32> {
+        let location = Location::caller();
+        let result = self.run_binary::<C32>(Rhs::Scalar(0.0f32), false, OpKind::Make, "to_complex", location);
+        Array::resolve(self.context(), self.shape(), result, "to_complex", location)
+    }
+}
+
+/// The operators between an `Array<C32>` and a real number (`f32`), which stands for `s + 0i`.
+macro_rules! impl_real_operator {
+    ($Trait:ident, $method:ident, $op:expr) => {
+        impl $Trait<f32> for &Array<C32> {
+            type Output = Array<C32>;
+            #[track_caller]
+            fn $method(self, rhs: f32) -> Array<C32> {
+                self.with_real(rhs, $op, false, Location::caller())
+            }
+        }
+
+        impl $Trait<f32> for Array<C32> {
+            type Output = Array<C32>;
+            #[track_caller]
+            fn $method(self, rhs: f32) -> Array<C32> {
+                self.with_real(rhs, $op, false, Location::caller())
+            }
+        }
+
+        impl $Trait<&Array<C32>> for f32 {
+            type Output = Array<C32>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<C32>) -> Array<C32> {
+                rhs.with_real(self, $op, true, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<C32>> for f32 {
+            type Output = Array<C32>;
+            #[track_caller]
+            fn $method(self, rhs: Array<C32>) -> Array<C32> {
+                rhs.with_real(self, $op, true, Location::caller())
+            }
+        }
+    };
+}
+
+impl_real_operator!(Add, add, BinOp::Add);
+impl_real_operator!(Sub, sub, BinOp::Sub);
+impl_real_operator!(Mul, mul, BinOp::Mul);
+impl_real_operator!(Div, div, BinOp::Div);
 
 #[cfg(test)]
 mod tests {

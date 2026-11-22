@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use crate::builtin::{df_library, BinOp, CmpOp, UnOp};
+use crate::builtin::{df_library, BinOp, CmpOp, Part, UnOp};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
@@ -19,7 +19,7 @@ use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
-            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
+            UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
             UnOp::Sqrt => 4.0,
             UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos => 8.0,
             UnOp::Tan | UnOp::Tanh => 16.0,
@@ -37,6 +37,13 @@ pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
             CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge | CmpOp::Eq | CmpOp::Ne => 1.0,
         },
         OpKind::Select => 1.0,
+        OpKind::Part(part) => match part {
+            Part::Real | Part::Imag => 1.0,
+            Part::NormSqr => 2.0,
+            Part::Abs => 10.0,
+            Part::Arg => 16.0,
+        },
+        OpKind::Make => 1.0,
         OpKind::Classify(_) => 2.0,
         OpKind::Clamp => 2.0,
         OpKind::Cast(to) => {
@@ -61,6 +68,12 @@ pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
         (ElemTy::Df32, OpKind::Unary(UnOp::Tanh)) => 24.0,
         (ElemTy::Df32, OpKind::Unary(UnOp::Log1p | UnOp::Expm1)) => 24.0,
         (ElemTy::Df32, OpKind::Powf) => 40.0,
+        // The components of a complex number are separate `f32` operations.
+        (ElemTy::C32, OpKind::Unary(UnOp::Neg | UnOp::Conj) | OpKind::Binary(BinOp::Add | BinOp::Sub)) => 2.0,
+        (ElemTy::C32, OpKind::Binary(BinOp::Mul)) => 4.0,
+        (ElemTy::C32, OpKind::Binary(BinOp::Div)) => 14.0,
+        (ElemTy::C32, OpKind::Unary(UnOp::Exp)) => 24.0,
+        (ElemTy::C32, OpKind::Unary(UnOp::Sqrt)) => 18.0,
         _ => base,
     };
     let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_) | OpKind::Powf)

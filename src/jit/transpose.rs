@@ -48,12 +48,12 @@ pub(super) struct Plan {
     tiles: u32,
 }
 
-/// The WGSL type the kernel moves: any 4-byte element is a `u32` (a copy of the bits), a `Df32`
+/// The WGSL type the kernel moves: any 4-byte element is a `u32` (a copy of the bits), a `Df32` or `C32`
 /// its two words.
 fn word_ty(ty: ElemTy) -> Option<&'static str> {
     match ty {
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => Some("u32"),
-        ElemTy::Df32 => Some("vec2<f32>"),
+        ElemTy::Df32 | ElemTy::C32 => Some("vec2<f32>"),
         ElemTy::Bool | ElemTy::F64 => None,
     }
 }

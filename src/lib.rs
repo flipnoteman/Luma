@@ -61,6 +61,8 @@ mod guide {
     pub mod loops {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
+    #[doc = include_str!("../guide/src/complex.md")]
+    pub mod complex {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
@@ -111,6 +113,8 @@ mod factorize;
 mod filter;
 mod generate;
 mod gpu;
+mod complex;
+mod dft_kernel;
 mod gpu_type;
 mod group;
 mod host;
@@ -134,6 +138,7 @@ mod segsort;
 mod scalar;
 mod shape;
 mod sort;
+mod spectral;
 mod tuning;
 mod until;
 mod view;
@@ -146,6 +151,8 @@ pub use gpu::pager::MemoryStats;
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
+pub use complex::C32;
+pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;

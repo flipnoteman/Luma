@@ -41,9 +41,10 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `bool` | the result of comparisons: a boolean per element ([booleans](integers.md#comparisons-booleans-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
 | `f64` | 64-bit float, only on devices with `SHADER_F64` (CUDA, the CPU backend, some Vulkan GPUs; not Metal) |
+| `C32` | complex `f32` (`re`, `im`), runs on every device, the element of the FFTs ([Complex numbers](complex.md)) |
 
 `[f32; 2]` / `[f32; 4]` / `[u32; 2]` / `[u32; 4]` (`vec2` / `vec4`) element types exist for custom kernels, and [records](records.md) group several
-arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32` and `f64`
+arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32`, `f64` and `C32`
 (the *scalar* types); what each type supports is listed in the chapters named in the table.
 
 ### Booleans
@@ -122,6 +123,7 @@ lazy and fuse:
 | `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`, `trunc`, `round`, `log1p`, `expm1`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
 | `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round` |
 | `Df32` | `sqrt`, `exp`, `ln`, `tanh`, `abs`, `log1p`, `expm1`, `powf(Df32)` ([Precision](precision.md)) |
+| `C32` | `conj`, `exp`, `sqrt`; `real`, `imag`, `abs`, `arg`, `norm_sqr` (to `f32`); `from_parts`, `from_polar` ([Complex numbers](complex.md)) |
 | `i32` | `abs`, `sign`, `shl`, `shr`; bit operators `& \| ^ !` ([Signed integers](integers.md#signed-integers-and-casts)) |
 | `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
 | every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |
