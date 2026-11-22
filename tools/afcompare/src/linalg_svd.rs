@@ -56,31 +56,32 @@ fn seconds(f: &mut dyn FnMut()) -> f64 {
 }
 
 fn sizes(b: &Bench) -> Vec<usize> {
+    // `LINALG_SIZES=1024,4096` runs only those sizes.
+    if let Ok(v) = std::env::var("LINALG_SIZES") {
+        return v.split(',').filter_map(|w| w.trim().parse().ok()).collect();
+    }
     if b.quick { vec![256, 1024] } else { vec![64, 128, 256, 1024, 4096] }
 }
 
-/// A random `n x n` matrix of known rank `r`: `B C` with uniform factors scaled to unit-order values.
-fn low_rank(n: usize, r: usize, seed: u64) -> Vec<f32> {
-    let bm = uniform(n * r, seed, -1.0, 1.0);
-    let cm = uniform(r * n, seed + 1, -1.0, 1.0);
-    let s = 1.0 / (r as f32).sqrt();
-    let mut a = vec![0.0f32; n * n];
-    for i in 0..n {
-        for k in 0..r {
-            let x = bm[i * r + k] * s;
-            for j in 0..n {
-                a[i * n + j] += x * cm[k * n + j];
-            }
-        }
-    }
-    a
+/// `LINALG_SVD=single,rank` runs only those parts (`single`, `pinv`, `rank`, `batched`; default all).
+fn part(name: &str) -> bool {
+    std::env::var("LINALG_SVD").map_or(true, |v| v.split(',').any(|w| w == name))
 }
 
 pub fn svd_rows(b: &mut Bench) {
     b.guarded("linalg_svd", |b| {
-        single(b);
-        pinv_rank(b);
-        batched(b);
+        if part("single") {
+            single(b);
+        }
+        if part("pinv") {
+            pinv_rank(b);
+        }
+        if part("rank") {
+            rank_rows(b);
+        }
+        if part("batched") {
+            batched(b);
+        }
     });
 }
 
@@ -192,8 +193,19 @@ fn pinv_rank(b: &mut Bench) {
                 afx::sync();
             },
         );
+    }
+}
+
+/// `rank` of a matrix of known rank `n / 2` at every size (ArrayFire's `rank` is a QR factorisation).
+fn rank_rows(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    for n in sizes(b) {
         let r = n / 2;
-        let lr = low_rank(n, r, 160 + n as u64);
+        // B C with uniform factors, multiplied on the device (a host product at 4096 takes minutes).
+        let s = 1.0 / (r as f32).sqrt();
+        let bm: Vec<f32> = uniform(n * r, 160 + n as u64, -1.0, 1.0).iter().map(|x| x * s).collect();
+        let cm = uniform(r * n, 161 + n as u64, -1.0, 1.0);
+        let lr = lumax::host(&lumax::arr(&ctx, &bm, [r, n]).matmul(&lumax::arr(&ctx, &cm, [n, r])));
         let (rl, ra) = (lumax::arr(&ctx, &lr, [n, n]), afx::arr(&lr, &[n as u64, n as u64]));
         let (got_l, got_a) = (rl.rank().item().unwrap(), af::rank(&ra, 1e-2));
         let text = format!("rank {r}: luma {got_l}, AF {got_a}");
@@ -202,9 +214,27 @@ fn pinv_rank(b: &mut Bench) {
             "rank f32",
             &format!("{n}x{n}, rank {r}"),
             v,
-            "luma rank (singular values, count above the default relative tolerance); AF rank(tol 1e-2), far cheaper than AF's own svd; result read back on both sides",
+            "luma rank (default relative tolerance, see Array::rank); AF rank(tol 1e-2) is an unpivoted QR; result read back on both sides",
             &mut || {
                 let _ = rl.rank().item().unwrap();
+            },
+            &mut || {
+                let _ = af::rank(&ra, 1e-2);
+                afx::sync();
+            },
+        );
+        // A tolerance above the rounding errors of a QR factorisation (see the `rank` module of
+        // luma): two QR factorisations decide it, no singular values.
+        let got_q = rl.rank_tol(4e-3).item().unwrap();
+        let text = format!("rank {r}: luma {got_q}, AF {got_a}");
+        let v = if got_q as usize == r { Verdict::yes(text) } else { Verdict::no(text) };
+        b.run(
+            "rank_tol(4e-3) f32",
+            &format!("{n}x{n}, rank {r}"),
+            v,
+            "luma rank_tol(4e-3) (certified by QR factorisations, no singular values); AF rank(tol 1e-2) is an unpivoted QR; result read back on both sides",
+            &mut || {
+                let _ = rl.rank_tol(4e-3).item().unwrap();
             },
             &mut || {
                 let _ = af::rank(&ra, 1e-2);
