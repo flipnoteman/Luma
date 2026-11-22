@@ -139,22 +139,29 @@ fn substitute(l: &Array<f32>, b: &Array<f32>, ld: Dims, bd: Dims, unit: bool, op
     }
 }
 
-/// Rows of a diagonal block the blocked solve takes: 128 where a workgroup has the 33 KiB its packed
-/// lower triangle takes, else 64 (`LUMA_CHOL_NB` overrides, as it does the factorisation's).
+/// Rows of a diagonal block the blocked factorisation and solves take: the largest of 128, 64 and 32
+/// whose kernels fit in a workgroup's memory (38 KiB for 128; `LUMA_CHOL_NB` overrides).
 pub(crate) fn block_size(ctx: &crate::context::Context) -> usize {
     if let Some(nb) = std::env::var("LUMA_CHOL_NB").ok().and_then(|v| v.parse().ok()).filter(|nb| [32, 64, 128].contains(nb)) {
         return nb;
     }
-    if ctx.info().limits.max_workgroup_storage_bytes >= (128 * 129 / 2) * 4 + 256 { 128 } else { 64 }
+    let bytes = ctx.info().limits.max_workgroup_storage_bytes as usize;
+    // The panel kernel of the factorisation (the rows of the tile and the staged square of the factor)
+    // and the block solve (the triangle and the right-hand sides).
+    let need = |nb: usize| (nb * 33 * 4 + nb.min(64) * nb.min(64) * 4).max(nb * (nb + 1) / 2 * 4 + nb * PITCH * 4 + nb * 4);
+    [128, 64].into_iter().find(|&nb| need(nb) + 256 <= bytes).unwrap_or(32)
 }
 
 /// Columns of the right-hand sides a workgroup of the block solve takes.
 const COLS: usize = 8;
+/// Pitch of a right-hand side row in workgroup memory (`COLS + 1`: odd, so that a warp of rows is conflict free).
+const PITCH: usize = COLS + 1;
 
 #[derive(encase::ShaderType)]
 struct BlockParams {
     n: u32,
     k: u32,
+    kp: u32,
     j0: u32,
     nbw: u32,
     has_t: u32,
@@ -162,28 +169,15 @@ struct BlockParams {
 }
 
 /// The block solve kernel: `X[j0..j0+nbw] = L_jj⁻¹ (B[j0..j0+nbw] - T)` where `T` (`[k, nbw]`) is
-/// the contribution of the solved rows above. An invocation per row of the block holds [`COLS`]
-/// right-hand-side columns of it; the triangle is in workgroup memory, packed (row `i` at
-/// `i (i + 1) / 2`, a warp's rows read one column without bank conflicts). Column oriented:
-/// after row `q` is solved its `COLS` values go to workgroup memory and every row below takes its
-/// share, one barrier per row of the block.
+/// the contribution of the solved rows above, for [`COLS`] columns of the right-hand sides at a
+/// workgroup. The triangle is in workgroup memory, packed (row `i` at `i (i + 1) / 2`, so that the
+/// 32 rows of a warp read one column without bank conflicts); the right-hand side rows are too,
+/// at a pitch of `COLS + 1`. Panels of 8 rows: the first `COLS` invocations each solve the 8 rows of
+/// a column against the panel's 8 x 8 triangle in registers (one chain, no barrier between the
+/// rows), then every row below takes the contribution of the 8 solved ones: two barriers a panel
+/// instead of one a row.
 fn block_source(nb: usize) -> String {
     let size = nb * (nb + 1) / 2;
-    let mut init = String::new();
-    let mut solve = String::new();
-    let mut upd = String::new();
-    for c in 0..COLS {
-        init += &format!(
-            "    var a{c} = 0.0;\n    if (col0 + {c}u < k && ii < nbw) {{
-        a{c} = b[luma_view_idx3(bv, col0 + {c}u, j0 + ii, 0u)];
-        if (p.has_t != 0u) {{ a{c} = a{c} - tm[ii * k + col0 + {c}u]; }}
-    }}\n"
-        );
-        solve += &format!(
-            "            let x{c} = a{c} * dv;\n            xs[buf * {COLS}u + {c}u] = x{c};\n            if (col0 + {c}u < k) {{ o[(j0 + q) * k + col0 + {c}u] = x{c}; }}\n"
-        );
-        upd += &format!("            a{c} = fma(-lq, xs[buf * {COLS}u + {c}u], a{c});\n");
-    }
     // The triangle is read eight rows at a step, the loads issued together (see `chol::diag_source`).
     let mut lload = String::new();
     let mut lstore = String::new();
@@ -193,8 +187,45 @@ fn block_source(nb: usize) -> String {
         );
         lstore += &format!("        if (live{u}) {{ ls[off(i0 + {u}u) + ii] = v{u}; }}\n");
     }
+    let mut init = String::new();
+    for c in 0..COLS {
+        init += &format!(
+            "    var a{c} = 0.0;\n    if (col0 + {c}u < k && ii < nbw) {{
+        a{c} = b[luma_view_idx3(bv, col0 + {c}u, j0 + ii, 0u)];
+        if (p.has_t != 0u) {{ a{c} = a{c} - tm[ii * kp + col0 + {c}u]; }}
+    }}
+    bm[ii * {PITCH}u + {c}u] = a{c};\n"
+        );
+    }
+    // Phase A: column `ii` of the panel's 8 rows.
+    let mut solve = String::new();
+    for r in 0..8 {
+        solve += &format!("            let b{r} = bm[(c0 + {r}u) * {PITCH}u + ii];\n");
+    }
+    for r in 0..8 {
+        let mut cur = format!("b{r}");
+        for q in 0..r {
+            solve += &format!("            let y{r}_{q} = fma(-x{q}, ls[off(c0 + {r}u) + c0 + {q}u], {cur});\n");
+            cur = format!("y{r}_{q}");
+        }
+        solve += &format!(
+            "            let x{r} = {cur} * dinv[c0 + {r}u];\n            bm[(c0 + {r}u) * {PITCH}u + ii] = x{r};\n            if (col0 + ii < k && c0 + {r}u < nbw) {{ o[(j0 + c0 + {r}u) * kp + col0 + ii] = x{r}; }}\n"
+        );
+    }
+    // Phase B: the row's own contribution of the 8 solved rows, a column at a time.
+    let mut upd = String::new();
+    for r in 0..8 {
+        upd += &format!("            let l{r} = ls[off(ii) + c0 + {r}u];\n");
+    }
+    for c in 0..COLS {
+        upd += &format!("            var u{c} = bm[ii * {PITCH}u + {c}u];\n");
+        for r in 0..8 {
+            upd += &format!("            u{c} = fma(-l{r}, bm[(c0 + {r}u) * {PITCH}u + {c}u], u{c});\n");
+        }
+        upd += &format!("            bm[ii * {PITCH}u + {c}u] = u{c};\n");
+    }
     format!(
-        "struct Params {{ n: u32, k: u32, j0: u32, nbw: u32, has_t: u32, unit: u32 }}
+        "struct Params {{ n: u32, k: u32, kp: u32, j0: u32, nbw: u32, has_t: u32, unit: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
 @group(1) @binding(1) var<uniform> lv: LumaView;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
@@ -204,13 +235,15 @@ fn block_source(nb: usize) -> String {
 @group(1) @binding(6) var<uniform> p: Params;
 
 var<workgroup> ls: array<f32, {size}>;
-var<workgroup> xs: array<f32, {xsize}>;\nvar<workgroup> dinv: array<f32, {nb}>;
+var<workgroup> bm: array<f32, {bsize}>;
+var<workgroup> dinv: array<f32, {nb}>;
 
 fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
 
 @compute @workgroup_size({nb})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) ii: u32) {{
     let k = p.k;
+    let kp = p.kp;
     let j0 = p.j0;
     let nbw = p.nbw;
     let col0 = wid.x * {COLS}u;
@@ -218,19 +251,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 {lload}{lstore}    }}
     if (ii < nbw) {{ dinv[ii] = select(1.0 / ls[off(ii) + ii], 1.0, p.unit != 0u); }}
 {init}    workgroupBarrier();
-    for (var q = 0u; q < nbw; q = q + 1u) {{
-        let buf = q & 1u;
-        if (ii == q) {{
-            let dv = dinv[q];
+    for (var c0 = 0u; c0 < nbw; c0 = c0 + 8u) {{
+        if (ii < {COLS}u) {{
 {solve}        }}
         workgroupBarrier();
-        if (ii > q && ii < nbw) {{
-            let lq = ls[off(ii) + q];
+        if (ii >= c0 + 8u && ii < nbw) {{
 {upd}        }}
+        workgroupBarrier();
     }}
 }}
 ",
-        xsize = 2 * COLS
+        bsize = nb * PITCH
     )
 }
 
@@ -242,7 +273,10 @@ fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'
     let n = l.shape().dims()[1];
     let [k, ..] = b.shape().dims();
     let nb = block_size(ctx);
-    let setup = (Array::<f32>::alloc(ctx, Shape::from([k, n])), Array::<f32>::alloc(ctx, Shape::from(1)));
+    // A few columns go to the backend's own products as four (a product with one column does not): the
+    // solution has the padding columns, left alone, and the caller gets the first `k`.
+    let kp = if k < 32 { k.next_multiple_of(4) } else { k };
+    let setup = (Array::<f32>::alloc(ctx, Shape::from([kp, n])), Array::<f32>::alloc(ctx, Shape::from(1)));
     let (mut out, dummy) = match setup {
         (Ok(o), Ok(d)) => (o, d),
         (Err(e), _) | (_, Err(e)) => return fail(ctx, b.shape(), e, op, loc),
@@ -251,7 +285,7 @@ fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'
     while j0 < n {
         let nbw = nb.min(n - j0);
         let t = (j0 > 0).then(|| matmul_f32(&l.slice(1, j0..j0 + nbw).slice(0, 0..j0), &out.slice(1, 0..j0)));
-        let params = BlockParams { n: n as u32, k: k as u32, j0: j0 as u32, nbw: nbw as u32, has_t: u32::from(j0 > 0), unit: u32::from(unit) };
+        let params = BlockParams { n: n as u32, k: k as u32, kp: kp as u32, j0: j0 as u32, nbw: nbw as u32, has_t: u32::from(j0 > 0), unit: u32::from(unit) };
         let args: [KernelArg<'_>; 5] = [view(l), view(b), t.as_ref().unwrap_or(&dummy).into(), (&mut out).into(), uniform(&params)];
         let key = format!("trsm_block/{nb}");
         if let Err(e) = launch_unchecked(ctx, &key, "trsm_block", || block_source(nb), [k.div_ceil(COLS) as u32, 1, 1], &args) {
@@ -259,7 +293,7 @@ fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'
         }
         j0 += nbw;
     }
-    out
+    if kp == k { out } else { out.slice(0, 0..k) }
 }
 
 /// Where a triangle of `n` rows splits: about half, at a multiple of 32 so that the blocks of the

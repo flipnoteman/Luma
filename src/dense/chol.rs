@@ -133,87 +133,103 @@ struct BlockParams {
 /// The kernel that factors the diagonal block of columns `k..k + nbw`: `A_kk - T[..nbw]` (`T` the
 /// product of the finished columns, see [`blocked`]) in workgroup memory as a packed lower
 /// triangle (row `i` at `i (i + 1) / 2`, so that the 32 rows of a warp read one column without bank
-/// conflicts). Right-looking in panels of 8 columns. The invocation of row `i` takes its entries
-/// of a column from the columns of the panel done so far (at most 8 products, one barrier per
-/// column; every invocation also takes `l_jj` from row `j` so that the column needs no second
-/// barrier, and the pivots go to `dg`: row `j` itself is read as it was by the others while it is
-/// computed). Then a rank-8 update of the rest of the triangle: two invocations share a row (every
-/// other column each), and the warps of the second one take the row groups in reverse order, so that
-/// the four schedulers of a multiprocessor get the same number of columns. The block's
-/// loads and stores go sixteen rows at a step with the loads issued together (a load that waits for
-/// its store before the next one is issued costs a full memory latency per row). The factor goes to
-/// `dk` (the panel kernel reads it) and into its place in the output.
+/// conflicts). Right-looking in panels of 8 columns: the first invocation factors the panel's 8 x 8
+/// block in registers (a chain of 8 columns with no barrier between them), every row below solves
+/// its 8 entries against it, then a rank-8 update of the rest of the triangle, the four invocations
+/// of a row taking every fourth column each. The warps are placed so that each of the four
+/// schedulers of a multiprocessor gets one warp of every group of 32 rows (the rows at the end of
+/// the triangle have the longest updates). The block's loads and stores go eight rows at a step
+/// per invocation, all the loads of a step issued together (a load that waits for its store before
+/// the next one is issued costs a full memory latency per row). The factor goes to `dk` (the panel
+/// kernel reads it) and into its place in the output.
 fn diag_source(nb: usize) -> String {
     let size = nb * (nb + 1) / 2;
-    let threads = 2 * nb;
+    let threads = 4 * nb;
     let groups = nb / 32;
+    let rstep = 8 * (threads / nb);
     let mut loads = String::new();
     let mut stores = String::new();
     let mut outs = String::new();
     for u in 0..8 {
         loads += &format!(
-            "        var v{u} = 0.0;
-        let live{u} = cid < nbw && cid <= i0 + {u}u && i0 + {u}u < nbw;
-        if (live{u}) {{
-            v{u} = a[luma_view_idx3(av, k + cid, k + i0 + {u}u, 0u)];
-            if (p.has_t != 0u) {{ v{u} = v{u} - tm[(i0 + {u}u) * nbw + cid]; }}
-        }}
+            "        let live{u} = cid < nbw && cid <= i0 + {u}u && i0 + {u}u < nbw;
+        let rr{u} = min(i0 + {u}u, nbw - 1u);
+        let cc{u} = min(cid, nbw - 1u);
+        let g{u} = a[luma_view_idx3(av, k + cc{u}, k + rr{u}, 0u)];
+        let t{u} = tm[select(0u, rr{u} * nbw + cc{u}, p.has_t != 0u)];
+        let v{u} = select(g{u}, g{u} - t{u}, p.has_t != 0u);
 "
         );
         stores += &format!("        if (live{u}) {{ s[off(i0 + {u}u) + cid] = v{u}; }}\n");
         outs += &format!(
             "        if (cid < nbw && i0 + {u}u < nbw) {{
-            let w{u} = select(select(0.0, s[off(i0 + {u}u) + cid], cid < i0 + {u}u), dg[cid], cid == i0 + {u}u);
+            let w{u} = select(0.0, s[off(i0 + {u}u) + cid], cid <= i0 + {u}u);
             dk[(i0 + {u}u) * {nb}u + cid] = w{u};
             o[(k + i0 + {u}u) * n + k + cid] = w{u};
         }}
 "
         );
     }
-    let mut cols = String::new();
-    for q in 0..8 {
-        let mut dsum = String::new();
-        let mut vsum = String::new();
-        for r in 0..q {
-            dsum += &format!("                    {{ let lj = s[rj + c0 + {r}u]; d = fma(-lj, lj, d); }}\n");
-            vsum += &format!("                        v = fma(-s[ri + c0 + {r}u], s[rj + c0 + {r}u], v);\n");
-        }
-        cols += &format!(
-            "        {{
-            let j = c0 + {q}u;
-            if (j < nbw) {{
-                if (h == 0u && i >= j && i < nbw) {{
-                    let rj = off(j);
-                    var d = s[rj + j];
-{dsum}                    let r = select({NAN}, sqrt(d), d > 0.0);
-                    if (i == j) {{
-                        dg[j] = r;
-                    }} else {{
-                        var v = s[ri + j];
-{vsum}                        s[ri + j] = v / r;
-                    }}
-                }}
-                workgroupBarrier();
-            }}
-        }}
-"
-        );
-    }
     let lds = (0..8).map(|r| format!("            let l{r} = s[ri + c0 + {r}u];\n")).collect::<String>();
-    // The trailing columns four at a step (two apart: the other invocation of the row takes the ones
+    // The trailing columns four at a step (four apart: the other invocations of the row take the ones
     // between): all their loads are issued before the first multiply-add.
     let mut quad_loads = String::new();
     let mut quad_fmas = String::new();
     let mut quad_stores = String::new();
     for w in 0..4 {
-        quad_loads += &format!("                let rq{w} = off(q + {}u);\n                var acc{w} = s[ri + q + {}u];\n", 2 * w, 2 * w);
+        quad_loads += &format!("                let rq{w} = off(q + {}u);\n                var acc{w} = s[ri + q + {}u];\n", 4 * w, 4 * w);
         for r in 0..8 {
             quad_loads += &format!("                let m{w}_{r} = s[rq{w} + c0 + {r}u];\n");
             quad_fmas += &format!("                acc{w} = fma(-l{r}, m{w}_{r}, acc{w});\n");
         }
-        quad_stores += &format!("                s[ri + q + {}u] = acc{w};\n", 2 * w);
+        quad_stores += &format!("                s[ri + q + {}u] = acc{w};\n", 4 * w);
     }
     let fmas = (0..8).map(|r| format!("                acc = fma(-l{r}, s[rq + c0 + {r}u], acc);\n")).collect::<String>();
+    // The panel's block, factored by one invocation: `a{p}_{q}` its entries, `l{p}_{q}` the factor,
+    // `iv{q}` the reciprocals of its diagonal (kept in `rv` for the rows below); the rows past the
+    // end of a short last panel are those of an identity.
+    let mut potf = String::new();
+    let mut solve = String::new();
+    for p in 0..8 {
+        for q in 0..=p {
+            let dflt = if p == q { "1.0" } else { "0.0" };
+            potf += &format!("            let a{p}_{q} = select({dflt}, s[off(c0 + {p}u) + c0 + {q}u], c0 + {p}u < nbw);\n");
+        }
+    }
+    for q in 0..8 {
+        let mut cur = format!("a{q}_{q}");
+        for k in 0..q {
+            potf += &format!("            let d{q}_{k} = fma(-l{q}_{k}, l{q}_{k}, {cur});\n");
+            cur = format!("d{q}_{k}");
+        }
+        potf += &format!("            let iv{q} = select({NAN}, inverseSqrt({cur}), {cur} > 0.0);\n            let r{q} = {cur} * iv{q};\n");
+        for p in q + 1..8 {
+            let mut cur = format!("a{p}_{q}");
+            for k in 0..q {
+                potf += &format!("            let x{p}_{q}_{k} = fma(-l{p}_{k}, l{q}_{k}, {cur});\n");
+                cur = format!("x{p}_{q}_{k}");
+            }
+            potf += &format!("            let l{p}_{q} = {cur} * iv{q};\n");
+        }
+    }
+    for p in 0..8 {
+        potf += &format!("            if (c0 + {p}u < nbw) {{\n");
+        for q in 0..p {
+            potf += &format!("                s[off(c0 + {p}u) + c0 + {q}u] = l{p}_{q};\n");
+        }
+        potf += &format!("                s[off(c0 + {p}u) + c0 + {p}u] = r{p};\n            }}\n            rv[{p}] = iv{p};\n");
+    }
+    for p in 0..8 {
+        solve += &format!("            let b{p} = s[ri + c0 + {p}u];\n");
+    }
+    for p in 0..8 {
+        let mut cur = format!("b{p}");
+        for q in 0..p {
+            solve += &format!("            let y{p}_{q} = fma(-x{q}, s[off(c0 + {p}u) + c0 + {q}u], {cur});\n");
+            cur = format!("y{p}_{q}");
+        }
+        solve += &format!("            let x{p} = {cur} * rv[{p}];\n            s[ri + c0 + {p}u] = x{p};\n");
+    }
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -223,8 +239,8 @@ fn diag_source(nb: usize) -> String {
 @group(1) @binding(4) var<storage, read_write> o: array<f32>;
 @group(1) @binding(5) var<uniform> p: Params;
 
+var<workgroup> rv: array<f32, 8>;
 var<workgroup> s: array<f32, {size}>;
-var<workgroup> dg: array<f32, {nb}>;
 
 fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
 
@@ -235,21 +251,27 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     let n = p.n;
     let cid = t % {nb}u;
     let hh = t / {nb}u;
-    for (var r0 = 0u; r0 < nbw; r0 = r0 + 16u) {{
+    for (var r0 = 0u; r0 < nbw; r0 = r0 + {rstep}u) {{
         let i0 = r0 + 8u * hh;
 {loads}{stores}    }}
     workgroupBarrier();
     let wp = t / 32u;
-    let rg = select({last}u - (wp - {groups}u), wp, wp < {groups}u);
-    let h = select(1u, 0u, wp < {groups}u);
+    let h = wp / {groups}u;
+    let rg = (wp % {groups}u + h) % {groups}u;
     let i = rg * 32u + t % 32u;
     let ri = off(i);
     for (var c0 = 0u; c0 < nbw; c0 = c0 + 8u) {{
-{cols}        if (i < nbw && i >= c0 + 8u) {{
+        if (t == 0u) {{
+{potf}        }}
+        workgroupBarrier();
+        if (h == 0u && i >= c0 + 8u && i < nbw) {{
+{solve}        }}
+        workgroupBarrier();
+        if (i < nbw && i >= c0 + 8u) {{
 {lds}            var q = c0 + 8u + h;
-            for (; q + 6u <= i; q = q + 8u) {{
+            for (; q + 12u <= i; q = q + 16u) {{
 {quad_loads}{quad_fmas}{quad_stores}            }}
-            for (; q <= i; q = q + 2u) {{
+            for (; q <= i; q = q + 4u) {{
                 let rq = off(q);
                 var acc = s[ri + q];
 {fmas}                s[ri + q] = acc;
@@ -257,12 +279,11 @@ fn main(@builtin(local_invocation_index) t: u32) {{
         }}
         workgroupBarrier();
     }}
-    for (var r0 = 0u; r0 < nbw; r0 = r0 + 16u) {{
+    for (var r0 = 0u; r0 < nbw; r0 = r0 + {rstep}u) {{
         let i0 = r0 + 8u * hh;
 {outs}    }}
 }}
-",
-        last = groups - 1,
+"
     )
 }
 
@@ -289,8 +310,8 @@ fn panel_source(nb: usize) -> String {
             out += &format!("                    let l{t}{u} = lb[(j + {u}u) * {h4}u + {col0}];\n");
         }
         for u in 0..4 {
-            for v in 0..4 {
-                out += &format!("                    s{u} = fma(-l{t}{u}.{c}, x{t}{v}, s{u});\n", c = comp[v]);
+            for (v, c) in comp.iter().enumerate() {
+                out += &format!("                    s{u} = fma(-l{t}{u}.{c}, x{t}{v}, s{u});\n");
             }
         }
         out
@@ -304,8 +325,8 @@ fn panel_source(nb: usize) -> String {
     let dld = (0..4).map(|u| format!("                let d{u} = lb[(j + {u}u) * {h4}u + j / 4u];\n")).collect::<String>();
     let mut diag = String::new();
     for u in 0..4 {
-        for v in 0..u {
-            diag += &format!("                s{u} = fma(-d{u}.{c}, s{v}, s{u});\n", c = comp[v]);
+        for (v, c) in comp.iter().enumerate().take(u) {
+            diag += &format!("                s{u} = fma(-d{u}.{c}, s{v}, s{u});\n");
         }
         diag += &format!("                s{u} = s{u} / d{u}.{c};\n", c = comp[u]);
     }
@@ -318,11 +339,11 @@ fn panel_source(nb: usize) -> String {
     for u in 0..4 {
         for cb in 0..colblocks {
             loads += &format!(
-                "        var v{u}_{cb} = 0.0;
-        if (rr + {u}u < rows && {cb}u * 32u + lane < nbw) {{
-            v{u}_{cb} = a[luma_view_idx3(av, k + {cb}u * 32u + lane, r0 + rr + {u}u, 0u)];
-            if (p.has_t != 0u) {{ v{u}_{cb} = v{u}_{cb} - tm[(r0 + rr + {u}u - k) * nbw + {cb}u * 32u + lane]; }}
-        }}
+                "        let ro{u}_{cb} = min(rr + {u}u, rows - 1u);
+        let co{u}_{cb} = min({cb}u * 32u + lane, nbw - 1u);
+        let g{u}_{cb} = a[luma_view_idx3(av, k + co{u}_{cb}, r0 + ro{u}_{cb}, 0u)];
+        let t{u}_{cb} = tm[select(0u, (r0 + ro{u}_{cb} - k) * nbw + co{u}_{cb}, p.has_t != 0u)];
+        let v{u}_{cb} = select(g{u}_{cb}, g{u}_{cb} - t{u}_{cb}, p.has_t != 0u);
 "
             );
             stores += &format!("        if (rr + {u}u < rows && {cb}u * 32u + lane < nbw) {{ tile[({cb}u * 32u + lane) * 33u + rr + {u}u] = v{u}_{cb}; }}\n");
@@ -335,10 +356,11 @@ fn panel_source(nb: usize) -> String {
         sl += &format!(
             "        let i{w} = idx + {}u;
         let b{w} = (c0 + i{w} / {h4}u) * {nb}u + pc + (i{w} % {h4}u) * 4u;
-        var w{w} = vec4<f32>(0.0);
-        if (i{w} < total) {{ w{w} = vec4<f32>(dk[b{w}], dk[b{w} + 1u], dk[b{w} + 2u], dk[b{w} + 3u]); }}
+        let e{w} = min(b{w}, {last}u);
+        let w{w} = vec4<f32>(dk[e{w}], dk[e{w} + 1u], dk[e{w} + 2u], dk[e{w} + 3u]);
 ",
-            32 * w
+            32 * w,
+            last = nb * nb - 4
         );
         ss += &format!("        if (i{w} < total) {{ lb[i{w}] = w{w}; }}\n");
     }

@@ -149,7 +149,8 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 9] = [
+        let groups: [(&str, fn(&mut Bench)); 10] = [
+            ("cholprobe", chol_probe),
             ("cholesky", cholesky),
             ("triangular", triangular),
             ("spd", spd_solve),
@@ -166,6 +167,31 @@ pub fn linalg(b: &mut Bench) {
             }
         }
     });
+}
+
+/// `LINALG_ROWS=cholprobe`: small single-block sizes of the Cholesky factorisation, to read the time of
+/// one diagonal / panel launch off the per-kernel profile (`LUMA_CHOL_NB` picks the block).
+fn chol_probe(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    for n in [128usize, 256, 512] {
+        let a = dd_spd(n, 70 + n as u64);
+        let (al, aa) = (lumax::arr(&ctx, &a, [n, n]), afx::arr(&a, &[n as u64, n as u64]));
+        b.run(
+            "cholprobe f32",
+            &format!("{n}x{n}"),
+            Verdict::yes(String::new()),
+            "probe",
+            &mut || {
+                al.cholesky().eval().unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let (r, _) = af::cholesky(&aa, false);
+                r.eval();
+                afx::sync();
+            },
+        );
+    }
 }
 
 fn triangular(b: &mut Bench) {
