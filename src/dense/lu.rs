@@ -932,10 +932,11 @@ fn leaf_width(m: usize, batch: usize) -> usize {
 /// Factors every `[w, m, batch]` matrix of `a` (`m >= w`) with one of the two kernels.
 fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let ctx = a.context();
-    if d.batch == 1 && d.rows > SMALL {
-        if let Some(f) = calu_leaf(a, d, op, loc) {
-            return f;
-        }
+    if d.batch == 1
+        && d.rows > SMALL
+        && let Some(f) = calu_leaf(a, d, op, loc)
+    {
+        return f;
     }
     let perm_shape = Shape::from([d.rows, 1, d.batch]);
     let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
