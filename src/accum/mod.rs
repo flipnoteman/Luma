@@ -36,10 +36,16 @@
 //! count in no statistic, as if masked out by `push_where`.
 
 mod blob;
+mod comoments;
+mod hist;
 mod moments;
+mod topk;
 mod wide;
 
+pub use comoments::{CoMoments, CoMomentsBuilder, Covariance};
+pub use hist::{Histogram, Histogram2d};
 pub use moments::{Accumulator, AccumulatorBuilder};
+pub use topk::TopK;
 pub use wide::{AccumInput, Wide};
 
 use crate::error::{LumaError, Result};

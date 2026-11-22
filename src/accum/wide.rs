@@ -126,6 +126,15 @@ pub fn check_wide<W: Wide>(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// `Df32` arrays have no reductions along an axis, only over the whole array, so a precise pass
+/// of a `Df32` state folds the whole batch.
+pub fn check_precise_axes<W: Wide>(precise: bool, dims: [usize; 4], axes: &[usize]) -> Result<()> {
+    if precise && std::any::TypeId::of::<W>() == std::any::TypeId::of::<Df32>() && !super::is_flat(dims, axes) {
+        return Err(LumaError::Unsupported("a precise pass of a Df32 state folds the whole batch (Df32 arrays have no reductions along an axis); use an f64 state or the default pass".into()));
+    }
+    Ok(())
+}
+
 /// An array of a [`Wide`] type with the arithmetic the merge formulas use.
 #[derive(Clone)]
 pub struct V<W: Wide>(pub Array<W>);
@@ -291,6 +300,11 @@ pub trait AccumInput: Numeric {
     /// The flat index of the smallest (largest) element.
     #[doc(hidden)]
     fn argmin_flat(a: &Array<Self>, max: bool) -> Result<Array<u32>>;
+    /// The value as `f64` (exact) and back (rounded to the type).
+    #[doc(hidden)]
+    fn to_host_f64(self) -> f64;
+    #[doc(hidden)]
+    fn from_host_f64(v: f64) -> Self;
     /// Scatter-min or -max into `len` elements starting at the identity.
     #[doc(hidden)]
     fn scatter_extreme(ctx: &Context, len: crate::Shape, idx: &Array<u32>, values: &Array<Self>, max: bool) -> Result<Array<Self>>;
@@ -323,6 +337,12 @@ macro_rules! arg_impls_atomic {
 }
 
 impl AccumInput for f32 {
+    fn to_host_f64(self) -> f64 {
+        self as f64
+    }
+    fn from_host_f64(v: f64) -> Self {
+        v as f32
+    }
     fn to_f32(a: &Array<Self>) -> Array<f32> {
         a.clone()
     }
@@ -345,6 +365,12 @@ impl AccumInput for f32 {
 }
 
 impl AccumInput for u32 {
+    fn to_host_f64(self) -> f64 {
+        f64::from(self)
+    }
+    fn from_host_f64(v: f64) -> Self {
+        v as u32
+    }
     fn to_f32(a: &Array<Self>) -> Array<f32> {
         a.to_f32()
     }
@@ -367,6 +393,12 @@ impl AccumInput for u32 {
 }
 
 impl AccumInput for i32 {
+    fn to_host_f64(self) -> f64 {
+        f64::from(self)
+    }
+    fn from_host_f64(v: f64) -> Self {
+        v as i32
+    }
     fn to_f32(a: &Array<Self>) -> Array<f32> {
         a.to_f32()
     }
@@ -389,6 +421,12 @@ impl AccumInput for i32 {
 }
 
 impl AccumInput for f64 {
+    fn to_host_f64(self) -> f64 {
+        self
+    }
+    fn from_host_f64(v: f64) -> Self {
+        v
+    }
     fn to_f32(a: &Array<Self>) -> Array<f32> {
         a.to_f32()
     }
@@ -420,6 +458,12 @@ impl AccumInput for f64 {
 }
 
 impl AccumInput for Df32 {
+    fn to_host_f64(self) -> f64 {
+        Df32::to_f64(self)
+    }
+    fn from_host_f64(v: f64) -> Self {
+        Df32::from(v)
+    }
     fn to_f32(a: &Array<Self>) -> Array<f32> {
         a.to_f32()
     }

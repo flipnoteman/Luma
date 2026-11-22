@@ -1,7 +1,7 @@
 //! Incremental accumulators against f64 host references: batches of any split, merge orders,
 //! cancellation, masks, groups, every element type, serialization.
 
-use luma::{Accumulator, Array, Df32, Fold, NanPolicy, Wide};
+use luma::{Accumulator, Array, CoMoments, Covariance, Df32, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 
 /// Deterministic pseudo-random uniform values in `[0, 1)`.
 fn uniform(n: usize, seed: u64) -> Vec<f64> {
@@ -451,4 +451,294 @@ fn the_precise_pass_is_exact_to_the_state() {
         close(sum, want.sum, 1e-11, 0.0, "precise sum");
         close(var, want.m2 / want.n, 1e-9, 0.0, "precise var");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two streams
+// ---------------------------------------------------------------------------------------------
+
+/// Host covariance of two columns: (n, mean_x, mean_y, m2x, m2y, cxy).
+fn host_co(x: &[f64], y: &[f64]) -> [f64; 6] {
+    let n = x.len() as f64;
+    let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
+    let (mut m2x, mut m2y, mut cxy) = (0.0, 0.0, 0.0);
+    for (a, b) in x.iter().zip(y) {
+        m2x += (a - mx) * (a - mx);
+        m2y += (b - my) * (b - my);
+        cxy += (a - mx) * (b - my);
+    }
+    [n, mx, my, m2x, m2y, cxy]
+}
+
+#[test]
+fn covariance_between_two_streams_per_position() {
+    const F: usize = 4;
+    let rows = 900;
+    let x = f32s(&normal(F * rows, 20));
+    // y correlates with x differently per feature.
+    let noise = normal(F * rows, 21);
+    let y: Vec<f32> = (0..F * rows).map(|i| (x[i] as f64 * (i % F) as f64 * 0.4 + noise[i] + 3.0) as f32).collect();
+    let acc = CoMoments::<Df32>::new(Fold::axis(1));
+    for (start, count) in [(0, 1), (1, 99), (100, 300), (400, 500)] {
+        let range = start * F..(start + count) * F;
+        acc.push(&Array::from_slice(&x[range.clone()], [F, count]).unwrap(), &Array::from_slice(&y[range], [F, count]).unwrap()).unwrap();
+    }
+    let (cov, corr, vx, vy, mx, my) = (read(acc.cov()), read(acc.corr()), read(acc.var_x()), read(acc.var_y()), read(acc.mean_x()), read(acc.mean_y()));
+    for f in 0..F {
+        let cx: Vec<f64> = (0..rows).map(|r| x[r * F + f] as f64).collect();
+        let cy: Vec<f64> = (0..rows).map(|r| y[r * F + f] as f64).collect();
+        let [n, hmx, hmy, m2x, m2y, cxy] = host_co(&cx, &cy);
+        close(mx[f], hmx, 1e-5, 1e-6, "mean x");
+        close(my[f], hmy, 1e-5, 1e-6, "mean y");
+        close(vx[f], m2x / n, 1e-5, 0.0, "var x");
+        close(vy[f], m2y / n, 1e-5, 0.0, "var y");
+        close(cov[f], cxy / n, 1e-4, 1e-6, "cov");
+        close(corr[f], cxy / (m2x * m2y).sqrt(), 1e-4, 1e-5, "corr");
+    }
+    // Whole-stream covariance, merged from two halves; masked; bytes.
+    let xs: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let ys: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+    let [n, _, _, m2x, m2y, cxy] = host_co(&xs, &ys);
+    let half = x.len() / 2;
+    let (a, b) = (CoMoments::<Df32>::new(Fold::all()), CoMoments::<f64>::new(Fold::all()));
+    a.push(&Array::from_slice(&x[..half], half).unwrap(), &Array::from_slice(&y[..half], half).unwrap()).unwrap();
+    b.push(&Array::from_slice(&x[half..], x.len() - half).unwrap(), &Array::from_slice(&y[half..], y.len() - half).unwrap()).unwrap();
+    let b = CoMoments::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
+    a.merge(&b).unwrap();
+    close(read(a.cov())[0], cxy / n, 1e-4, 1e-6, "merged cov");
+    close(read(a.corr())[0], cxy / (m2x * m2y).sqrt(), 1e-4, 1e-5, "merged corr");
+    close(read(a.count())[0], n, 0.0, 0.0, "merged count");
+    let masked = CoMoments::<Df32>::new(Fold::all());
+    let keep: Vec<bool> = (0..x.len()).map(|i| i % 2 == 0).collect();
+    masked.push_where(&Array::from_slice(&x, x.len()).unwrap(), &Array::from_slice(&y, y.len()).unwrap(), &Array::from_slice(&keep, keep.len()).unwrap()).unwrap();
+    let hx: Vec<f64> = xs.iter().step_by(2).copied().collect();
+    let hy: Vec<f64> = ys.iter().step_by(2).copied().collect();
+    let [n, _, _, _, _, cxy] = host_co(&hx, &hy);
+    close(read(masked.cov())[0], cxy / n, 1e-4, 1e-6, "masked cov");
+}
+
+#[test]
+fn cross_moments_survive_a_large_offset() {
+    let noise = normal(10_000, 22);
+    let other = normal(10_000, 23);
+    let x: Vec<f64> = noise.iter().map(|v| 1.0e6 + 0.01 * v).collect();
+    let y: Vec<f64> = x.iter().zip(&other).map(|(a, b)| -2.0e6 + 3.0 * (a - 1.0e6) + 0.005 * b).collect();
+    let acc = CoMoments::<f64>::builder(Fold::all()).precise().build();
+    for (cx, cy) in x.chunks(1000).zip(y.chunks(1000)) {
+        acc.push(&Array::from_slice(cx, cx.len()).unwrap(), &Array::from_slice(cy, cy.len()).unwrap()).unwrap();
+    }
+    let [n, _, _, m2x, m2y, cxy] = host_co(&x, &y);
+    close(read(acc.cov())[0], cxy / n, 1e-9, 0.0, "cov at offset");
+    close(read(acc.corr())[0], cxy / (m2x * m2y).sqrt(), 1e-9, 0.0, "corr at offset");
+}
+
+#[test]
+fn feature_covariance_matrix() {
+    const F: usize = 6;
+    let samples = 1500;
+    let base = normal(F * samples, 24);
+    // Mix the features so that the matrix is not diagonal, and add an offset.
+    let data: Vec<f32> = (0..F * samples).map(|i| (base[i] + 0.5 * base[(i / F) * F + (i % F + 1) % F] + 40.0 * (i % F) as f64) as f32).collect();
+    let acc = Covariance::<Df32>::new();
+    for (start, count) in [(0, 1), (1, 249), (250, 750), (1000, 500)] {
+        acc.push(&Array::from_slice(&data[start * F..(start + count) * F], [F, count]).unwrap()).unwrap();
+    }
+    let cov = read(acc.cov());
+    let corr = read(acc.corr());
+    let mean = read(acc.mean());
+    let var = read(acc.var());
+    let n = samples as f64;
+    let col = |f: usize| -> Vec<f64> { (0..samples).map(|r| data[r * F + f] as f64).collect() };
+    for i in 0..F {
+        for j in 0..F {
+            let [_, mi, mj, m2i, m2j, cij] = host_co(&col(i), &col(j));
+            close(cov[i + F * j], cij / n, 1e-4, 1e-6, "cov entry");
+            close(corr[i + F * j], cij / (m2i * m2j).sqrt(), 1e-4, 1e-5, "corr entry");
+            if i == j {
+                close(mean[i], mi, 1e-6, 1e-4, "mean");
+                close(var[i], m2i / n, 1e-4, 0.0, "var");
+            }
+            let _ = mj;
+        }
+    }
+    // Merging two accumulators and a round trip through bytes give the same matrix.
+    let (a, b) = (Covariance::<Df32>::new(), Covariance::<f64>::new());
+    a.push(&Array::from_slice(&data[..F * 700], [F, 700]).unwrap()).unwrap();
+    b.push(&Array::from_slice(&data[F * 700..], [F, samples - 700]).unwrap()).unwrap();
+    let b = Covariance::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
+    a.merge(&b).unwrap();
+    let merged = read(a.cov());
+    for k in 0..F * F {
+        close(merged[k], cov[k], 1e-4, 1e-6, "merged cov");
+    }
+    assert!(Covariance::<Df32>::new().push(&Array::<f32>::zeros([3, 4, 2]).unwrap()).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Histograms
+// ---------------------------------------------------------------------------------------------
+
+fn host_hist(values: &[f32], bins: usize, lo: f32, hi: f32) -> (Vec<f64>, [f64; 3]) {
+    let mut counts = vec![0.0; bins];
+    let mut out = [0.0; 3];
+    let scale = bins as f32 / (hi - lo);
+    for &v in values {
+        if v.is_nan() {
+            out[2] += 1.0;
+        } else if v < lo {
+            out[0] += 1.0;
+        } else if v > hi {
+            out[1] += 1.0;
+        } else {
+            counts[(((v - lo) * scale) as usize).min(bins - 1)] += 1.0;
+        }
+    }
+    (counts, out)
+}
+
+#[test]
+fn histograms_count_exactly_and_merge() {
+    let mut data = f32s(&uniform(50_000, 30).iter().map(|v| v * 1.4 - 0.2).collect::<Vec<_>>());
+    for i in (0..data.len()).step_by(997) {
+        data[i] = f32::NAN;
+    }
+    data[5] = 1.0; // the top edge belongs to the last bin
+    let (want, out) = host_hist(&data, 20, 0.0, 1.0);
+    let hist = Histogram::<Df32>::new(20, 0.0, 1.0).unwrap();
+    for chunk in data.chunks(7000) {
+        hist.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+    }
+    assert_eq!(read(hist.counts()), want);
+    assert_eq!(read(hist.outliers()), out);
+    // Halves on two accumulators, one of them an f64 state travelling as bytes.
+    let (a, b) = (Histogram::<Df32>::new(20, 0.0, 1.0).unwrap(), Histogram::<f64>::new(20, 0.0, 1.0).unwrap());
+    a.push(&Array::from_slice(&data[..20_000], 20_000).unwrap()).unwrap();
+    b.push(&Array::from_slice(&data[20_000..], 30_000).unwrap()).unwrap();
+    a.merge(&Histogram::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap()).unwrap();
+    assert_eq!(read(a.counts()), want);
+    assert_eq!(a.edges().len(), 21);
+    // Masked, and per feature.
+    let keep: Vec<bool> = (0..data.len()).map(|i| i % 4 != 1).collect();
+    let picked: Vec<f32> = data.iter().zip(&keep).filter(|(_, k)| **k).map(|(&v, _)| v).collect();
+    let masked = Histogram::<Df32>::new(20, 0.0, 1.0).unwrap();
+    masked.push_where(&Array::from_slice(&data, data.len()).unwrap(), &Array::from_slice(&keep, keep.len()).unwrap()).unwrap();
+    assert_eq!(read(masked.counts()), host_hist(&picked, 20, 0.0, 1.0).0);
+    const F: usize = 3;
+    let rows = 10_000;
+    let per = Histogram::<Df32>::with_fold(8, 0.0, 1.0, Fold::axis(1)).unwrap();
+    per.push(&Array::from_slice(&data[..F * rows], [F, rows]).unwrap()).unwrap();
+    let counts = read(per.counts());
+    assert_eq!(counts.len(), F * 8);
+    for f in 0..F {
+        let column: Vec<f32> = (0..rows).map(|r| data[r * F + f]).collect();
+        let want = host_hist(&column, 8, 0.0, 1.0).0;
+        for b in 0..8 {
+            assert_eq!(counts[f + F * b], want[b], "feature {f} bin {b}");
+        }
+    }
+    assert!(Histogram::<Df32>::new(0, 0.0, 1.0).is_err());
+    assert!(Histogram::<Df32>::new(4, 1.0, 1.0).is_err());
+}
+
+#[test]
+fn joint_histogram_and_mutual_information() {
+    let n = 40_000;
+    let x = f32s(&uniform(n, 31));
+    let y: Vec<f32> = x.iter().zip(uniform(n, 32)).map(|(&a, b)| if b < 0.5 { a } else { (b * 2.0 - 1.0) as f32 }).collect();
+    let (bx, by) = (8usize, 8usize);
+    let joint = Histogram2d::<Df32>::new((bx, by), (0.0, 1.0), (0.0, 1.0)).unwrap();
+    for (cx, cy) in x.chunks(9000).zip(y.chunks(9000)) {
+        joint.push(&Array::from_slice(cx, cx.len()).unwrap(), &Array::from_slice(cy, cy.len()).unwrap()).unwrap();
+    }
+    let mut want = vec![0.0; bx * by];
+    for (&a, &b) in x.iter().zip(&y) {
+        let (i, j) = ((a * bx as f32) as usize, (b * by as f32) as usize);
+        want[i.min(bx - 1) + bx * j.min(by - 1)] += 1.0;
+    }
+    assert_eq!(read(joint.counts()), want);
+    assert_eq!(read(joint.outside()), vec![0.0]);
+    let marginal = read(joint.marginal_x());
+    assert_eq!(marginal.iter().sum::<f64>(), n as f64);
+    // Mutual information against the host formula.
+    let total = n as f64;
+    let px: Vec<f64> = (0..bx).map(|i| (0..by).map(|j| want[i + bx * j]).sum::<f64>() / total).collect();
+    let py: Vec<f64> = (0..by).map(|j| (0..bx).map(|i| want[i + bx * j]).sum::<f64>() / total).collect();
+    let mut mi = 0.0;
+    for i in 0..bx {
+        for j in 0..by {
+            let p = want[i + bx * j] / total;
+            if p > 0.0 {
+                mi += p * (p / (px[i] * py[j])).ln();
+            }
+        }
+    }
+    let got = joint.mutual_information().unwrap().to_vec().unwrap()[0] as f64;
+    close(got, mi, 1e-3, 1e-5, "mutual information");
+    assert!(mi > 0.1, "the streams are dependent");
+    let ent: f64 = -px.iter().map(|p| p * p.ln()).sum::<f64>();
+    close(joint.entropy_x().unwrap().to_vec().unwrap()[0] as f64, ent, 1e-3, 1e-5, "entropy");
+    // Out-of-range pairs are counted aside.
+    let out = Histogram2d::<Df32>::new((2, 2), (0.0, 1.0), (0.0, 1.0)).unwrap();
+    out.push(&Array::from_slice(&[0.1f32, 2.0, f32::NAN, 0.9], 4).unwrap(), &Array::from_slice(&[0.1f32, 0.5, 0.5, -1.0], 4).unwrap()).unwrap();
+    assert_eq!(read(out.outside()), vec![3.0]);
+    assert_eq!(read(out.counts()), vec![1.0, 0.0, 0.0, 0.0]);
+    // Merge and bytes.
+    let other = Histogram2d::<f64>::new((bx, by), (0.0, 1.0), (0.0, 1.0)).unwrap();
+    other.push(&Array::from_slice(&x[..100], 100).unwrap(), &Array::from_slice(&y[..100], 100).unwrap()).unwrap();
+    let other = Histogram2d::<Df32>::from_bytes(&other.to_bytes().unwrap()).unwrap();
+    joint.merge(&other).unwrap();
+    assert_eq!(read(joint.marginal_x()).iter().sum::<f64>(), n as f64 + 100.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Top-k
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn top_k_keeps_the_best_with_global_indices() {
+    let data = f32s(&normal(10_000, 40));
+    // Duplicates: ties go to the earlier index.
+    let mut data = data;
+    data[7000] = data[3];
+    data[3] = 99.0;
+    data[7000] = 99.0;
+    let k = 25;
+    let mut order: Vec<usize> = (0..data.len()).collect();
+    order.sort_by(|&a, &b| data[b].total_cmp(&data[a]).then(a.cmp(&b)));
+    let top = TopK::<f32, Df32>::largest(k);
+    for chunk in data.chunks(1500) {
+        top.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+    }
+    assert_eq!(top.values().unwrap().to_vec().unwrap(), order[..k].iter().map(|&i| data[i]).collect::<Vec<_>>());
+    assert_eq!(read(top.indices()), order[..k].iter().map(|&i| i as f64).collect::<Vec<_>>());
+    assert_eq!(top.elements_seen(), 10_000);
+    // The smallest, with NaN ignored.
+    let mut with_nan = data.clone();
+    with_nan[10] = f32::NAN;
+    let mut order: Vec<usize> = (0..data.len()).filter(|&i| i != 10).collect();
+    order.sort_by(|&a, &b| data[a].total_cmp(&data[b]).then(a.cmp(&b)));
+    let low = TopK::<f32, Df32>::smallest(k);
+    for chunk in with_nan.chunks(4096) {
+        low.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+    }
+    assert_eq!(read(low.indices()), order[..k].iter().map(|&i| i as f64).collect::<Vec<_>>());
+    // Merge of two halves (the second half's indices continue the first's), through bytes.
+    let (a, b) = (TopK::<f32, Df32>::largest(k), TopK::<f32, f64>::largest(k));
+    a.push(&Array::from_slice(&data[..6000], 6000).unwrap()).unwrap();
+    b.push(&Array::from_slice(&data[6000..], 4000).unwrap()).unwrap();
+    let b = TopK::<f32, Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
+    a.merge(&b).unwrap();
+    let mut order: Vec<usize> = (0..data.len()).collect();
+    order.sort_by(|&a, &b| data[b].total_cmp(&data[a]).then(a.cmp(&b)));
+    assert_eq!(read(a.indices()), order[..k].iter().map(|&i| i as f64).collect::<Vec<_>>());
+    // Fewer than k elements: the empty slots are marked.
+    let few = TopK::<i32, Df32>::largest(5);
+    few.push(&Array::from_slice(&[3i32, -7, 5], 3).unwrap()).unwrap();
+    assert_eq!(few.values().unwrap().to_vec().unwrap()[..3], [5, 3, -7]);
+    assert_eq!(read(few.indices()), vec![2.0, 0.0, 1.0, -1.0, -1.0]);
+    // Masked elements are never selected but take indices.
+    let masked = TopK::<u32, Df32>::largest(2);
+    masked.push_where(&Array::from_slice(&[9u32, 8, 7, 6], 4).unwrap(), &Array::from_slice(&[false, true, true, true], 4).unwrap()).unwrap();
+    assert_eq!(masked.values().unwrap().to_vec().unwrap(), [8, 7]);
+    assert_eq!(read(masked.indices()), vec![1.0, 2.0]);
 }

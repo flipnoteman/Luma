@@ -388,6 +388,7 @@ impl<W: Wide> Accumulator<W> {
         super::wide::check_wide::<W>(ctx)?;
         let dims = batch.shape().dims();
         let axes = self.cfg.fold.resolve(dims)?;
+        super::wide::check_precise_axes::<W>(self.cfg.precise, dims, &axes)?;
         let kept = kept_dims(dims, &axes);
         let mut guard = self.lock();
         if guard.state.is_none() {
@@ -704,7 +705,7 @@ fn effective_mask<T: AccumInput>(cfg: &Config, batch: &Array<T>, mask: Option<&A
 }
 
 /// Reductions of `x` over the folded axes (the reduction of one array, or per line).
-fn reduce_folded<T: crate::gpu_type::Numeric>(x: &Array<T>, axes: &[usize], ops: &[Reduction]) -> Vec<Array<T>> {
+pub(super) fn reduce_folded<T: crate::gpu_type::Numeric>(x: &Array<T>, axes: &[usize], ops: &[Reduction]) -> Vec<Array<T>> {
     let dims = x.shape().dims();
     if is_flat(dims, axes) {
         return reduce_flat(x, ops);
