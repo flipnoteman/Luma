@@ -549,7 +549,8 @@ mod tests {
         use crate::complex::C32;
         let ctx = context(false);
         let data = [C32::new(f32::INFINITY, 1.0), C32::new(-0.0, 2.0), C32::new(f32::NAN, -3.0), C32::new(1.5, f32::NEG_INFINITY)];
-        let cases: [(&str, bool, fn(&Array<C32>) -> Vec<C32>); 4] = [
+        type ComplexCase = (&'static str, bool, fn(&Array<C32>) -> Vec<C32>);
+        let cases: [ComplexCase; 4] = [
             ("make of the parts", true, |w| {
                 let w = w.conj();
                 Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap()
