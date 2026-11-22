@@ -200,20 +200,21 @@ pub fn rows(b: &mut Bench) {
                     xl.orb(20.0, 3000, 1.5, 4, blur).unwrap();
                 };
                 let got = xl.orb(20.0, 3000, 1.5, 4, blur).unwrap().map(|(k, d)| luma_points(&k, lumax::host(&d).iter().map(|&v| f32::from_bits(v)).collect(), 8, true)).expect("luma orb found nothing");
-                let want = af_orb_points(&xa, 20.0, 3000, 1.5, 4, blur);
+                // ArrayFire's orb with blur_img smooths its input image in place: every call gets a copy.
+                let want = af_orb_points(&xa.copy(), 20.0, 3000, 1.5, 4, blur);
                 let verdict = compare_points(&got, &want, true, 0.97);
                 let name = if blur { "vision orb blur" } else { "vision orb" };
                 b.run(
                     name,
                     &size,
                     verdict,
-                    "fast_thr 20, max_feat 3000, scale 1.5, 4 levels; sets compared (ArrayFire's order depends on its CUDA blocks)",
+                    "fast_thr 20, max_feat 3000, scale 1.5, 4 levels; sets compared (ArrayFire's order depends on its CUDA blocks); ArrayFire's blur_img smooths its input in place, so its side copies the image first (the copy is timed)",
                     &mut || {
                         l();
                         ctx.sync().unwrap();
                     },
                     &mut || {
-                        let _ = af_orb_points_timed(&xa, blur);
+                        let _ = if blur { af_orb_points_timed(&xa.copy(), blur) } else { af_orb_points_timed(&xa, blur) };
                         afx::sync();
                     },
                 );
