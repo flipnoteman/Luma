@@ -289,20 +289,33 @@ fn calu_parts(rows: usize) -> usize {
 }
 
 /// The largest of `n` keys and its index as statements declaring `bv` and `bi`: `key` and `index`
-/// are the expressions of entry `{k}`. The loads come first, the comparisons are branch-free. Of
-/// equal keys the lowest index wins (`by_index`) or the first entry, which has a lower index than
-/// the later ones.
+/// are the expressions of entry `{k}`. The loads come first and the comparisons are a tree of
+/// branch-free steps (pairs, then pairs of pairs), so that the chain of dependent instructions is
+/// short. Of equal keys the lowest index wins (`by_index`) or the left one, which has a lower
+/// index than the right one.
 fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, by_index: bool, indent: &str) -> String {
     let mut text = String::new();
     for k in 0..n {
-        text += &format!("{indent}let v{k} = {};\n", key.replace("{k}", &k.to_string()));
-        text += &format!("{indent}let j{k} = {};\n", index.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let v0_{k} = {};\n", key.replace("{k}", &k.to_string()));
+        text += &format!("{indent}let j0_{k} = {};\n", index.replace("{k}", &k.to_string()));
     }
-    text += &format!("{indent}var {bv} = v0;\n{indent}var {bi} = j0;\n");
-    for k in 1..n {
-        let better = if by_index { format!("(v{k} > {bv} || (v{k} == {bv} && j{k} < {bi}))") } else { format!("v{k} > {bv}") };
-        text += &format!("{indent}{bi} = select({bi}, j{k}, {better});\n{indent}{bv} = max({bv}, v{k});\n");
+    let (mut level, mut count) = (0, n);
+    while count > 1 {
+        let next = count.div_ceil(2);
+        for k in 0..next {
+            let (l, r) = (2 * k, 2 * k + 1);
+            let (lv, nl) = (level, level + 1);
+            if r < count {
+                let better = if by_index { format!("(v{lv}_{r} > v{lv}_{l} || (v{lv}_{r} == v{lv}_{l} && j{lv}_{r} < j{lv}_{l}))") } else { format!("v{lv}_{r} > v{lv}_{l}") };
+                text += &format!("{indent}let j{nl}_{k} = select(j{lv}_{l}, j{lv}_{r}, {better});\n{indent}let v{nl}_{k} = max(v{lv}_{l}, v{lv}_{r});\n");
+            } else {
+                text += &format!("{indent}let j{nl}_{k} = j{lv}_{l};\n{indent}let v{nl}_{k} = v{lv}_{l};\n");
+            }
+        }
+        level += 1;
+        count = next;
     }
+    text += &format!("{indent}let {bv} = v{level}_0;\n{indent}let {bi} = j{level}_0;\n");
     text
 }
 
