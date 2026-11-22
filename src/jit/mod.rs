@@ -2404,13 +2404,17 @@ struct ConsTable {
     epoch: u64,
     /// The operations, by hash: sets of [`CONS_WAYS`] entries each (a power of two of them), made
     /// when the first entry is stored. No node is ever looked for by walking: a lookup or an
-    /// insert reads one cache line, with no sweep for dead entries (a node is made per
-    /// operation, and nearly all of them die young). The table grows when a live entry would have
-    /// to give way: an expression made of more operations than the table holds would not share
-    /// its common parts any more, which costs far more than the table.
+    /// insert reads the entries of one set (an entry of a dead node is replaced by the insert
+    /// that finds it, and [`ConsTable::sweep`] drops the others in bulk). The table grows when a
+    /// live entry would have to give way: an expression made of more operations than the table
+    /// holds would not share its common parts any more, which costs far more than the table.
     sets: Vec<ConsSet>,
     /// The sets that hold an entry, so that forgetting them all does not visit the others.
     filled: Vec<u32>,
+    /// Entries stored since the dead ones were last dropped.
+    stored: usize,
+    /// Entries stored at which the dead ones are dropped next (see [`ConsTable::sweep`]).
+    sweep_at: usize,
     /// The masks of region assignments (see [`MaskKey`]).
     masks: FxMap<MaskKey, Weak<Node>>,
 }
@@ -2422,27 +2426,59 @@ impl std::fmt::Debug for ConsTable {
 }
 
 /// Entries of a [`ConsSet`].
-const CONS_WAYS: usize = 4;
+const CONS_WAYS: usize = 8;
+
+/// Every entry of a set in use.
+const CONS_FULL: u32 = (1 << CONS_WAYS) - 1;
+
+/// Fewest entries stored between two drops of the dead ones (see [`ConsTable::sweep`]).
+const CONS_SWEEP_MIN: usize = 16384;
 
 /// Sets a [`ConsTable`] starts with (a power of two).
-const CONS_SETS_MIN: usize = 256;
+const CONS_SETS_MIN: usize = 128;
 
 /// Most sets a [`ConsTable`] grows to: 1M operations. Past that live entries are replaced.
-const CONS_SETS_MAX: usize = 1 << 18;
+const CONS_SETS_MAX: usize = 1 << 17;
 
-/// One entry of the table: the hash of an operation and the node that computes it, if the entry
-/// is in use.
+/// The entries of one hash value range: the node that computes an operation, if the entry is in
+/// use (bit `i` of `used`), and the high half of the hash of the operation (the half that tells
+/// the set, see [`ConsTable::set_of`]). A lookup reads the first cache line only (the tags and
+/// `used`), compares the tags of all the entries without a branch per entry, and leaves a
+/// collision of tags to the comparison of the operands.
 #[derive(Default)]
-struct ConsEntry {
-    hash: u64,
-    node: Option<Weak<Node>>,
+#[repr(C, align(64))]
+struct ConsSet {
+    tags: [u32; CONS_WAYS],
+    used: u32,
+    nodes: [Option<Weak<Node>>; CONS_WAYS],
 }
 
-/// The entries of one hash value range, on a cache line of their own.
-#[derive(Default)]
-#[repr(align(64))]
-struct ConsSet {
-    entries: [ConsEntry; CONS_WAYS],
+impl ConsSet {
+    /// The entries (bit `i` for entry `i`) in use that hold the tag of `hash`.
+    #[inline]
+    fn matching(&self, hash: u64) -> u32 {
+        let tag = (hash >> 32) as u32;
+        self.used & self.tags.iter().enumerate().fold(0, |bits, (i, &entry)| bits | u32::from(entry == tag) << i)
+    }
+
+    /// Drops the entries of dead nodes; returns the entries that are still in use.
+    fn drop_dead(&mut self) -> u32 {
+        for way in 0..CONS_WAYS {
+            if self.used >> way & 1 != 0 && self.nodes[way].as_ref().is_none_or(|weak| weak.strong_count() == 0) {
+                self.nodes[way] = None;
+                self.used &= !(1 << way);
+            }
+        }
+        self.used
+    }
+
+    /// Puts `node` in entry `way`.
+    #[inline]
+    fn put(&mut self, way: usize, hash: u64, node: Weak<Node>) {
+        self.tags[way] = (hash >> 32) as u32;
+        self.nodes[way] = Some(node);
+        self.used |= 1 << way;
+    }
 }
 
 impl ConsTable {
@@ -2450,13 +2486,39 @@ impl ConsTable {
     fn clear_for(&mut self, epoch: u64) {
         for at in self.filled.drain(..) {
             if let Some(set) = self.sets.get_mut(at as usize) {
-                for entry in &mut set.entries {
-                    entry.node = None;
-                }
+                set.nodes.fill_with(|| None);
+                set.used = 0;
             }
         }
         self.masks.clear();
+        self.stored = 0;
         self.epoch = epoch;
+    }
+
+    /// Drops the entries of dead nodes. A `Weak` keeps the memory of its node (a few hundred
+    /// bytes) allocated, so an entry left for the insert that replaces it keeps a whole dead
+    /// expression's nodes out of the allocator: the operations made next get fresh memory, cold
+    /// in every cache (a recorded SHA-3 of 4096 messages made 83 % more page faults and took
+    /// 1.8x the host time), where memory freed at once is reused while it is still cached.
+    /// Runs after as many inserts as entries survived the last time (at least
+    /// [`CONS_SWEEP_MIN`]), which keeps what it costs per insert constant.
+    fn sweep(&mut self) {
+        let Self { sets, filled, .. } = self;
+        let mut live = 0;
+        let mut drop_dead = |set: &mut ConsSet| {
+            let used = set.drop_dead();
+            live += used.count_ones() as usize;
+            used != 0
+        };
+        if filled.len() * 8 >= sets.len() {
+            // Most sets hold something: reading them in order is what the memory is best at.
+            filled.clear();
+            filled.extend(sets.iter_mut().enumerate().filter_map(|(at, set)| drop_dead(set).then_some(at as u32)));
+        } else {
+            filled.retain(|&at| sets.get_mut(at as usize).is_some_and(&mut drop_dead));
+        }
+        self.stored = 0;
+        self.sweep_at = live.max(CONS_SWEEP_MIN);
     }
 
     /// The set `hash` belongs to, of `sets` sets.
@@ -2470,7 +2532,15 @@ impl ConsTable {
     #[inline]
     fn find(&self, hash: u64) -> Option<Arc<Node>> {
         let set = self.sets.get(Self::set_of(hash, self.sets.len().max(1)))?;
-        set.entries.iter().find(|entry| entry.hash == hash).and_then(|entry| entry.node.as_ref()?.upgrade())
+        let mut hits = set.matching(hash);
+        while hits != 0 {
+            let way = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            if let Some(node) = set.nodes[way].as_ref().and_then(Weak::upgrade) {
+                return Some(node);
+            }
+        }
+        None
     }
 
     /// Records `node` for `hash`, in place of what the hash had, in a free entry, or in one whose
@@ -2480,27 +2550,30 @@ impl ConsTable {
         if self.sets.is_empty() {
             self.sets.resize_with(CONS_SETS_MIN, ConsSet::default);
         }
+        self.stored += 1;
+        if self.stored >= self.sweep_at.max(CONS_SWEEP_MIN) {
+            self.sweep();
+        }
         loop {
             let count = self.sets.len();
             let at = Self::set_of(hash, count);
             let Some(set) = self.sets.get_mut(at) else { return };
-            let was_empty = set.entries[0].node.is_none();
-            let way = set
-                .entries
-                .iter()
-                .position(|entry| entry.hash == hash && entry.node.is_some())
-                .or_else(|| set.entries.iter().position(|entry| entry.node.as_ref().is_none_or(|weak| weak.strong_count() == 0)));
-            let way = match way {
-                Some(way) => way,
-                None if count < CONS_SETS_MAX => {
-                    self.grow();
-                    continue;
-                }
-                None => (hash as usize) & (CONS_WAYS - 1),
+            let used = set.used;
+            let same = set.matching(hash);
+            let way = if same != 0 {
+                same.trailing_zeros() as usize
+            } else if used != CONS_FULL {
+                (!used).trailing_zeros() as usize
+            } else if let Some(way) = set.nodes.iter().position(|node| node.as_ref().is_none_or(|weak| weak.strong_count() == 0)) {
+                way
+            } else if count < CONS_SETS_MAX {
+                self.grow();
+                continue;
+            } else {
+                (hash as usize) % CONS_WAYS
             };
-            let Some(set) = self.sets.get_mut(at) else { return };
-            set.entries[way] = ConsEntry { hash, node: Some(node) };
-            if was_empty {
+            set.put(way, hash, node);
+            if used == 0 {
                 self.filled.push(at as u32);
             }
             return;
@@ -2515,16 +2588,15 @@ impl ConsTable {
         let mut filled = Vec::with_capacity(self.filled.len() * 2);
         for &at in &self.filled {
             let Some(from) = self.sets.get_mut(at as usize) else { continue };
-            for entry in &mut from.entries {
-                let Some(node) = entry.node.take() else { continue };
-                let to = Self::set_of(entry.hash, old * 2);
+            for way in 0..CONS_WAYS {
+                let Some(node) = from.nodes[way].take() else { continue };
+                let to = Self::set_of(u64::from(from.tags[way]) << 32, old * 2);
                 let Some(set) = sets.get_mut(to) else { continue };
-                if set.entries[0].node.is_none() {
+                if set.used == 0 {
                     filled.push(to as u32);
                 }
-                if let Some(slot) = set.entries.iter_mut().find(|slot| slot.node.is_none()) {
-                    *slot = ConsEntry { hash: entry.hash, node: Some(node) };
-                }
+                let slot = (!set.used).trailing_zeros() as usize;
+                set.put(slot, u64::from(from.tags[way]) << 32, node);
             }
         }
         self.sets = sets;
