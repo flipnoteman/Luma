@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn tiled_transpose_of_halves_matches_the_host() {
-        check_small(|i| (i as u32).wrapping_mul(2654435761).to_be_bytes()[0] as u16 * 257 + i as u16, 2);
+        check_small(|i| ((i as u32).wrapping_mul(2654435761).to_be_bytes()[0] as u16 * 257).wrapping_add(i as u16), 2);
         check_small(|i| (i as i16).wrapping_mul(-1357), 2);
     }
 
