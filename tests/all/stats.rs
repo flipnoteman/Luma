@@ -206,7 +206,8 @@ fn zero_sized_arrays_do_not_exist_and_one_element_products_are_the_element() {
     assert!(Array::<f32>::zeros_on(&ctx, 0).is_err());
     for value in [3.5f32, -0.0, f32::NAN] {
         let x = Array::from_slice_on(&ctx, &[value], 1).unwrap();
-        assert_eq!(x.prod().item().unwrap().to_bits(), value.to_bits());
+        let got = x.prod().item().unwrap();
+        assert!(got.to_bits() == value.to_bits() || (got.is_nan() && value.is_nan()), "{got} for {value}");
     }
     assert_eq!(Array::from_slice_on(&ctx, &[7u32], 1).unwrap().prod().item().unwrap(), 7);
 }

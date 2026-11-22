@@ -179,6 +179,28 @@ fn whole_array(b: &mut Bench) {
             },
         );
 
+        for bias in [Bias::Population, Bias::Sample] {
+            let (lm, lv) = xl.meanvar_weighted(&wl, bias);
+            let (am, av) = af::meanvar(&xa, &wa, bias_af(bias), 0);
+            let v = compare(&lumax::host(&lm), &afx::host(&am), 1e-4, 0.0).and(compare(&lumax::host(&lv), &afx::host(&av), 1e-3, 0.0));
+            b.run(
+                &format!("3 reduce weighted meanvar ({})", name(bias)),
+                &size,
+                v,
+                "both results evaluated together",
+                &mut || {
+                    let (m, v) = xl.meanvar_weighted(&wl, bias);
+                    luma::eval_all(&[&m, &v]).unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    let (m, v) = af::meanvar(&xa, &wa, bias_af(bias), 0);
+                    af::eval_multiple(vec![&m, &v]);
+                    afx::sync();
+                },
+            );
+        }
+
         let (mx, my) = (mean_ref, other.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64);
         let cov_ref = data.iter().zip(&other).map(|(&a, &b)| (f64::from(a) - mx) * (f64::from(b) - my)).sum::<f64>() / (n - 1) as f64;
         let (lc, ac) = (lumax::host(&xl.cov(&yl, Bias::Sample)), afx::host(&af::cov_v2(&xa, &ya, af::VarianceBias::SAMPLE)));

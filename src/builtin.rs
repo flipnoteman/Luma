@@ -1333,26 +1333,30 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
         let mut lanes = String::new();
         let mut first = String::new();
         for (j, &op) in ops.as_slice().iter().enumerate() {
+            let prod_name = format!("luma_sgprod{j}");
             let (group_op, ident) = match op {
                 ReduceOp::Sum | ReduceOp::SumSquares => ("subgroupAdd", "zero".to_owned()),
                 ReduceOp::Min => ("subgroupMin", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
-                ReduceOp::Prod => unreachable!("products combine in workgroup memory"),
+                ReduceOp::Prod => (prod_name.as_str(), "one".to_owned()),
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
+            // The product of a subgroup is a function of the lane too (see `reduce_main`).
+            let call = |value: String| if op == ReduceOp::Prod { format!("{group_op}({value}, lane, sg)") } else { format!("{group_op}({value})") };
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
                 lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if ({group} * {block}u + lid >= {n}) {{ acc{j} = first{j}; }}\n");
             }
-            lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
+            lanes += &format!("    let r{j} = {};\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", call(format!("acc{j}")), j as u32 * MAX_SUBGROUPS);
             let (lets, fin) = epilogue.map_or_else(|| (String::new(), format!("f{j}")), |list| list.epilogue_statements(j, &format!("f{j}"), &format!("g{j}_")));
             let store = store(j, &fin);
             first += &format!(
                 "        var t{j} = {ident};
         for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
-        let f{j} = {group_op}(t{j});
+        let f{j} = {};
         if (lane == 0u) {{ {lets}{store} }}
 ",
-                j as u32 * MAX_SUBGROUPS
+                j as u32 * MAX_SUBGROUPS,
+                call(format!("t{j}"))
             );
         }
         finish += &format!(
@@ -1505,8 +1509,24 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
     }
 
-    // There is no `subgroupMul`: a product combines the accumulators in workgroup memory.
-    let subgroups = tuning.subgroups && elem.subgroups() && !ops.as_slice().contains(&ReduceOp::Prod);
+    // There is no `subgroupMul`: a product of `f32`, `u32` or `i32` is combined within a subgroup by a butterfly of
+    // `subgroupShuffle`s (every lane ends with the product of all of them); other types combine in workgroup memory.
+    let products = ops.as_slice().contains(&ReduceOp::Prod);
+    let subgroups = tuning.subgroups && elem.subgroups() && (!products || matches!(elem, ReduceElem::Plain("f32" | "u32" | "i32")));
+    if subgroups {
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            if op == ReduceOp::Prod {
+                combines += &format!(
+                    "fn luma_sgprod{j}(v: {ty}, lane: u32, sg: u32) -> {ty} {{
+    var r = v;
+    for (var o = 1u; o < sg; o = o << 1u) {{ r = c{j}(r, subgroupShuffle(r, lane ^ o)); }}
+    return r;
+}}
+"
+                );
+            }
+        }
+    }
     let (shared, extra_args) = if subgroups {
         let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
         (
