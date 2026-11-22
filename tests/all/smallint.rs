@@ -422,6 +422,52 @@ macro_rules! small_suite {
                 }
             }
 
+
+            #[test]
+            fn filter_concat_stack_range_and_broadcast() {
+                let ctx = Context::new().unwrap();
+                for n in [1usize, 5, 33, 1000] {
+                    let a = data(n, 23);
+                    let x = array(&ctx, &a);
+                    let flags: Vec<bool> = lcg(n, 24).iter().map(|&v| v % 3 != 0).collect();
+                    let mask = Array::from_slice_on(&ctx, &flags, n).unwrap();
+                    let want: Vec<T> = a.iter().zip(&flags).filter(|(_, f)| **f).map(|(v, _)| *v).collect();
+                    match x.filter(&mask).unwrap() {
+                        Some(kept) => assert_eq!(kept.to_vec().unwrap(), want, "filter n = {n}"),
+                        None => assert!(want.is_empty()),
+                    }
+                    let (padded, count) = x.filter_padded(&mask, 9 as T);
+                    let mut want_padded = want.clone();
+                    want_padded.resize(n, 9);
+                    assert_eq!(padded.to_vec().unwrap(), want_padded, "filter_padded n = {n}");
+                    assert_eq!(count.item().unwrap() as usize, want.len());
+
+                    let b = data(n, 25);
+                    let y = array(&ctx, &b);
+                    let joined = concat(0, [&x, &y]);
+                    assert_eq!(joined.to_vec().unwrap(), [a.clone(), b.clone()].concat(), "concat n = {n}");
+                    let stacked = stack(1, [&x, &y]);
+                    assert_eq!(stacked.to_vec().unwrap(), [a.clone(), b.clone()].concat(), "stack n = {n}");
+                    let top = stack(0, [&x, &y]);
+                    let want: Vec<T> = (0..n).flat_map(|i| [a[i], b[i]]).collect();
+                    assert_eq!(top.to_vec().unwrap(), want, "stack axis 0, n = {n}");
+                    // Sums of stacked halves go through the widening cast.
+                    assert_eq!(((&x + &y) * (2 as T)).reshape([1, n]).to_vec().unwrap(), a.iter().zip(&b).map(|(p, q)| p.wrapping_add(*q).wrapping_mul(2)).collect::<Vec<_>>());
+
+                    let r = Array::<T>::range_on(&ctx, [n, 1], 0).unwrap();
+                    assert_eq!(r.to_vec().unwrap(), (0..n).map(|i| i as T).collect::<Vec<_>>(), "range n = {n}");
+                    let r = Array::<T>::range_on(&ctx, [3, n.min(7)], 1).unwrap();
+                    assert_eq!(r.to_vec().unwrap(), (0..n.min(7)).flat_map(|j| [j as T; 3]).collect::<Vec<_>>(), "range axis 1");
+                    assert_eq!(Array::<T>::range_on(&ctx, [n, 1], 0).unwrap().sum().item().unwrap(), (0..n).fold(0 as $wide, |s, i| s.wrapping_add((i as T) as $wide)), "sum of a range");
+
+                    let col = Array::from_slice_on(&ctx, &a[..n.min(5)], [n.min(5), 1]).unwrap();
+                    let row = Array::from_slice_on(&ctx, &b[..n.min(7)], [1, n.min(7)]).unwrap();
+                    let grid = &col + &row;
+                    let want: Vec<T> = (0..n.min(7)).flat_map(|j| (0..n.min(5)).map(move |i| (i, j))).map(|(i, j)| a[i].wrapping_add(b[j])).collect();
+                    assert_eq!(grid.to_vec().unwrap(), want, "broadcast n = {n}");
+                }
+            }
+
             #[test]
             fn arrays_of_several_buffers_agree_with_one_buffer() {
                 let one = Context::new().unwrap();

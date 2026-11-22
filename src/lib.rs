@@ -63,6 +63,8 @@ mod guide {
     pub mod precision {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
+    #[doc = include_str!("../guide/src/compact.md")]
+    pub mod compact {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
     pub mod custom_kernels {}
     #[doc = include_str!("../guide/src/performance.md")]

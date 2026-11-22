@@ -187,6 +187,12 @@ fn colstats_cases(h: &mut Harness) {
         let (m, v) = (xf.mean_axis(1), xf.var_axis(1));
         eval_all(&[&m, &v]).unwrap();
     });
+    case_trim(h, "colstats/mean_i16", &sz, Work::Bytes(bytes_i), &mut || xi.mean_axis(1).eval().unwrap());
+    case_trim(h, "colstats/mean_f32", &sz, Work::Bytes(bytes_f), &mut || xf.mean_axis(1).eval().unwrap());
+    case_trim(h, "colstats/var_i16", &sz, Work::Bytes(bytes_i), &mut || xi.var_axis(1).eval().unwrap());
+    case_trim(h, "colstats/var_f32", &sz, Work::Bytes(bytes_f), &mut || xf.var_axis(1).eval().unwrap());
+    case_trim(h, "colstats/sum_i16", &sz, Work::Bytes(bytes_i), &mut || xi.sum_axis(1).eval().unwrap());
+    case_trim(h, "colstats/sum_f32", &sz, Work::Bytes(bytes_f), &mut || xf.sum_axis(1).eval().unwrap());
     case_trim(h, "colstats/ttest_i16", &sz, Work::Bytes(bytes_i), &mut || ttest(&xi.to_f32(), &group, n1, n0).eval().unwrap());
     case_trim(h, "colstats/ttest_f32", &sz, Work::Bytes(bytes_f), &mut || ttest(&xf, &group, n1, n0).eval().unwrap());
     // Along the contiguous axis: every row's mean.

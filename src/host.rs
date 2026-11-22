@@ -41,10 +41,10 @@ fn load(storage: &Storage) -> Option<Vec<u32>> {
     let layout = storage.layout();
     storage
         .with_host_bytes(|bytes| {
-            if layout.is_packed() {
+            if layout.is_bits() {
                 let words = bytes.get(..n.div_ceil(32) * 4)?;
                 Some((0..n).map(|i| (word_at(words, i / 32) >> (i % 32)) & 1).collect())
-            } else if layout.stride() == 4 {
+            } else if layout.stride() == 4 && !layout.is_packed() {
                 let bytes = bytes.get(..n * 4)?;
                 if let Ok(slice) = bytemuck::try_cast_slice::<u8, u32>(bytes) {
                     Some(slice.to_vec())
@@ -82,7 +82,7 @@ fn store_words(ctx: &Context, len: usize, ty: ElemTy, words: &[u32]) -> Option<A
     }
     let layout = ty.layout();
     Storage::alloc_host(ctx, len, layout, |dst| {
-        if layout.is_packed() {
+        if layout.is_bits() {
             for (j, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let mut word = 0u32;
                 for (b, &v) in words[j * 32..(j * 32 + 32).min(len)].iter().enumerate() {
@@ -716,7 +716,7 @@ pub(crate) fn try_eval_reduced(reduced: &Reduced, ctx: &Context) -> Option<Arc<S
     let words = reduced_words(reduced, ctx)?;
     let layout = reduced.layout();
     Storage::alloc_host(ctx, words.len(), layout, |dst| {
-        if layout.is_packed() {
+        if layout.is_bits() {
             write_words(dst, &[words[0] & 1]);
         } else {
             write_words(dst, &words);

@@ -78,7 +78,7 @@ pub(super) fn loop_ops(ctx: &crate::context::Context, key: &FusedKey, states: &[
     let typed = matches!(state_ty, Some(ElemTy::F32 | ElemTy::U32))
         && key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| Some(i.op.out_ty()) == state_ty))
         && states.iter().zip(&key.input_tys).all(|(state, ty)| state.is_none() || Some(*ty) == state_ty);
-    if shifts || !key.subs.is_empty() || !typed || !key.narrow() {
+    if shifts || !key.subs.is_empty() || !typed || !key.plain_words() {
         return None;
     }
     let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();

@@ -267,13 +267,20 @@ pub(super) fn shape_of(instrs: &[Instr], subs: &[Vec<Instr>]) -> u64 {
 }
 
 impl FusedKey {
-    /// Whether every value the program reads, computes or writes is 4 bytes wide: the register
-    /// loops, stencils and speculation only handle those.
+    /// Whether every value the program reads, computes or writes is 4 bytes wide (or a `bool`, a
+    /// word in registers): what the kernels of the fused reductions need.
     pub(crate) fn narrow(&self) -> bool {
-        self.input_tys.iter().all(|ty| ty.slots() == 1 && !ty.is_small())
-            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| {
-                instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1 && !instr.op.ty.is_small() && !instr.op.out_ty().is_small()
-            })
+        self.input_tys.iter().all(|ty| ty.slots() == 1)
+            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
+    }
+
+    /// [`FusedKey::narrow`] and no value that is a small integer: the register loops, stencils,
+    /// tiles and speculation only handle words that are the elements (a small integer's elements
+    /// share words in buffers).
+    pub(crate) fn plain_words(&self) -> bool {
+        self.narrow()
+            && !self.input_tys.iter().any(|ty| ty.is_small())
+            && !self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| instr.op.ty.is_small() || instr.op.out_ty().is_small())
     }
 
     /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
@@ -2168,7 +2175,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
     }
     let fused = flat.finish(tail, outputs);
     // Traced steps are for the 4-byte machinery (loops, speculation, stencils).
-    fused.key.narrow().then_some(Traced { fused, members: nodes })
+    fused.key.plain_words().then_some(Traced { fused, members: nodes })
 }
 
 /// Whether `a` and `b` are the same step: the same program with the same scalar values and the

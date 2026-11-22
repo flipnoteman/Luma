@@ -11,6 +11,7 @@
 - [Loops](loops.md)
 - [Precision](precision.md)
 - [Integer and bit operations](integers.md)
+- [Compact integers](compact.md)
 - [Custom kernels](custom-kernels.md)
 - [Performance guide](performance.md)
 - [Worked examples](examples.md)

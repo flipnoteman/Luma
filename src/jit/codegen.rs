@@ -440,13 +440,17 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Index => match ty {
             ElemTy::U32 => index.to_owned(),
-            ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => unreachable!("bool and small integers have no generators"),
+            ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, index),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({index})")),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
-            ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => unreachable!("bool and small integers have no generators"),
+            ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &format!("(({index} >> {a}) & {b})")),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>(({index} >> {a}) & {b})")),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
@@ -463,7 +467,9 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             };
             match ty {
                 ElemTy::U32 => coord,
-                ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => unreachable!("bool and small integers have no generators"),
+                ElemTy::Bool => unreachable!("bool has no generators"),
+                ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &coord),
+                ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({coord})")),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
             }
@@ -1467,7 +1473,9 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                         ElemTy::U32 => format!("u32({coord})"),
                         ElemTy::I32 => coord,
                         ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(u32({coord}))"),
-                        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => unreachable!("bool and small integers have no generators"),
+                        ElemTy::Bool => unreachable!("bool has no generators"),
+                        ElemTy::U8 | ElemTy::U16 => narrow_expr(op.ty, &format!("u32({coord})")),
+                        ElemTy::I8 | ElemTy::I16 => narrow_expr(op.ty, &coord),
                     }
                 }
                 _ => {
@@ -1626,7 +1634,7 @@ impl Tile {
 /// as functions called per shift.
 pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
     // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
-    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.narrow() || key.writes_bits() || key.writes_small() {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.plain_words() || key.writes_bits() || key.writes_small() {
         return None;
     }
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();

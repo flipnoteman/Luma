@@ -67,6 +67,12 @@ The rules:
 - **Element sizes** are checked: a binding `array<f32>` takes arrays of 4-byte elements,
   `array<vec2<f32>>` arrays of 8-byte ones (`[f32; 2]`, `Df32`, `f64`). Only the size is compared,
   not the type: an `Array<u32>` passes for `array<f32>`, so keep the types straight yourself.
+- **`Array<u8>`, `Array<i8>`, `Array<u16>` and `Array<i16>`** bind as `array<u32>` of words that
+  hold four or two elements ([Compact integers](compact.md#how-they-are-stored)): element `i` of
+  a byte array is `(a[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu`, of a 16-bit one
+  `(a[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu` (sign-extend the signed types). The bytes of the
+  last word past the end of the array are unspecified: ignore them. A kernel that writes one writes whole words, or
+  updates single fields with `atomicAnd` / `atomicOr` on an `array<atomic<u32>>` binding.
 - **`Array<bool>`** binds as `array<u32>` of *bit-packed words*: an array of `n` booleans is
   `ceil(n / 32)` words, and element `i` is bit `i % 32` of word `i / 32`, so
   `(a[i >> 5u] >> (i & 31u)) & 1u` reads it (the launch size is the number of elements, not of

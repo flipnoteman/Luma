@@ -630,7 +630,9 @@ impl<'a> Lower<'a> {
             ElemTy::U32 => coord,
             ElemTy::I32 => fb.bitcast(coord, KirType::I32),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => fb.convert(coord, KirType::F32),
-            ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => self.fail(fb, "a generator of bools or small integers"),
+            ElemTy::U8 | ElemTy::U16 => self.narrow(fb, ty, coord),
+            ElemTy::I8 | ElemTy::I16 => self.narrow(fb, ty, fb.bitcast(coord, KirType::I32)),
+            ElemTy::Bool => self.fail(fb, "a generator of bools"),
         }
     }
 

@@ -144,7 +144,7 @@ pub(crate) fn force_with_record<T: GpuType>(
         // Sub-programs read through views are written out where they are read (see `inline`), which
         // a reduction does; those staged in workgroup memory need a store kernel's tiles.
         && (key.subs.is_empty() || (key.inlines() && key.staging.is_none()))
-        && key.narrow()
+        && key.plain_words()
         && fused.inputs.iter().all(|input| input.segments() == 1)
         && fused.inputs.len() + stored.len() < max_inputs;
     if !fits {
@@ -206,7 +206,7 @@ fn fuse(ctx: &Context, first: &Arc<Node>, residual: &Arc<Node>, probe: &Arc<Stor
         && f32_at(stored)
         && f32_at(reduced)
         && key.subs.is_empty()
-        && key.narrow()
+        && key.plain_words()
         && fused.inputs.iter().all(|input| input.segments() == 1)
         && fused.inputs.len() + 1 < ctx.jit().max_inputs();
     fits.then_some(fused)
@@ -263,8 +263,8 @@ pub(crate) fn run_until(
         || !stores_f32
         || !reads_f32
         || !one_buffer(&body)
-        || !body.key.narrow()
-        || !check.key.narrow()
+        || !body.key.plain_words()
+        || !check.key.plain_words()
         || !one_buffer(&check)
     {
         return None;
