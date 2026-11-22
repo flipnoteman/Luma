@@ -86,6 +86,7 @@ mod builtin;
 mod context;
 mod conv;
 mod cyclic;
+mod dense;
 mod solve;
 mod error;
 mod fields;
@@ -139,6 +140,8 @@ pub use linalg::{
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use bmm::matmul_batched;
+pub use dense::lu::Lu;
+pub use dense::Triangle;
 pub use matmul::{matmul, matmul_f32, matmul_tf32};
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};

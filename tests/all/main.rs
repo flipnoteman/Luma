@@ -5,6 +5,7 @@
 #![allow(clippy::duplicate_mod)]
 
 mod common;
+mod dense_host;
 
 mod argmax;
 mod array_ops;
@@ -63,3 +64,5 @@ mod transfer;
 mod tridiagonal;
 mod vector_reductions;
 mod views;
+mod cholesky;
+mod lu;

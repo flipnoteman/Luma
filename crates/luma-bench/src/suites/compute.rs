@@ -17,6 +17,7 @@
 
 mod bandwidth;
 mod crypto;
+mod dense;
 mod linalg;
 mod physics;
 mod scans;
@@ -94,4 +95,5 @@ pub fn run(h: &mut Harness) {
     physics::run(h);
     signal::run(h);
     crypto::run(h);
+    dense::run(h);
 }
