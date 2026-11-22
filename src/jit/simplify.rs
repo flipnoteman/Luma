@@ -541,6 +541,45 @@ mod tests {
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
     }
 
+    /// The parts of a complex number put together are that number, the real part of a made number
+    /// is its first part, `conj conj` is the identity; a real number in a complex product is not
+    /// a rule (`z * (1 + 0i)` is not `z`: `inf * 0`).
+    #[test]
+    fn simplify_complex_rules() {
+        use crate::complex::C32;
+        let ctx = context(false);
+        let data = [C32::new(f32::INFINITY, 1.0), C32::new(-0.0, 2.0), C32::new(f32::NAN, -3.0), C32::new(1.5, f32::NEG_INFINITY)];
+        let cases: [(&str, bool, fn(&Array<C32>) -> Vec<C32>); 4] = [
+            ("make of the parts", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap()
+            }),
+            ("real of make", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).conj().to_vec().unwrap()
+            }),
+            ("conj conj", true, |w| w.conj().conj().to_vec().unwrap()),
+            ("times one", false, |w| (&w.conj() * C32::ONE).to_vec().unwrap()),
+        ];
+        for (name, shorter, case) in cases {
+            let mut results = Vec::new();
+            for simplify in [false, true] {
+                ctx.jit().set_simplify(simplify);
+                let z = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+                let got = case(&z);
+                let bits: Vec<(u32, u32)> = got.iter().map(|c| (if c.re.is_nan() { 0 } else { c.re.to_bits() }, if c.im.is_nan() { 0 } else { c.im.to_bits() })).collect();
+                results.push((bits, ctx.jit().last_program_len()));
+            }
+            ctx.jit().set_simplify(true);
+            assert_eq!(results[0].0, results[1].0, "{name}: the bits");
+            if shorter {
+                assert!(results[1].1 < results[0].1, "{name}: {} instructions against {}", results[1].1, results[0].1);
+            } else {
+                assert_eq!(results[1].1, results[0].1, "{name}: not a rule");
+            }
+        }
+    }
+
     #[test]
     fn simplify_cast_through_f64() {
         let ctx = context(false);
