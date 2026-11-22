@@ -65,3 +65,8 @@ mod vector_reductions;
 mod views;
 mod image;
 mod vision;
+mod vision_corners;
+mod vision_matching;
+mod vision_edges;
+mod vision_regions;
+mod vision_descriptors;

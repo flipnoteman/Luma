@@ -13,6 +13,20 @@
 
 mod fast;
 
+// The implementation groups; each owns its file (and a directory of submodules).
+mod corners;
+mod descriptors;
+mod edges;
+mod matching;
+mod regions;
+
+// Public items of the groups.
+pub use corners::*;
+pub use descriptors::*;
+pub use edges::*;
+pub use matching::*;
+pub use regions::*;
+
 use std::panic::Location;
 use std::sync::Arc;
 
@@ -96,6 +110,16 @@ pub(crate) enum Kernel {
     ScanCounts,
     /// The FAST detector, see [`fast`].
     Fast(fast::Kernel),
+    /// Harris, SUSAN, difference of Gaussians.
+    Corners(corners::Kernel),
+    /// Template matching, nearest neighbours, Hamming matcher.
+    Matching(matching::Kernel),
+    /// Canny, anisotropic diffusion, mean shift.
+    Edges(edges::Kernel),
+    /// Connected components, confidence connected, deconvolution.
+    Regions(regions::Kernel),
+    /// ORB, SIFT, GLOH.
+    Descriptors(descriptors::Kernel),
 }
 
 /// The WGSL of a kernel of this module.
@@ -103,6 +127,11 @@ pub(crate) fn source(kernel: Kernel) -> String {
     match kernel {
         Kernel::ScanCounts => scan_counts_source(),
         Kernel::Fast(k) => fast::source(k),
+        Kernel::Corners(k) => corners::source(k),
+        Kernel::Matching(k) => matching::source(k),
+        Kernel::Edges(k) => edges::source(k),
+        Kernel::Regions(k) => regions::source(k),
+        Kernel::Descriptors(k) => descriptors::source(k),
     }
 }
 
