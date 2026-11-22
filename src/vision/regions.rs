@@ -28,12 +28,14 @@ pub enum Connectivity {
 pub(crate) enum Kernel {
     Label(label::Kernel),
     Confidence(confidence::Kernel),
+    Deconv(deconv::Kernel),
 }
 
 pub(crate) fn source(kernel: Kernel) -> String {
     match kernel {
         Kernel::Label(k) => label::source(k),
         Kernel::Confidence(k) => confidence::source(k),
+        Kernel::Deconv(k) => deconv::source(k),
     }
 }
 
