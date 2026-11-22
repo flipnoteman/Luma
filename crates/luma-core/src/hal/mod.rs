@@ -887,13 +887,15 @@ pub struct MatmulSpec {
     pub rhs_transposed: bool,
 }
 
-/// A matrix product on tensor cores, with the operands rounded to TF32 (10 bits of mantissa) and
-/// accumulated in `f32` (`Builtin::Matmul` of `luma` with a `Tensor` tile). The launch is that of
+/// A matrix product the backend runs as its own tiled kernel (`Builtin::Matmul` of `luma` with a
+/// `Gemm` tile): on tensor cores with the operands rounded to TF32 (10 bits of mantissa) and
+/// accumulated in `f32`, or with `exact` on the ordinary cores, every output an `f32` chain of
+/// fused multiply-adds over `k` in ascending order (per slice of K). The launch is that of
 /// [`MatmulSpec`] (the bindings, the uniform `{m, n, k, kc}`, the slices of K), but one workgroup
 /// computes a tile of `rows` x `cols` outputs and the grid is `[column tiles, row tiles, slices]`
 /// (never folded). `m`, `n` and `k` are multiples of 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TensorSpec {
+pub struct GemmSpec {
     /// Rows of an output tile.
     pub rows: u32,
     /// Columns of an output tile.
@@ -902,6 +904,8 @@ pub struct TensorSpec {
     pub lhs_transposed: bool,
     /// Whether `b` holds the transpose of the right matrix.
     pub rhs_transposed: bool,
+    /// `f32` multiply-adds instead of TF32 tensor cores.
+    pub exact: bool,
 }
 
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
@@ -989,13 +993,14 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
         None
     }
-    /// The output tiles (rows, columns) of the tensor-core products ([`Backend::compile_tensor_matmul`])
-    /// the backend runs, largest first; empty if it has none.
-    fn tensor_matmul_tiles(&self) -> &[(u32, u32)] {
+    /// The output tiles (rows, columns) of the products ([`Backend::compile_gemm`]) the backend
+    /// runs, largest first, on tensor cores in TF32 or (with `exact`) in `f32`; empty if it has
+    /// none.
+    fn gemm_tiles(&self, _exact: bool) -> &[(u32, u32)] {
         &[]
     }
-    /// The code of a tensor-core matrix product with one of the tiles of [`Backend::tensor_matmul_tiles`].
-    fn compile_tensor_matmul(&self, _spec: &TensorSpec) -> Option<RawKernel> {
+    /// The code of a matrix product with one of the tiles of [`Backend::gemm_tiles`].
+    fn compile_gemm(&self, _spec: &GemmSpec) -> Option<RawKernel> {
         None
     }
     /// The native code of a batched matrix product (`Builtin::Bmm` of `luma`), `None` to compile

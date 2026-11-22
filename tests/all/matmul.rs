@@ -92,7 +92,7 @@ impl Case {
     }
 }
 
-const SHAPES: [(usize, usize, usize); 10] = [
+const SHAPES: [(usize, usize, usize); 15] = [
     (16, 128, 128),
     (1000, 1000, 1000),
     (64, 1 << 16, 64),
@@ -104,6 +104,13 @@ const SHAPES: [(usize, usize, usize); 10] = [
     (300, 200, 150),
     (4099, 100, 100),
     (3000, 1, 1),
+    // Multiples of 4 that are not whole tiles of the backend's own kernels (ragged rows, columns and
+    // K stages, a long K that splits, one operand or both read transposed).
+    (100, 36, 68),
+    (4100, 100, 132),
+    (36, 132, 196),
+    (1028, 260, 44),
+    (16388, 36, 40),
 ];
 
 #[test]
@@ -177,7 +184,7 @@ fn vectors_are_matrices_with_an_extent_of_one() {
 
 #[test]
 fn transposed_operands_are_read_through_their_views() {
-    for (k, m, n) in [(64, 96, 80), (200, 150, 140), (1 << 12, 33, 48), (64, 128, 256)] {
+    for (k, m, n) in [(64, 96, 80), (200, 150, 140), (1 << 12, 33, 48), (64, 128, 256), (200, 148, 140), (4096, 36, 48), (36, 132, 64), (1028, 260, 44)] {
         let case = Case::new(k, m, n);
         // The same operands, stored the other way round.
         let a_t: Vec<f32> = (0..k * m).map(|i| case.a[(i % m) * k + i / m]).collect();

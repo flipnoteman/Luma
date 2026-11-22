@@ -79,7 +79,49 @@ fn tf32_pair(h: &mut Harness, m: usize, k: usize, n: usize, layout: u8) {
     }
 }
 
+/// One `f32` product (`layout` 0 = plain, 1 = the right operand a lazy transpose, 2 = the left),
+/// verified against the host and timed as `matmul/shape`; run it with and without
+/// `LUMA_OWN_GEMM=off` to compare kernels.
+fn shape_case(h: &mut Harness, m: usize, k: usize, n: usize, layout: u8) {
+    let name = ["nn", "nt", "tn"][layout as usize];
+    let (ad, bd) = (values(m * k, 81, -1.0, 1.0), values(k * n, 82, -1.0, 1.0));
+    let transpose = |d: &[f32], rows: usize, cols: usize| -> Vec<f32> { (0..rows * cols).map(|i| d[(i % rows) * cols + i / rows]).collect() };
+    let (a, b, at, bt) = (upload(h, &ad, [k, m]), upload(h, &bd, [n, k]), upload(h, &transpose(&ad, m, k), [m, k]), upload(h, &transpose(&bd, k, n), [k, n]));
+    let run = || match layout {
+        0 => a.matmul_f32(&b),
+        1 => a.matmul_f32(&bt.transpose()),
+        _ => at.transpose().matmul_f32(&b),
+    };
+    verify("matmul/shape", &host(&run()), &ad, &bd, m, k, n, false, false);
+    h.case("matmul/shape", &format!("{name} {m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || run().eval().unwrap());
+}
+
 pub fn run(h: &mut Harness) {
+    if !h.ctx.is_cpu() && std::env::var_os("LUMA_BENCH_SHAPES").is_some() {
+        h.guarded("matmul", |h| {
+            let small = std::env::var("LUMA_BENCH_SHAPES").as_deref() == Ok("small");
+            let squares: &[usize] = if small { &[1024, 4096] } else { &[128, 256, 512, 1024, 2048, 4096, 8192] };
+            for &n in squares {
+                shape_case(h, n, n, n, 0);
+            }
+            let shapes: &[(usize, usize, usize)] = if small {
+                &[(256, 1024, 1024), (2048, 512, 128), (2048, 2048, 64), (4096, 1024, 1024)]
+            } else {
+                &[(256, 1024, 1024), (4096, 1024, 1024), (2048, 512, 128), (256, 512, 8192), (32, 4096, 4096), (256, 16384, 64), (2048, 2048, 64), (2048, 64, 2048), (4096, 128, 4096), (4096, 4096, 128), (16384, 64, 64), (64, 1 << 20, 64), (128, 1 << 18, 128), (96, 96, 96), (192, 320, 160), (384, 384, 384), (768, 768, 768), (1536, 1536, 1536)]
+            };
+            for &(m, k, n) in shapes {
+                shape_case(h, m, k, n, 0);
+            }
+            for layout in [1, 2] {
+                shape_case(h, 1024, 1024, 1024, layout);
+                shape_case(h, 2048, 512, 128, layout);
+                if !small {
+                    shape_case(h, 4096, 4096, 4096, layout);
+                }
+            }
+        });
+        return;
+    }
     if !h.ctx.is_cpu() && std::env::var_os("LUMA_BENCH_TF32").is_some() {
         h.guarded("matmul", |h| {
             if std::env::var("LUMA_BENCH_TF32").as_deref() == Ok("small") {

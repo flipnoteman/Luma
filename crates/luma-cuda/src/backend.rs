@@ -25,7 +25,7 @@ use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
-    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TensorSpec, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, GemmSpec, TuningProfile,
 };
 
 use crate::codegen::{self, CudaArgAbi};
@@ -288,25 +288,46 @@ fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[boo
 /// The output tiles of the tensor-core products, largest first (see [`crate::tensor`]).
 const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
 
-/// The tensor-core product of `spec`, loaded from its PTX.
-fn compile_tensor(shared: &CudaShared, spec: &TensorSpec) -> Result<CudaKernel, BackendError> {
-    let config = crate::tensor::Config::of(spec);
-    let source = crate::tensor::ptx(&config);
+/// The matrix product of `spec` (tensor cores, or `f32` on the CUDA cores), loaded from its PTX.
+fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, BackendError> {
+    let (source, threads, bytes) = if spec.exact {
+        let config = crate::sgemm::Config::of(spec);
+        (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
+    } else {
+        let config = crate::tensor::Config::of(spec);
+        (crate::tensor::ptx(&config), config.threads(), config.shared_bytes())
+    };
     if let Some(dir) = DUMP_DIR.as_deref() {
         // Best effort: a debugging aid must not fail a compile.
         let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join(format!("tensor-{}x{}-{}{}.ptx", spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed))), &source);
+        let name = format!("{}-{}x{}-{}{}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed));
+        let _ = std::fs::write(dir.join(name), &source);
     }
     shared.ctx.bind_to_thread().map_err(gpu)?;
     let module = shared.ctx.load_module(Ptx::from_src(source)).map_err(gpu)?;
     let func = module.load_function("main").map_err(gpu)?;
-    let bytes = config.shared_bytes();
     if bytes > 48 * 1024 {
         func.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32).map_err(gpu)?;
     }
+    if DUMP_DIR.is_some() {
+        // A tuning aid: registers, spills and resident workgroups per multiprocessor.
+        let spilled = func.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES).unwrap_or(-1);
+        eprintln!(
+            "gemm-info {} {}x{} t{}{}: {} registers, {} bytes of local memory, {} bytes of shared memory, {:?} workgroups per multiprocessor",
+            if spec.exact { "f32" } else { "tf32" },
+            spec.rows,
+            spec.cols,
+            u8::from(spec.lhs_transposed),
+            u8::from(spec.rhs_transposed),
+            func.num_regs().unwrap_or(-1),
+            spilled,
+            bytes,
+            func.occupancy_max_active_blocks_per_multiprocessor(threads, bytes as usize, None).ok()
+        );
+    }
     Ok(CudaKernel {
         func,
-        workgroup: [config.threads(), 1, 1],
+        workgroup: [threads, 1, 1],
         shared_bytes: bytes,
         param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: 16 }],
         array_lengths: Vec::new(),
@@ -1339,15 +1360,19 @@ impl Backend for CudaBackend {
         compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
     }
 
-    fn tensor_matmul_tiles(&self) -> &[(u32, u32)] {
-        if self.shared.cc.0 >= 8 { &TENSOR_TILES } else { &[] }
+    fn gemm_tiles(&self, exact: bool) -> &[(u32, u32)] {
+        match (self.shared.cc.0 >= 8, exact) {
+            (false, _) => &[],
+            (true, false) => &TENSOR_TILES,
+            (true, true) => &crate::sgemm::TILES,
+        }
     }
 
-    fn compile_tensor_matmul(&self, spec: &TensorSpec) -> Option<RawKernel> {
-        match compile_tensor(&self.shared, spec) {
+    fn compile_gemm(&self, spec: &GemmSpec) -> Option<RawKernel> {
+        match compile_gemm_ptx(&self.shared, spec) {
             Ok(kernel) => Some(RawKernel::new(kernel)),
             Err(error) => {
-                log::warn!("luma-cuda: the tensor-core product {spec:?} did not compile: {error}");
+                log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}");
                 None
             }
         }

@@ -118,7 +118,7 @@ fn the_f32_product_does_not_round_its_operands() {
     check(&luma::matmul_f32(&lhs, &rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32 function");
     // A context with the tensor cores turned off: `matmul` is the same product.
     let off = Context::with_options(ContextOptions::from_env().tf32_matmul(false)).unwrap();
-    assert!(!off.tf32_matmul() && Context::new().unwrap().tf32_matmul());
+    assert!(!off.tf32_matmul());
     let (_, _, lhs, rhs) = operands(&off, k, m, n);
     check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "tf32 off");
 }

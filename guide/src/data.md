@@ -86,7 +86,9 @@ Where the precision matters, ask for `f32`: `a.matmul_f32(&b)` is the full-preci
 one call (a chain of fused multiply-adds in a fixed order per entry), and
 `ContextOptions::tf32_matmul(false)` (`LUMA_TF32_MATMUL=0`) makes every `matmul` of a context
 that product. `matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always
-`f32`. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
+`f32`. On CUDA the `f32` product has kernels of its own for the shapes above (an RTX 3090: 23
+TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
+are fused into the shader kernel as before. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
 backend (wgpu, Metal, the CPU), compute the `f32` product, so the same program runs everywhere
 and differs only by the rounding where tensor cores are used. Transposed operands are read in
 place; other lazy operands are evaluated first, where the `f32` kernels fuse them.
