@@ -133,16 +133,17 @@ pub(crate) fn stack_batch(parts: &[Array<f32>]) -> Array<f32> {
     crate::view::concat_slice(2, parts)
 }
 
-/// The barriers of a kernel that hands data between invocations through storage buffers: on the
-/// backends where a workgroup barrier does not order storage accesses (everything but CUDA, whose
-/// barrier is `__syncthreads`, and the CPU backend, whose phases run in order) a storage fence
-/// goes first. `LUMA_LINALG_FENCE=1|0` forces it on or off.
+/// The barriers of a kernel that hands data between invocations through storage buffers: a storage
+/// fence goes before the workgroup barrier on every backend but the CPU one, whose phases run in
+/// order (a workgroup barrier alone orders only workgroup memory in WGSL, and on CUDA the compiler
+/// may treat the `noalias` buffers as untouched by the barrier). `LUMA_LINALG_FENCE=0` leaves it
+/// out (measured in the changelog), `1` forces it on.
 pub(crate) fn fence(ctx: &Context) -> &'static str {
     use crate::BackendKind;
     let needed = match std::env::var("LUMA_LINALG_FENCE").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
-        _ => !matches!(ctx.backend(), BackendKind::Cuda | BackendKind::Cpu),
+        _ => !matches!(ctx.backend(), BackendKind::Cpu),
     };
     if needed { "storageBarrier();" } else { "" }
 }
