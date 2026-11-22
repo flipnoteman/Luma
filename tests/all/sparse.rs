@@ -820,3 +820,47 @@ fn rows_cut_in_several_pieces() {
         }
     }
 }
+
+#[test]
+fn vector_products_of_mixed_rows_across_tile_ends() {
+    // Rows longer than 64 entries take the tile kernel, which cuts the entries in tiles whatever
+    // the rows are: random mixes of empty rows, short rows, rows around the tile size, rows of
+    // several tiles, and a matrix that ends in empty rows, so that rows start and end on, before
+    // and after tile ends, and a row spans many tiles.
+    let mut rng = Rng(21);
+    for case in 0..60usize {
+        let rows = 40 + rng.below(400);
+        let cols = 1500usize;
+        let mut h = Host { rows, cols, r: vec![], c: vec![], v: vec![] };
+        let hubs = 1 + case % 3;
+        for r in 0..rows {
+            let len = match rng.below(20) {
+                0..=5 => 0,
+                6..=15 => 1 + rng.below(9),
+                16 | 17 => 60 + rng.below(30),
+                18 => 300 + rng.below(40),
+                _ if hubs > 0 && rng.below(hubs) == 0 => 700 + rng.below(700),
+                _ => 1 + rng.below(40),
+            };
+            // The last rows stay empty (every other case), and the first row is a long one.
+            let len = if case % 2 == 0 && r + 5 >= rows { 0 } else if r == 0 { 70 + case } else { len };
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < len.min(cols) {
+                let c = rng.below(cols);
+                if seen.insert(c) {
+                    h.r.push(r as u32);
+                    h.c.push(c as u32);
+                    h.v.push(rng.quant());
+                }
+            }
+        }
+        let d = h.dense();
+        let x = quantized(&mut rng, cols);
+        let want = host_matmul(&d, rows, cols, &x, 1);
+        let xa = Array::from_slice(&x, cols).unwrap();
+        let s = h.sparse(SparseFormat::Csr);
+        for _ in 0..2 {
+            assert_eq!(s.matmul(&xa).to_vec().unwrap(), want, "case {case}: {rows} rows");
+        }
+    }
+}

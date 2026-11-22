@@ -1414,6 +1414,18 @@ impl<T: SortKey> Array<T> {
     }
 
     fn run_sort_by_key<V: ScalarType>(&self, values: &Array<V>, descending: bool) -> Outcome<(Array<T>, Array<V>)> {
+        self.run_sort_by_key_bits(values, descending, 32)
+    }
+
+    /// [`Array::sort_by_key`] of keys that differ only in their low `key_bits` bits (as transformed
+    /// for the sort: for `u32` the key itself): one radix pass fewer per 8 bits that are known to
+    /// be zero in every key. The sparse conversions know their indices are below the dimension.
+    pub(crate) fn sort_by_key_bits<V: ScalarType>(&self, values: &Array<V>, key_bits: u32) -> (Array<T>, Array<V>) {
+        let result = self.run_sort_by_key_bits(values, false, key_bits);
+        self.resolve_pair(values, result, "sort_by_key", Location::caller())
+    }
+
+    fn run_sort_by_key_bits<V: ScalarType>(&self, values: &Array<V>, descending: bool, key_bits: u32) -> Outcome<(Array<T>, Array<V>)> {
         let ctx = self.context();
         self.check_pair(values)?;
         if self.len() <= 1 {
@@ -1422,7 +1434,7 @@ impl<T: SortKey> Array<T> {
             return Ok((self.clone(), values.clone()));
         }
         if V::LAYOUT == ElemLayout::plain(4) && !(ctx.can_run_on_host() && self.len() <= crate::host::MAX_SORT_ELEMS) {
-            let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: true };
+            let spec = Spec { transform: T::TRANSFORM, descending, key_bits, want_keys: true };
             let sorted = self.radix(Payload::Buffer(values.storage()?), spec)?;
             let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
             let moved = Array::from_storage(ctx, self.shape(), sorted.payload.expect("the payload was asked for"));

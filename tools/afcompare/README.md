@@ -81,4 +81,7 @@ measured on (in `cusparseCreateSpMatDescr`, a call into the cuSPARSE the build s
 products and the CSR -> CSC conversion the reference is then **cuSPARSE called directly**
 (`src/cusparse.rs`: `cusparseSpMV` / `cusparseSpMM` with the default algorithms, the workspace
 allocated once, and `cusparseCsr2cscEx2`), which is what ArrayFire's wrappers call; the row's note
-says which one it is. Rows with no reference are luma-only.
+says which one it is. Rows with no reference are luma-only. For a profiler, `SPARSE_MATS=4`
+(indices of the matrices, comma separated) and `SPARSE_STAGES=p|c|d` narrow the group, and
+`afcompare sparse-diag spmv|spmvt|csc|cusparse|cusparset` runs one operation on the big power-law
+matrix three times (every luma kernel is called `luma_main` to `ncu`: pick launches by order).

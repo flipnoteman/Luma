@@ -29,9 +29,9 @@
 //! [`Sparse::matmul`] computes `A x` and [`Sparse::matmul_t`] `A^T x` for a vector or a dense
 //! matrix `x`. A product whose output runs along the compressed axis (CSR `A x`, CSC `A^T x`) runs
 //! on the row kernels: for a vector with rows of at most 64 entries a thread, or a few lanes
-//! combining in workgroup memory, per row; for a vector with longer rows a gather, a product and a
-//! segmented sum over the pointer ([`Array::sum_segments`], entries split evenly whatever the
-//! row lengths); for `c` dense columns one invocation per output element walks its row (the `c`
+//! combining in workgroup memory, per row; for a vector with longer rows a kernel that takes
+//! tiles of consecutive entries whatever the row lengths are (the balance of a merge-path
+//! product, with a carry pass for the rows that cross tiles); for `c` dense columns one invocation per output element walks its row (the `c`
 //! invocations of a row read `c` adjacent elements of `x`, so the gather is coalesced) and rows of
 //! more than 256 entries are cut in pieces of 2048 that a workgroup each sums, the pieces added in
 //! order. None of them uses atomics: the sums are the same on every run. The first product of
@@ -56,7 +56,7 @@ use std::sync::{Arc, OnceLock};
 use crate::array::Array;
 use crate::context::{default_context, Context};
 use crate::error::{LumaError, Result};
-use crate::scatter::{bincount, AtomicElem};
+use crate::scatter::AtomicElem;
 use crate::search::Side;
 use crate::shape::Shape;
 use crate::view::concat;
@@ -139,6 +139,188 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     if (mine && lane == 0u) { y[row] = sh[li]; }
 }
 "#;
+
+/// Invocations of a workgroup of the tile kernel.
+const MERGE_WG: u32 = 128;
+/// Entries an invocation of the tile kernel sums: one `vec4` of `minor` and of `val`.
+const MERGE_PER: u32 = 4;
+/// Entries of a tile.
+const MERGE_TILE: u32 = MERGE_WG * MERGE_PER;
+
+/// The tile kernel of a vector product over a matrix with rows longer than [`SHORT_ROWS`]: a
+/// workgroup takes a tile of [`MERGE_TILE`] consecutive entries, whatever the lengths of the rows
+/// it cuts. The balance by entries is that of the merge-path product of Merrill and Garland,
+/// "Merge-based parallel sparse matrix-vector multiplication" (SC'16), of which this is a
+/// simplification: the tiles are cut at multiples of the tile size and the rows that start in a
+/// tile come from `part` (the first row that starts at or after the first entry of every tile,
+/// searched once per matrix), where the merge path cuts the sum of rows and entries by a binary
+/// search per block; empty rows are written by the invocation that finds them, and the part of a
+/// row that crosses a tile is completed by [`merge_carry_source`].
+///
+/// Every invocation loads its own run of four consecutive entries as one `vec4` of `minor` and of
+/// `val` (the same buffers bound a second time as `vec4`s: the run is one aligned 16 byte load
+/// that a warp covers in a few sectors, where a coalesced scalar load would have to be
+/// transposed through workgroup memory, which measured 8 to 10 % slower on an RTX 3090 and an
+/// RTX 3080 Laptop), multiplies them by `x`, and sums the run cutting it at the rows that start in
+/// it. The row starts of the tile are scattered by one invocation per row to `hrow`, one word
+/// per entry slot (the row plus one at the first entry of a row). The part of a row that
+/// continues into the following invocations is added by the invocation that holds its start,
+/// which walks over their sums in order (a row longer than a few tiles is the only case where the
+/// walk is long); what a tile contributes to the rows that cross its ends goes to `sc` (the part
+/// before the first row start; the part of the last row and its number plus one). Every row is
+/// written by exactly one invocation and every sum has a fixed order, so the result is the same
+/// on every run.
+///
+/// The kernel is trusted (no bounds checks): whatever `ptr`, `minor` and `part` hold, every
+/// access is clamped or guarded to be in bounds (a wrong row pointer or column gives an
+/// unspecified result).
+fn merge_source() -> String {
+    let (w, tile) = (MERGE_WG, MERGE_TILE);
+    let padded = tile + tile / MERGE_PER;
+    format!(
+        "struct Params {{ n: u32, rows: u32, nb: u32, nx: u32 }}
+@group(1) @binding(0) var<storage, read> ptr: array<u32>;
+@group(1) @binding(1) var<storage, read> minor: array<u32>;
+@group(1) @binding(2) var<storage, read> val: array<f32>;
+@group(1) @binding(3) var<storage, read> x: array<f32>;
+@group(1) @binding(4) var<storage, read> part: array<u32>;
+@group(1) @binding(5) var<storage, read_write> y: array<f32>;
+@group(1) @binding(6) var<storage, read_write> sc: array<u32>;
+@group(1) @binding(7) var<uniform> p: Params;
+@group(1) @binding(8) var<storage, read> minor4: array<vec4<u32>>;
+@group(1) @binding(9) var<storage, read> val4: array<vec4<f32>>;
+fn pad(j: u32) -> u32 {{ return j + j / 4u; }}
+var<workgroup> hrow: array<u32, {padded}>;
+var<workgroup> sv: array<f32, {w}>;
+var<workgroup> sf: array<u32, {w}>;
+@compute @workgroup_size({w})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {{
+    let tile = wg.y * 65535u + wg.x;
+    if (tile >= p.nb) {{ return; }}
+    let e0 = tile * {tile}u;
+    let e1 = min(e0 + {tile}u, p.n);
+    let last = tile + 1u == p.nb;
+    let c0 = e0 + t * 4u;
+    var k = vec4<u32>(0u);
+    var v = vec4<f32>(0.0);
+    if (c0 + 4u <= e1) {{
+        k = minor4[c0 / 4u];
+        v = val4[c0 / 4u];
+    }} else {{
+        if (c0 < e1) {{ k.x = minor[c0]; v.x = val[c0]; }}
+        if (c0 + 1u < e1) {{ k.y = minor[c0 + 1u]; v.y = val[c0 + 1u]; }}
+        if (c0 + 2u < e1) {{ k.z = minor[c0 + 2u]; v.z = val[c0 + 2u]; }}
+        if (c0 + 3u < e1) {{ k.w = minor[c0 + 3u]; v.w = val[c0 + 3u]; }}
+    }}
+    let g = vec4<f32>(
+        select(0.0, v.x * x[min(k.x, p.nx)], c0 < e1),
+        select(0.0, v.y * x[min(k.y, p.nx)], c0 + 1u < e1),
+        select(0.0, v.z * x[min(k.z, p.nx)], c0 + 2u < e1),
+        select(0.0, v.w * x[min(k.w, p.nx)], c0 + 3u < e1));
+    let r0 = part[tile];
+    let r1 = min(select(part[tile + 1u], p.rows, last), p.rows);
+    for (var j = 0u; j < 4u; j += 1u) {{ hrow[pad(t + j * {w}u)] = 0u; }}
+    workgroupBarrier();
+    for (var r = r0 + t; r < r1; r += {w}u) {{
+        let s = ptr[r];
+        if (ptr[r + 1u] > s) {{
+            if (s >= e0 && s < e1) {{ hrow[pad(s - e0)] = r + 1u; }}
+        }} else {{
+            y[r] = 0.0;
+        }}
+    }}
+    workgroupBarrier();
+    var run = 0.0;
+    var runrow = 0u;
+    var has = false;
+    var lead = 0.0;
+    for (var i = 0u; i < 4u; i += 1u) {{
+        let hr = hrow[pad(t * 4u + i)];
+        if (hr != 0u) {{
+            if (has) {{ y[runrow - 1u] = run; }} else {{ lead = run; }}
+            has = true;
+            run = g[i];
+            runrow = hr;
+        }} else {{
+            run = run + g[i];
+        }}
+    }}
+    if (!has) {{ lead = run; }}
+    sv[t] = lead;
+    sf[t] = select(0u, 1u, has);
+    workgroupBarrier();
+    if (t == 0u) {{
+        var acc = 0.0;
+        var u = 0u;
+        loop {{
+            if (u >= {w}u) {{ break; }}
+            acc = acc + sv[u];
+            if (sf[u] != 0u) {{ break; }}
+            u += 1u;
+        }}
+        sc[tile * 3u] = bitcast<u32>(acc);
+        if (u >= {w}u) {{ sc[tile * 3u + 2u] = 0u; }}
+    }}
+    if (has) {{
+        var total = run;
+        var u = t + 1u;
+        loop {{
+            if (u >= {w}u) {{ break; }}
+            total = total + sv[u];
+            if (sf[u] != 0u) {{ break; }}
+            u += 1u;
+        }}
+        let row = runrow - 1u;
+        if (u >= {w}u && ptr[row + 1u] > e1) {{
+            sc[tile * 3u + 1u] = bitcast<u32>(total);
+            sc[tile * 3u + 2u] = runrow;
+        }} else {{
+            y[row] = total;
+            if (u >= {w}u) {{ sc[tile * 3u + 2u] = 0u; }}
+        }}
+    }}
+}}
+"
+    )
+}
+
+/// The rows that continue past their tile of [`merge_source`]: one invocation per tile whose last
+/// row does, adding the carries of the tiles the row covers, in order, to the tile's own part.
+fn merge_carry_source() -> String {
+    let tile = MERGE_TILE;
+    format!(
+        "struct Params {{ n: u32, rows: u32, nb: u32, nx: u32 }}
+@group(1) @binding(0) var<storage, read_write> y: array<f32>;
+@group(1) @binding(1) var<storage, read> sc: array<u32>;
+@group(1) @binding(2) var<storage, read> ptr: array<u32>;
+@group(1) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let k = gid.x + gid.y * nwg.x * 128u;
+    if (k >= p.nb) {{ return; }}
+    let crossing = sc[k * 3u + 2u];
+    if (crossing == 0u) {{ return; }}
+    let row = crossing - 1u;
+    let hi = min((ptr[row + 1u] - 1u) / {tile}u + 1u, p.nb);
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+    var j = k + 1u;
+    for (; j + 3u < hi; j += 4u) {{
+        a0 = a0 + bitcast<f32>(sc[j * 3u]);
+        a1 = a1 + bitcast<f32>(sc[(j + 1u) * 3u]);
+        a2 = a2 + bitcast<f32>(sc[(j + 2u) * 3u]);
+        a3 = a3 + bitcast<f32>(sc[(j + 3u) * 3u]);
+    }}
+    for (; j < hi; j += 1u) {{
+        a0 = a0 + bitcast<f32>(sc[j * 3u]);
+    }}
+    y[row] = bitcast<f32>(sc[k * 3u + 1u]) + ((a0 + a1) + (a2 + a3));
+}}
+"
+    )
+}
 
 /// `Y[j, r] = sum_k val[k] * X[j, minor[k]]` over the entries `k` of row `r` (at most `cap` of
 /// them), one invocation per output element, entries in order, four loads in flight.
@@ -331,10 +513,11 @@ pub struct Sparse<T: SparseElem = f32> {
 /// What the row kernels need to know about a compressed matrix, read back once.
 #[derive(Clone)]
 struct RowPlan {
-    /// The longest row.
-    max_len: u32,
     /// The rows longer than [`LONG_ROW`] (`None` if there are none).
     long: Option<LongRows>,
+    /// For a matrix with rows longer than [`SHORT_ROWS`]: the first row that starts at or after the
+    /// first entry of every tile of [`merge_source`] (`tiles + 1` of them, the last unused).
+    tiles: Option<Array<u32>>,
 }
 
 /// The rows longer than [`LONG_ROW`], each cut in pieces of [`CHUNK`] entries.
@@ -349,8 +532,8 @@ struct LongRows {
 }
 
 /// Matrices whose rows are all at most this long take the row kernel for a vector product (a
-/// thread or a few lanes per row, no scratch pass); others the segmented sum, which splits the
-/// entries evenly whatever the row lengths are.
+/// thread or a few lanes per row, no scratch pass); others the tile kernel ([`merge_source`]), which
+/// splits the entries evenly whatever the row lengths are.
 const SHORT_ROWS: u32 = 64;
 
 /// The arrays of a [`Sparse`] matrix as [`Sparse::info`] returns them (ArrayFire's
@@ -436,21 +619,23 @@ fn flat<T: crate::gpu_type::ScalarType>(array: &Array<T>) -> Array<T> {
     if array.shape().dims() == [n, 1, 1, 1] { array.cache() } else { array.reshape(n).cache() }
 }
 
-/// The offsets of `n` groups from the group of every entry (`ids`, not necessarily sorted):
-/// `n + 1` offsets, the first 0.
-fn pointer(ids: &Array<u32>, n: usize) -> Array<u32> {
-    let ends = bincount(ids, n).cumsum(0);
-    match Array::<u32>::zeros_on(ids.context(), 1) {
-        Ok(zero) => concat(0, [&zero, &ends]).cache(),
-        Err(error) => Array::poisoned(ids.context(), Shape::from(n + 1), Arc::new(error)),
+/// The offsets of `n` groups from the group of every entry in ascending order (`sorted`): `n + 1`
+/// offsets, the first 0, the offset of group `g` being the number of entries of lower groups.
+fn pointer(sorted: &Array<u32>, n: usize) -> Array<u32> {
+    match Array::<u32>::range_on(sorted.context(), n + 1, 0) {
+        Ok(groups) => sorted.searchsorted(&groups, Side::Left).cache(),
+        Err(error) => Array::poisoned(sorted.context(), Shape::from(n + 1), Arc::new(error)),
     }
 }
 
 /// `(pointer, other, values)` of the entries regrouped by `key` (a stable sort, so the entries of a
-/// group keep their order), for `n` groups.
+/// group keep their order), for `n` groups: two radix sorts of the key (below `n`, so of
+/// `ceil(log2 n)` bits) that carry `other` and `val` along, then the offsets from the sorted keys.
 fn regroup(key: &Array<u32>, other: &Array<u32>, val: &Array<f32>, n: usize) -> (Array<u32>, Array<u32>, Array<f32>) {
-    let perm = key.argsort();
-    (pointer(key, n), other.take(&perm).cache(), val.take(&perm).cache())
+    let bits = usize::BITS - n.saturating_sub(1).leading_zeros();
+    let (sorted, other) = key.sort_by_key_bits(other, bits.max(1));
+    let (_, val) = key.sort_by_key_bits(val, bits.max(1));
+    (pointer(&sorted.cache(), n), other.cache(), val.cache())
 }
 
 impl Sparse<f32> {
@@ -909,8 +1094,11 @@ impl Sparse<f32> {
                 Ok(plan) => plan,
                 Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
-            if c == 1 && plan.max_len > SHORT_ROWS {
-                return (val * x.reshape(inner).take(minor)).sum_segments(ptr).reshape(out_shape);
+            if let (1, Some(tiles)) = (c, &plan.tiles) {
+                return match self.merge_product((ptr, minor, val), tiles, &x.reshape(inner), outer) {
+                    Ok(y) => y.reshape(out_shape),
+                    Err(e) => Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
+                };
             }
             return match self.rows_kernels(plan, (ptr, minor, val), x, c, outer) {
                 Ok(y) => y.reshape(out_shape),
@@ -959,12 +1147,68 @@ impl Sparse<f32> {
                 let pieces = ends.slice(0, rows.len() - 1..rows.len()).item().map_err(Arc::new)? as usize;
                 long = Some(LongRows { rows, piece_ptr, pieces });
             }
-            Ok(RowPlan { max_len, long })
+            let mut tiles = None;
+            if max_len > SHORT_ROWS {
+                let nb = self.nnz.div_ceil(MERGE_TILE as usize);
+                let first = (Array::<u32>::range_on(&self.ctx, nb + 1, 0).map_err(Arc::new)? * MERGE_TILE).minimum(self.nnz as u32);
+                tiles = Some(ptr.searchsorted(&first, Side::Left).cache());
+            }
+            Ok(RowPlan { long, tiles })
         });
         match plan {
             Ok(plan) => Ok(plan.clone()),
             Err(e) => Err(LumaError::clone(e)),
         }
+    }
+
+    /// `y = A x` for a compressed matrix by the tile kernel ([`merge_source`]) and its carry pass.
+    fn merge_product(&self, (ptr, minor, val): (&Array<u32>, &Array<u32>, &Array<f32>), tiles: &Array<u32>, x: &Array<f32>, outer: usize) -> Result<Array<f32>> {
+        use crate::array::Failure;
+        use crate::context::{RawArg, Scratch};
+        // The same buffers are bound twice, as scalars and as `vec4`s, which the typed kernel
+        // arguments of `launch_raw` do not allow.
+        let plain = |f: Failure| match f {
+            Failure::New(e) => e,
+            Failure::Inherited(e) => LumaError::clone(&e),
+        };
+        let ctx = &self.ctx;
+        let nb = self.nnz.div_ceil(MERGE_TILE as usize);
+        let y = Array::<f32>::alloc(ctx, Shape::from(outer))?;
+        let y_storage = Arc::clone(y.storage().map_err(plain)?);
+        let y_pin = y_storage.pin_single()?;
+        let (ptr_pin, ptr_bytes) = ptr.ready().map_err(plain)?;
+        let (minor_pin, minor_bytes) = minor.ready().map_err(plain)?;
+        let (val_pin, val_bytes) = val.ready().map_err(plain)?;
+        let (x_pin, x_bytes) = x.ready().map_err(plain)?;
+        let (tiles_pin, tiles_bytes) = tiles.ready().map_err(plain)?;
+        let mut scratch = Scratch::new(ctx);
+        let sc_bytes = nb as u64 * 12;
+        let sc = scratch.take(sc_bytes)?;
+        let nbu = u32::try_from(nb).map_err(|_| LumaError::DimensionTooLarge { shape: [nb, 1, 1, 1] })?;
+        // `Params` of the kernels: the entries, the rows, the tiles, the last index of `x`.
+        let params = [self.nnz as u32, outer as u32, nbu, (x.len() - 1) as u32];
+        let uniform = bytemuck::cast_slice::<u32, u8>(&params);
+        let core = ctx.jit().scan_kernel(ctx, "sparse_spmv_tiles".into(), "sparse_spmv_tiles", merge_source)?;
+        let args = [
+            RawArg::read(ptr_pin.buffer(), ptr_bytes),
+            RawArg::read(minor_pin.buffer(), minor_bytes),
+            RawArg::read(val_pin.buffer(), val_bytes),
+            RawArg::read(x_pin.buffer(), x_bytes),
+            RawArg::read(tiles_pin.buffer(), tiles_bytes),
+            RawArg::write(y_pin.buffer(), y.byte_len()),
+            RawArg::write(&sc, sc_bytes),
+            RawArg::Uniform(uniform),
+            RawArg::read(minor_pin.buffer(), minor_bytes),
+            RawArg::read(val_pin.buffer(), val_bytes),
+        ];
+        ctx.launch(&core, crate::ops::fold_workgroups(ctx, nbu)?, [nbu, 1, 1], &args)?;
+        if nb > 1 {
+            let core = ctx.jit().scan_kernel(ctx, "sparse_spmv_carry".into(), "sparse_spmv_carry", merge_carry_source)?;
+            let args = [RawArg::write(y_pin.buffer(), y.byte_len()), RawArg::read(&sc, sc_bytes), RawArg::read(ptr_pin.buffer(), ptr_bytes), RawArg::Uniform(uniform)];
+            ctx.launch(&core, crate::ops::fold_workgroups(ctx, nbu.div_ceil(128))?, [nbu, 1, 1], &args)?;
+        }
+        drop(scratch);
+        Ok(y)
     }
 
     /// `Y = A X` for a compressed matrix (`ptr`, the `minor` index of every entry, `val`) and a

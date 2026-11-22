@@ -198,13 +198,25 @@ pub fn sparse(b: &mut Bench) {
             mats.push(("powerlaw", power_law(800_000, 1 << 17, 32)));
             mats.push(("uniform", uniform(600_000, 8, 24, 33)));
         }
-        for (kind, a) in &mats {
-            products(b, &ctx, cs.as_ref(), kind, a);
+        // `SPARSE_MATS=4` (indices into the list above, comma separated) and `SPARSE_STAGES=pcd`
+        // (products, conversions, dense forms) narrow the run for a profiler.
+        let picked: Option<Vec<usize>> = std::env::var("SPARSE_MATS").ok().map(|v| v.split(',').filter_map(|i| i.trim().parse().ok()).collect());
+        let stages = std::env::var("SPARSE_STAGES").unwrap_or_else(|_| "pcd".into());
+        if stages.contains('p') {
+            for (i, (kind, a)) in mats.iter().enumerate() {
+                if picked.as_ref().is_none_or(|p| p.contains(&i)) {
+                    products(b, &ctx, cs.as_ref(), kind, a);
+                }
+            }
         }
         // Conversions and constructors on the big power-law matrix.
         let (_, big) = mats.iter().rev().find(|(k, _)| *k == "powerlaw").unwrap();
-        conversions(b, &ctx, cs.as_ref(), big);
-        dense_forms(b, &ctx);
+        if stages.contains('c') {
+            conversions(b, &ctx, cs.as_ref(), big);
+        }
+        if stages.contains('d') {
+            dense_forms(b, &ctx);
+        }
     });
 }
 
@@ -585,4 +597,48 @@ pub fn probe(op: &str) {
         other => panic!("unknown probe {other}"),
     }
     afx::sync();
+}
+
+/// `afcompare sparse-diag WHAT` for a profiler (every luma kernel is named `luma_main`, so the
+/// launches are picked by their order): `spmv` / `spmvt` / `csc` on the 9.2M-entry power-law
+/// matrix, three timed repetitions after the setup.
+pub fn diag(what: &str) {
+    if what == "cusparse" || what == "cusparset" {
+        // cuSPARSE's SpMV on the same matrix (a profiler shows its kernels by name).
+        afx::init();
+        let a = power_law(800_000, 1 << 17, 32);
+        let cs = cusparse::Cusparse::open().expect("cuSPARSE");
+        let mut g = Gen::new(13);
+        let xh: Vec<f32> = (0..a.cols).map(|_| g.quant()).collect();
+        let (ptr, col, val) = (afx::arr(&up_i32(&a.ptr), &[a.rows as u64 + 1]), afx::arr(&up_i32(&a.col), &[a.nnz() as u64]), afx::arr(&a.val, &[a.nnz() as u64]));
+        let xa = afx::arr(&xh, &[a.cols as u64, 1]);
+        let y = afx::arr(&vec![0.0f32; a.rows], &[a.rows as u64, 1]);
+        let prod = cs.product(cs.csr(a.rows, a.cols, &ptr, &col, &val), &xa, &y, 1, what == "cusparset");
+        cs.run(&prod);
+        cs.sync();
+        println!("setup done ({what})");
+        for _ in 0..3 {
+            cs.run(&prod);
+            cs.sync();
+        }
+        return;
+    }
+    let ctx = lumax::open();
+    let a = power_law(800_000, 1 << 17, 32);
+    let m = build(&ctx, &a);
+    let mut g = Gen::new(13);
+    let xh: Vec<f32> = (0..a.cols).map(|_| g.quant()).collect();
+    let x = lumax::arr(&ctx, &xh, a.cols);
+    x.eval().unwrap();
+    ctx.sync().unwrap();
+    println!("setup done ({what})");
+    for _ in 0..3 {
+        match what {
+            "spmv" => m.l_csr.matmul(&x).eval().unwrap(),
+            "spmvt" => m.l_csr.matmul_t(&x).eval().unwrap(),
+            "csc" => settle(&m.l_csr.to_format(SparseFormat::Csc)),
+            other => panic!("unknown diag {other}"),
+        }
+        ctx.sync().unwrap();
+    }
 }
