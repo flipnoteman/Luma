@@ -1,4 +1,4 @@
-# Connected components, confidence connected components
+# Connected components, confidence connected components, deconvolution
 
 `Array<bool>::regions` labels the connected components of a binary image and
 `Array<f32>::confidence_cc` grows a region from seed pixels by the statistics of the pixels
@@ -98,9 +98,61 @@ image**; probing it (CPU backend; the shared code behind it is the same on CUDA)
 * ArrayFire's CPU backend adds stray components not connected to the seed to the segmentation of
   the later iterations (seen with identical intervals); luma's segmentation is always the
   component of the seeds.
-* The sums are accumulated per workgroup from values shifted by their mean, so an interval can
-  differ from ArrayFire's in the last digits; a pixel exactly on the border of the interval may
-  go either way.
+* ArrayFire takes the window sums from an `f32` summed-area table of the whole image, which has no
+  precision left on a big image (on 4K its segmentation is the seed alone). luma adds up the
+  pixels of the windows from values shifted by their mean, so its intervals are exact; a pixel
+  exactly on the border of an interval may go either way.
 
-For a single interior seed and no further iteration the segmentation is ArrayFire's (compared
-pixel for pixel in the `afcompare` rows).
+For a single interior seed on an image small enough for ArrayFire's summed-area table (1080p) the
+segmentation is ArrayFire's up to the pixels its imprecise interval gets wrong (the `afcompare`
+rows count them).
+
+## Deconvolution
+
+`iterative_deconv(&psf, iterations, relaxation, algo)` and `inverse_deconv(&psf, gamma, algo)`
+(ArrayFire's `iterativeDeconv` and `inverseDeconv`) restore an `[H, W]` image blurred by a known
+point spread function `[PH, PW]` whose centre is `(PH / 2, PW / 2)`.
+
+```rust
+use luma::{Array, InverseDeconvAlgo, IterativeDeconvAlgo};
+
+let img = Array::from_slice(&(0..20).map(|i| 1.0 + i as f32).collect::<Vec<_>>(), [4, 5])?;
+// A psf that is a single 1 at its centre does not blur.
+let psf = Array::from_slice(&[0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], [3, 3])?;
+let same = img.iterative_deconv(&psf, 3, 0.5, IterativeDeconvAlgo::RichardsonLucy).to_vec()?;
+assert!(same.iter().zip(img.to_vec()?).all(|(a, b)| (a - b).abs() < 1e-4));
+// Tikhonov divides the spectrum by |P|^2 + gamma = 1 + gamma.
+let tik = img.inverse_deconv(&psf, 0.5, InverseDeconvAlgo::Tikhonov).to_vec()?;
+assert!((tik[0] - 1.0 / 1.5).abs() < 1e-4);
+# Ok::<(), luma::LumaError>(())
+```
+
+* **Landweber** (`IterativeDeconvAlgo::Landweber`, ArrayFire's default): `x += a P^T (y - P x)`
+  per iteration, starting from the blurred image `y`.
+* **Richardson-Lucy**: `x *= P^T (y / (P x))`; `relaxation` is unused (but must be positive, as in
+  ArrayFire). Needs positive data.
+* **Tikhonov** (`InverseDeconvAlgo::Tikhonov`): `X = Y conj(P) / (|P|^2 + gamma)` per frequency.
+
+The problem is solved on the image padded to `(H + PH) x (W + PW)`, each size rounded up to one whose
+prime factors are all at most 13 (ArrayFire's rule, verified on its CPU backend), with the nearest
+pixel; the psf is zero padded to the same size and rolled so that its centre is the origin. The
+convolutions are circular on the padded image, so the border sees a replicated, not a periodic,
+image. The result is the central `[H, W]` part.
+
+Landweber's step is diagonal in the frequency domain (`X += a conj(P) (Y - P X)`), so any number of
+iterations costs one forward transform, one inverse transform and one elementwise pass per
+iteration; Richardson-Lucy needs two forward and two inverse real transforms per iteration.
+
+### Differences from ArrayFire
+
+* ArrayFire's Landweber and Tikhonov results are `N0 * N1` times larger than the estimate (the
+  padded pixel count: its last inverse transform is not scaled; its Richardson-Lucy result is not
+  affected). luma returns the estimate; multiply by `N0 * N1` for ArrayFire's numbers.
+  Everything else (padding, centring, update) is ArrayFire's, to float rounding: the `afcompare`
+  rows and a test compare the results with ArrayFire's.
+* Where the blurred estimate of Richardson-Lucy is not positive the ratio is taken as 0.
+  ArrayFire's division gives inf or NaN there, which spreads over the whole image through the next
+  transform (any zero pixel of the input spoils its result).
+* The input is `f32` (ArrayFire also takes `u8`, `u16`, `i16`; convert with `to_f32`).
+* Like ArrayFire, `iterations`, `relaxation` and `gamma` must be positive and the arrays two-dimensional;
+  the point spread function may be larger than the image.

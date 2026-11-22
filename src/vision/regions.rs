@@ -92,8 +92,10 @@ impl Array<f32> {
     /// statistics of several seeds are those of the union of their windows (ArrayFire sums over all
     /// pairs of seed rows and columns, which makes its first segmentation just the seeds), the
     /// widening uses the values of the seeds (ArrayFire's the values at all pairs of rows and
-    /// columns) and seeds outside the image are ignored. Sums are accumulated from shifted values
-    /// per workgroup, so the intervals differ from ArrayFire's in the last digits. The input is
+    /// columns) and seeds outside the image are ignored. ArrayFire takes the window sums from an `f32`
+    /// summed-area table of the whole image, which has no precision left on big images (at 4K it
+    /// segments the seed alone); luma sums the pixels of the windows from values shifted by their
+    /// mean, so its intervals are the exact ones. The input is
     /// `f32` (convert integer images with the `to_f32` methods; the result has ArrayFire's type for
     /// `f32` input). An image without any pixel of different value is segmented whole.
     ///

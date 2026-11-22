@@ -40,7 +40,7 @@ fn friendly(mut n: usize) -> usize {
     loop {
         let mut m = n;
         for p in [2, 3, 5, 7, 11, 13] {
-            while m % p == 0 {
+            while m.is_multiple_of(p) {
                 m /= p;
             }
         }
@@ -81,7 +81,7 @@ impl Padded {
 }
 
 pub(super) fn iterative(image: &Array<f32>, psf: &Array<f32>, iterations: u32, relaxation: f32, algo: IterativeDeconvAlgo) -> Outcome<Array<f32>> {
-    if iterations == 0 || !(relaxation > 0.0) {
+    if iterations == 0 || relaxation.is_nan() || relaxation <= 0.0 {
         return Err(invalid(format!("iterative_deconv needs iterations > 0 and relaxation > 0, got {iterations} and {relaxation}")));
     }
     let p = Padded::new(image, psf, "iterative_deconv")?;
@@ -114,7 +114,7 @@ pub(super) fn iterative(image: &Array<f32>, psf: &Array<f32>, iterations: u32, r
 }
 
 pub(super) fn inverse(image: &Array<f32>, psf: &Array<f32>, gamma: f32, algo: InverseDeconvAlgo) -> Outcome<Array<f32>> {
-    if !(gamma > 0.0) {
+    if gamma.is_nan() || gamma <= 0.0 {
         return Err(invalid(format!("inverse_deconv needs gamma > 0, got {gamma}")));
     }
     let p = Padded::new(image, psf, "inverse_deconv")?;

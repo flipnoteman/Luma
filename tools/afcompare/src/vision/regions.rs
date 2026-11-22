@@ -178,7 +178,7 @@ pub fn rows(b: &mut Bench) {
                 let friendly = |mut n: usize| loop {
                     let mut m = n;
                     for p in [2, 3, 5, 7, 11, 13] {
-                        while m % p == 0 {
+                        while m.is_multiple_of(p) {
                             m /= p;
                         }
                     }

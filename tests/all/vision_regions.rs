@@ -71,7 +71,7 @@ fn regions_uniform() {
         check(&vec![false; h * w], h, w);
     }
     let ctx = ctx();
-    let img = Array::from_slice_on(&ctx, &vec![false; 12], [3, 4]).unwrap();
+    let img = Array::from_slice_on(&ctx, &[false; 12], [3, 4]).unwrap();
     assert_eq!(img.regions(Connectivity::Eight).to_vec().unwrap(), vec![0; 12]);
 }
 
@@ -159,7 +159,7 @@ fn regions_compose() {
 fn confidence_ref(img: &[f32], h: usize, w: usize, seeds: &[(usize, usize)], radius: usize, mult: u32, iterations: u32) -> Vec<bool> {
     let (mn, mx) = img.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
     let range = mx - mn;
-    let flat = !(range.abs() >= 1e-6);
+    let flat = range.abs().is_nan() || range.abs() < 1e-6;
     let inv = 1.0 / range;
     let j: Vec<f32> = img.iter().map(|&v| if flat { 1.0 } else { (v - mn) * inv + 1.0 }).collect();
     let seeds: Vec<(usize, usize)> = seeds.iter().copied().filter(|&(x, y)| x < h && y < w).collect();
@@ -344,7 +344,7 @@ fn friendly(mut n: usize) -> usize {
     loop {
         let mut m = n;
         for p in [2, 3, 5, 7, 11, 13] {
-            while m % p == 0 {
+            while m.is_multiple_of(p) {
                 m /= p;
             }
         }
