@@ -1159,7 +1159,8 @@ fn solve_with(f: &Lu, b: &Array<f32>, op: &'static str, loc: &'static Location<'
 
 fn solve_matrix(f: &Lu, rhs: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let pb = gather_rows(rhs, &f.perm, loc);
-    if f.lu.shape().dims()[2] == 1 {
+    let k = rhs.shape().dims()[0];
+    if f.lu.shape().dims()[2] == 1 && !super::trsv::applies(f.lu.context(), f.lu.shape().dims()[1], k, 1) {
         let y = solve_lower(&f.lu, &pb, true, op, loc);
         return solve_lower(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1);
     }

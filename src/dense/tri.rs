@@ -114,6 +114,9 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'stati
     if ld.rows <= BASE {
         return substitute(l, b, ld, bd, unit, op, loc);
     }
+    if super::trsv::applies(ctx, ld.rows, bd.cols, ld.batch) {
+        return super::trsv::lower_left(l, b, unit, op, loc);
+    }
     if ld.batch > 1 {
         let parts: Vec<Array<f32>> = (0..ld.batch).map(|i| blocked(&nth(l, i), &nth(b, i), unit, op, loc)).collect();
         return stack_batch(&parts);

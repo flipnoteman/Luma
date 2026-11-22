@@ -149,7 +149,8 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 13] = [
+        let groups: [(&str, fn(&mut Bench)); 14] = [
+            ("trsvprobe", trsv_probe),
             ("hostprobe", host_probe),
             ("launchprobe", launch_probe),
             ("mmprobe", mm_probe),
@@ -260,6 +261,37 @@ fn launch_probe(b: &mut Bench) {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             }
             println!("launchprobe len {len:<8} steps {steps:<5}: eager {:.2} us/launch (min {:.2}), iterate {:.2} us/launch (min {:.2})", t[0][7], t[0][0], t[1][7], t[1][0]);
+        }
+    }
+}
+
+/// `LINALG_ROWS=trsvprobe`: wall time of `solve_triangular` of one lower triangle (luma only; `TRSV_N`, `TRSV_K`
+/// lists), the launch to profile with `ncu -k regex:luma_main -s 1 -c 1` (the first call compiles).
+fn trsv_probe(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    let list = |name: &str, default: &str| -> Vec<usize> { std::env::var(name).unwrap_or_else(|_| default.into()).split(',').filter_map(|v| v.parse().ok()).collect() };
+    for n in list("TRSV_N", "4096") {
+        let mut t = uniform(n * n, 80 + n as u64, -1.0, 1.0);
+        for i in 0..n {
+            for j in 0..n {
+                t[i * n + j] = if j < i { t[i * n + j] / (n as f32).sqrt() } else if j == i { 2.0 } else { 0.0 };
+            }
+        }
+        let tl = lumax::arr(&ctx, &t, [n, n]);
+        for k in list("TRSV_K", "1,16") {
+            let rl = lumax::arr(&ctx, &uniform(n * k, 81, -1.0, 1.0), [k, n]);
+            let run = || tl.solve_triangular(&rl, luma::Triangle::Lower, false, false).eval().unwrap();
+            run();
+            ctx.sync().unwrap();
+            let mut v = Vec::new();
+            for _ in 0..25 {
+                let t0 = std::time::Instant::now();
+                run();
+                ctx.sync().unwrap();
+                v.push(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("trsvprobe n={n} k={k}: min {:.1} us, median {:.1} us", v[0], v[12]);
         }
     }
 }
