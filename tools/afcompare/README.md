@@ -34,7 +34,7 @@ the same ArrayFire install.)
 
 * `afcompare [--only SUBSTR] [--quick] [--out DIR]`: steady-state table
   (`DIR/results.md`, `DIR/results.jsonl`). `--only` selects case groups by name
-  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter mlp compact`).
+  (`ew small reduce matmul bmm fft sort scan hist gather stencil filter data mlp compact`).
 * `afcompare cold [--reps N] [--only CASE] [--out DIR]`: first-call (cold) times, each
   measurement in a fresh process (`DIR/cold.md`).
 * `AFCOMPARE_KERNELS=1` prints luma's per-kernel GPU time of every timed luma call (a profiled call).
@@ -59,7 +59,11 @@ the same ArrayFire install.)
   mode set to TF32 through `afcu_cublasSetMathMode` (looked up with `dlsym` in `libafcuda`; the
   program probes that the mode really changes ArrayFire's results and says so; if it does not,
   the TF32 rows are labelled as a different precision).
-* luma has no standalone FFT: the FFT case compares `conv1d_fft` with ArrayFire's
-  `fft_convolve1`, and lists raw ArrayFire FFTs without a luma counterpart.
+* FFT (group `fft`): `fft`/`ifft` (1M, 16M, 2^20, 2^24, 1000003 points), `rfft` against `fft_r2c`,
+  `fft2`/`ifft2` (2048 x 2048), `fft3` (256^3), `fft_convolve2`/`fft_convolve3` against
+  ArrayFire's `fft_convolve2`/`fft_convolve3` (same-size output, odd kernels) and `conv1d_fft` against
+  `fft_convolve1`. ArrayFire's `ifft` takes the `1 / N` scale as an argument; luma's `ifft` has it built
+  in (`FftNorm::Backward`), so both sides produce the same values. `AFCOMPARE_KERNELS=1` prints luma's
+  per-kernel times.
 * ArrayFire has no scatter-add; the weighted case uses `sort_by_key` + `sum_by_key`, the unweighted
   count uses `histogram`; both are labelled as different algorithms.

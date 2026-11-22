@@ -179,6 +179,34 @@ assert!((y.var_axis(0).item()? - 1.25).abs() < 1e-3);
 # Ok::<(), luma::LumaError>(())
 ```
 
+### Variance with a divisor, weights, covariance
+
+`var(bias)`, `std(bias)` and `meanvar(bias)` do the same for the whole array (`f32` and `f64`), and
+`var_axis_bias(axis, bias)`, `std_axis_bias` and `meanvar_axis` along an axis. A [`Bias`] is ArrayFire's
+`af_var_bias`: `Population` divides by `n`, `Sample` by `n - 1`. The mean and variance of a `meanvar`
+come from one pass over the data (the sum and the sum of squares of the data minus its first element).
+`mean_weighted(&w)` and `meanvar_weighted(&w, bias)` take weights of the array's shape (or extent 1
+along the axes to broadcast), `mean_axis_weighted(axis, &w)` along an axis. `cov(&y, bias)` and
+`corrcoef(&y)` pair two arrays of one shape element by element (the sums of the three expressions are
+recorded in one kernel); `cov_axis` and `corrcoef_axis` work per line. Axis forms are `f32` only
+(there are no axis reductions of `f64`).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let y = Array::from_slice(&[2.0f32, 4.0, 6.0, 8.0], 4)?;
+assert_eq!(x.var(Bias::Population).item()?, 1.25);
+assert!((x.var(Bias::Sample).item()? - 5.0 / 3.0).abs() < 1e-6);
+let (mean, var) = x.meanvar(Bias::Population);
+assert_eq!((mean.item()?, var.item()?), (2.5, 1.25));
+let w = Array::from_slice(&[1.0f32, 1.0, 1.0, 5.0], 4)?;
+assert_eq!(x.mean_weighted(&w).item()?, 3.25);
+assert!((x.corrcoef(&y).item()? - 1.0).abs() < 1e-6);
+assert!((x.cov(&y, Bias::Sample).item()? - 10.0 / 3.0).abs() < 1e-5);
+# Ok::<(), luma::LumaError>(())
+```
+
 ## Argmax and argmin
 
 `argmax` and `argmin` give the **flat index** of the largest or smallest element as a
@@ -699,5 +727,69 @@ use luma::*;
 
 let x = Array::from_slice(&[-2.0f32, 0.5, 3.0], 3)?;
 assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+## Tiles, diagonals, triangles, differences
+
+ArrayFire's structural functions are index maps and generators in luma: none is a kernel of its
+own, each fuses into the expression that reads it, and none reads or writes memory until an
+evaluation needs it. Shapes list the extents with the first dimension fastest, exactly like
+ArrayFire's `dim4`, so the dimension arguments carry over unchanged (`af::tile(a, 2, 3)` is
+`a.tile([2, 3])`, `af::diff1(a, 1)` is `a.diff1(1)`). Element `(i, j)` has `i` along dimension 0;
+diagonal `k` holds the elements with `j - i = k`.
+
+**`tile`** repeats an array along every dimension, a lazy read like a wrapping pad; **`iota`**
+counts the elements of a shape in memory order and tiles the count; **`identity`** is generated
+inside the kernel that uses it:
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+assert_eq!(a.tile([2, 2]).to_vec()?, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+assert_eq!(Array::<u32>::iota([2, 2], [1, 2])?.to_vec()?, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+let id = Array::<f32>::identity([3, 3])?;
+assert_eq!(id.to_vec()?, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`diag(k)`** extracts the `k`-th diagonal of every matrix of dimensions 0 and 1 (dimensions 2 and
+3 are batches) as a view, and **`diag_matrix(k)`** builds the matrix with a column on its
+diagonal `k`; **`lower(unit)`** and **`upper(unit)`** zero the other triangle (with `unit` the
+diagonal is one) and work on non-square matrices and batches. All of them accept every element
+type (`f32`, `i32`, `u32`, `bool`, `f64`, `Df32`), and a NaN that is not kept is zeroed, not
+propagated:
+
+```rust
+use luma::*;
+
+let m = Array::from_slice(&[1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0], [3, 3])?;
+assert_eq!(m.diag(0).to_vec()?, vec![1.0, 5.0, 9.0]);
+assert_eq!(m.diag(1).to_vec()?, vec![2.0, 6.0]);
+assert_eq!(m.diag(-1).to_vec()?, vec![4.0, 8.0]);
+assert_eq!(m.lower(false).to_vec()?, vec![1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]);
+assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0, 1.0]);
+let v = Array::from_slice(&[1.0f32, 2.0], 2)?;
+assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
+with `InvalidShape` (as `diff1` does for an extent below 2).
+
+**`replace(&cond, b)`** is `af::replace` returning a new array (`a` where `cond`, else `b`, an
+array or a scalar: `select(&cond, &a, b)`), and **`diff1(axis)`** / **`diff2(axis)`** are the first
+and second differences along an axis, one and two shorter, as a fused difference of slices that
+reads the array once:
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, f32::NAN, 4.0, 9.0], 4)?;
+assert_eq!(x.replace(&!x.is_nan(), 0.0).to_vec()?, vec![1.0, 0.0, 4.0, 9.0]);
+let y = Array::from_slice(&[0.0f32, 1.0, 4.0, 9.0, 16.0], 5)?;
+assert_eq!(y.diff1(0).to_vec()?, vec![1.0, 3.0, 5.0, 7.0]);
+assert_eq!(y.diff2(0).to_vec()?, vec![2.0, 2.0, 2.0]);
 # Ok::<(), luma::LumaError>(())
 ```

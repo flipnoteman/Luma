@@ -54,7 +54,7 @@ pub(super) struct Plan {
 fn word_ty(ty: ElemTy) -> Option<&'static str> {
     match ty {
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => Some("u32"),
-        ElemTy::Df32 => Some("vec2<f32>"),
+        ElemTy::Df32 | ElemTy::C32 => Some("vec2<f32>"),
         ElemTy::U8 | ElemTy::I8 => Some("u8"),
         ElemTy::U16 | ElemTy::I16 => Some("u16"),
         ElemTy::Bool | ElemTy::F64 => None,

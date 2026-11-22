@@ -171,7 +171,7 @@ macro_rules! plain_gpu_type {
     )*};
 }
 
-plain_gpu_type!(u32, i32, f32, f64, Df32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]);
+plain_gpu_type!(u32, i32, f32, f64, Df32, crate::complex::C32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]);
 
 impl GpuType for bool {
     type Repr = u32;

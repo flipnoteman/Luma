@@ -245,10 +245,16 @@ impl<'a> Eval<'a> {
                 Some(match kind {
                     OpKind::Unary(u) => {
                         u.expr_for(ty)?;
+                        if u.needs_helper() || ty == ElemTy::F64 {
+                            return None;
+                        }
                         zip(len, &a, &b, &c, |x, _, _| unary(u, ty, x))
                     }
                     OpKind::Binary(bin) => {
                         bin.expr_for(ty)?;
+                        if bin.needs_helper() || bin == BinOp::Mod || ty == ElemTy::F64 {
+                            return None;
+                        }
                         zip(len, &a, &b, &c, |x, y, _| binary(bin, ty, x, y))
                     }
                     OpKind::Compare(cmp) => zip(len, &a, &b, &c, |x, y, _| compare(cmp, ty, x, y)),
@@ -274,7 +280,7 @@ impl<'a> Eval<'a> {
                         let cast = cast_fn(ty, to)?;
                         zip(len, &a, &b, &c, |x, _, _| cast(x))
                     }
-                    OpKind::Generate(_) | OpKind::Shift(_) => return None,
+                    OpKind::Generate(_) | OpKind::Shift(_) | OpKind::Part(_) | OpKind::Make => return None,
                 })
             }
         }
@@ -488,6 +494,19 @@ fn unary(op: UnOp, ty: ElemTy, x: u32) -> u32 {
                 UnOp::Round => v.round_ties_even(),
                 UnOp::Log1p => v.ln_1p(),
                 UnOp::Expm1 => v.exp_m1(),
+                UnOp::Asin => v.asin(),
+                UnOp::Acos => v.acos(),
+                UnOp::Atan => v.atan(),
+                UnOp::Sinh => v.sinh(),
+                UnOp::Cosh => v.cosh(),
+                UnOp::Asinh => v.asinh(),
+                UnOp::Acosh => v.acosh(),
+                UnOp::Atanh => v.atanh(),
+                UnOp::Exp2 => v.exp2(),
+                UnOp::Log2 => v.log2(),
+                UnOp::Log10 => v.log2() * std::f32::consts::LOG10_2,
+                UnOp::Rsqrt => 1.0 / v.sqrt(),
+                UnOp::Sigmoid => 1.0 / (1.0 + (-v).exp()),
                 _ => v,
             };
             r.to_bits()
@@ -737,6 +756,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             }
             ReduceOp::Min => it.fold(f(first), |acc, w| acc.min(f(w))).to_bits(),
             ReduceOp::Max => it.fold(f(first), |acc, w| acc.max(f(w))).to_bits(),
+            ReduceOp::Prod => it.fold(f(first), |acc, w| acc * f(w)).to_bits(),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::U32 => match op {
@@ -744,6 +764,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             ReduceOp::SumSquares => it.fold(first.wrapping_mul(first), |acc, w| acc.wrapping_add(w.wrapping_mul(w))),
             ReduceOp::Min => it.fold(first, u32::min),
             ReduceOp::Max => it.fold(first, u32::max),
+            ReduceOp::Prod => it.fold(first, u32::wrapping_mul),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::I32 => match op {
@@ -754,6 +775,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             }
             ReduceOp::Min => it.fold(first as i32, |acc, w| acc.min(w as i32)) as u32,
             ReduceOp::Max => it.fold(first as i32, |acc, w| acc.max(w as i32)) as u32,
+            ReduceOp::Prod => it.fold(first, |acc, w| (acc as i32).wrapping_mul(w as i32) as u32),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::Bool => match op {

@@ -389,6 +389,22 @@ struct FnCtx<'m> {
     out: Vec<Vec<Stmt>>,
 }
 
+/// The operation a stub function named `luma_ir_<op>` of a WGSL module stands for: calls of it
+/// lower to the operation, whatever the stub's body says.
+fn intrinsic_of(name: Option<&str>) -> Option<IrUnOp> {
+    Some(match name?.strip_prefix("luma_ir_")? {
+        "erf" => IrUnOp::Erf,
+        "erfc" => IrUnOp::Erfc,
+        "lgamma" => IrUnOp::Lgamma,
+        "tgamma" => IrUnOp::Tgamma,
+        "cbrt" => IrUnOp::Cbrt,
+        "log10" => IrUnOp::Log10,
+        "log1p" => IrUnOp::Log1p,
+        "expm1" => IrUnOp::Expm1,
+        _ => return None,
+    })
+}
+
 impl<'m> FnCtx<'m> {
     fn new(arena: &'m Arena<Expression>, func: Option<&'m Function>) -> Self {
         FnCtx {
@@ -907,6 +923,15 @@ impl<'m> Lowerer<'m> {
                 ctx.emit(Stmt::Barrier(BarrierScope::Workgroup));
                 self.bind(ctx, *result, read, ty);
                 ctx.emit(Stmt::Barrier(BarrierScope::Workgroup));
+            }
+            Statement::Call { function, arguments, result: Some(result) }
+                if intrinsic_of(self.m.functions[*function].name.as_deref()).is_some() && arguments.len() == 1 =>
+            {
+                // A call of a stub named `luma_ir_<op>`: the operation itself, for the types
+                // WGSL has no function for (`f64` `erf`, `lgamma`, ...).
+                let op = intrinsic_of(self.m.functions[*function].name.as_deref()).expect("checked by the guard");
+                let (arg, ty) = self.val(ctx, arguments[0])?;
+                self.bind(ctx, *result, Expr::Unary { op, arg: arg.boxed(), ty: ty.clone() }, ty);
             }
             Statement::Call { function, arguments, result } => {
                 let func = *self.fn_ids.get(function).ok_or_else(|| BackendError::Unsupported("call of an unreachable function".into()))?;
@@ -1506,6 +1531,11 @@ impl<'m> Lowerer<'m> {
             M::Asin => Ok(un(IrUnOp::Asin, a, &ta)),
             M::Acos => Ok(un(IrUnOp::Acos, a, &ta)),
             M::Atan => Ok(un(IrUnOp::Atan, a, &ta)),
+            M::Sinh => Ok(un(IrUnOp::Sinh, a, &ta)),
+            M::Cosh => Ok(un(IrUnOp::Cosh, a, &ta)),
+            M::Asinh => Ok(un(IrUnOp::Asinh, a, &ta)),
+            M::Acosh => Ok(un(IrUnOp::Acosh, a, &ta)),
+            M::Atanh => Ok(un(IrUnOp::Atanh, a, &ta)),
             M::Exp => Ok(un(IrUnOp::Exp, a, &ta)),
             M::Exp2 => Ok(un(IrUnOp::Exp2, a, &ta)),
             M::Log => Ok(un(IrUnOp::Ln, a, &ta)),

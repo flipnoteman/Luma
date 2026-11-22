@@ -64,7 +64,7 @@ pub(crate) fn swapped(a: usize, b: usize) -> [usize; 4] {
 }
 
 /// The dimensions of `shape` as `u32`.
-fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
+pub(crate) fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
     let dims = shape.dims();
     let mut out = [1u32; 4];
     for (slot, &dim) in out.iter_mut().zip(&dims) {
@@ -1408,6 +1408,7 @@ assign_rhs_value!(i8);
 assign_rhs_value!(u16);
 assign_rhs_value!(i16);
 assign_rhs_value!(Df32);
+assign_rhs_value!(crate::complex::C32);
 assign_rhs_host!(f32);
 assign_rhs_host!(u32);
 assign_rhs_host!(i32);
@@ -1497,6 +1498,7 @@ view_arithmetic_values!(f32);
 view_arithmetic_values!(u32);
 view_arithmetic_values!(f64);
 view_arithmetic_values!(Df32);
+view_arithmetic_values!(crate::complex::C32);
 view_arithmetic_host!(f32);
 view_arithmetic_host!(u32);
 

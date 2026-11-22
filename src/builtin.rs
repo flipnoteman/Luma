@@ -70,8 +70,46 @@ pub(crate) enum UnOp {
     Log1p,
     /// `e^x - 1`, accurate for small `x`.
     Expm1,
+    /// Inverse sine.
+    Asin,
+    /// Inverse cosine.
+    Acos,
+    /// Inverse tangent.
+    Atan,
+    /// Hyperbolic sine.
+    Sinh,
+    /// Hyperbolic cosine.
+    Cosh,
+    /// Inverse hyperbolic sine.
+    Asinh,
+    /// Inverse hyperbolic cosine.
+    Acosh,
+    /// Inverse hyperbolic tangent.
+    Atanh,
+    /// `2^x`.
+    Exp2,
+    /// Base-2 logarithm.
+    Log2,
+    /// Base-10 logarithm.
+    Log10,
+    /// `1 / sqrt(x)`.
+    Rsqrt,
+    /// Real cube root (negative for a negative operand).
+    Cbrt,
+    /// The error function.
+    Erf,
+    /// The complementary error function `1 - erf(x)`.
+    Erfc,
+    /// `ln |gamma(x)|`.
+    Lgamma,
+    /// The gamma function.
+    Tgamma,
+    /// The logistic function `1 / (1 + e^-x)`.
+    Sigmoid,
     /// The identity: a copy of the operand (internal).
     Id,
+    /// The complex conjugate (`C32` only).
+    Conj,
     /// Bitwise complement (`u32` only).
     BitNot,
     /// Shift left by a constant amount `0..32` (`u32` only). The amount is part of the
@@ -130,6 +168,159 @@ fn expm1_expr() -> &'static str {
     })
 }
 
+
+/// WGSL helper functions the expressions of [`UnOp`] and [`BinOp`] call (`luma_erf(x)`, ...): `f32`
+/// functions WGSL has no built-in for, written with the built-ins, so that every backend runs
+/// the same code. The kernels that use them define them, see [`special_helpers`].
+const ERF_WGSL: &str = "
+fn luma_erfc_pos(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.5 * x);
+    let p = -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    let hi = floor(x * 16.0) / 16.0;
+    return t * exp(-hi * hi) * exp(-(x - hi) * (x + hi) + p);
+}
+fn luma_erf_series(x: f32) -> f32 {
+    let w = x * x;
+    let q = 1.0 + w * (-0.33333334 + w * (0.1 + w * (-0.023809524 + w * (0.0046296296 + w * (-0.00075757576 + w * (0.00010683761 + w * (-1.3227513e-5 + w * (1.4589169e-6 + w * (-1.4503852e-7 + w * (1.3122533e-8 + w * -1.0892221e-9))))))))));
+    return 1.1283792 * x * q;
+}
+fn luma_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let c = select(a, 10.0, a > 10.0);
+    let e = 1.0 - luma_erfc_pos(c);
+    return select(select(select(e, -e, x < 0.0), luma_erf_series(x), a < 1.0), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+fn luma_erfc(x: f32) -> f32 {
+    let a = abs(x);
+    let c = select(a, 10.0, a > 10.0);
+    let e = select(luma_erfc_pos(c), 0.0, a > 10.0);
+    return select(select(select(e, 2.0 - e, x < 0.0), 1.0 - luma_erf_series(x), a < 0.5), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const GAMMA_WGSL: &str = "
+fn luma_sinpi(r: f32) -> f32 {
+    let u = 3.14159265 * r;
+    let t = u * u;
+    return u * (1.0 + t * (-0.16666667 + t * (0.008333334 + t * (-0.0001984127 + t * (2.7557319e-6 + t * (-2.5052108e-8 + t * (1.6059044e-10 + t * -7.647163e-13)))))));
+}
+fn luma_lgamma_pos(x: f32) -> f32 {
+    let small = x < 5.0;
+    let z = select(x, x + 5.0, small);
+    let p = select(1.0, x * (x + 1.0) * (x + 2.0) * (x + 3.0) * (x + 4.0), small);
+    let i = 1.0 / z;
+    let i2 = i * i;
+    let series = i * (0.083333333 + i2 * (-0.0027777778 + i2 * (0.00079365079 + i2 * (-0.0005952381 + i2 * 0.00084175084))));
+    let r = (z - 0.5) * log(z) - z + 0.91893853 + series - log(p);
+    return select(r, bitcast<f32>(0x7f800000u), x > 1.0e37);
+}
+fn luma_gamma_pos(x: f32) -> f32 {
+    let small = x < 5.0;
+    let z = select(x, x + 5.0, small);
+    let p = select(1.0, x * (x + 1.0) * (x + 2.0) * (x + 3.0) * (x + 4.0), small);
+    let i = 1.0 / z;
+    let i2 = i * i;
+    let series = i * (0.083333333 + i2 * (-0.0027777778 + i2 * (0.00079365079 + i2 * (-0.0005952381 + i2 * 0.00084175084))));
+    return select(exp((z - 0.5) * log(z) - z + 0.91893853 + series) / p, bitcast<f32>(0x7f800000u), x > 36.0);
+}
+fn luma_lgamma(x: f32) -> f32 {
+    let pos = luma_lgamma_pos(select(1.0 - x, x, x >= 0.5));
+    let r = x - round(x);
+    let s = abs(luma_sinpi(r));
+    let v = select(log(3.14159265 / s) - pos, pos, x >= 0.5);
+    return select(select(v, bitcast<f32>(0x7f800000u), abs(x) > 1.0e37), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+fn luma_tgamma(x: f32) -> f32 {
+    let n = round(x);
+    let r = select(x - n, x, abs(x) < 0.5);
+    let odd = (n - 2.0 * floor(n * 0.5)) != 0.0;
+    let s = luma_sinpi(r) * select(1.0, -1.0, odd);
+    let g = luma_gamma_pos(select(1.0 - x, x, x >= 0.5));
+    let v = select(3.14159265 / (s * g), g, x >= 0.5);
+    return select(select(v, bitcast<f32>(0x7fc00000u), (x < 0.0) & (x == floor(x))), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const CBRT_WGSL: &str = "
+fn luma_cbrt(x: f32) -> f32 {
+    let a = abs(x);
+    let y0 = exp2(log2(a) * 0.33333334);
+    let y1 = y0 - (y0 - a / (y0 * y0)) * 0.33333334;
+    let r = select(a, y1, (a > 0.0) & (a < 3.4028235e38));
+    return select(bitcast<f32>(bitcast<u32>(r) | (bitcast<u32>(x) & 0x80000000u)), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const POW_WGSL: &str = "
+fn luma_powf(x: f32, y: f32) -> f32 {
+    let r = pow(abs(x), y);
+    let integer = floor(y) == y;
+    let odd = integer & (abs(y) < 16777216.0) & ((y - 2.0 * floor(0.5 * y)) == 1.0);
+    let negative = (bitcast<u32>(x) >> 31u) == 1u;
+    let signed = select(r, select(-r, r, !odd), negative);
+    let c = select(signed, bitcast<f32>(0x7fc00000u), negative & !integer);
+    return select(c, 1.0, (y == 0.0) | (x == 1.0));
+}
+";
+const MOD_WGSL: &str = "
+fn luma_modf(x: f32, y: f32) -> f32 {
+    let r = select(x % y, x, (abs(y) > 3.4028235e38) & (abs(x) < 3.4028235e38));
+    return select(r, r + y, (r != 0.0) & ((r < 0.0) != (y < 0.0)));
+}
+fn luma_modi(x: i32, y: i32) -> i32 {
+    let r = x % y;
+    return select(r, r + y, (r != 0) & ((r < 0) != (y < 0)));
+}
+fn luma_modd(x: f64, y: f64) -> f64 {
+    let r = select(x % y, x, (abs(y) > 1.7976931348623157e308lf) & (abs(x) < 1.7976931348623157e308lf));
+    return select(r, r + y, (r != f64(0.0)) & ((r < f64(0.0)) != (y < f64(0.0))));
+}
+";
+const WIDE_WGSL: &str = "
+fn luma_hypotd(x: f64, y: f64) -> f64 {
+    let a = abs(x);
+    let b = abs(y);
+    let m = max(a, b);
+    let u = a / m;
+    let v = b / m;
+    return select(a + b, m * sqrt(u * u + v * v), (m > f64(0.0)) & (m < 1.7976931348623157e308lf));
+}
+fn luma_copysignd(x: f64, y: f64) -> f64 {
+    let neg = (y < f64(0.0)) | ((y == f64(0.0)) & ((f64(1.0) / y) < f64(0.0)));
+    return select(abs(x), -abs(x), neg);
+}
+";
+/// Stubs for the `f64` operations WGSL has no function for: a call of `luma_ir_<name>` lowers to the
+/// operation of that name (see `luma_core::kir::from_wgsl`), whatever the body says.
+const WIDE_STUBS: &str = "
+fn luma_ir_erf(x: f64) -> f64 { return x; }
+fn luma_ir_erfc(x: f64) -> f64 { return x; }
+fn luma_ir_lgamma(x: f64) -> f64 { return x; }
+fn luma_ir_tgamma(x: f64) -> f64 { return x; }
+fn luma_ir_cbrt(x: f64) -> f64 { return x; }
+fn luma_ir_log10(x: f64) -> f64 { return x; }
+fn luma_ir_log1p(x: f64) -> f64 { return x; }
+fn luma_ir_expm1(x: f64) -> f64 { return x; }
+";
+
+/// The WGSL helper functions among the above that the code uses: `uses(name)` says whether a
+/// function (`luma_erf(`, with its parenthesis) is called.
+pub(crate) fn special_helpers(mut uses: impl FnMut(&str) -> bool) -> String {
+    let groups: [(&[&str], &str); 7] = [
+        (&["luma_erf(", "luma_erfc("], ERF_WGSL),
+        (&["luma_lgamma(", "luma_tgamma("], GAMMA_WGSL),
+        (&["luma_cbrt("], CBRT_WGSL),
+        (&["luma_powf("], POW_WGSL),
+        (&["luma_modf(", "luma_modi(", "luma_modd("], MOD_WGSL),
+        (&["luma_hypotd(", "luma_copysignd("], WIDE_WGSL),
+        (&["luma_ir_"], WIDE_STUBS),
+    ];
+    let mut out = String::new();
+    for (needles, text) in groups {
+        if needles.iter().any(|needle| uses(needle)) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 impl UnOp {
     /// The operation as a WGSL expression of the operand `x`.
     pub(crate) fn expr(self) -> &'static str {
@@ -152,7 +343,27 @@ impl UnOp {
             UnOp::Round => "round(x)",
             UnOp::Log1p => log1p_expr(),
             UnOp::Expm1 => expm1_expr(),
+            UnOp::Asin => "asin(x)",
+            UnOp::Acos => "acos(x)",
+            UnOp::Atan => "atan(x)",
+            UnOp::Sinh => "sinh(x)",
+            UnOp::Cosh => "cosh(x)",
+            UnOp::Asinh => "asinh(x)",
+            UnOp::Acosh => "acosh(x)",
+            UnOp::Atanh => "atanh(x)",
+            UnOp::Exp2 => "exp2(x)",
+            UnOp::Log2 => "log2(x)",
+            // `log2(x) / log2(10)`; `log2` is the device's, exact at powers of two.
+            UnOp::Log10 => "(log2(x) * 0.30102999566398120)",
+            UnOp::Rsqrt => "inverseSqrt(x)",
+            UnOp::Cbrt => "luma_cbrt(x)",
+            UnOp::Erf => "luma_erf(x)",
+            UnOp::Erfc => "luma_erfc(x)",
+            UnOp::Lgamma => "luma_lgamma(x)",
+            UnOp::Tgamma => "luma_tgamma(x)",
+            UnOp::Sigmoid => "(1.0 / (1.0 + exp(-x)))",
             UnOp::Id => "x",
+            UnOp::Conj => "vec2<f32>(x.r, -x.g)",
             UnOp::BitNot => "~x",
             UnOp::Shl(k) => by_constant(0, k),
             UnOp::Shr(k) => by_constant(1, k),
@@ -178,7 +389,26 @@ impl UnOp {
             UnOp::Round => "round",
             UnOp::Log1p => "log1p",
             UnOp::Expm1 => "expm1",
+            UnOp::Asin => "asin",
+            UnOp::Acos => "acos",
+            UnOp::Atan => "atan",
+            UnOp::Sinh => "sinh",
+            UnOp::Cosh => "cosh",
+            UnOp::Asinh => "asinh",
+            UnOp::Acosh => "acosh",
+            UnOp::Atanh => "atanh",
+            UnOp::Exp2 => "exp2",
+            UnOp::Log2 => "log2",
+            UnOp::Log10 => "log10",
+            UnOp::Rsqrt => "rsqrt",
+            UnOp::Cbrt => "cbrt",
+            UnOp::Erf => "erf",
+            UnOp::Erfc => "erfc",
+            UnOp::Lgamma => "lgamma",
+            UnOp::Tgamma => "tgamma",
+            UnOp::Sigmoid => "sigmoid",
             UnOp::Id => "copy",
+            UnOp::Conj => "conj",
             UnOp::BitNot => "not",
             UnOp::Shl(_) => "shl",
             UnOp::Shr(_) => "shr",
@@ -188,6 +418,27 @@ impl UnOp {
 }
 
 impl UnOp {
+    /// The `f64` form of the operations whose WGSL text is the same function of `x` for every float
+    /// width (the `tanh` text is `f32`'s with a bound).
+    fn expr_f64_plain(self) -> &'static str {
+        match self {
+            UnOp::Tanh => "tanh(x)",
+            other => other.expr(),
+        }
+    }
+
+    /// Whether the operation calls a function of [`special_helpers`] (an `f32` one), which the
+    /// kernels that use it have to define; such an operation cannot run inside a reduction's last pass.
+    pub(crate) fn needs_helper(self) -> bool {
+        matches!(self, UnOp::Cbrt | UnOp::Erf | UnOp::Erfc | UnOp::Lgamma | UnOp::Tgamma)
+    }
+
+    /// Whether `f64` elements need a backend with `f64` math functions (CUDA or the CPU): WGSL
+    /// has none, so on a Vulkan device `f64` only has the arithmetic.
+    pub(crate) fn wide_math(self) -> bool {
+        !matches!(self, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_))
+    }
+
     /// Whether the operation only exists for `u32`.
     pub(crate) fn is_bitwise(self) -> bool {
         matches!(self, UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_))
@@ -261,10 +512,34 @@ impl UnOp {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::F32 if self.is_bitwise() => None,
+            ElemTy::F32 if self.is_bitwise() || self == UnOp::Conj => None,
             ElemTy::F32 => Some(self.expr()),
+            ElemTy::C32 => match self {
+                UnOp::Neg => Some("-x"),
+                UnOp::Conj => Some(self.expr()),
+                UnOp::Sqrt => Some("c_sqrt(x)"),
+                UnOp::Exp => Some("c_exp(x)"),
+                UnOp::Id => Some("x"),
+                _ => None,
+            },
             ElemTy::F64 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
+                // The `f64` math functions exist on the backends with `f64` math (CUDA and the CPU, see
+                // `UnOp::wide_math`); the ones WGSL has no function for are calls of stubs the
+                // lowering replaces by the operation (see `WIDE_STUBS`).
+                UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos | UnOp::Tan | UnOp::Tanh | UnOp::Asin | UnOp::Acos | UnOp::Atan | UnOp::Sinh | UnOp::Cosh | UnOp::Asinh | UnOp::Acosh | UnOp::Atanh | UnOp::Exp2 | UnOp::Log2 => {
+                    Some(self.expr_f64_plain())
+                }
+                UnOp::Rsqrt => Some("inverseSqrt(x)"),
+                UnOp::Sigmoid => Some("(f64(1.0) / (f64(1.0) + exp(-x)))"),
+                UnOp::Log10 => Some("luma_ir_log10(x)"),
+                UnOp::Cbrt => Some("luma_ir_cbrt(x)"),
+                UnOp::Erf => Some("luma_ir_erf(x)"),
+                UnOp::Erfc => Some("luma_ir_erfc(x)"),
+                UnOp::Lgamma => Some("luma_ir_lgamma(x)"),
+                UnOp::Tgamma => Some("luma_ir_tgamma(x)"),
+                UnOp::Log1p => Some("luma_ir_log1p(x)"),
+                UnOp::Expm1 => Some("luma_ir_expm1(x)"),
                 // The drivers' `f64` `round` and `trunc` are not exact everywhere (Mesa's lavapipe
                 // rounds -2.50000000025 to -2), so both are built from `floor` of `|x|` and exact
                 // `f64` arithmetic on its remainder; a zero keeps its sign, a NaN stays NaN.
@@ -304,6 +579,8 @@ pub(crate) enum BinOp {
     Hypot,
     Copysign,
     Rem,
+    /// The modulus: the remainder with the sign of the divisor (`-1 mod 3 = 2`).
+    Mod,
     /// Bitwise operations on `u32` (shift and rotate amounts are taken modulo 32).
     BitAnd,
     BitOr,
@@ -314,6 +591,17 @@ pub(crate) enum BinOp {
 }
 
 impl BinOp {
+    /// Whether the operation calls a function of [`special_helpers`] for `f32` elements (see
+    /// [`UnOp::needs_helper`]).
+    pub(crate) fn needs_helper(self) -> bool {
+        matches!(self, BinOp::Mod)
+    }
+
+    /// Whether `f64` elements need a backend with `f64` math functions (see [`UnOp::wide_math`]).
+    pub(crate) fn wide_math(self) -> bool {
+        matches!(self, BinOp::Rem | BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign | BinOp::Mod)
+    }
+
     /// Whether the operation only exists for `u32`.
     pub(crate) fn is_bitwise(self) -> bool {
         matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl)
@@ -338,6 +626,7 @@ impl BinOp {
             BinOp::Hypot => "select(select(abs(x) + abs(y), max(abs(x), abs(y)) * length(vec2<f32>(x / max(abs(x), abs(y)), y / max(abs(x), abs(y)))), max(abs(x), abs(y)) > 0.0 && max(abs(x), abs(y)) < 3.4028235e38), bitcast<f32>(0x7f800000u), abs(x) > 3.4028235e38 || abs(y) > 3.4028235e38)",
             BinOp::Copysign => "bitcast<f32>((bitcast<u32>(x) & 0x7fffffffu) | (bitcast<u32>(y) & 0x80000000u))",
             BinOp::Rem => "x % y",
+            BinOp::Mod => "luma_modf(x, y)",
             BinOp::BitAnd => "x & y",
             BinOp::BitOr => "x | y",
             BinOp::BitXor => "x ^ y",
@@ -352,6 +641,7 @@ impl BinOp {
     /// [`BinOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it.
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
+            ElemTy::U32 if self == BinOp::Mod => Some("(x % y)"),
             ElemTy::U32 => Some(self.expr()),
             ElemTy::Bool => match self {
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
@@ -359,6 +649,7 @@ impl BinOp {
             },
             ElemTy::I32 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                BinOp::Mod => Some("luma_modi(x, y)"),
                 BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
                 BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
                 _ => None,
@@ -377,7 +668,16 @@ impl BinOp {
             }
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max | BinOp::Rem | BinOp::Atan2 => Some(self.expr()),
+                BinOp::Mod => Some("luma_modd(x, y)"),
+                BinOp::Hypot => Some("luma_hypotd(x, y)"),
+                BinOp::Copysign => Some("luma_copysignd(x, y)"),
+                _ => None,
+            },
+            ElemTy::C32 => match self {
+                BinOp::Add | BinOp::Sub => Some(self.expr()),
+                BinOp::Mul => Some("c_mul(x, y)"),
+                BinOp::Div => Some("c_div(x, y)"),
                 _ => None,
             },
             ElemTy::Df32 => match self {
@@ -418,9 +718,18 @@ impl CmpOp {
 }
 
 impl CmpOp {
+    /// Whether the comparison exists for elements of type `ty`: complex numbers are only equal or not.
+    pub(crate) fn exists_for(self, ty: ElemTy) -> bool {
+        ty != ElemTy::C32 || matches!(self, CmpOp::Eq | CmpOp::Ne)
+    }
+
     /// [`CmpOp::expr`] for elements of type `ty`.
     pub(crate) fn expr_for(self, ty: ElemTy) -> &'static str {
         match ty {
+            ElemTy::C32 => match self {
+                CmpOp::Ne => "select(1u, 0u, c_eq(x, y))",
+                _ => "select(0u, 1u, c_eq(x, y))",
+            },
             ElemTy::Df32 => match self {
                 CmpOp::Lt => "select(0u, 1u, df_lt(x, y))",
                 CmpOp::Le => "select(0u, 1u, df_le(x, y))",
@@ -432,6 +741,98 @@ impl CmpOp {
             _ => self.expr(),
         }
     }
+}
+
+/// A real quantity of a complex number (see [`ElemTy::C32`]): the operation maps an element
+/// `vec2<f32>` `(re, im)` to an `f32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Part {
+    /// The real part.
+    Real,
+    /// The imaginary part.
+    Imag,
+    /// The modulus, scaled so that it neither overflows nor underflows where the result is
+    /// representable.
+    Abs,
+    /// The argument `atan2(im, re)`.
+    Arg,
+    /// `re * re + im * im`.
+    NormSqr,
+}
+
+impl Part {
+    /// The quantity as a WGSL expression of the operand `x` (its components are `r` and `g`:
+    /// [`substitute`] replaces every `x` of the template, `x.x` included).
+    pub(crate) fn expr(self) -> &'static str {
+        match self {
+            Part::Real => "x.r",
+            Part::Imag => "x.g",
+            Part::Abs => "c_abs(x)",
+            Part::Arg => "atan2(x.g, x.r)",
+            Part::NormSqr => "(x.r * x.r + x.g * x.g)",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Part::Real => "real",
+            Part::Imag => "imag",
+            Part::Abs => "abs",
+            Part::Arg => "arg",
+            Part::NormSqr => "norm_sqr",
+        }
+    }
+}
+
+/// The complex arithmetic that is not a single `f32` operation per component, on `vec2<f32>` `(re,
+/// im)`: the functions of [`BinOp::expr_for`], [`UnOp::expr_for`], [`CmpOp::expr_for`] and
+/// [`Part::expr`] for `C32`. Pure `f32` arithmetic without the guard of [`df_library`], so that the
+/// compiler fuses the products into `fma`.
+///
+/// * `c_mul`: the textbook product.
+/// * `c_div`: Smith's algorithm (the quotient of the components of the denominator scales the
+///   rest, so no intermediate overflows where the result is representable); a zero denominator
+///   gives `(re / 0, im / 0)`, infinity or `NaN` per component as `C99` Annex G has it, with no
+///   trap.
+/// * `c_abs`: the modulus from the components scaled by a power of two (exact) when the larger is
+///   above `2^62` or below `2^-62`, so no square overflows or underflows, and with no division
+///   (a fast division returns 0 for a divisor above `2^126`). Infinite if a component is.
+/// * `c_exp`: `e^re (cos im, sin im)`, the imaginary part of the result keeps the sign of a zero `im`
+///   (so `exp(inf + 0i)` is `inf + 0i`, not `NaN`).
+/// * `c_sqrt`: the principal square root, `(t, im / 2t)` with `t = sqrt((|z| + |re|) / 2)`
+///   on the right half-plane and the mirrored form on the left one (no cancellation).
+pub(crate) fn complex_library() -> &'static str {
+    "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let big = abs(b.y) <= abs(b.x);
+    let r = select(b.x / b.y, b.y / b.x, big);
+    let d = select(b.x * r + b.y, b.x + b.y * r, big);
+    let n = select(vec2<f32>(a.x * r + a.y, a.y * r - a.x), vec2<f32>(a.x + a.y * r, a.y - a.x * r), big);
+    return select(n / d, a / b.x, (b.x == 0.0) & (b.y == 0.0));
+}
+fn c_abs(a: vec2<f32>) -> f32 {
+    let x = abs(a.x); let y = abs(a.y);
+    let m = max(x, y);
+    let huge = m > 4.611686e18;
+    let tiny = m < 2.1684043e-19;
+    let down = select(select(1.0, 7.3786976e19, tiny), 1.3552527e-20, huge);
+    let up = select(select(1.0, 1.3552527e-20, tiny), 7.3786976e19, huge);
+    let r = sqrt((x * down) * (x * down) + (y * down) * (y * down)) * up;
+    return select(r, bitcast<f32>(0x7f800000u), (x > 3.4028235e38) | (y > 3.4028235e38));
+}
+fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x == b.x) & (a.y == b.y); }
+fn c_exp(a: vec2<f32>) -> vec2<f32> {
+    let e = exp(a.x);
+    return vec2<f32>(e * cos(a.y), select(e * sin(a.y), a.y, a.y == 0.0));
+}
+fn c_sqrt(a: vec2<f32>) -> vec2<f32> {
+    let t = sqrt(0.5 * (c_abs(a) + abs(a.x)));
+    let u = a.y / (2.0 * t);
+    let flipped = select(t, -t, (bitcast<u32>(a.y) & 0x80000000u) != 0u);
+    let root = select(vec2<f32>(abs(u), flipped), vec2<f32>(t, u), a.x >= 0.0);
+    return select(root, vec2<f32>(0.0, a.y), (a.x == 0.0) & (a.y == 0.0));
+}
+"
 }
 
 /// A test of what kind of floating-point value an element is, read from the bits of its
@@ -488,6 +889,10 @@ pub(crate) enum ReduceOp {
     Max,
     /// Sum of squares of the input; the later passes over its partial results are sums.
     SumSquares,
+    /// The product of the input, identity 1 (a NaN gives NaN, integers wrap); the later passes
+    /// over its partial results are products. There is no subgroup product: the kernels combine
+    /// lanes with shuffles (`f32`, `u32`, `i32`) or in workgroup memory.
+    Prod,
     /// The index of the first largest element of a line (a NaN is the largest); the partial results
     /// of a pass are (value, index) pairs. Only the axis passes of [`crate::arg`] run it, alone in
     /// its [`ReduceList`].
@@ -879,6 +1284,13 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
+    /// One pass of a public FFT, see [`crate::dft_kernel`].
+    Dft(crate::dft_kernel::DftPass),
+    /// The packing step of a real FFT (`true`: unpack a spectrum after the forward transform; the second flag: multiply the spectrum by a table first, inverse only),
+    /// see [`crate::spectral`].
+    RealStage(bool, bool),
+    /// The chirp tables of Bluestein's algorithm, see [`crate::spectral`].
+    Chirp,
     /// The convergence gate between the steps of `iterate_until`; arguments: the residual, the
     /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
     /// `{tol, step, words}`.
@@ -985,6 +1397,7 @@ fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
     let value = match op {
         ReduceOp::Sum | ReduceOp::SumSquares => "countOneBits(w)",
         ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("boolean words have no arg reductions"),
+        ReduceOp::Prod => unreachable!("boolean words have no products"),
         ReduceOp::Max => "select(0u, 1u, w != 0u)",
         ReduceOp::Min => "select(0u, 1u, w == select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == p.n - 1u && (p.len & 31u) != 0u))",
     };
@@ -1027,7 +1440,17 @@ impl<'a> ReduceElem<'a> {
             (ReduceElem::Df32 { .. }, ReduceOp::Sum | ReduceOp::SumSquares) => "df_add(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Min) => "df_min(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Max) => "df_max(u, v)",
+            (ReduceElem::Plain(_), ReduceOp::Prod) => "u * v",
+            (ReduceElem::Df32 { .. }, ReduceOp::Prod) => "df_mul(u, v)",
             (_, ReduceOp::ArgMax | ReduceOp::ArgMin) => unreachable!("arg reductions have their own passes (`crate::arg`)"),
+        }
+    }
+
+    /// The multiplicative identity of the type, as a WGSL expression.
+    fn one(self) -> String {
+        match self {
+            ReduceElem::Plain(ty) => format!("{ty}(1)"),
+            ReduceElem::Df32 { .. } => "vec2<f32>(1.0, 0.0)".to_owned(),
         }
     }
 
@@ -1334,7 +1757,7 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
             if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
                 unreachable!("arg reductions have their own passes (`crate::arg`)");
             }
-            inits += &format!("    var acc{j} = zero;\n");
+            inits += &format!("    var acc{j} = {};\n", if op == ReduceOp::Prod { "one" } else { "zero" });
             for s in 0..per_thread {
                 if *segmented {
                     if s == 0 {
@@ -1354,6 +1777,9 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
                     ReduceOp::SumSquares => {
                         let sq = elem.square(&e);
                         if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::Prod => {
+                        if s == 0 { e } else { format!("select(one, {e}, base + {wg}u * {s}u < {n})") }
                     }
                     ReduceOp::Min | ReduceOp::Max => e,
                     ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
@@ -1375,25 +1801,30 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
         let mut lanes = String::new();
         let mut first = String::new();
         for (j, &op) in ops.as_slice().iter().enumerate() {
+            let prod_name = format!("luma_sgprod{j}");
             let (group_op, ident) = match op {
                 ReduceOp::Sum | ReduceOp::SumSquares => ("subgroupAdd", "zero".to_owned()),
                 ReduceOp::Min => ("subgroupMin", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
+                ReduceOp::Prod => (prod_name.as_str(), "one".to_owned()),
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
+            // The product of a subgroup is a function of the lane too (see `reduce_main`).
+            let call = |value: String| if op == ReduceOp::Prod { format!("{group_op}({value}, lane, sg)") } else { format!("{group_op}({value})") };
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
                 lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if ({group} * {block}u + lid >= {n}) {{ acc{j} = first{j}; }}\n");
             }
-            lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
+            lanes += &format!("    let r{j} = {};\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", call(format!("acc{j}")), j as u32 * MAX_SUBGROUPS);
             let (lets, fin) = epilogue.map_or_else(|| (String::new(), format!("f{j}")), |list| list.epilogue_statements(j, &format!("f{j}"), &format!("g{j}_")));
             let store = store(j, &fin);
             first += &format!(
                 "        var t{j} = {ident};
         for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
-        let f{j} = {group_op}(t{j});
+        let f{j} = {};
         if (lane == 0u) {{ {lets}{store} }}
 ",
-                j as u32 * MAX_SUBGROUPS
+                j as u32 * MAX_SUBGROUPS,
+                call(format!("t{j}"))
             );
         }
         finish += &format!(
@@ -1445,7 +1876,7 @@ fn merged_loop(elem: ReduceElem<'_>, ops: ReduceList, roots: &[u8], phase: &Phas
     let count = ops.as_slice().len();
     let mut inits = String::new();
     for j in 0..count {
-        inits += &format!("    var acc{j} = zero;\n");
+        inits += &format!("    var acc{j} = {};\n", if ops.as_slice()[j] == ReduceOp::Prod { "one" } else { "zero" });
     }
     // The names of the value each op holds for the elements `lo..hi` once emitted.
     let name = |j: usize, lo: usize, hi: usize| if hi - lo == 1 { format!("v{j}_{lo}") } else { format!("w{j}_{lo}_{hi}") };
@@ -1481,6 +1912,9 @@ fn merged_loop(elem: ReduceElem<'_>, ops: ReduceList, roots: &[u8], phase: &Phas
                 ReduceOp::SumSquares => {
                     let sq = elem.square(&e);
                     if s == 0 { sq } else { format!("select(zero, {sq}, in{s})") }
+                }
+                ReduceOp::Prod => {
+                    if s == 0 { e } else { format!("select(one, {e}, in{s})") }
                 }
                 ReduceOp::Min | ReduceOp::Max => e,
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
@@ -1535,6 +1969,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
     debug_assert!(single_pass.is_none() || !segmented, "only a first pass can finish the reduction itself");
     debug_assert!(gate.is_none() || ops.gate().is_some(), "a gate needs a pass with a gate");
     let ty = elem.storage_ty();
+    let one = elem.one();
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let mut combines = String::new();
     for (j, &op) in ops.as_slice().iter().enumerate() {
@@ -1542,7 +1977,24 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
     }
 
-    let subgroups = tuning.subgroups && elem.subgroups();
+    // There is no `subgroupMul`: a product of `f32`, `u32` or `i32` is combined within a subgroup by a butterfly of
+    // `subgroupShuffle`s (every lane ends with the product of all of them); other types combine in workgroup memory.
+    let products = ops.as_slice().contains(&ReduceOp::Prod);
+    let subgroups = tuning.subgroups && elem.subgroups() && (!products || matches!(elem, ReduceElem::Plain("f32" | "u32" | "i32")));
+    if subgroups {
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            if op == ReduceOp::Prod {
+                combines += &format!(
+                    "fn luma_sgprod{j}(v: {ty}, lane: u32, sg: u32) -> {ty} {{
+    var r = v;
+    for (var o = 1u; o < sg; o = o << 1u) {{ r = c{j}(r, subgroupShuffle(r, lane ^ o)); }}
+    return r;
+}}
+"
+                );
+            }
+        }
+    }
     let (shared, extra_args) = if subgroups {
         let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
         (
@@ -1648,6 +2100,7 @@ fn main(
     let groups = min((p.n + {block}u - 1u) / {block}u, {cap}u);
     if (group >= groups) {{ return; }}
 {gate_entry}    let zero = {ty}();
+    let one = {one};
 {body}{last_block}}}
 ",
         elem.library(),
@@ -2629,6 +3082,9 @@ impl Builtin {
             Builtin::Conv1d => BuiltinKernel::Module(conv1d_module()),
             Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
             Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
+            Builtin::Dft(pass) => wgsl(crate::dft_kernel::source(&pass)),
+            Builtin::RealStage(forward, table) => wgsl(crate::spectral::real_stage_source(forward, table)),
+            Builtin::Chirp => wgsl(crate::spectral::chirp_source()),
             Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
             Builtin::Tridiagonal { block, starts, workgroup, twisted } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup), twisted)),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
@@ -2697,6 +3153,8 @@ mod tests {
             ReduceList::new(&[ReduceOp::Max]),
             ReduceList::new(&[ReduceOp::SumSquares]).with_epilogue(sqrt),
             ReduceList::new(&[ReduceOp::Sum, ReduceOp::Min, ReduceOp::Max, ReduceOp::SumSquares]),
+            ReduceList::new(&[ReduceOp::Prod]),
+            ReduceList::new(&[ReduceOp::Sum, ReduceOp::Prod, ReduceOp::Max]),
         ];
         for subgroups in [false, true] {
             let tuning = Tuning { subgroups, ..Tuning::for_tests() };

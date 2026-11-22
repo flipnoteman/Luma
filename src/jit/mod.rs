@@ -193,7 +193,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
-use crate::builtin::{BinOp, Class, CmpOp, UnOp};
+use crate::builtin::{BinOp, Class, CmpOp, Part, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu::built::BuildCache;
@@ -309,6 +309,9 @@ pub(crate) enum ElemTy {
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
     Df32,
+    /// Complex single precision: a `vec2<f32>` `(re, im)` with the arithmetic of
+    /// `builtin::complex_library`.
+    C32,
 }
 
 impl ElemTy {
@@ -337,6 +340,8 @@ impl ElemTy {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
             Some(ElemTy::Df32)
+        } else if id == TypeId::of::<crate::complex::C32>() {
+            Some(ElemTy::C32)
         } else {
             None
         }
@@ -352,7 +357,7 @@ impl ElemTy {
             ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => "u32",
             ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => "i32",
             ElemTy::F64 => "f64",
-            ElemTy::Df32 => "vec2<f32>",
+            ElemTy::Df32 | ElemTy::C32 => "vec2<f32>",
         }
     }
 
@@ -397,7 +402,7 @@ impl ElemTy {
             ElemTy::Bool => ElemLayout::PACKED,
             ElemTy::U8 | ElemTy::I8 => ElemLayout::BYTE,
             ElemTy::U16 | ElemTy::I16 => ElemLayout::HALF,
-            ElemTy::F64 | ElemTy::Df32 => ElemLayout::plain(8),
+            ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
 
@@ -420,7 +425,7 @@ impl ElemTy {
     pub(crate) fn slots(self) -> usize {
         match self {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => 1,
-            ElemTy::Df32 => 2,
+            ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
     }
@@ -438,6 +443,7 @@ impl ElemTy {
             ElemTy::I16 => "i16",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
+            ElemTy::C32 => "C32",
         }
     }
 }
@@ -455,6 +461,10 @@ pub(crate) enum OpKind {
     Powf,
     /// `clamp(x, lo, hi)`; operands: x, lo, hi (scalars).
     Clamp,
+    /// A real quantity of a complex operand (see [`Part`]); the result is an [`ElemTy::F32`].
+    Part(Part),
+    /// `complex(re, im)`; operands: re, im (of type `F32`; the op's type); the result is a [`ElemTy::C32`].
+    Make,
     /// `cond != 0 ? a : b`; operands: condition (a `bool`, or any `u32` word: non-zero is true), a, b.
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
@@ -669,10 +679,11 @@ impl ViewMap {
 impl OpKind {
     pub(crate) fn arity(&self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Part(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
+            | OpKind::Make
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
@@ -721,6 +732,8 @@ impl Op {
     pub(crate) fn out_ty(&self) -> ElemTy {
         match self.kind {
             OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Bool,
+            OpKind::Part(_) => ElemTy::F32,
+            OpKind::Make => ElemTy::C32,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
@@ -781,11 +794,11 @@ impl Scalar {
     }
 
     /// The `f32` uniform slots (as bit patterns) this scalar occupies in a program: one for a
-    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
+    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => [self.bits as u32, 0, 0],
-            ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
+            ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
                 let a = v as f32;
@@ -1968,18 +1981,21 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 }
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
-/// no transcendental functions or `powf` (and needs a device with 64-bit shader floats), `Df32`
-/// only the operations of its library, and neither has generators; the bitwise operations only
+/// the math functions and `powf` only on the CUDA and CPU backends (and needs a device with 64-bit shader floats), `Df32`
+/// only the operations of its library, `C32` the field operations, `exp`, `sqrt`, equality and the
+/// real parts, and none of the three has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
 fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
-    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
+    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32 | ElemTy::C32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
-        OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool),
-        OpKind::Powf => op.ty != ElemTy::F64,
+        OpKind::Compare(cmp) => cmp.exists_for(op.ty),
+        OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
+        OpKind::Clamp => op.ty != ElemTy::C32,
+        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
+        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };
@@ -1988,6 +2004,16 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
     }
     if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
+    }
+    // WGSL has no `f64` math functions: they exist where the backend lowers them itself.
+    let math = match op.kind {
+        OpKind::Unary(unary) => unary.wide_math(),
+        OpKind::Binary(binary) => binary.wide_math(),
+        OpKind::Powf => true,
+        _ => false,
+    };
+    if op.ty == ElemTy::F64 && math && !matches!(ctx.backend(), luma_core::BackendKind::Cuda | luma_core::BackendKind::Cpu) {
+        return Err(LumaError::Unsupported(format!("{name} of f64 arrays needs the CUDA or the CPU backend")));
     }
     Ok(())
 }
@@ -2870,6 +2896,9 @@ pub(crate) struct JitState {
     fused: transpose::FusedCache,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
+    /// The kernels of `scan` (see [`JitState::scan_kernel`]) by what their source is made of, so
+    /// that a call does not generate and hash the source of a kernel it has run before.
+    scans: BuildCache<String, Arc<KernelCore>>,
     /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
     /// (register loops, stencils; see [`JitState::module_kernel`]).
     modules: BuildCache<String, Arc<KernelCore>>,
@@ -3018,6 +3047,7 @@ impl JitState {
             fast_kernels: Mutex::new(FxMap::default()),
             fused: transpose::FusedCache::default(),
             stencils: BuildCache::default(),
+            scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             reductions: Mutex::new(Vec::new()),
@@ -3919,6 +3949,12 @@ impl JitState {
             self.stats.built.fetch_add(1, Ordering::Relaxed);
         }
         Ok(core)
+    }
+
+    /// The scan or reduction kernel whose WGSL `source` generates is a function of `key` alone:
+    /// `source` runs, and the kernel compiles, on first use of the key.
+    pub(crate) fn scan_kernel(&self, ctx: &Context, key: String, label: &str, source: impl FnOnce() -> String) -> Result<Arc<KernelCore>> {
+        self.scans.get_or_build(&key, || self.stencil_kernel(ctx, source(), label)).map(|(core, _)| core)
     }
 
     /// The kernel built as Kernel IR by `build`, compiled on first use; `key` names what the

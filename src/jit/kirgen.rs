@@ -21,7 +21,7 @@ use luma_core::kir::{
     KirType, LocalId, ModuleBuilder, ScalarTy, Val,
 };
 
-use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, UnOp, df_library};
+use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, Part, UnOp, complex_library, df_library, special_helpers};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
 use crate::gpu::lower::{Library, finish, library};
@@ -30,7 +30,7 @@ use crate::tuning::Tuning;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::WORKGROUP;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -52,7 +52,7 @@ pub(super) fn reg(ty: ElemTy) -> KirType {
         ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => KirType::U32,
         ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => KirType::I32,
         ElemTy::F64 => KirType::Scalar(ScalarTy::F64),
-        ElemTy::Df32 => KirType::vec(ScalarTy::F32, 2),
+        ElemTy::Df32 | ElemTy::C32 => KirType::vec(ScalarTy::F32, 2),
     }
 }
 
@@ -303,7 +303,7 @@ impl<'a> Lower<'a> {
                     let wide = |j: u32| fb.convert(self.scalar(fb, k + j), KirType::Scalar(ScalarTy::F64));
                     (wide(0) + wide(1)) + wide(2)
                 }
-                ElemTy::Df32 => fb.compose(reg(ElemTy::Df32), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
+                ElemTy::Df32 | ElemTy::C32 => fb.compose(reg(ty), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
                 ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => self.scalar(fb, k),
             },
             Ref::Tmp(k) => match f.t(k as usize) {
@@ -357,6 +357,19 @@ impl<'a> Lower<'a> {
             };
             return self.call(fb, name, &[x]);
         }
+        if ty == ElemTy::C32 {
+            return match op {
+                UnOp::Neg => fb.neg(x),
+                UnOp::Id => x,
+                UnOp::Conj => {
+                    let (re, im) = self.parts(fb, x);
+                    fb.compose(reg(ElemTy::C32), &[re, fb.neg(im)])
+                }
+                UnOp::Sqrt => self.call(fb, "c_sqrt", &[x]),
+                UnOp::Exp => self.call(fb, "c_exp", &[x]),
+                other => self.fail(fb, format!("{other:?} of a C32")),
+            };
+        }
         if ty == ElemTy::Bool {
             return match op {
                 UnOp::Id => x,
@@ -376,8 +389,37 @@ impl<'a> Lower<'a> {
             }
         }
         let float = |op: IrUnOp| fb.unary(op, x);
+        let wide = ty == ElemTy::F64;
+        // The functions without a WGSL built-in: `f32` ones are the helpers of the library, `f64`
+        // ones the operation itself (CUDA and the CPU lower it).
+        let special = |name: &str, op: IrUnOp| if wide { fb.unary(op, x) } else { self.call(fb, name, &[x]) };
         match op {
+            UnOp::Asin => float(IrUnOp::Asin),
+            UnOp::Acos => float(IrUnOp::Acos),
+            UnOp::Atan => float(IrUnOp::Atan),
+            UnOp::Sinh => float(IrUnOp::Sinh),
+            UnOp::Cosh => float(IrUnOp::Cosh),
+            UnOp::Asinh => float(IrUnOp::Asinh),
+            UnOp::Acosh => float(IrUnOp::Acosh),
+            UnOp::Atanh => float(IrUnOp::Atanh),
+            UnOp::Exp2 => float(IrUnOp::Exp2),
+            UnOp::Log2 => float(IrUnOp::Log2),
+            UnOp::Rsqrt => float(IrUnOp::InverseSqrt),
+            UnOp::Log10 if wide => float(IrUnOp::Log10),
+            UnOp::Log10 => fb.unary(IrUnOp::Log2, x) * fb.lit_f32(std::f32::consts::LOG10_2),
+            UnOp::Cbrt => special("luma_cbrt", IrUnOp::Cbrt),
+            UnOp::Erf => special("luma_erf", IrUnOp::Erf),
+            UnOp::Erfc => special("luma_erfc", IrUnOp::Erfc),
+            UnOp::Lgamma => special("luma_lgamma", IrUnOp::Lgamma),
+            UnOp::Tgamma => special("luma_tgamma", IrUnOp::Tgamma),
+            UnOp::Sigmoid => {
+                let one = if wide { fb.lit_f64(1.0) } else { fb.lit_f32(1.0) };
+                one / (one + fb.unary(IrUnOp::Exp, fb.neg(x)))
+            }
+            UnOp::Log1p if wide => float(IrUnOp::Log1p),
+            UnOp::Expm1 if wide => float(IrUnOp::Expm1),
             UnOp::Id => x,
+            UnOp::Conj => self.fail(fb, "conj of a real number"),
             UnOp::BitNot => fb.bit_not(x),
             UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0) => x,
             UnOp::Shl(k) => fb.shl(x, lu(fb, u32::from(k))),
@@ -404,7 +446,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real and imaginary part of the complex value `z`.
+    fn parts(&self, fb: &FnBuilder<'_>, z: Val) -> (Val, Val) {
+        (fb.field(z, 0, KirType::F32), fb.field(z, 1, KirType::F32))
+    }
+
     fn binary(&self, fb: &mut FnBuilder<'_>, op: BinOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let (a, b) = (self.parts(fb, x), self.parts(fb, y));
+            let c32 = reg(ElemTy::C32);
+            return match op {
+                BinOp::Add => fb.compose(c32, &[a.0 + b.0, a.1 + b.1]),
+                BinOp::Sub => fb.compose(c32, &[a.0 - b.0, a.1 - b.1]),
+                BinOp::Mul => fb.compose(c32, &[a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0]),
+                BinOp::Div => self.call(fb, "c_div", &[x, y]),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             return match op {
                 BinOp::Add => self.call(fb, "df_add", &[x, y]),
@@ -433,7 +491,15 @@ impl<'a> Lower<'a> {
             BinOp::Min => fb.binary(IrBinOp::Min, x, y),
             BinOp::Max => fb.binary(IrBinOp::Max, x, y),
             BinOp::Atan2 => fb.binary(IrBinOp::Atan2, x, y),
+            BinOp::Hypot if ty == ElemTy::F64 => self.call(fb, "luma_hypotd", &[x, y]),
             BinOp::Hypot => self.call(fb, "luma_hypot", &[x, y]),
+            BinOp::Mod => match ty {
+                ElemTy::F32 => self.call(fb, "luma_modf", &[x, y]),
+                ElemTy::F64 => self.call(fb, "luma_modd", &[x, y]),
+                ElemTy::I32 => self.call(fb, "luma_modi", &[x, y]),
+                _ => x % y,
+            },
+            BinOp::Copysign if ty == ElemTy::F64 => self.call(fb, "luma_copysignd", &[x, y]),
             BinOp::Copysign => {
                 let (xb, yb) = (fb.bitcast(x, KirType::U32), fb.bitcast(y, KirType::U32));
                 let bits = fb.bit_or(fb.bit_and(xb, lu(fb, 0x7fff_ffff)), fb.bit_and(yb, lu(fb, 0x8000_0000)));
@@ -453,6 +519,14 @@ impl<'a> Lower<'a> {
 
     /// The comparison as a `bool`.
     fn compare_cond(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let equal = self.call(fb, "c_eq", &[x, y]);
+            return match op {
+                CmpOp::Eq => equal,
+                CmpOp::Ne => fb.unary(IrUnOp::Not, equal),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             let cond = match op {
                 CmpOp::Lt => self.call(fb, "df_lt", &[x, y]),
@@ -561,6 +635,7 @@ impl<'a> Lower<'a> {
             (ElemTy::Bool, ElemTy::U32) => x,
             (ElemTy::Bool, ElemTy::F64) => fb.convert(x, f64t),
             (ElemTy::Bool, ElemTy::Df32) => fb.compose(df, &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
+            (ElemTy::Bool, ElemTy::C32) => fb.compose(reg(ElemTy::C32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ if from == to => x,
             _ if from.is_small() || to.is_small() => self.small_cast(fb, from, to, x),
             _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
@@ -633,6 +708,7 @@ impl<'a> Lower<'a> {
             ElemTy::U8 | ElemTy::U16 => self.narrow(fb, ty, coord),
             ElemTy::I8 | ElemTy::I16 => self.narrow(fb, ty, fb.bitcast(coord, KirType::I32)),
             ElemTy::Bool => self.fail(fb, "a generator of bools"),
+            ElemTy::C32 => self.fail(fb, "a generator of complex numbers"),
         }
     }
 
@@ -676,6 +752,18 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real quantity `part` of the complex value `x`.
+    fn part(&self, fb: &mut FnBuilder<'_>, part: Part, x: Val) -> Val {
+        let (re, im) = self.parts(fb, x);
+        match part {
+            Part::Real => re,
+            Part::Imag => im,
+            Part::Abs => self.call(fb, "c_abs", &[x]),
+            Part::Arg => fb.binary(IrBinOp::Atan2, im, re),
+            Part::NormSqr => re * re + im * im,
+        }
+    }
+
     /// The operation `op` (anything but a shift) on the operands `x`, `y` and `z`; `index` is the
     /// element it is computed at. `None` for a shift.
     pub(super) fn operation(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
@@ -693,8 +781,11 @@ impl<'a> Lower<'a> {
             OpKind::Binary(b) => self.binary(fb, b, ty, x, y),
             OpKind::Compare(c) => self.compare(fb, c, ty, x, y),
             OpKind::Classify(class) => self.classify(fb, class, ty, x),
+            OpKind::Part(part) => self.part(fb, part, x),
+            OpKind::Make => fb.compose(reg(ElemTy::C32), &[x, y]),
             OpKind::Powf if ty == ElemTy::Df32 => self.call(fb, "df_pow", &[x, y]),
-            OpKind::Powf => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf if ty == ElemTy::F64 => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf => self.call(fb, "luma_powf", &[x, y]),
             OpKind::Clamp if ty == ElemTy::Df32 => {
                 let above = self.call(fb, "df_max", &[x, y]);
                 self.call(fb, "df_min", &[above, z])
@@ -1820,6 +1911,9 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
             text.push_str(DF_MATH_LIBRARY);
         }
     }
+    if instrs().any(calls_complex_library) {
+        text.push_str(complex_library());
+    }
     text.push_str(&generator_helpers(programs.iter().copied()));
     if edges {
         text.push_str(EDGE_HELPERS);
@@ -1836,6 +1930,17 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
     if instrs().any(|instr| matches!(instr.op.kind, OpKind::Binary(BinOp::Hypot)) && instr.op.ty == ElemTy::F32) {
         text.push_str(&format!("fn luma_hypot(x: f32, y: f32) -> f32 {{ return {}; }}\n", BinOp::Hypot.expr()));
     }
+    // The expressions of the operations name the helpers they call (`luma_erf(x)`); `f64` ones
+    // are built in place.
+    text.push_str(&special_helpers(|needle| {
+        needle != "luma_ir_"
+            && instrs().any(|instr| match instr.op.kind {
+                OpKind::Powf => needle == "luma_powf(" && instr.op.ty == ElemTy::F32,
+                OpKind::Unary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                OpKind::Binary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                _ => false,
+            })
+    }));
     if text.is_empty() { Ok(None) } else { library(&text).map(Some) }
 }
 
@@ -1887,6 +1992,13 @@ struct Build<'a> {
     shared_w: Vec<Option<u32>>,
 }
 
+/// Elements every invocation of the private scatter loads before it adds any of them.
+///
+/// Measured on an RTX 3090 (histogram of 256 bins of 10M `f32`, 0.0632 ms with one element): 2
+/// elements 0.059, 4 0.058, 8 0.053 with the 1024 workgroups of the time, and 1 to 16 the same
+/// 0.0502 at the workgroups of `launch::PRIVATE_GROUPS`; 16 was slower where all the elements
+/// fall in one bin (0.083 against 0.077 ms).
+const PRIVATE_UNROLL: u32 = 4;
 /// What a private accumulator starts as for `op` on elements of type `ty`, as bits (the merge
 /// skips the elements still holding it).
 fn seed_bits(ty: ElemTy, op: AtomicOp) -> u32 {
@@ -2431,14 +2543,27 @@ impl<'a> Build<'a> {
         });
         fb.barrier(BarrierScope::Workgroup);
         let (start, size, step) = (group * lu(fb, wg) + lx, fb.grid_size(0), nx * ny * lu(fb, wg));
-        fb.for_range("i", start, size, step, |b, i| {
-            let index = self.global(b, i);
-            let prog = self.program(b, i, index);
-            let j = self.value(b, &prog, slot as usize);
-            let value = self.value(b, &prog, stored as usize);
-            let j = b.let_val("j", j);
-            let inside = b.lt(j, lu(b, len));
-            b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+        let last = size - lu(fb, 1);
+        let unroll = if scalar == ScalarTy::F32 { 1 } else { PRIVATE_UNROLL };
+        fb.for_range("i", start, size, step * lu(fb, unroll), |b, i| {
+            // The loads of all the elements come before the first atomic; elements past the end
+            // read the last one (no branch around the loads) and add nothing.
+            let mut elements = Vec::with_capacity(unroll as usize);
+            for k in 0..unroll {
+                let e = if k == 0 { i } else { b.let_val("e", i + step * lu(b, k)) };
+                let at = if k == 0 { e } else { b.let_val("ec", b.select(b.lt(e, size), e, last)) };
+                let index = self.global(b, at);
+                let prog = self.program(b, at, index);
+                let j = self.value(b, &prog, slot as usize);
+                let value = self.value(b, &prog, stored as usize);
+                let j = b.let_val("j", j);
+                let value = b.let_val("v", value);
+                elements.push((e, j, value));
+            }
+            for (e, j, value) in elements {
+                let inside = b.and(b.lt(e, size), b.lt(j, lu(b, len)));
+                b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+            }
         });
         fb.barrier(BarrierScope::Workgroup);
         let target = self.env.outs.first().copied().unwrap_or(0);

@@ -239,6 +239,62 @@ impl CpuBackend {
     }
 }
 
+/// Revision of the code this crate generates and the tables that code calls through: a hash of
+/// the sources of the code generator, the ABI (the layout of the math table the machine code
+/// indexes), the packet math routines, the planner and the runtime, so that a blob written by a
+/// build that differs in any of them is never loaded.
+fn code_revision() -> u64 {
+    static REVISION: OnceLock<u64> = OnceLock::new();
+    *REVISION.get_or_init(|| {
+        let sources = [
+            include_str!("codegen.rs"),
+            include_str!("abi.rs"),
+            include_str!("vecmath.rs"),
+            include_str!("fission.rs"),
+            include_str!("exec.rs"),
+            include_str!("gemm.rs"),
+            include_str!("solve.rs"),
+            include_str!("backend.rs"),
+        ];
+        cache::source_revision(&sources)
+    })
+}
+
+/// The file name of the compiled blob of the optimized kernel `kir` (its text) under `revision`.
+fn cache_stem(kir: &str, used: Option<&[bool]>, zero_workgroup_memory: bool, revision: u64) -> String {
+    let identity = format!(
+        "{kir}\n{used:?}\n{zero_workgroup_memory}\n{}\n{}\n{revision:016x}",
+        crate::codegen::host_isa_key(),
+        crate::codegen::REVISION
+    );
+    format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// A blob cached by one revision of the generated code is not found by another.
+    #[test]
+    fn a_blob_of_another_code_revision_is_not_used() {
+        let dir = std::env::temp_dir().join(format!("luma-cpu-revision-test-{}", std::process::id()));
+        let disk = DiskCache::open(Some(dir.clone()), "test".into());
+        let old = cache_stem("kernel", None, false, 1);
+        let new = cache_stem("kernel", None, false, 2);
+        assert_ne!(old, new);
+        assert!(disk.store_blob(&old, cache::CPU_MAGIC, b"machine code"));
+        assert_eq!(disk.load_blob(&old, cache::CPU_MAGIC).as_deref(), Some(&b"machine code"[..]));
+        assert!(disk.load_blob(&new, cache::CPU_MAGIC).is_none());
+        // The same kernel under the same revision is the same file; a different kernel is not.
+        assert_eq!(old, cache_stem("kernel", None, false, 1));
+        assert_ne!(old, cache_stem("other", None, false, 1));
+        // The revision of this build is stable within the process and depends on the sources.
+        assert_eq!(code_revision(), code_revision());
+        assert_ne!(cache::source_revision(&["a"]), cache::source_revision(&["b"]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// Plans, compiles (or loads from the disk cache) the kernel of a checked `module`; runs on the
 /// calling thread, which may be a compile worker.
 fn compile_native(
@@ -262,13 +318,7 @@ fn compile_native(
             plan.shared_bytes, max_shared_bytes
         )));
     }
-    let identity = format!(
-        "{optimized:?}\n{used:?}\n{}\n{}\n{}",
-        trust.zero_workgroup_memory(),
-        crate::codegen::host_isa_key(),
-        crate::codegen::REVISION
-    );
-    let stem = format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()));
+    let stem = cache_stem(&format!("{optimized:?}"), used, trust.zero_workgroup_memory(), code_revision());
     if let Some(bytes) = disk.load_blob(&stem, cache::CPU_MAGIC)
         && let Ok(blob) = ExecBlob::new(&bytes)
     {

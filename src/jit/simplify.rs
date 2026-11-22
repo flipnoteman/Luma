@@ -13,7 +13,7 @@
 //! is what the hazard analysis walks, and a copy that read `x` directly would not see that the
 //! expression below it has to be evaluated before the write.
 
-use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Scalar, Src, UnOp};
+use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
 pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
@@ -21,14 +21,14 @@ pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
 }
 
 fn is_float(ty: ElemTy) -> bool {
-    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32)
+    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32)
 }
 
 /// The bit pattern of the constant `value` as a scalar of type `ty` (`Df32`: `hi` is `value`,
-/// `lo` is 0).
+/// `lo` is 0; `C32`: the real part is `value`, the imaginary part 0).
 fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
-        ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
+        ElemTy::F32 | ElemTy::Df32 | ElemTy::C32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
         ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => u64::from(value as u32),
         ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => u64::from(value as i32 as u32),
@@ -105,6 +105,18 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, c] = args;
     let ty = op.ty;
     match op.kind {
+        // Not one identity of a real number holds bit for bit for a complex one: `z * 1` has
+        // `inf * 0` in it, and `z + (-0)` turns a `-0` imaginary part into `+0`.
+        OpKind::Binary(_) if ty == ElemTy::C32 => None,
+        OpKind::Part(Part::Real | Part::Imag) => {
+            let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Make)?;
+            identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))])
+        }
+        OpKind::Make => {
+            let (_, real) = inner(a, |inside| inside.kind == OpKind::Part(Part::Real))?;
+            let (_, imag) = inner(b, |inside| inside.kind == OpKind::Part(Part::Imag))?;
+            if same(&real[0], &imag[0]) { identity(op, &real[0]) } else { None }
+        }
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             let float = is_float(ty);
@@ -157,14 +169,14 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Unary(un) => {
             if !matches!(
                 un,
-                UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
+                UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
             ) {
                 return None;
             }
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) | (UnOp::Conj, UnOp::Conj) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
                 (UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round, UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round) => {
                     unary(inner_un, ty, &iargs[0])
@@ -187,7 +199,7 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                 None
             }
         }
-        OpKind::Compare(cmp) if same(a, b) => match cmp {
+        OpKind::Compare(cmp) if same(a, b) && cmp.exists_for(ty) => match cmp {
             CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
             CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
             CmpOp::Ne if !is_float(ty) => constant(op, 0.0),
@@ -527,6 +539,46 @@ mod tests {
         assert!(same(&operands[0], &args(1, &f, &g)[1]));
         let (_, operands) = rewrite(&op, &args(0, &f, &g), false).unwrap();
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
+    }
+
+    /// The parts of a complex number put together are that number, the real part of a made number
+    /// is its first part, `conj conj` is the identity; a real number in a complex product is not
+    /// a rule (`z * (1 + 0i)` is not `z`: `inf * 0`).
+    #[test]
+    fn simplify_complex_rules() {
+        use crate::complex::C32;
+        let ctx = context(false);
+        let data = [C32::new(f32::INFINITY, 1.0), C32::new(-0.0, 2.0), C32::new(f32::NAN, -3.0), C32::new(1.5, f32::NEG_INFINITY)];
+        type ComplexCase = (&'static str, bool, fn(&Array<C32>) -> Vec<C32>);
+        let cases: [ComplexCase; 4] = [
+            ("make of the parts", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap()
+            }),
+            ("real of make", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).conj().to_vec().unwrap()
+            }),
+            ("conj conj", true, |w| w.conj().conj().to_vec().unwrap()),
+            ("times one", false, |w| (&w.conj() * C32::ONE).to_vec().unwrap()),
+        ];
+        for (name, shorter, case) in cases {
+            let mut results = Vec::new();
+            for simplify in [false, true] {
+                ctx.jit().set_simplify(simplify);
+                let z = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+                let got = case(&z);
+                let bits: Vec<(u32, u32)> = got.iter().map(|c| (if c.re.is_nan() { 0 } else { c.re.to_bits() }, if c.im.is_nan() { 0 } else { c.im.to_bits() })).collect();
+                results.push((bits, ctx.jit().last_program_len()));
+            }
+            ctx.jit().set_simplify(true);
+            assert_eq!(results[0].0, results[1].0, "{name}: the bits");
+            if shorter {
+                assert!(results[1].1 < results[0].1, "{name}: {} instructions against {}", results[1].1, results[0].1);
+            } else {
+                assert_eq!(results[1].1, results[0].1, "{name}: not a rule");
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::tuning::Coarsen;
 
 use super::cost::{op_weight, CostModel};
 use super::program::{FusedKey, Tail};
-use super::{ElemTy, OpKind, ShiftKind};
+use super::{Edge, ElemTy, OpKind, ShiftKind};
 
 /// The most elements one invocation computes.
 pub(crate) const MAX_COARSEN: u8 = 8;
@@ -76,6 +76,9 @@ struct Features {
     wide_ops: usize,
     /// Gathers (`take`): the load of the element waits for the load of its index.
     gathers: usize,
+    /// Reads through a wrapping view (`tile`, a wrapping pad): the source is read again and again, and
+    /// the load waits for the index math (a division and a remainder per axis).
+    wraps: usize,
     /// What one element costs in `f32` operations (see `cost::op_weight`): the index math of views
     /// and gathers, the arithmetic and the casts of the main program and of the sub-programs.
     weight: f64,
@@ -92,6 +95,8 @@ impl Features {
                 OpKind::Unary(op) if op != UnOp::Id && instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
                 OpKind::Binary(_) | OpKind::Clamp | OpKind::Powf if instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
                 OpKind::Shift(ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => features.gathers += 1,
+                OpKind::Shift(ShiftKind::View { edge: Edge::Wrap, .. }) => features.wraps += 1,
+                OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge == Edge::Wrap => features.wraps += 1,
                 _ => {}
             }
         }
@@ -130,7 +135,7 @@ fn peak_live(key: &FusedKey) -> usize {
 fn pick(features: &Features, waves: f64, max_live: usize) -> u8 {
     let wanted: u8 = if features.wide_ops >= WIDE_OPS && waves >= WAITING_WAVES {
         8
-    } else if features.gathers >= GATHERS && waves >= WAITING_WAVES {
+    } else if (features.gathers >= GATHERS || features.wraps >= 1) && waves >= WAITING_WAVES {
         4
     } else if features.weight <= LIGHT_WEIGHT && waves < BANDWIDTH_WAVES {
         2
@@ -306,7 +311,7 @@ mod tests {
 
     #[test]
     fn the_planner_picks_by_what_the_kernel_waits_for() {
-        let features = |wide_ops, gathers, weight, live| Features { wide_ops, gathers, weight, live };
+        let features = |wide_ops, gathers, weight, live| Features { wide_ops, gathers, wraps: 0, weight, live };
         assert_eq!(pick(&features(0, 0, 100.0, 4), 200.0, 96), 1, "a heavy kernel with nothing to wait for");
         assert_eq!(pick(&features(0, 0, 8.0, 4), 200.0, 96), 1, "a streaming kernel on a long grid is bandwidth bound");
         assert_eq!(pick(&features(0, 0, 8.0, 4), 8.0, 96), 2, "a light kernel on a short grid");
@@ -316,6 +321,8 @@ mod tests {
         assert_eq!(pick(&features(16, 0, 600.0, 4), 8.0, 96), 1, "on a short grid");
         assert_eq!(pick(&features(0, 4, 100.0, 4), 200.0, 96), 4, "gathers");
         assert_eq!(pick(&features(16, 4, 600.0, 4), 200.0, 96), 8);
+        let wrapping = Features { wraps: 1, ..features(0, 0, 8.0, 4) };
+        assert_eq!(pick(&wrapping, 200.0, 96), 4, "a wrapping view reads the source again and again");
         assert_eq!(pick(&features(16, 0, 600.0, 30), 200.0, 96), 2, "registers for no more copies than 96 values allow");
         assert_eq!(pick(&features(16, 0, 600.0, 100), 200.0, 96), 1);
     }

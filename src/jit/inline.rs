@@ -270,6 +270,11 @@ fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
 /// `if`/`else`.
 const BRANCH_GAIN: f64 = 8.0;
 
+/// What not reading an input saves, in the same units: a read from memory costs far more than an
+/// arithmetic operation in a kernel that is bound by memory, which the weights of arithmetic do
+/// not show.
+const INPUT_READ: f64 = 24.0;
+
 /// The result of [`branches`].
 struct Branches {
     region: Vec<Region>,
@@ -362,7 +367,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
         .map(|flat| {
             matches!(flat.op.kind, OpKind::Select)
                 && matches!(flat.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
-                && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
+                && (matches!(flat.args[1], Ref::Tmp(_) | Ref::Input(_)) || matches!(flat.args[2], Ref::Tmp(_) | Ref::Input(_)))
         })
         .collect();
     if !branch.iter().any(|&b| b) {
@@ -565,6 +570,19 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                     saved[s] += weight[x] * chance[x] * (1.0 - here) / here;
                 }
                 r = parent(&region, r);
+            }
+        }
+        // An operand that is an input is read inside its branch: the elements that do not take it
+        // do not read it (a triangle of a matrix reads half of it).
+        for (m, flat) in flats.iter().enumerate() {
+            if !branch[m] {
+                continue;
+            }
+            let at = group[m] as usize;
+            for (slot, here) in [(1, share[m]), (2, 1.0 - share[m])] {
+                if matches!(flat.args[slot], Ref::Input(_)) {
+                    saved[at] += INPUT_READ * chance[m] * (1.0 - here);
+                }
             }
         }
         let mut dropped = false;

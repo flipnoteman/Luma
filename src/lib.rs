@@ -61,6 +61,8 @@ mod guide {
     pub mod loops {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
+    #[doc = include_str!("../guide/src/complex.md")]
+    pub mod complex {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
     #[doc = include_str!("../guide/src/compact.md")]
@@ -87,6 +89,7 @@ extern crate self as luma;
 mod arg;
 mod array;
 mod builtin;
+mod bykey;
 mod context;
 mod conv;
 mod cyclic;
@@ -101,6 +104,8 @@ mod factorize;
 mod filter;
 mod generate;
 mod gpu;
+mod complex;
+mod dft_kernel;
 mod gpu_type;
 mod group;
 mod host;
@@ -122,9 +127,14 @@ mod search;
 mod segments;
 mod segsort;
 mod small;
+mod setmerge;
+mod setops;
 mod scalar;
 mod shape;
 mod sort;
+mod structure;
+mod stats;
+mod spectral;
 mod tuning;
 mod until;
 mod view;
@@ -136,6 +146,8 @@ pub use gpu::pager::MemoryStats;
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
+pub use complex::C32;
+pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
@@ -154,6 +166,7 @@ pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
+pub use stats::{Bias, Norm};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 

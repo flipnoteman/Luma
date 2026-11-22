@@ -291,6 +291,7 @@ pub fn reductions(b: &mut Bench) {
             },
         );
     });
+    crate::stats::reductions_extra(b);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -462,7 +463,7 @@ pub fn batched(b: &mut Bench) {
 pub fn fft(b: &mut Bench) {
     b.guarded("fft", |b| {
         let ctx = b.ctx.clone();
-        // luma has no public FFT, only FFT convolution (`conv1d_fft`, built on its own FFT passes):
+        // FFT convolution (`conv1d_fft`, built on luma's convolution FFT passes):
         // compare that with ArrayFire's `fft_convolve1` (cuFFT), full linear convolution in both.
         for (n, k) in [(1_000_000usize, 4096usize), (16_000_000, 4096), (1_000_000, 1_000_000)] {
             let x = uniform(n, 31, -1.0, 1.0);
@@ -496,26 +497,120 @@ pub fn fft(b: &mut Bench) {
                 },
             );
         }
-        // ArrayFire alone: raw complex transforms, for reference (no luma API to compare with).
-        let cplx = |n: usize, seed: u64| -> Vec<af::c32> {
+        // Complex and real transforms: luma's own FFT (`fft`, `ifft`, `rfft`, `fft2`, `fft3`) against cuFFT through ArrayFire.
+        let cplx = |n: usize, seed: u64| -> Vec<(f32, f32)> {
             let (re, im) = (uniform(n, seed, -1.0, 1.0), uniform(n, seed + 1, -1.0, 1.0));
-            re.iter().zip(&im).map(|(&r, &i)| af::c32::new(r, i)).collect()
+            re.iter().zip(&im).map(|(&r, &i)| (r, i)).collect()
         };
-        for n in [1_000_000usize, 16_000_000] {
+        let flat_l = |v: &[luma::C32]| -> Vec<f32> { v.iter().flat_map(|c| [c.re, c.im]).collect() };
+        let flat_a = |v: &[af::c32]| -> Vec<f32> { v.iter().flat_map(|c| [c.re, c.im]).collect() };
+        let agree = |l: &[luma::C32], a: &[af::c32]| {
+            let (l, a) = (flat_l(l), flat_a(a));
+            compare(&l, &a, 0.0, 5e-5 * rms(&a))
+        };
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
             let c = cplx(n, 33);
-            let ca = afx::arr(&c, &[n as u64]);
-            b.run_one("6 FFT 1D complex c2c (ArrayFire only)", &human(n), None, Some(&mut || {
-                af::fft(&ca, 1.0, 0).eval();
-                afx::sync();
-            }), "luma has no FFT API: no luma row");
+            let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+            let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+            let (xl, xa) = (lumax::arr(&ctx, &lc, n), afx::arr(&ac, &[n as u64]));
+            let v = agree(&lumax::host(&xl.fft()), &afx::host(&af::fft(&xa, 1.0, 0)));
+            b.run(
+                "6 FFT 1D complex c2c (forward)",
+                &human(n),
+                v,
+                "luma fft vs AF fft (cuFFT)",
+                &mut || {
+                    xl.fft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::fft(&xa, 1.0, 0).eval();
+                    afx::sync();
+                },
+            );
+            let v = agree(&lumax::host(&xl.ifft()), &afx::host(&af::ifft(&xa, 1.0 / n as f64, 0)));
+            b.run(
+                "6 FFT 1D complex c2c (inverse)",
+                &human(n),
+                v,
+                "luma ifft vs AF ifft (cuFFT)",
+                &mut || {
+                    xl.ifft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::ifft(&xa, 1.0 / n as f64, 0).eval();
+                    afx::sync();
+                },
+            );
+        }
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
+            let r = uniform(n, 37, -1.0, 1.0);
+            let (xl, xa) = (lumax::arr(&ctx, &r, n), afx::arr(&r, &[n as u64]));
+            let v = agree(&lumax::host(&xl.rfft()), &afx::host(&af::fft_r2c(&xa, 1.0, 0)));
+            b.run(
+                "6 FFT 1D real-to-complex",
+                &human(n),
+                v,
+                "luma rfft vs AF fft_r2c (cuFFT R2C)",
+                &mut || {
+                    xl.rfft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::fft_r2c(&xa, 1.0, 0).eval();
+                    afx::sync();
+                },
+            );
         }
         let n = 2048usize;
         let c = cplx(n * n, 35);
-        let ca = afx::arr(&c, &[n as u64, n as u64]);
-        b.run_one("6 FFT 2D complex c2c (ArrayFire only)", "2048 x 2048", None, Some(&mut || {
-            af::fft2(&ca, 1.0, 0, 0).eval();
-            afx::sync();
-        }), "luma has no FFT API (no 2D convolution either): no luma row");
+        let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+        let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+        let (xl, xa) = (lumax::arr(&ctx, &lc, [n, n]), afx::arr(&ac, &[n as u64, n as u64]));
+        let v = agree(&lumax::host(&xl.fft2()), &afx::host(&af::fft2(&xa, 1.0, 0, 0)));
+        b.run("6 FFT 2D complex c2c (forward)", "2048 x 2048", v, "luma fft2 vs AF fft2", &mut || { xl.fft2().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::fft2(&xa, 1.0, 0, 0).eval(); afx::sync(); });
+        let v = agree(&lumax::host(&xl.ifft2()), &afx::host(&af::ifft2(&xa, 1.0 / (n * n) as f64, 0, 0)));
+        b.run("6 FFT 2D complex c2c (inverse)", "2048 x 2048", v, "luma ifft2 vs AF ifft2", &mut || { xl.ifft2().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::ifft2(&xa, 1.0 / (n * n) as f64, 0, 0).eval(); afx::sync(); });
+        let n = 256usize;
+        let c = cplx(n * n * n, 39);
+        let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+        let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+        let (xl, xa) = (lumax::arr(&ctx, &lc, [n, n, n]), afx::arr(&ac, &[n as u64, n as u64, n as u64]));
+        let v = agree(&lumax::host(&xl.fft3()), &afx::host(&af::fft3(&xa, 1.0, 0, 0, 0)));
+        b.run("6 FFT 3D complex c2c (forward)", "256^3", v, "luma fft3 vs AF fft3", &mut || { xl.fft3().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::fft3(&xa, 1.0, 0, 0, 0).eval(); afx::sync(); });
+        // FFT convolution in two and three dimensions (same-size output, odd kernels).
+        for (sd, kd) in [([2048usize, 2048, 1], [15usize, 15, 1]), ([4096, 4096, 1], [31, 31, 1]), ([256, 256, 256], [9, 9, 9])] {
+            let three = sd[2] > 1;
+            let (sl, kl) = (sd.iter().product::<usize>(), kd.iter().product::<usize>());
+            let x = uniform(sl, 51, -1.0, 1.0);
+            let kern = uniform(kl, 52, -1.0, 1.0);
+            let ldims: Vec<usize> = if three { sd.to_vec() } else { sd[..2].to_vec() };
+            let kdims: Vec<usize> = if three { kd.to_vec() } else { kd[..2].to_vec() };
+            let shape = |d: &[usize]| luma::Shape::from([d[0], d[1], *d.get(2).unwrap_or(&1), 1]);
+            let (xl, kl_) = (lumax::arr(&ctx, &x, shape(&ldims)), lumax::arr(&ctx, &kern, shape(&kdims)));
+            let adims = |d: &[usize]| d.iter().map(|&v| v as u64).collect::<Vec<_>>();
+            let (xa, ka) = (afx::arr(&x, &adims(&ldims)), afx::arr(&kern, &adims(&kdims)));
+            let luma_conv = |x: &luma::Array<f32>, k: &luma::Array<f32>| if three { x.fft_convolve3(k, luma::ConvMode::Same) } else { x.fft_convolve2(k, luma::ConvMode::Same) };
+            let af_conv = |x: &af::Array<f32>, k: &af::Array<f32>| if three { af::fft_convolve3(x, k, af::ConvMode::DEFAULT) } else { af::fft_convolve2(x, k, af::ConvMode::DEFAULT) };
+            let (lo, ao) = (lumax::host(&luma_conv(&xl, &kl_)), afx::host(&af_conv(&xa, &ka)));
+            let v = compare(&lo, &ao, 0.0, 2e-4 * rms(&ao));
+            let size = format!("{} (x) {}", ldims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"), kdims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"));
+            b.run(
+                if three { "6 FFT convolution 3D (real)" } else { "6 FFT convolution 2D (real)" },
+                &size,
+                v,
+                "luma fft_convolve (same) vs AF fft_convolve (cuFFT)",
+                &mut || {
+                    luma_conv(&xl, &kl_).eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af_conv(&xa, &ka).eval();
+                    afx::sync();
+                },
+            );
+        }
     });
 }
 
@@ -599,10 +694,7 @@ pub fn sorts(b: &mut Bench) {
                 // sort_by_key: values are the original positions (exact in f32 below 2^24).
                 let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
                 let (vl, va) = (lumax::arr(&ctx, &vals, n), afx::arr(&vals, &[n as u64]));
-                let by_key_l = || {
-                    let idx = xl.argsort();
-                    (xl.take(&idx), vl.take(&idx))
-                };
+                let by_key_l = || xl.sort_by_key(&vl);
                 let (lk, lv) = by_key_l();
                 let (ak, av) = af::sort_by_key(&xa, &va, 0, true);
                 let (lk, lv, ak, av) = (lumax::host(&lk), lumax::host(&lv), afx::host(&ak), afx::host(&av));
@@ -614,7 +706,7 @@ pub fn sorts(b: &mut Bench) {
                     "7 sort_by_key f32 keys, f32 values",
                     &human(n),
                     v,
-                    "luma has no sort_by_key: argsort + two takes (gathers); AF sort_by_key",
+                    "luma sort_by_key (keys and values move together in the radix passes) vs AF sort_by_key",
                     &mut || {
                         let (k, v) = by_key_l();
                         luma::eval_all(&[&k, &v]).unwrap();
@@ -1089,5 +1181,195 @@ pub fn filters(b: &mut Bench) {
                 afx::sync();
             },
         );
+    });
+}
+
+// ------------------------------------------------------------------------------------------
+// Data movement and generators: tile, diag, identity, lower / upper, iota, replace, diff1 / diff2
+// ------------------------------------------------------------------------------------------
+
+/// One row of the `data` group: `luma_op` and `af_op` build the result from inputs that stay on
+/// the device; both are evaluated in full and synchronised every call. `want` is the host
+/// reference (checked against both sides, which must also agree with each other exactly).
+fn data_row(b: &mut Bench, name: &str, size: &str, note: &str, want: &[f32], luma_op: &dyn Fn() -> L, af_op: &dyn Fn() -> A) {
+    let ctx = b.ctx.clone();
+    let (lo, ao) = (lumax::host(&luma_op()), afx::host(&af_op()));
+    let v = exact(&lo, &ao).and(exact(&lo, want));
+    drop((lo, ao));
+    b.run(
+        name,
+        size,
+        v,
+        note,
+        &mut || {
+            luma_op().eval().unwrap();
+            ctx.sync().unwrap();
+        },
+        &mut || {
+            af_op().eval();
+            afx::sync();
+        },
+    );
+}
+
+pub fn data_ops(b: &mut Bench) {
+    b.guarded("data", |b| {
+        let ctx = b.ctx.clone();
+        let side = 4096usize;
+        let n = side * side;
+        let side64 = side as u64;
+
+        // tile: a [1024, 1024] matrix repeated 4 x 4, and a 1000-vector repeated 16384 times.
+        let src = uniform(1024 * 1024, 301, -1.0, 1.0);
+        let (sl, sa) = (lumax::arr(&ctx, &src, [1024, 1024]), afx::arr(&src, &[1024, 1024]));
+        let want: Vec<f32> = (0..n).map(|i| src[(i % side) % 1024 + 1024 * ((i / side) % 1024)]).collect();
+        data_row(b, "20 tile (4x4 of a matrix)", "[1024,1024] -> [4096,4096]", "", &want, &|| sl.tile([4, 4]), &|| af::tile(&sa, afx::dims(&[4, 4])));
+        drop((sl, sa, src, want));
+        let vec = uniform(1000, 302, -1.0, 1.0);
+        let (vl, va) = (lumax::arr(&ctx, &vec, 1000), afx::arr(&vec, &[1000]));
+        let want: Vec<f32> = (0..16_384_000).map(|i| vec[i % 1000]).collect();
+        data_row(b, "20b tile (vector repeated)", "1000 x 16384 = 16.4M", "", &want, &|| vl.tile(16384), &|| af::tile(&va, afx::dims(&[16384])));
+        drop((vl, va, want));
+
+        // diag: extract from a big matrix (tiny output), a batch, and create a matrix from a vector.
+        let m = 8192usize;
+        let mat = uniform(m * m, 303, -1.0, 1.0);
+        let (ml, ma) = (lumax::arr(&ctx, &mat, [m, m]), afx::arr(&mat, &[m as u64, m as u64]));
+        let want: Vec<f32> = (0..m - 100).map(|i| mat[i + m * (i + 100)]).collect();
+        data_row(b, "21 diag extract (k = 100)", "[8192,8192] -> 8092", "", &want, &|| ml.diag(100), &|| af::diag_extract(&ma, 100));
+        let want: Vec<f32> = (0..m).map(|i| mat[i + m * i]).collect();
+        data_row(b, "21b diag extract (k = 0)", "[8192,8192] -> 8192", "", &want, &|| ml.diag(0), &|| af::diag_extract(&ma, 0));
+        drop((ml, ma, mat, want));
+        let bm = 1024usize;
+        let batch = uniform(bm * bm * 16, 304, -1.0, 1.0);
+        let (bl, ba) = (lumax::arr(&ctx, &batch, [bm, bm, 16]), afx::arr(&batch, &[bm as u64, bm as u64, 16]));
+        let want: Vec<f32> = (0..16 * bm).map(|o| batch[(o % bm) + bm * (o % bm) + bm * bm * (o / bm)]).collect();
+        // ArrayFire: the batched diagonal is dims [1024, 1, 16] too.
+        match attempt(|| afx::host(&af::diag_extract(&ba, 0))) {
+            Some(_) => data_row(b, "21c diag extract (batch of 16)", "[1024,1024,16] -> [1024,1,16]", "", &want, &|| bl.diag(0), &|| af::diag_extract(&ba, 0)),
+            None => println!("ArrayFire diag_extract of a batch failed (see message above); no row"),
+        }
+        drop((bl, ba, batch, want));
+        let diag_in = uniform(side, 305, -1.0, 1.0);
+        let (dl, da) = (lumax::arr(&ctx, &diag_in, side), afx::arr(&diag_in, &[side64]));
+        let want: Vec<f32> = (0..n).map(|i| if i % side == i / side { diag_in[i % side] } else { 0.0 }).collect();
+        data_row(b, "22 diag create (vector -> matrix)", "4096 -> [4096,4096]", "", &want, &|| dl.diag_matrix(0), &|| af::diag_create(&da, 0));
+        drop((dl, da, diag_in, want));
+
+        // identity
+        let want: Vec<f32> = (0..n).map(|i| if i % side == i / side { 1.0 } else { 0.0 }).collect();
+        data_row(
+            b,
+            "23 identity",
+            "[4096,4096]",
+            "",
+            &want,
+            &|| L::identity_on(&ctx, [side, side]).unwrap(),
+            &|| af::identity::<f32>(afx::dims(&[side64, side64])),
+        );
+        drop(want);
+
+        // lower / upper triangles of a matrix input
+        let mat = uniform(n, 306, 0.5, 1.5);
+        let (tl, ta) = (lumax::arr(&ctx, &mat, [side, side]), afx::arr(&mat, &[side64, side64]));
+        let want: Vec<f32> = (0..n).map(|i| if i / side > i % side { 0.0 } else { mat[i] }).collect();
+        data_row(b, "24 lower", "[4096,4096]", "", &want, &|| tl.lower(false), &|| af::lower(&ta, false));
+        let want: Vec<f32> = (0..n).map(|i| if i / side == i % side { 1.0 } else if i / side < i % side { 0.0 } else { mat[i] }).collect();
+        data_row(b, "25 upper, unit diagonal", "[4096,4096]", "", &want, &|| tl.upper(true), &|| af::upper(&ta, true));
+        drop((tl, ta, want));
+
+        // iota
+        let want: Vec<f32> = (0..n).map(|i| ((i % side) % 1024 + 1024 * ((i / side) % 1024)) as f32).collect();
+        data_row(
+            b,
+            "26 iota (tiled)",
+            "[1024,1024] x 4x4",
+            "values up to 2^20: exact in f32",
+            &want,
+            &|| LA::<f32>::iota_on(&ctx, [1024, 1024], [4, 4]).unwrap(),
+            &|| af::iota::<f32>(afx::dims(&[1024, 1024]), afx::dims(&[4, 4])),
+        );
+        let want: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        data_row(
+            b,
+            "26b iota (untiled)",
+            "16.8M",
+            "ramp 0..2^24: exact in f32",
+            &want,
+            &|| LA::<f32>::iota_on(&ctx, n, 1).unwrap(),
+            &|| af::iota::<f32>(afx::dims(&[n as u64]), afx::dims(&[1])),
+        );
+        drop(want);
+
+        // replace: a where cond else b. ArrayFire's replace works in place; luma returns a new array.
+        let (ad, bd) = (uniform(n, 307, -1.0, 1.0), uniform(n, 308, 10.0, 11.0));
+        let (xl, xa) = (lumax::arr(&ctx, &ad, n), afx::arr(&ad, &[n as u64]));
+        let (yl, ya) = (lumax::arr(&ctx, &bd, n), afx::arr(&bd, &[n as u64]));
+        let (cl, ca) = (xl.gt(0.0), af::gt(&xa, &0.0f32, false));
+        cl.eval().unwrap();
+        ca.eval();
+        ctx.sync().unwrap();
+        afx::sync();
+        let want: Vec<f32> = (0..n).map(|i| if ad[i] > 0.0 { ad[i] } else { bd[i] }).collect();
+        let work = std::cell::RefCell::new(xa.copy());
+        data_row(
+            b,
+            "27 replace (array)",
+            "16.8M",
+            "luma: new array; AF: in place on its own array (the condition does not change, so repeats are idempotent)",
+            &want,
+            &|| xl.replace(&cl, &yl),
+            &|| {
+                af::replace(&mut work.borrow_mut(), &ca, &ya);
+                work.borrow().clone()
+            },
+        );
+        let want: Vec<f32> = (0..n).map(|i| if ad[i] > 0.0 { ad[i] } else { 0.5 }).collect();
+        let work = std::cell::RefCell::new(xa.copy());
+        data_row(
+            b,
+            "27b replace (scalar)",
+            "16.8M",
+            "luma: new array; AF: replace_scalar in place",
+            &want,
+            &|| xl.replace(&cl, 0.5),
+            &|| {
+                af::replace_scalar(&mut work.borrow_mut(), &ca, 0.5);
+                work.borrow().clone()
+            },
+        );
+        drop((xl, xa, yl, ya, cl, ca, ad, bd, want, work));
+
+        // diff1 / diff2
+        let d = uniform(n, 309, 0.0, 1.0);
+        let (dl, da) = (lumax::arr(&ctx, &d, n), afx::arr(&d, &[n as u64]));
+        let want: Vec<f32> = (0..n - 1).map(|i| d[i + 1] - d[i]).collect();
+        data_row(b, "28 diff1 (vector)", "16.8M", "", &want, &|| dl.diff1(0), &|| af::diff1(&da, 0));
+        let want: Vec<f32> = (0..n - 2).map(|i| (d[i + 2] - d[i + 1]) - (d[i + 1] - d[i])).collect();
+        // ArrayFire's diff2 is diff(diff(x)) too, but its kernel may associate the three terms differently: compare closely.
+        let (lo, ao) = (lumax::host(&dl.diff2(0)), afx::host(&af::diff2(&da, 0)));
+        let v = compare(&lo, &ao, 1e-5, 1e-6).and(compare(&lo, &want, 0.0, 0.0));
+        drop((lo, ao));
+        b.run(
+            "29 diff2 (vector)",
+            "16.8M",
+            v,
+            "",
+            &mut || {
+                dl.diff2(0).eval().unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                af::diff2(&da, 0).eval();
+                afx::sync();
+            },
+        );
+        drop((dl, da, want));
+        let mat = uniform(n, 310, 0.0, 1.0);
+        let (ml, ma) = (lumax::arr(&ctx, &mat, [side, side]), afx::arr(&mat, &[side64, side64]));
+        let want: Vec<f32> = (0..side * (side - 1)).map(|i| mat[i + side] - mat[i]).collect();
+        data_row(b, "28b diff1 along dim 1", "[4096,4096] -> [4096,4095]", "", &want, &|| ml.diff1(1), &|| af::diff1(&ma, 1));
+        let want: Vec<f32> = (0..(side - 1) * side).map(|i| mat[i + i / (side - 1) + 1] - mat[i + i / (side - 1)]).collect();
+        data_row(b, "28c diff1 along dim 0", "[4096,4096] -> [4095,4096]", "", &want, &|| ml.diff1(0), &|| af::diff1(&ma, 0));
     });
 }

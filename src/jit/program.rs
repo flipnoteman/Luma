@@ -218,6 +218,20 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
     }
 }
 
+/// Whether the WGSL of `instr` calls a function of the complex library
+/// (`builtin::complex_library`): the product, quotient, modulus, equality test, `exp` and `sqrt`
+/// of `C32` values.
+pub(super) fn calls_complex_library(instr: &Instr) -> bool {
+    let c32 = instr.op.ty == ElemTy::C32;
+    match instr.op.kind {
+        OpKind::Unary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Binary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Compare(_) => c32,
+        OpKind::Part(part) => part.expr().contains("c_"),
+        _ => false,
+    }
+}
+
 /// Whether the WGSL of `instr` calls a function of the double-float math library
 /// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh`, `log1p`, `expm1` and `powf` of a `Df32`.
 pub(super) fn calls_df_math(instr: &Instr) -> bool {
@@ -316,6 +330,37 @@ impl FusedKey {
     pub(crate) fn inlines(&self) -> bool {
         self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| {
             matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. })) && matches!(instr.args[0], Ref::Sub(_))
+        }) || self.selects_what_it_may_not_read()
+    }
+
+    /// Whether the program selects, by a mask of the coordinates alone, between an input and
+    /// another value: where the mask does not take the input it need not be read (a triangle of a
+    /// stored matrix), which only the lowered program (see `jit::inline`) can do.
+    fn selects_what_it_may_not_read(&self) -> bool {
+        if !self.subs.is_empty()
+            || !self.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Select))
+            || self.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)))
+        {
+            return false;
+        }
+        let mut coordinates = vec![false; self.instrs.len()];
+        for (at, instr) in self.instrs.iter().enumerate() {
+            coordinates[at] = match instr.op.kind {
+                OpKind::Generate(super::Gen::Index | super::Gen::RangePow2 | super::Gen::RangeConst { .. } | super::Gen::ParamRange { .. }) => true,
+                OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+                    instr.args.iter().take(instr.op.kind.arity()).all(|arg| match *arg {
+                        Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
+                        Ref::Scalar(_) | Ref::Unused => true,
+                        _ => false,
+                    })
+                }
+                _ => false,
+            };
+        }
+        self.instrs.iter().any(|instr| {
+            matches!(instr.op.kind, OpKind::Select)
+                && matches!(instr.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
+                && (matches!(instr.args[1], Ref::Input(_)) || matches!(instr.args[2], Ref::Input(_)))
         })
     }
 

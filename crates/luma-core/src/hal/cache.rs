@@ -84,6 +84,14 @@ pub fn checksum(bytes: &[u8]) -> u64 {
     hash ^ (hash >> 32)
 }
 
+/// A revision of generated code, from the text of the sources that generate it (a backend passes
+/// its `include_str!`s): part of the key of every compiled blob, so a build whose code generator
+/// (or the tables its machine code calls through) differs from the one that wrote a blob never
+/// reads it. Any edit of those sources changes it, with no constant to remember to bump.
+pub fn source_revision(sources: &[&str]) -> u64 {
+    sources.iter().fold(0, |acc, text| acc.rotate_left(17) ^ checksum(text.as_bytes()).wrapping_add(text.len() as u64))
+}
+
 /// Whether the environment value `text` switches a feature off (`0`, `off`, `false`).
 fn is_off(text: &OsString) -> bool {
     text.to_str().is_some_and(|text| ["0", "off", "false"].contains(&text.to_ascii_lowercase().as_str()))
