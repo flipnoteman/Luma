@@ -255,3 +255,107 @@ fn set_operations_on_large_sorted_inputs_match_host_sets() {
         assert_eq!(xe.set_union(&xo, true).unwrap().len(), evens.len() + odds.len());
     }
 }
+
+/// Sorted inputs (duplicates allowed: the merge drops them) against `BTreeSet` references.
+fn check_merge_u32(ctx: &Context, a: &[u32], b: &[u32], what: &str) {
+    let sa: std::collections::BTreeSet<u32> = a.iter().copied().collect();
+    let sb: std::collections::BTreeSet<u32> = b.iter().copied().collect();
+    let union: Vec<u32> = sa.union(&sb).copied().collect();
+    let both: Vec<u32> = sa.intersection(&sb).copied().collect();
+    let (xa, xb) = (Array::from_slice_on(ctx, a, a.len()).unwrap(), Array::from_slice_on(ctx, b, b.len()).unwrap());
+    assert_eq!(xa.set_union(&xb, true).unwrap().to_vec().unwrap(), union, "union {what}");
+    let got = xa.set_intersect(&xb, true).unwrap();
+    assert_eq!(got.map(|r| r.to_vec().unwrap()).unwrap_or_default(), both, "intersect {what}");
+}
+
+/// Tile boundaries of the merge (2048 merged items a tile), one-element sides, duplicates inside
+/// `a` and `b` (also across tile boundaries), identical, nested and disjoint inputs.
+#[test]
+fn set_merge_tile_boundaries_duplicates_and_extremes() {
+    let ctx = Context::new().unwrap();
+    let mut rng = Rng(4242);
+    let sorted = |rng: &mut Rng, n: usize, range: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|_| rng.next() % range).collect();
+        v.sort_unstable();
+        v
+    };
+    for (na, nb) in [(1usize, 1usize), (1, 2047), (2047, 1), (1, 2048), (2048, 1), (1024, 1024), (2048, 2048), (2049, 2047), (4095, 1), (1, 4097), (4097, 4095), (6000, 2), (3, 70_000)] {
+        // Few distinct values: runs of duplicates that cross the tile boundaries.
+        let (a, b) = (sorted(&mut rng, na, 1 + (na + nb) as u32 / 40), sorted(&mut rng, nb, 1 + (na + nb) as u32 / 40));
+        check_merge_u32(&ctx, &a, &b, &format!("duplicates {na} {nb}"));
+        let (a, b) = (sorted(&mut rng, na, 1 << 30), sorted(&mut rng, nb, 1 << 30));
+        check_merge_u32(&ctx, &a, &b, &format!("sparse {na} {nb}"));
+    }
+    // One value everywhere; the extreme keys.
+    check_merge_u32(&ctx, &vec![7; 5000], &vec![7; 3000], "one value");
+    check_merge_u32(&ctx, &[0, 0, u32::MAX], &[0, u32::MAX, u32::MAX], "extremes");
+    check_merge_u32(&ctx, &vec![u32::MAX; 4100], &vec![u32::MAX; 4100], "only the largest key");
+    // Identical, nested, disjoint (a before b, b before a), interleaved one by one.
+    let a = sorted(&mut rng, 30_000, 1 << 24);
+    check_merge_u32(&ctx, &a, &a, "identical");
+    let inner: Vec<u32> = a.iter().step_by(3).copied().collect();
+    check_merge_u32(&ctx, &a, &inner, "nested");
+    check_merge_u32(&ctx, &inner, &a, "nested the other way");
+    let high: Vec<u32> = a.iter().map(|x| x + (1 << 25)).collect();
+    check_merge_u32(&ctx, &a, &high, "a below b");
+    check_merge_u32(&ctx, &high, &a, "b below a");
+    let evens: Vec<u32> = (0..9000).map(|i| 2 * i).collect();
+    let odds: Vec<u32> = (0..9000).map(|i| 2 * i + 1).collect();
+    check_merge_u32(&ctx, &evens, &odds, "interleaved");
+    check_merge_u32(&ctx, &evens, &evens[2000..4100], "a middle part");
+}
+
+/// Sorted floats with NaNs and both zeros, a few hundred tiles: all NaNs are one value, `-0.0`
+/// and `+0.0` are equal and come out as `+0.0`.
+#[test]
+fn set_merge_floats_with_nans_and_zeros() {
+    let ctx = Context::new().unwrap();
+    let mut rng = Rng(99);
+    let pool = |rng: &mut Rng, n: usize| -> Vec<f32> {
+        let mut v: Vec<f32> = (0..n)
+            .map(|_| match rng.next() % 40 {
+                0 => f32::NAN,
+                1 => -0.0,
+                2 => 0.0,
+                3 => f32::INFINITY,
+                4 => f32::NEG_INFINITY,
+                x => (x as f32 - 20.0) * 0.5,
+            })
+            .collect();
+        v.sort_by(|x, y| match (x.is_nan(), y.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => x.partial_cmp(y).unwrap(),
+        });
+        v
+    };
+    let norm = |x: f32| if x.is_nan() { 0x7fc0_0000 } else if x == 0.0 { 0 } else { x.to_bits() };
+    for (na, nb) in [(5usize, 9usize), (3000, 2500), (500_000, 400_000)] {
+        let (a, b) = (pool(&mut rng, na), pool(&mut rng, nb));
+        let sa: std::collections::BTreeSet<u32> = a.iter().map(|&x| norm(x)).collect();
+        let sb: std::collections::BTreeSet<u32> = b.iter().map(|&x| norm(x)).collect();
+        // The float order of the keys of a set: by value, NaN last (key order of the sort).
+        let order = |bits: &u32| {
+            let x = f32::from_bits(*bits);
+            if x.is_nan() { (1, 0.0f32) } else { (0, x + 0.0) }
+        };
+        let sorted_by_value = |set: Vec<u32>| {
+            let mut v = set;
+            v.sort_by(|p, q| {
+                let (p, q) = (order(p), order(q));
+                p.0.cmp(&q.0).then(p.1.partial_cmp(&q.1).unwrap())
+            });
+            v
+        };
+        let union = sorted_by_value(sa.union(&sb).copied().collect());
+        let both = sorted_by_value(sa.intersection(&sb).copied().collect());
+        let (xa, xb) = (Array::from_slice_on(&ctx, &a, a.len()).unwrap(), Array::from_slice_on(&ctx, &b, b.len()).unwrap());
+        let got: Vec<u32> = xa.set_union(&xb, true).unwrap().to_vec().unwrap().iter().map(|&x| norm(x)).collect();
+        assert_eq!(got, union, "union {na} {nb}");
+        let raw = xa.set_union(&xb, true).unwrap().to_vec().unwrap();
+        assert!(raw.iter().all(|x| *x != 0.0 || x.to_bits() == 0), "a zero of the union is +0.0");
+        let got: Vec<u32> = xa.set_intersect(&xb, true).unwrap().map(|r| r.to_vec().unwrap().iter().map(|&x| norm(x)).collect()).unwrap_or_default();
+        assert_eq!(got, both, "intersect {na} {nb}");
+    }
+}
