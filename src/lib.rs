@@ -55,6 +55,8 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/linear-algebra.md")]
+    pub mod linear_algebra {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -141,6 +143,7 @@ pub use linalg::{
 };
 pub use bmm::matmul_batched;
 pub use dense::lu::Lu;
+pub use dense::qr::Qr;
 pub use dense::Triangle;
 pub use matmul::{matmul, matmul_f32, matmul_tf32};
 pub use jit::fusion_limit;

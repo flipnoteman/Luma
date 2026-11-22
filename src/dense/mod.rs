@@ -25,6 +25,7 @@ use crate::shape::Shape;
 
 pub(crate) mod chol;
 pub(crate) mod lu;
+pub(crate) mod qr;
 pub(crate) mod tri;
 
 /// Which triangle of a matrix an operation reads.

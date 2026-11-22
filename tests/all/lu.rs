@@ -318,7 +318,7 @@ fn nan_input_propagates_and_shapes_are_checked() {
     let x = mat(&ctx, &a, 20, 20, 1).solve(&mat(&ctx, &values(20, 2, 0.0, 1.0), 1, 20, 1)).to_vec().unwrap();
     assert!(x.iter().any(|v| v.is_nan()));
     let rect = Array::<f32>::zeros_on(&ctx, [3, 4]).unwrap();
-    assert!(rect.solve(&Array::<f32>::zeros_on(&ctx, [1, 4]).unwrap()).to_vec().is_err());
+    assert!(rect.solve(&Array::<f32>::zeros_on(&ctx, [1, 3]).unwrap()).to_vec().is_err());
     assert!(rect.inverse().to_vec().is_err());
     assert!(rect.det().to_vec().is_err());
     let wide = Array::<f32>::zeros_on(&ctx, [4, 3]).unwrap();

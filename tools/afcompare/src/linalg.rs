@@ -150,6 +150,7 @@ pub fn linalg(b: &mut Bench) {
         lu_rows(b);
         general_solve(b);
         inverse_det(b);
+        qr_rows(b);
         batched(b);
     });
 }
@@ -368,6 +369,76 @@ fn inverse_det(b: &mut Bench) {
     }
 }
 
+/// QR of square and tall matrices, and the least-squares solve of the tall ones.
+fn qr_rows(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    let mut shapes: Vec<(usize, usize)> = sizes(b).into_iter().map(|n| (n, n)).collect();
+    shapes.push((256, 512));
+    shapes.push((1024, 2048));
+    for (n, m) in shapes {
+        let a = uniform(n * m, 64 + (n + m) as u64, -1.0, 1.0);
+        // ArrayFire gets the same m x n matrix in its column-major layout.
+        let a_cm: Vec<f32> = (0..m * n).map(|p| a[(p % m) * n + p / m]).collect();
+        let (al, aa) = (lumax::arr(&ctx, &a, [n, m]), afx::arr(&a_cm, &[m as u64, n as u64]));
+        let z: Vec<f64> = uniform(n, 13, -1.0, 1.0).iter().map(|&x| f64::from(x)).collect();
+        let az = matvec(&|i, j| f64::from(a[i * n + j]), m, n, &z);
+        let f = al.qr();
+        let (q, r) = (lumax::host(&f.q_thin()), lumax::host(&f.r()));
+        let rz = matvec(&|i, j| f64::from(r[i * n + j]), n, n, &z);
+        let el = rel(&matvec(&|i, j| f64::from(q[i * n + j]), m, n, &rz), &az);
+        let (qa, ra, _tau) = af::qr(&aa);
+        let (qa, ra) = (afx::host(&qa), afx::host(&ra));
+        let rz = matvec(&|i, j| if i <= j { at(&ra, m, n, Layout::Col, i, j) } else { 0.0 }, m, n, &z);
+        let ea = rel(&matvec(&|i, j| at(&qa, m, m, Layout::Col, i, j), m, m, &rz), &az);
+        b.run(
+            "qr f32",
+            &format!("{m}x{n}"),
+            verdict2("|Q R z - A z|/|A z|", el, ea, 1e-4),
+            "luma qr (packed factor + T, Q not formed); AF qr_inplace (cuSOLVER geqrf) on a copy",
+            &mut || {
+                let f = al.qr();
+                f.qr.eval().unwrap();
+                f.t.eval().unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let mut c = aa.copy();
+                let _tau = af::qr_inplace(&mut c);
+                c.eval();
+                afx::sync();
+            },
+        );
+        if m > n {
+            let rhs = uniform(m, 85, -1.0, 1.0);
+            let (rl, ra_) = (lumax::arr(&ctx, &rhs, [1, m]), afx::arr(&rhs, &[m as u64]));
+            let lf = |al: &L, rl: &L| al.lstsq(rl);
+            let af_ls = |aa: &A, ra: &A| af::solve(aa, ra, af::MatProp::NONE);
+            let (lx, ax) = (lumax::host(&lf(&al, &rl)), afx::host(&af_ls(&aa, &ra_)));
+            // A^T (A x - b) must vanish.
+            let orth = |x: &[f32]| -> f64 {
+                let xd: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+                let res: Vec<f64> = matvec(&|i, j| f64::from(a[i * n + j]), m, n, &xd).iter().zip(&rhs).map(|(p, q)| p - f64::from(*q)).collect();
+                let atr = matvec(&|i, j| f64::from(a[j * n + i]), n, m, &res);
+                atr.iter().map(|v| v * v).sum::<f64>().sqrt() / (fro(&a) * res.iter().map(|v| v * v).sum::<f64>().sqrt())
+            };
+            b.run(
+                "lstsq f32",
+                &format!("{m}x{n}, 1 rhs"),
+                verdict2("|At r|/(|A||r|)", orth(&lx), orth(&ax), 1e-4),
+                "luma lstsq (QR); AF solve of a tall matrix (QR)",
+                &mut || {
+                    lf(&al, &rl).eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af_ls(&aa, &ra_).eval();
+                    afx::sync();
+                },
+            );
+        }
+    }
+}
+
 /// A batch of small matrices: one luma launch against a loop of ArrayFire calls.
 fn batched(b: &mut Bench) {
     let ctx = b.ctx.clone();
@@ -438,6 +509,19 @@ fn batched(b: &mut Bench) {
             }
             afx::sync();
         }), "one launch vs a loop of AF lu_inplace calls (separate timings, not interleaved)");
+        b.run_one("batched qr f32", &size, Some(&mut || {
+            let f = gen_l.qr();
+            f.qr.eval().unwrap();
+            f.t.eval().unwrap();
+            ctx.sync().unwrap();
+        }), Some(&mut || {
+            for a in &gen_a {
+                let mut c = a.copy();
+                let _ = af::qr_inplace(&mut c);
+                c.eval();
+            }
+            afx::sync();
+        }), "one launch vs a loop of AF qr_inplace calls (separate timings)");
         b.run_one("batched inverse f32", &size, Some(&mut || {
             gen_l.inverse().eval().unwrap();
             ctx.sync().unwrap();

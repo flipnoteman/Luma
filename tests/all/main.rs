@@ -66,3 +66,4 @@ mod vector_reductions;
 mod views;
 mod cholesky;
 mod lu;
+mod qr;

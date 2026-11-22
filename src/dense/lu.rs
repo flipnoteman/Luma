@@ -287,18 +287,22 @@ impl Array<f32> {
         factor(self, "lu", Location::caller())
     }
 
-    /// Solves `A X = B` for a square `A` (`self`) by LU with partial pivoting; `b` is `[k, n]`
-    /// (`[k, n, batch]`) or a vector (see [`Array::solve_triangular`]). A singular matrix gives
-    /// `Inf` / `NaN`.
+    /// Solves `A X = B` (`self` is `A`) by LU with partial pivoting for a square `A`; `b` is
+    /// `[k, n]` (`[k, n, batch]`) or, for a square `A`, a vector (see [`Array::solve_triangular`]).
+    /// A singular matrix gives `Inf` / `NaN`. A tall `A` (more rows than columns) gives the
+    /// least-squares solution ([`Array::lstsq`]), a wide one the minimum norm solution (by QR of
+    /// the transpose), as ArrayFire's `solve` does.
     ///
     /// # Errors
     ///
-    /// The result is poisoned if `A` is not square or `b` does not match it.
+    /// The result is poisoned if `b` does not match `A`.
     #[track_caller]
     pub fn solve(&self, b: &Array<f32>) -> Array<f32> {
         let loc = Location::caller();
-        match Dims::square(self) {
-            Ok(_) => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+        match Dims::of(self) {
+            Ok(d) if d.rows == d.cols => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+            Ok(d) if d.rows > d.cols => super::qr::Qr::lstsq(&self.qr(), b),
+            Ok(_) => super::qr::min_norm(self, b, "solve", loc),
             Err(e) => fail(self.context(), b.shape(), e, "solve", loc),
         }
     }
