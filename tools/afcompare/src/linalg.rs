@@ -149,7 +149,8 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 14] = [
+        let groups: [(&str, fn(&mut Bench)); 15] = [
+            ("cholonly", chol_only),
             ("trsvprobe", trsv_probe),
             ("hostprobe", host_probe),
             ("launchprobe", launch_probe),
@@ -293,6 +294,20 @@ fn trsv_probe(b: &mut Bench) {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             println!("trsvprobe n={n} k={k}: min {:.1} us, median {:.1} us", v[0], v[12]);
         }
+    }
+}
+
+/// `LINALG_ROWS=cholonly`: luma's `cholesky` alone (`CHOL_N` list, default 4096), to profile its kernels with `ncu`.
+fn chol_only(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    let sizes: Vec<usize> = std::env::var("CHOL_N").unwrap_or_else(|_| "4096".into()).split(',').filter_map(|v| v.parse().ok()).collect();
+    for n in sizes {
+        let al = lumax::arr(&ctx, &dd_spd(n, 70 + n as u64), [n, n]);
+        for _ in 0..3 {
+            al.cholesky().eval().unwrap();
+            ctx.sync().unwrap();
+        }
+        println!("cholonly n={n} done");
     }
 }
 
