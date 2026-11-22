@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 
 use crate::array::Array;
 use crate::builtin::Builtin;
-use crate::context::{RawArg, Scratch};
+use crate::context::{Context, RawArg, Scratch};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 use crate::vision::{invalid, scan_counts, tile_grid, to_u32, Kernel as Any};
@@ -36,15 +36,18 @@ const NONE: &str = "0xFFFFFFFFu";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Kernel {
-    Local { eight: bool },
-    Seams { eight: bool },
+    /// Local pass over the bits of a boolean image, or over the pixels of an `f32` image whose
+    /// value (normalised by the control words of [`confidence`](super::confidence)) is in range.
+    Local { eight: bool, range: bool },
+    /// `gated` kernels do nothing once the control words of the confidence loop say it is done.
+    Seams { eight: bool, gated: bool },
     Flatten,
     Rename,
 }
 
 /// The union-find functions over the atomic array `a` (`find` with path halving, `union` hooks a
 /// larger root under a smaller one).
-fn union_find(s: &mut String, a: &str, suffix: &str) {
+pub(super) fn union_find(s: &mut String, a: &str, suffix: &str) {
     let _ = write!(
         s,
         "fn find_{suffix}(x0: u32) -> u32 {{
@@ -75,37 +78,66 @@ fn union_{suffix}(a0: u32, b0: u32) {{
     );
 }
 
-const PARAMS: &str = "struct Params { h: u32, w: u32, tiles_x: u32, tiles_y: u32, nv: u32, nh: u32, n: u32, chunks: u32 }\n";
+/// The uniform of every kernel of this module (and of [`confidence`](super::confidence)); `h`
+/// and `w` are the sizes along axis 0 and 1, `nv`/`nh` the seam pixels of [`Kernel::Seams`], `n`
+/// the pixel count, `chunks` the 1024-pixel chunks, the rest belongs to the confidence loop.
+pub(super) const PARAMS: &str = "struct Params { h: u32, w: u32, tiles_x: u32, tiles_y: u32, nv: u32, nh: u32, n: u32, chunks: u32, ns: u32, radius: u32, mult: u32, groups: u32 }\n";
+pub(super) const PARAM_WORDS: usize = 12;
+pub(super) const NONE_WORD: &str = NONE;
+pub(super) const GROUP_SIZE: u32 = GROUP;
+pub(super) const CHUNK_PIXELS: u32 = CHUNK;
+pub(super) const TILE: [u32; 2] = [TX, TY];
 
 pub(crate) fn source(k: Kernel) -> String {
     let mut s = String::from(PARAMS);
     match k {
-        Kernel::Local { eight } => {
-            s.push_str("@group(1) @binding(0) var<storage, read> src: array<u32>;\n@group(1) @binding(1) var<storage, read_write> lab: array<u32>;\n@group(1) @binding(2) var<uniform> p: Params;\n");
+        Kernel::Local { eight, range } => {
+            // Bindings: the image (bits, or `f32` pixels with the control words), the labels (and
+            // for the range variant the segmentation, cleared here), the uniform.
+            let (tx_mask, tx_bits) = (TX - 1, TX.trailing_zeros());
+            if range {
+                s.push_str("@group(1) @binding(0) var<storage, read> src: array<f32>;\n@group(1) @binding(1) var<storage, read> ctrl: array<u32>;\n@group(1) @binding(2) var<storage, read_write> lab: array<u32>;\n@group(1) @binding(3) var<storage, read_write> seg: array<u32>;\n@group(1) @binding(4) var<uniform> p: Params;\nvar<workgroup> stop: u32;\n");
+                s.push_str(&super::confidence::norm_source());
+            } else {
+                s.push_str("@group(1) @binding(0) var<storage, read> src: array<u32>;\n@group(1) @binding(1) var<storage, read_write> lab: array<u32>;\n@group(1) @binding(2) var<uniform> p: Params;\n");
+            }
             let _ = writeln!(s, "var<workgroup> loc: array<atomic<u32>, {}>;\nvar<workgroup> fgm: array<u32, {}>;", TX * TY, TX * TY);
             union_find(&mut s, "loc", "l");
             let _ = write!(
                 s,
                 "@compute @workgroup_size({GROUP})
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
-    let tx = t & {tx_mask}u;
+"
+            );
+            if range {
+                s.push_str("    if (t == 0u) { stop = ctrl[7]; }\n    workgroupBarrier();\n    if (workgroupUniformLoad(&stop) != 0u) { return; }\n");
+            }
+            let _ = write!(
+                s,
+                "    let tx = t & {tx_mask}u;
     let ty = t >> {tx_bits}u;
     let i0 = wid.x * {TX}u + tx;
     let i1 = wid.y * {TY}u + ty;
     let inb = i0 < p.h && i1 < p.w;
     let idx = i0 + p.h * i1;
     var fg = 0u;
-    if (inb) {{ fg = (src[idx >> 5u] >> (idx & 31u)) & 1u; }}
-    fgm[t] = fg;
+"
+            );
+            if range {
+                s.push_str("    if (inb) { let v = norm(src[idx]); fg = select(0u, 1u, v >= bitcast<f32>(ctrl[0]) && v <= bitcast<f32>(ctrl[1])); }\n");
+            } else {
+                s.push_str("    if (inb) { fg = (src[idx >> 5u] >> (idx & 31u)) & 1u; }\n");
+            }
+            let _ = write!(
+                s,
+                "    fgm[t] = fg;
     atomicStore(&loc[t], t);
     workgroupBarrier();
     if (fg != 0u) {{
         if (tx > 0u && fgm[t - 1u] != 0u) {{ union_l(t, t - 1u); }}
         if (ty > 0u) {{
             if (fgm[t - {TX}u] != 0u) {{ union_l(t, t - {TX}u); }}
-",
-                tx_mask = TX - 1,
-                tx_bits = TX.trailing_zeros(),
+"
             );
             if eight {
                 let _ = write!(
@@ -130,15 +162,19 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
         }} else {{
             lab[idx] = {NONE};
         }}
-    }}
-}}
-",
-                tx_mask = TX - 1,
-                tx_bits = TX.trailing_zeros(),
+"
             );
+            if range {
+                s.push_str("        seg[idx] = 0u;\n");
+            }
+            s.push_str("    }\n}\n");
         }
-        Kernel::Seams { eight } => {
-            s.push_str("@group(1) @binding(0) var<storage, read_write> lab: array<atomic<u32>>;\n@group(1) @binding(1) var<uniform> p: Params;\n");
+        Kernel::Seams { eight, gated } => {
+            if gated {
+                s.push_str("@group(1) @binding(0) var<storage, read_write> lab: array<atomic<u32>>;\n@group(1) @binding(1) var<storage, read> ctrl: array<u32>;\n@group(1) @binding(2) var<uniform> p: Params;\n");
+            } else {
+                s.push_str("@group(1) @binding(0) var<storage, read_write> lab: array<atomic<u32>>;\n@group(1) @binding(1) var<uniform> p: Params;\n");
+            }
             union_find(&mut s, "lab", "g");
             let _ = write!(
                 s,
@@ -149,7 +185,14 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
 }}
 @compute @workgroup_size({GROUP})
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let g = (wid.x + wid.y * nwg.x) * {GROUP}u + t;
+"
+            );
+            if gated {
+                s.push_str("    if (ctrl[7] != 0u) { return; }\n");
+            }
+            let _ = write!(
+                s,
+                "    let g = (wid.x + wid.y * nwg.x) * {GROUP}u + t;
     if (g < p.nv) {{
         let i0 = (g / p.w + 1u) * {TX}u;
         let i1 = g % p.w;
@@ -250,50 +293,90 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     s
 }
 
+/// The sizes of the launches over an `[H, W]` image.
+pub(super) struct Geom {
+    pub(super) h: u32,
+    pub(super) w: u32,
+    pub(super) n: u32,
+    pub(super) tiles_x: u32,
+    pub(super) tiles_y: u32,
+    pub(super) seam_threads: u32,
+    pub(super) nv: u32,
+    pub(super) nh: u32,
+    pub(super) chunks: u32,
+}
+
+impl Geom {
+    pub(super) fn new(op: &str, shape: Shape) -> Outcome<Geom> {
+        let d = shape.dims();
+        if d[2] != 1 || d[3] != 1 {
+            return Err(invalid(format!("{op} takes an [H, W] image, got shape {d:?}")));
+        }
+        let (h, w) = (d[0], d[1]);
+        let n = h.checked_mul(w).filter(|&n| n < u32::MAX as usize).ok_or_else(|| invalid(format!("{op}: {h} x {w} pixels do not fit 32-bit labels")))?;
+        let (tiles_x, tiles_y) = (to_u32(h.div_ceil(TX as usize), "tiles")?, to_u32(w.div_ceil(TY as usize), "tiles")?);
+        let nv = (tiles_x - 1) as u64 * w as u64;
+        let nh = (tiles_y - 1) as u64 * h as u64;
+        let seam_threads = u32::try_from(nv + nh).map_err(|_| invalid(format!("{op}: image too large")))?;
+        Ok(Geom { h: h as u32, w: w as u32, n: n as u32, tiles_x, tiles_y, seam_threads, nv: nv as u32, nh: nh as u32, chunks: (n as u32).div_ceil(CHUNK) })
+    }
+
+    /// The uniform words; `rest` are the last four (seeds, radius, multiplier, groups).
+    pub(super) fn params(&self, rest: [u32; 4]) -> [u32; PARAM_WORDS] {
+        [self.h, self.w, self.tiles_x, self.tiles_y, self.nv, self.nh, self.n, self.chunks, rest[0], rest[1], rest[2], rest[3]]
+    }
+
+    /// Records the local pass (`args` without the uniform, which is appended).
+    pub(super) fn local(&self, ctx: &Context, k: Kernel, args: &[RawArg<'_>], params: &[u32; PARAM_WORDS]) -> Outcome<()> {
+        let grid = tile_grid(ctx, self.tiles_x, self.tiles_y)?;
+        let mut all = args.to_vec();
+        all.push(RawArg::Uniform(bytemuck::bytes_of(params)));
+        let kernel = ctx.builtin(Builtin::Vision(Any::Regions(super::Kernel::Label(k))), "u32")?;
+        ctx.launch(&kernel, grid, [self.h, self.w, 1], &all)?;
+        Ok(())
+    }
+
+    /// Records the seam pass (nothing for an image of a single tile).
+    pub(super) fn seams(&self, ctx: &Context, k: Kernel, args: &[RawArg<'_>], params: &[u32; PARAM_WORDS]) -> Outcome<()> {
+        if self.seam_threads == 0 {
+            return Ok(());
+        }
+        let groups = fold_workgroups(ctx, self.seam_threads.div_ceil(GROUP))?;
+        let mut all = args.to_vec();
+        all.push(RawArg::Uniform(bytemuck::bytes_of(params)));
+        let kernel = ctx.builtin(Builtin::Vision(Any::Regions(super::Kernel::Label(k))), "u32")?;
+        ctx.launch(&kernel, groups, [self.seam_threads, 1, 1], &all)?;
+        Ok(())
+    }
+}
+
 /// The label image of the binary `image` (a plain `[H, W]` array).
 pub(super) fn run(image: &Array<bool>, connectivity: Connectivity) -> Outcome<Array<u32>> {
     let ctx = image.context();
-    let d = image.shape().dims();
-    if d[2] != 1 || d[3] != 1 {
-        return Err(invalid(format!("regions takes an [H, W] image, got shape {d:?}")));
-    }
-    let (h, w) = (d[0], d[1]);
-    let n = h.checked_mul(w).filter(|&n| n < u32::MAX as usize).ok_or_else(|| invalid(format!("regions: {h} x {w} pixels do not fit 32-bit labels")))?;
+    let geom = Geom::new("regions", image.shape())?;
     let eight = connectivity == Connectivity::Eight;
     image.storage()?;
     let out = Array::<u32>::alloc(ctx, image.shape())?;
-    let (tiles_x, tiles_y) = (to_u32(h.div_ceil(TX as usize), "tiles")?, to_u32(w.div_ceil(TY as usize), "tiles")?);
-    let grid = tile_grid(ctx, tiles_x, tiles_y)?;
-    let n32 = n as u32;
-    let chunks = n32.div_ceil(CHUNK);
-    let nv = (tiles_x - 1) as u64 * w as u64;
-    let nh = (tiles_y - 1) as u64 * h as u64;
-    let seam_threads = u32::try_from(nv + nh).map_err(|_| invalid("regions: image too large"))?;
-    let params = [h as u32, w as u32, tiles_x, tiles_y, nv as u32, nh as u32, n32, chunks];
-    let counts = Array::<u32>::alloc(ctx, Shape::from(chunks as usize + 1))?;
+    let counts = Array::<u32>::alloc(ctx, Shape::from(geom.chunks as usize + 1))?;
     let (src, src_bytes) = image.ready()?;
     let (lab, lab_bytes) = out.ready()?;
     let counts_pin = counts.ready()?;
     let mut scratch = Scratch::new(ctx);
-    let rank_bytes = u64::from(n32) * 4;
+    let rank_bytes = u64::from(geom.n) * 4;
     let rank = scratch.take(rank_bytes)?;
+    let params = geom.params([0; 4]);
     let uniform = RawArg::Uniform(bytemuck::bytes_of(&params));
     let kernel = |k: Kernel| ctx.builtin(Builtin::Vision(Any::Regions(super::Kernel::Label(k))), "u32");
 
-    let k = kernel(Kernel::Local { eight })?;
-    ctx.launch(&k, grid, [h as u32, w as u32, 1], &[RawArg::read(src.buffer(), src_bytes), RawArg::write(lab.buffer(), lab_bytes), uniform])?;
-    if seam_threads > 0 {
-        let groups = fold_workgroups(ctx, seam_threads.div_ceil(GROUP))?;
-        let k = kernel(Kernel::Seams { eight })?;
-        ctx.launch(&k, groups, [seam_threads, 1, 1], &[RawArg::write(lab.buffer(), lab_bytes), uniform])?;
-    }
-    let groups = fold_workgroups(ctx, chunks)?;
+    geom.local(ctx, Kernel::Local { eight, range: false }, &[RawArg::read(src.buffer(), src_bytes), RawArg::write(lab.buffer(), lab_bytes)], &params)?;
+    geom.seams(ctx, Kernel::Seams { eight, gated: false }, &[RawArg::write(lab.buffer(), lab_bytes)], &params)?;
+    let groups = fold_workgroups(ctx, geom.chunks)?;
     let args = [RawArg::write(lab.buffer(), lab_bytes), RawArg::write(&rank, rank_bytes), RawArg::write(counts_pin.0.buffer(), counts_pin.1), uniform];
     let k = kernel(Kernel::Flatten)?;
-    ctx.launch(&k, groups, [n32, 1, 1], &args)?;
-    scan_counts(ctx, &counts_pin, chunks)?;
+    ctx.launch(&k, groups, [geom.n, 1, 1], &args)?;
+    scan_counts(ctx, &counts_pin, geom.chunks)?;
     let args = [RawArg::write(lab.buffer(), lab_bytes), RawArg::read(&rank, rank_bytes), RawArg::read(counts_pin.0.buffer(), counts_pin.1), uniform];
     let k = kernel(Kernel::Rename)?;
-    ctx.launch(&k, groups, [n32, 1, 1], &args)?;
+    ctx.launch(&k, groups, [geom.n, 1, 1], &args)?;
     Ok(out)
 }
