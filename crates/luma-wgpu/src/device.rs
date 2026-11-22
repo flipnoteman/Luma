@@ -1,7 +1,7 @@
 //! The process-wide pool of opened wgpu devices, and the driver's pipeline cache of each.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use log::debug;
@@ -203,9 +203,17 @@ fn device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
 /// The process's wgpu instance and the adapter picked on it, once there is one.
 static ADAPTER: Mutex<Option<(wgpu::Instance, wgpu::Adapter)>> = Mutex::new(None);
 
-/// Picks an adapter of the wanted kind and opens a [Device] / [Queue] pair on it. Only
-/// [`acquire`] calls this.
-async fn request_device() -> Result<Gpu, BackendError> {
+/// Drops the cached instance and adapter, so that the next device opens on new ones. Done after a
+/// device was lost: the loss may have left the instance and its adapter unusable, and a later
+/// context must not inherit that. Devices already open keep what they need alive on their own.
+fn forget_adapter() {
+    let old = lock(&ADAPTER).take();
+    drop(old);
+}
+
+/// Picks an adapter of the wanted kind and opens a [Device] / [Queue] pair on it; with `fresh`, on
+/// an instance and adapter opened anew. Only [`acquire`] calls this.
+async fn request_device(fresh: bool) -> Result<Gpu, BackendError> {
     let mut instance_desc = InstanceDescriptor::new_without_display_handle();
     // Buffer creation reports out-of-memory once usage would pass 90% of the driver's live
     // budget (Vulkan with VK_EXT_memory_budget, DX12) instead of failing later in a command.
@@ -225,7 +233,12 @@ async fn request_device() -> Result<Gpu, BackendError> {
     let validated = instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION);
     // The instance and the adapter are opened once per process: the Vulkan loader and the driver
     // take about 70 ms for them, and every further device of the process (contexts alive at the
-    // same time each have one) reuses them. Only `acquire` calls this, under `OPENING`.
+    // same time each have one) reuses them. They are dropped after a device was lost (see
+    // [`forget_adapter`]) and when `fresh` says so, so that nothing a loss left in them reaches a
+    // later device. Only `acquire` calls this, under `OPENING`.
+    if fresh {
+        forget_adapter();
+    }
     let cached = lock(&ADAPTER).as_ref().map(|(_, adapter)| adapter.clone());
     let adapter = match cached {
         Some(adapter) => adapter,
@@ -305,34 +318,116 @@ async fn request_device() -> Result<Gpu, BackendError> {
     Ok(Gpu { device, queue, adapter: info, lost, memory, compute_units, cost: Arc::new(OnceLock::new()), disk, store })
 }
 
-/// Process-wide pool of opened GPU devices.
+/// The process-wide pool of opened GPU devices, and who holds the others.
 ///
 /// Destroying a Vulkan device while other threads are inside the driver deadlocks the NVIDIA
 /// driver (615.71): the thread in `vkDestroyDevice` holds the driver's global mutex and the
 /// loader lock and joins a driver worker thread that never exits. Devices are therefore never
-/// destroyed: [`release`] parks the device of a finished backend in an idle list and
+/// destroyed: [`release`] parks the device of a finished backend in the idle list and
 /// [`acquire`] hands it to the next one. The pool never shrinks; it holds as many devices
 /// as backends were alive at once.
-static IDLE: Mutex<Vec<Gpu>> = Mutex::new(Vec::new());
+struct Pool {
+    /// Devices no backend uses; none of them is lost.
+    idle: Vec<Gpu>,
+    /// Devices handed out by [`acquire`] that [`release`] has not got back yet.
+    leased: usize,
+    /// How many times [`release`] ran: a waiting [`acquire`] sees that a device came back.
+    returns: u64,
+}
+
+static POOL: Mutex<Pool> = Mutex::new(Pool { idle: Vec::new(), leased: 0, returns: 0 });
+
+/// Signalled by [`release`], for an [`acquire`] that waits for a device to come back.
+static RETURNED: Condvar = Condvar::new();
 
 /// Serializes [`acquire`]. A burst of threads opening backends must not each create a device
 /// while the devices of finished ones are about to come back, and the driver caps how many
-/// devices can be alive at once (around 60 on NVIDIA; `RequestDevice(Device(Lost))` beyond).
+/// devices can be alive at once: 63 or 64 per process on NVIDIA's Linux driver (not per instance:
+/// a second instance gets none once the first has used them up), after which `vkCreateDevice` fails
+/// with `VK_ERROR_INITIALIZATION_FAILED`, which wgpu reports as
+/// `RequestDevice("Parent device is lost")`, though no device is lost.
 static OPENING: Mutex<()> = Mutex::new(());
+
+/// How long [`acquire`] waits for a device to come back when none can be created.
+const DEVICE_WAIT: Duration = Duration::from_secs(60);
 
 /// Hands out an idle pooled device of the wanted kind, or opens a new one when none is idle.
 ///
 /// Holds `OPENING` for the whole call so that concurrent callers queue up and reuse the devices
 /// that [`release`] returns in the meantime instead of all creating their own.
+///
+/// A device that cannot be created while others are out is not an error yet: the driver may be
+/// at its limit of devices, so the call waits (up to [`DEVICE_WAIT`]) for a backend to give its
+/// device back and takes that one. With no device out, the failure is the GPU's: a lost device
+/// may have left the instance and adapter unusable, so the device is created once more on new ones.
+///
+/// Devices found lost are discarded, never handed out, and make the next device open on a new
+/// instance and adapter (see [`forget_adapter`]).
 pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu, BackendError> {
     if kind == DeviceKind::Cpu {
         return Err(BackendError::NoDevice("software adapters are not used; the cpu backend runs on the CPU"));
     }
+    let give_up = Instant::now() + DEVICE_WAIT;
     let _opening = lock(&OPENING);
-    if let Some(gpu) = lock(&IDLE).pop() {
-        return Ok(gpu);
+    let mut fresh = false;
+    loop {
+        let (idle, returns) = take_idle();
+        if let Some(gpu) = idle {
+            return Ok(gpu);
+        }
+        let error = match crate::exit::driver_call(|| pollster::block_on(request_device(fresh))) {
+            Ok(gpu) => {
+                lock(&POOL).leased += 1;
+                return Ok(gpu);
+            }
+            Err(error) => error,
+        };
+        if lock(&POOL).leased > 0 {
+            if !wait_for_return(returns, give_up) {
+                return Err(error);
+            }
+        } else if fresh || !matches!(error, BackendError::RequestDevice(_)) {
+            return Err(error);
+        } else {
+            fresh = true;
+        }
     }
-    crate::exit::driver_call(|| pollster::block_on(request_device()))
+}
+
+/// Takes an idle device that is not lost, if there is one, and counts it as leased; also says how
+/// many returns [`release`] has made so far. Devices found lost are discarded, and make the next
+/// device open on a new instance and adapter.
+fn take_idle() -> (Option<Gpu>, u64) {
+    let mut lost = Vec::new();
+    let (taken, returns) = {
+        let mut pool = lock(&POOL);
+        let taken = loop {
+            match pool.idle.pop() {
+                Some(gpu) if gpu.lost.load(Ordering::Acquire) => lost.push(gpu),
+                found => break found,
+            }
+        };
+        if taken.is_some() {
+            pool.leased += 1;
+        }
+        (taken, pool.returns)
+    };
+    if !lost.is_empty() {
+        forget_adapter();
+    }
+    drop(lost);
+    (taken, returns)
+}
+
+/// Waits until [`release`] has run since it had made `seen` returns. `false` once `give_up` has
+/// passed before that.
+fn wait_for_return(seen: u64, give_up: Instant) -> bool {
+    let mut pool = lock(&POOL);
+    while pool.returns == seen {
+        let Some(left) = give_up.checked_duration_since(Instant::now()) else { return false };
+        pool = RETURNED.wait_timeout(pool, left).unwrap_or_else(PoisonError::into_inner).0;
+    }
+    true
 }
 
 /// Returns the device of a finished backend to the pool.
@@ -340,13 +435,147 @@ pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu, BackendError> {
 /// Waits for the device to go idle first, so that the backend's submitted work, its map
 /// callbacks and the deferred destruction of its resources are finished before the next owner
 /// gets the device (destroying the device used to wait for exactly that). A lost device is
-/// dropped instead of pooled, as it must not be handed out again. Does not take `OPENING`: a
-/// thread returning a device must never wait for one being created.
+/// dropped instead of pooled, as it must not be handed out again, and the instance and adapter
+/// it came from are dropped too (see [`forget_adapter`]). Does not take `OPENING`: a thread
+/// returning a device must never wait for one being created.
 pub(crate) fn release(gpu: Gpu) {
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
     gpu.store.checkpoint();
-    if gpu.lost.load(Ordering::Acquire) {
-        return;
+    let lost = gpu.lost.load(Ordering::Acquire);
+    if lost {
+        forget_adapter();
     }
-    lock(&IDLE).push(gpu);
+    {
+        let mut pool = lock(&POOL);
+        pool.leased -= 1;
+        pool.returns += 1;
+        if !lost {
+            pool.idle.push(gpu);
+        }
+    }
+    RETURNED.notify_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A device from the pool, or `None` where the machine has no adapter.
+    fn open() -> Option<Gpu> {
+        match acquire(DeviceKind::Auto) {
+            Ok(gpu) => Some(gpu),
+            Err(BackendError::NoAdapter(_) | BackendError::NoDevice(_)) => None,
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    /// Whether `gpu` runs work: a buffer written and read back.
+    fn works(gpu: &Gpu) -> bool {
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(&buffer, 0, &(1..=16u8).collect::<Vec<_>>());
+        gpu.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result.is_ok());
+        });
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap() && buffer.slice(..).get_mapped_range().unwrap().iter().copied().eq(1..=16u8)
+    }
+
+    /// A device lost while a backend used it is dropped when the backend is, never pooled, and
+    /// the next device opens on a new instance and adapter. Holding `OPENING` keeps the other
+    /// tests of the process from opening one in between.
+    #[test]
+    fn a_lost_device_is_not_pooled_and_the_instance_is_opened_anew() {
+        let Some(gpu) = open() else { return };
+        let lost = Arc::clone(&gpu.lost);
+        gpu.device.destroy();
+        {
+            let _opening = lock(&OPENING);
+            release(gpu);
+            assert!(lost.load(Ordering::Acquire), "the loss was noticed");
+            assert!(lock(&ADAPTER).is_none(), "the instance and adapter of a lost device are dropped");
+            assert!(lock(&POOL).idle.iter().all(|idle| !Arc::ptr_eq(&idle.lost, &lost)), "a lost device was pooled");
+        }
+        let next = open().expect("a device opens after a loss");
+        assert!(!Arc::ptr_eq(&next.lost, &lost));
+        assert!(works(&next));
+        release(next);
+    }
+
+    /// Devices that were lost while idle (a GPU reset takes all of them) are never handed out.
+    #[test]
+    fn idle_devices_that_were_lost_are_discarded() {
+        let Some(first) = open() else { return };
+        let second = open().expect("a second device opens");
+        let lost = [Arc::clone(&first.lost), Arc::clone(&second.lost)];
+        let devices = [first.device.clone(), second.device.clone()];
+        {
+            let _opening = lock(&OPENING);
+            release(first);
+            release(second);
+            for device in &devices {
+                device.destroy();
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            }
+            assert!(lost.iter().all(|flag| flag.load(Ordering::Acquire)), "the loss was noticed");
+        }
+        let next = open().expect("a device opens after the idle ones were lost");
+        assert!(!lost.iter().any(|flag| Arc::ptr_eq(flag, &next.lost)), "a lost device was handed out");
+        assert!(works(&next));
+        release(next);
+        assert!(lock(&POOL).idle.iter().all(|idle| !lost.iter().any(|flag| Arc::ptr_eq(flag, &idle.lost))), "a lost device stayed in the pool");
+    }
+
+    /// The driver gives a process only so many devices (63 or 64 on NVIDIA's Linux driver, where
+    /// the next `vkCreateDevice` fails with an error wgpu words "Parent device is lost"): contexts
+    /// beyond that wait for one to come back instead of failing. More threads than the limit hold
+    /// a device each until the ones that found no device left are waiting, then all let go.
+    #[test]
+    fn more_devices_than_the_driver_gives_wait_for_one_to_come_back() {
+        const THREADS: usize = 72;
+        let Some(probe) = open() else { return };
+        release(probe);
+        let held = AtomicUsize::new(0);
+        let go = (Mutex::new(false), Condvar::new());
+        let finished = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let gpu = acquire(DeviceKind::Auto)?;
+                        held.fetch_add(1, Ordering::SeqCst);
+                        drop(go.1.wait_while(lock(&go.0), |go| !*go).unwrap_or_else(PoisonError::into_inner));
+                        release(gpu);
+                        Ok::<(), BackendError>(())
+                    })
+                })
+                .collect();
+            // Done once all hold one, or the count stopped growing: the rest wait for a device.
+            let mut last = (0, Instant::now());
+            loop {
+                let now = held.load(Ordering::SeqCst);
+                if now != last.0 {
+                    last = (now, Instant::now());
+                }
+                if now == THREADS || (now > 0 && last.1.elapsed() > Duration::from_secs(3)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Visible with `--nocapture`: how many devices the driver gave before the rest waited.
+            eprintln!("{} of {THREADS} threads hold a device; the others wait for one", held.load(Ordering::SeqCst));
+            *lock(&go.0) = true;
+            go.1.notify_all();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Result<Vec<_>, _>>()
+        });
+        finished.expect("every thread got a device");
+        assert_eq!(held.load(Ordering::SeqCst), THREADS);
+    }
 }

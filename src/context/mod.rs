@@ -46,6 +46,9 @@ struct Inner {
     /// Kernels of library modules that write their WGSL themselves (see [`Context::cached_kernel`]),
     /// by (module, variant, entry point).
     module_kernels: Mutex<ModuleKernels>,
+    /// Kernels of the dense linear algebra by a key that determines their source (see
+    /// [`Context::keyed_kernel`]).
+    keyed_kernels: Mutex<std::collections::HashMap<String, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
@@ -595,6 +598,7 @@ impl Context {
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
                 module_kernels: Mutex::default(),
+                keyed_kernels: Mutex::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
@@ -820,6 +824,20 @@ impl Context {
         }
         let kernel = self.kernel(&source()).entry(entry).build()?;
         self.inner.module_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, kernel.core());
+        Ok(kernel)
+    }
+
+    /// The kernel of source `make()` that `key` names (the key must determine the source), built
+    /// on the first call with `label`: later calls find it by the key. The cache belongs to this
+    /// context and holds the compiled kernels only, never a handle to a context, so it dies with
+    /// it and a finished context gives its device back to the pool.
+    pub(crate) fn keyed_kernel(&self, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        let cached = self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned();
+        if let Some(core) = cached {
+            return Ok(crate::Kernel::from_core(self, core));
+        }
+        let kernel = self.kernel(&make()).label(label).build()?;
+        self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.to_owned(), kernel.core());
         Ok(kernel)
     }
 
