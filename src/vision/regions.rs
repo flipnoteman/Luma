@@ -178,7 +178,7 @@ impl Array<f32> {
     /// the blurred image as the first estimate. `iterations` and `relaxation` must be positive.
     ///
     /// The image is padded to `H + PH` x `W + PW`, each rounded up to a size whose prime factors
-    /// are at most 13, with its edge pixels; the convolutions are circular over the padded
+    /// are at most 7 (ArrayFire's CUDA backend; its CPU backend allows 13), with its edge pixels; the convolutions are circular over the padded
     /// image (see the guide).
     ///
     /// Differences from ArrayFire: the Landweber result is the true estimate, while ArrayFire's is

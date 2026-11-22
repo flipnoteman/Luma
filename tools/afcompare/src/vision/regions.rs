@@ -177,7 +177,7 @@ pub fn rows(b: &mut Bench) {
                 // The padded pixel count of ArrayFire's scaling.
                 let friendly = |mut n: usize| loop {
                     let mut m = n;
-                    for p in [2, 3, 5, 7, 11, 13] {
+                    for p in [2, 3, 5, 7] {
                         while m.is_multiple_of(p) {
                             m /= p;
                         }

@@ -2,7 +2,7 @@
 //! `Array<f32>::inverse_deconv`), ArrayFire's `iterativeDeconv` and `inverseDeconv`.
 //!
 //! Both work on the image padded to a size `N0 x N1` (`H + PH` and `W + PW` rounded up to a size
-//! whose prime factors are all at most 13) with the nearest pixel, the point spread function
+//! whose prime factors are all at most 7) with the nearest pixel, the point spread function
 //! padded with zeros to the same size and rolled so that its centre `(PH / 2, PW / 2)` is the
 //! origin: a circular convolution of the padded image is then the convolution of the image with
 //! the replicated border. The transforms are the half-spectrum real FFTs of [`crate::spectral`].
@@ -35,11 +35,12 @@ pub enum InverseDeconvAlgo {
     Tikhonov,
 }
 
-/// The smallest size at least `n` whose prime factors are all at most 13.
+/// The smallest size at least `n` whose prime factors are all at most 7 (ArrayFire's CUDA rule;
+/// its CPU backend allows factors up to 13).
 fn friendly(mut n: usize) -> usize {
     loop {
         let mut m = n;
-        for p in [2, 3, 5, 7, 11, 13] {
+        for p in [2, 3, 5, 7] {
             while m.is_multiple_of(p) {
                 m /= p;
             }

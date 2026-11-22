@@ -343,7 +343,7 @@ include!("vision_regions_af.rs");
 fn friendly(mut n: usize) -> usize {
     loop {
         let mut m = n;
-        for p in [2, 3, 5, 7, 11, 13] {
+        for p in [2, 3, 5, 7] {
             while m.is_multiple_of(p) {
                 m /= p;
             }
@@ -530,7 +530,7 @@ fn deconv_matches_host() {
 
 #[test]
 fn deconv_matches_arrayfire() {
-    // ArrayFire scales its Landweber and Tikhonov results by the padded pixel count (11 x 13).
+    // ArrayFire (CUDA backend) scales its Landweber and Tikhonov results by the padded pixel count (12 x 14).
     let ctx = ctx();
     let a = Array::from_slice_on(&ctx, &AF_IMAGE, [8, 10]).unwrap();
     let p = Array::from_slice_on(&ctx, &AF_PSF, [3, 3]).unwrap();
@@ -540,9 +540,9 @@ fn deconv_matches_arrayfire() {
             assert!((g * scale - w).abs() <= 1e-5 * m, "{what}: element {i}: {} vs {w}", g * scale);
         }
     };
-    cmp(a.iterative_deconv(&p, 2, 0.7, IterativeDeconvAlgo::Landweber).to_vec().unwrap(), &AF_LANDWEBER, 143.0, "landweber");
+    cmp(a.iterative_deconv(&p, 2, 0.7, IterativeDeconvAlgo::Landweber).to_vec().unwrap(), &AF_LANDWEBER, 168.0, "landweber");
     cmp(a.iterative_deconv(&p, 2, 0.7, IterativeDeconvAlgo::RichardsonLucy).to_vec().unwrap(), &AF_RICHARDSON_LUCY, 1.0, "richardson-lucy");
-    cmp(a.inverse_deconv(&p, 0.2, InverseDeconvAlgo::Tikhonov).to_vec().unwrap(), &AF_TIKHONOV, 143.0, "tikhonov");
+    cmp(a.inverse_deconv(&p, 0.2, InverseDeconvAlgo::Tikhonov).to_vec().unwrap(), &AF_TIKHONOV, 168.0, "tikhonov");
 }
 
 #[test]
@@ -580,4 +580,21 @@ fn deconv_errors_and_zero_background() {
     img[27] = 5.0;
     let z = Array::from_slice_on(&ctx, &img, [8, 8]).unwrap();
     assert!(z.iterative_deconv(&p, 3, 1.0, IterativeDeconvAlgo::RichardsonLucy).to_vec().unwrap().iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn lazy_inputs() {
+    // Operands that are still unevaluated expressions.
+    let ctx = ctx();
+    let (h, w) = (37, 29);
+    let img = blobs(h, w, 8);
+    let a = Array::from_slice_on(&ctx, &img, [h, w]).unwrap();
+    let mask: Vec<bool> = img.iter().map(|&v| v > 12.0).collect();
+    assert_eq!(a.gt(12.0).regions(Connectivity::Eight).to_vec().unwrap(), regions_ref(&mask, h, w, true));
+    let sx = Array::from_slice_on(&ctx, &[3.0f32, 20.0], [2]).unwrap().to_u32();
+    let sy = Array::from_slice_on(&ctx, &[4.0f32, 9.0], [2]).unwrap().to_u32();
+    let scaled: Vec<f32> = img.iter().map(|v| v * 2.0 + 1.0).collect();
+    let got = (&a * 2.0 + 1.0).confidence_cc(&sx, &sy, 1, 2, 2, 1.0).to_vec().unwrap();
+    let want: Vec<f32> = confidence_ref(&scaled, h, w, &[(3, 4), (20, 9)], 1, 2, 2).into_iter().map(|b| if b { 1.0 } else { 0.0 }).collect();
+    assert_eq!(got, want);
 }

@@ -103,9 +103,10 @@ image**; probing it (CPU backend; the shared code behind it is the same on CUDA)
   pixels of the windows from values shifted by their mean, so its intervals are exact; a pixel
   exactly on the border of an interval may go either way.
 
-For a single interior seed on an image small enough for ArrayFire's summed-area table (1080p) the
-segmentation is ArrayFire's up to the pixels its imprecise interval gets wrong (the `afcompare`
-rows count them).
+For a single seed with its window inside the image the segmentation is the one of ArrayFire's CUDA
+backend (identical in 31 of 31 random probes; the CPU backend adds stray components) up to the
+pixels where ArrayFire's imprecise interval is wrong on a big image (the `afcompare` rows count
+them).
 
 ## Deconvolution
 
@@ -134,7 +135,8 @@ assert!((tik[0] - 1.0 / 1.5).abs() < 1e-4);
 * **Tikhonov** (`InverseDeconvAlgo::Tikhonov`): `X = Y conj(P) / (|P|^2 + gamma)` per frequency.
 
 The problem is solved on the image padded to `(H + PH) x (W + PW)`, each size rounded up to one whose
-prime factors are all at most 13 (ArrayFire's rule, verified on its CPU backend), with the nearest
+prime factors are all at most 7 (the rule of ArrayFire's CUDA backend, probed; its CPU backend
+rounds to factors of at most 13 and so pads differently, which changes the border of the result), with the nearest
 pixel; the psf is zero padded to the same size and rolled so that its centre is the origin. The
 convolutions are circular on the padded image, so the border sees a replicated, not a periodic,
 image. The result is the central `[H, W]` part.
