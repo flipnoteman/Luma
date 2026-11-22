@@ -23,7 +23,7 @@ use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
 use crate::shape::Shape;
-use crate::view::{concat, concat_slice};
+use crate::view::concat_slice;
 
 /// Columns of a panel one workgroup factors.
 const PANEL: usize = 32;
@@ -213,6 +213,38 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
     }
 }
 
+/// A factorisation under construction by the recursion: the packed factor with the unit lower trapezoid
+/// `V` of its reflectors next to it (the updates of the columns to its right are products with it).
+struct Node {
+    qr: Array<f32>,
+    v: Array<f32>,
+    tau: Array<f32>,
+    t: Array<f32>,
+}
+
+impl Node {
+    fn failed(ctx: &crate::Context, a: &Array<f32>, e: LumaError, op: &'static str, loc: &'static Location<'static>) -> Node {
+        let Qr { qr, tau, t } = failed_qr(ctx, a, e, op, loc);
+        Node { v: qr.clone(), qr, tau, t }
+    }
+
+    fn of(q: Qr) -> Node {
+        Node { v: unit_lower(&q.qr).cache(), qr: q.qr, tau: q.tau, t: q.t }
+    }
+
+    fn into_qr(self) -> Qr {
+        Qr { qr: self.qr, tau: self.tau, t: self.t }
+    }
+}
+
+/// One panel of up to [`PANEL`] columns of a single matrix by [`super::tsqr`].
+fn tsqr_panel(a: &Array<f32>, plan: super::tsqr::Plan, op: &'static str, loc: &'static Location<'static>) -> Node {
+    match super::tsqr::panel(a, plan) {
+        Ok([qr, v, tau, t]) => Node { qr, v, tau, t },
+        Err(e) => Node::failed(a.context(), a, e, op, loc),
+    }
+}
+
 /// The unit lower trapezoid `V` of a packed `[w, m]` factor (ones on the diagonal, zeros above).
 pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
     let rows = f.index(1);
@@ -221,35 +253,145 @@ pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
     select(&cols.eq(&rows), 1.0f32, below)
 }
 
+/// The packed factor and `V` of a node from those of its halves: columns `0..n1` are the left
+/// half's, the right half's rows `0..n1` are the updated `c` (the rows of `R` above its own
+/// factor), the rest its own factor (`f2`, `v2`, from row `n1` on); `V` is zero above its own.
+const JOIN: &str = "struct Params { m: u32, w: u32, n1: u32 }
+@group(1) @binding(0) var<storage, read> f1: array<f32>;
+@group(1) @binding(1) var<uniform> f1v: LumaView;
+@group(1) @binding(2) var<storage, read> v1: array<f32>;
+@group(1) @binding(3) var<uniform> v1v: LumaView;
+@group(1) @binding(4) var<storage, read> c: array<f32>;
+@group(1) @binding(5) var<uniform> cv: LumaView;
+@group(1) @binding(6) var<storage, read> f2: array<f32>;
+@group(1) @binding(7) var<uniform> f2v: LumaView;
+@group(1) @binding(8) var<storage, read> v2: array<f32>;
+@group(1) @binding(9) var<uniform> v2v: LumaView;
+@group(1) @binding(10) var<storage, read_write> fo: array<f32>;
+@group(1) @binding(11) var<storage, read_write> vo: array<f32>;
+@group(1) @binding(12) var<uniform> p: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let w = p.w;
+    let n1 = p.n1;
+    let total = p.m * w;
+    for (var idx = gid.x; idx < total; idx = idx + nwg.x * 256u) {
+        let i = idx / w;
+        let col = idx - i * w;
+        if (col < n1) {
+            fo[idx] = f1[luma_view_idx3(f1v, col, i, 0u)];
+            vo[idx] = v1[luma_view_idx3(v1v, col, i, 0u)];
+        } else if (i < n1) {
+            fo[idx] = c[luma_view_idx3(cv, col - n1, i, 0u)];
+            vo[idx] = 0.0;
+        } else {
+            fo[idx] = f2[luma_view_idx3(f2v, col - n1, i - n1, 0u)];
+            vo[idx] = v2[luma_view_idx3(v2v, col - n1, i - n1, 0u)];
+        }
+    }
+}
+";
+
+fn join(ctx: &crate::Context, parts: [&Array<f32>; 5], shape: Shape, n1: usize) -> Result<(Array<f32>, Array<f32>), LumaError> {
+    let [w, m, ..] = shape.dims();
+    let (mut fo, mut vo) = (Array::<f32>::alloc(ctx, shape)?, Array::<f32>::alloc(ctx, shape)?);
+    // (`batch` carries `n1`: the kernel's struct has the same three words.)
+    let params = Params { m: m as u32, w: w as u32, batch: n1 as u32 };
+    let args: [KernelArg<'_>; 8] = [
+        view(parts[0]),
+        view(parts[1]),
+        view(parts[2]),
+        view(parts[3]),
+        view(parts[4]),
+        (&mut fo).into(),
+        (&mut vo).into(),
+        uniform(&params),
+    ];
+    let groups = (m * w).div_ceil(256).min(4096) as u32;
+    launch(ctx, "qr_join", "qr_join", || JOIN.to_owned(), [groups, 1, 1], &args)?;
+    Ok((fo, vo))
+}
+
+/// `T = [[T1, -T12], [0, T2]]` and `tau = [tau1, tau2]` of a node, one element per invocation.
+const TJOIN: &str = "struct Params { w: u32, n1: u32 }
+@group(1) @binding(0) var<storage, read> t1: array<f32>;
+@group(1) @binding(1) var<uniform> t1v: LumaView;
+@group(1) @binding(2) var<storage, read> t12: array<f32>;
+@group(1) @binding(3) var<uniform> t12v: LumaView;
+@group(1) @binding(4) var<storage, read> t2: array<f32>;
+@group(1) @binding(5) var<uniform> t2v: LumaView;
+@group(1) @binding(6) var<storage, read> u1: array<f32>;
+@group(1) @binding(7) var<uniform> u1v: LumaView;
+@group(1) @binding(8) var<storage, read> u2: array<f32>;
+@group(1) @binding(9) var<uniform> u2v: LumaView;
+@group(1) @binding(10) var<storage, read_write> to: array<f32>;
+@group(1) @binding(11) var<storage, read_write> uo: array<f32>;
+@group(1) @binding(12) var<uniform> p: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let w = p.w;
+    let n1 = p.n1;
+    for (var idx = gid.x; idx < w * w; idx = idx + nwg.x * 256u) {
+        let i = idx / w;
+        let col = idx - i * w;
+        var v = 0.0;
+        if (i < n1) {
+            if (col < n1) { v = t1[luma_view_idx3(t1v, col, i, 0u)]; } else { v = -t12[luma_view_idx3(t12v, col - n1, i, 0u)]; }
+        } else if (col >= n1) {
+            v = t2[luma_view_idx3(t2v, col - n1, i - n1, 0u)];
+        }
+        to[idx] = v;
+        if (idx < w) {
+            if (idx < n1) { uo[idx] = u1[luma_view_idx3(u1v, idx, 0u, 0u)]; } else { uo[idx] = u2[luma_view_idx3(u2v, idx - n1, 0u, 0u)]; }
+        }
+    }
+}
+";
+
+/// `T` and `tau` of a node from those of its halves and `T12 = T1 Z T2` (with a minus sign).
+fn tjoin(ctx: &crate::Context, [t1, t12, t2, tau1, tau2]: [&Array<f32>; 5], n1: usize, w: usize) -> Result<(Array<f32>, Array<f32>), LumaError> {
+    let (mut to, mut uo) = (Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?, Array::<f32>::alloc(ctx, Shape::from([w, 1, 1]))?);
+    let params = TParams { w: w as u32, n1: n1 as u32 };
+    let args: [KernelArg<'_>; 8] = [view(t1), view(t12), view(t2), view(tau1), view(tau2), (&mut to).into(), (&mut uo).into(), uniform(&params)];
+    let groups = (w * w).div_ceil(256).min(4096) as u32;
+    launch(ctx, "qr_tjoin", "qr_tjoin", || TJOIN.to_owned(), [groups, 1, 1], &args)?;
+    Ok((to, uo))
+}
+
+#[derive(encase::ShaderType)]
+struct TParams {
+    w: u32,
+    n1: u32,
+}
+
 /// A recursion over one `[w, m]` matrix, `m >= w`.
-fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
+fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Node {
     let [w, m, ..] = a.shape().dims();
+    if w <= PANEL
+        && let Some(plan) = super::tsqr::plan(a.context(), m, w)
+    {
+        return tsqr_panel(a, plan, op, loc);
+    }
     if w <= if m <= 64 { PANEL } else { super::panel_width() } {
-        return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
+        return Node::of(leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc));
     }
     let n1 = super::split_cols(w);
     let n2 = w - n1;
-    let Qr { qr: f1, tau: tau1, t: t1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
-    let f1 = f1.cache();
-    let v1 = unit_lower(&f1).cache();
+    let Node { qr: f1, v: v1, tau: tau1, t: t1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let c = block(a, 0..m, n1..w).cache();
     // C <- Q1ᵀ C = C - V1 (T1ᵀ (V1ᵀ C)).
     let wmat = matmul_f32(&v1.transpose(), &c);
     let wmat = matmul_f32(&t1.transpose(), &wmat);
     let c = (&c - &matmul_f32(&v1, &wmat)).cache();
-    let Qr { qr: f2, tau: tau2, t: t2 } = recurse(&block(&c, n1..m, 0..n2), op, loc);
-    let v2 = unit_lower(&f2).cache();
+    let Node { qr: f2, v: v2, tau: tau2, t: t2 } = recurse(&block(&c, n1..m, 0..n2), op, loc);
     let v1b = block(&v1, n1..m, 0..n1).cache();
     // T12 = -T1 (V1bᵀ V2) T2.
     let z = matmul_f32(&v1b.transpose(), &v2);
-    let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2)) * -1.0f32;
-    let zeros = match Array::<f32>::zeros_on(a.context(), [n1, n2]) {
-        Ok(z) => z,
-        Err(e) => return failed_qr(a.context(), a, e, op, loc),
-    };
-    let t = concat(1, [&concat(0, [&t1, &t12]), &concat(0, [&zeros, &t2])]);
-    let right = concat(1, [&block(&c, 0..n1, 0..n2), &f2]);
-    Qr { qr: concat(0, [&f1, &right]), tau: concat(0, [&tau1, &tau2]), t }
+    let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2));
+    let joined = tjoin(a.context(), [&t1, &t12, &t2, &tau1, &tau2], n1, w).and_then(|(t, tau)| join(a.context(), [&f1, &v1, &c, &f2, &v2], a.shape(), n1).map(|(qr, v)| Node { qr, v, tau, t }));
+    joined.unwrap_or_else(|e| Node::failed(a.context(), a, e, op, loc))
 }
 
 fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
@@ -262,15 +404,21 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
+    if d.batch == 1
+        && d.cols <= PANEL
+        && let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols)
+    {
+        return tsqr_panel(a, plan, op, loc).into_qr();
+    }
     if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {
-        let parts: Vec<Qr> = (0..d.batch).map(|i| recurse(&nth(a, i), op, loc)).collect();
+        let parts: Vec<Qr> = (0..d.batch).map(|i| recurse(&nth(a, i), op, loc).into_qr()).collect();
         let pick = |f: fn(&Qr) -> &Array<f32>| -> Vec<Array<f32>> { parts.iter().map(|p| f(p).clone()).collect() };
         return Qr { qr: stack_batch(&pick(|p| &p.qr)), tau: concat_slice(2, &pick(|p| &p.tau)), t: concat_slice(2, &pick(|p| &p.t)) };
     }
-    recurse(a, op, loc)
+    recurse(a, op, loc).into_qr()
 }
 
 /// `a b` for matrices or batches of them.

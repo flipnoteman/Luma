@@ -29,6 +29,7 @@ pub(crate) mod lu;
 pub(crate) mod svd;
 pub(crate) mod qr;
 pub(crate) mod tri;
+pub(crate) mod tsqr;
 
 /// Which triangle of a matrix an operation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -85,6 +86,15 @@ pub(crate) fn per_matrix(ctx: &Context, count: usize) -> [u32; 3] {
     let max = ctx.max_workgroups_per_dimension() as usize;
     let x = count.min(max);
     [x as u32, count.div_ceil(x) as u32, 1]
+}
+
+/// Like [`launch`], for a kernel whose every access to workgroup and storage memory is in bounds by
+/// construction (its sizes come from the launching code, which allocates and indexes to them; the
+/// tests run it on every backend): built without the per-access bounds checks, which in the
+/// column loops of the small factorisation kernels are most of their instructions.
+pub(crate) fn launch_unchecked(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
+    // SAFETY: the callers' kernels index only within the sizes they allocate (see above).
+    unsafe { ctx.keyed_kernel_unchecked(&format!("unchecked/{key}"), label, make) }?.launch_raw(groups, args)
 }
 
 /// Records the launch over `groups` workgroups of the kernel `make()` names by `key` (which must
@@ -157,4 +167,21 @@ pub(crate) fn panel_width() -> usize {
 /// that are still narrow.
 pub(crate) fn split_cols(w: usize) -> usize {
     if w <= 64 { (w / 2).next_multiple_of(8).min(w - 1).max(1) } else { tri::split(w) }
+}
+
+/// Whether the trailing-update products of the factorisations run on tensor cores in TF32
+/// (`LUMA_LINALG_TF32=1`; default off: every product is the exact `f32` one). The operands are
+/// rounded to a 10-bit mantissa, so the factors carry a backward error of about 1e-3 of the
+/// entries of the updates instead of 1e-7; only the CUDA backend on a device with tensor cores of
+/// compute capability 8.0 or higher takes it (see [`Array::matmul_tf32`]), every other
+/// backend computes the `f32` product anyway.
+pub(crate) fn tf32_updates() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUMA_LINALG_TF32").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The product of the update of a factorisation: [`matmul_f32`](crate::matmul::matmul_f32), or the TF32
+/// one with [`tf32_updates`].
+pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    if tf32_updates() { crate::matmul::matmul_tf32(lhs, rhs) } else { crate::matmul::matmul_f32(lhs, rhs) }
 }

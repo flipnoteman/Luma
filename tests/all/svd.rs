@@ -205,7 +205,7 @@ fn svd_square_sizes() {
 #[test]
 fn svd_tall_and_wide() {
     let ctx = Context::new().unwrap();
-    for &(m, n) in &[(2usize, 1usize), (1, 2), (5, 3), (3, 5), (8, 1), (1, 8), (40, 7), (7, 40), (33, 32), (32, 33), (64, 31), (31, 64), (100, 33), (33, 100), (300, 20), (20, 300), (130, 129), (129, 130)] {
+    for &(m, n) in &[(2usize, 1usize), (1, 2), (5, 3), (3, 5), (8, 1), (1, 8), (40, 7), (7, 40), (33, 32), (32, 33), (64, 31), (31, 64), (100, 33), (33, 100), (300, 20), (20, 300), (130, 129), (129, 130), (520, 130), (130, 520)] {
         check_batch(&ctx, &random(m, n, 20 + (m * 3 + n) as u64), m, n, 1, "rect");
     }
 }
@@ -435,6 +435,59 @@ fn rank_of_batches_and_known_ranks() {
     // A big matrix.
     let a = with_spectrum(120, 100, &(0..37).map(|i| 1.0 + i as f64).collect::<Vec<_>>(), 5);
     assert_eq!(mat(&ctx, &a, 100, 120, 1).rank().to_vec().unwrap(), vec![37]);
+}
+
+/// The rank of big matrices (decided by two QR factorisations when they can bound it, by the
+/// singular values otherwise) is what counting the singular values above the cut gives.
+#[test]
+fn rank_of_big_matrices_matches_the_singular_values() {
+    let ctx = Context::new().unwrap();
+    let count = |s: &[f32], tol: f32| s.iter().filter(|&&x| x > tol * s[0]).count() as u32;
+    let cases: Vec<(usize, usize, Vec<f64>, f32)> = vec![
+        // Well separated from the cut: decided by the factorisations.
+        (150, 150, (0..70).map(|i| 1.0 - 0.01 * i as f64).collect(), 1e-4),
+        (150, 150, (0..150).map(|i| 1.0 - 0.006 * i as f64).collect(), 1e-4),
+        (170, 100, (0..40).map(|i| 2.0 - 0.03 * i as f64).collect(), 1e-4),
+        (100, 170, (0..40).map(|i| 2.0 - 0.03 * i as f64).collect(), 1e-4),
+        // Values on both sides of the cut, a few times away from it.
+        (130, 130, (0..60).map(|i| 1.0 - 0.01 * i as f64).chain((0..20).map(|i| 3e-3 * (1.0 - 0.01 * i as f64))).chain((0..20).map(|i| 3e-5 * (1.0 - 0.01 * i as f64))).collect(), 1e-4),
+        // A decay that crosses the cut gradually.
+        (120, 120, (0..120).map(|i| 0.9f64.powi(i)).collect(), 1e-4),
+    ];
+    for (i, (m, n, spec, tol)) in cases.iter().enumerate() {
+        let a = with_spectrum(*m, *n, spec, 300 + i as u64);
+        let arr = mat(&ctx, &a, *n, *m, 1);
+        let want = count(&arr.singular_values().to_vec().unwrap(), *tol);
+        assert_eq!(arr.rank_tol(*tol).to_vec().unwrap(), vec![want], "case {i}: {m}x{n}");
+        let expected = spec.iter().filter(|&&x| x > f64::from(*tol) * spec[0]).count() as u32;
+        assert_eq!(want, expected, "case {i}: the host count and the singular values differ");
+    }
+    // A random full rank matrix at the default tolerance, and one with a zero first column.
+    let a = random(140, 140, 77);
+    let arr = mat(&ctx, &a, 140, 140, 1);
+    let tol = 140.0 * f32::EPSILON;
+    assert_eq!(arr.rank().to_vec().unwrap(), vec![count(&arr.singular_values().to_vec().unwrap(), tol)]);
+    let mut b = random(110, 110, 78);
+    for r in 0..110 {
+        b[r * 110] = 0.0;
+    }
+    assert_eq!(mat(&ctx, &b, 110, 110, 1).rank().to_vec().unwrap(), vec![109]);
+    // A shift matrix (ones above the diagonal): the first QR factorisation sees a zero column.
+    let mut shift = vec![0.0f32; 100 * 100];
+    for r in 0..99 {
+        shift[r * 100 + r + 1] = 1.0;
+    }
+    assert_eq!(mat(&ctx, &shift, 100, 100, 1).rank().to_vec().unwrap(), vec![99]);
+    // Zero, and a batch of big matrices of different ranks.
+    assert_eq!(mat(&ctx, &vec![0.0; 100 * 100], 100, 100, 1).rank().to_vec().unwrap(), vec![0]);
+    let mut data = Vec::new();
+    for (b, r) in [30usize, 100, 55].into_iter().enumerate() {
+        let spec: Vec<f64> = (0..r).map(|i| 1.0 - 0.008 * i as f64).collect();
+        data.extend(with_spectrum(110, 100, &spec, 400 + b as u64));
+    }
+    let got = mat(&ctx, &data, 100, 110, 3).rank();
+    assert_eq!(got.shape().dims(), [1, 1, 3, 1]);
+    assert_eq!(got.to_vec().unwrap(), vec![30, 100, 55]);
 }
 
 #[test]

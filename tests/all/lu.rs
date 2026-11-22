@@ -88,7 +88,9 @@ fn lu_factors_every_size() {
         assert!(is_permutation(&perm), "n = {n}: not a permutation");
         let (err, lmax) = lu_error(&lu, &perm, &a, n);
         assert!(err < 3e-6 * (n as f64).sqrt().max(1.0) * 4.0, "n = {n}: ||PA - LU|| / ||A|| = {err}");
-        assert!(lmax <= 1.0 + 1e-6, "n = {n}: |l| = {lmax}");
+        // Partial pivoting bounds the multipliers by 1; a tall panel is pivoted by a tournament
+        // over chunks of rows (the multipliers can exceed 1, mildly) wherever it has several.
+        assert!(lmax <= if n > 64 { 8.0 } else { 1.0 + 1e-6 }, "n = {n}: |l| = {lmax}");
     }
 }
 
@@ -110,7 +112,7 @@ fn lu_needs_pivoting() {
         let f = mat(&ctx, &b, n, n, 1).lu();
         let (lu, perm) = (f.lu.to_vec().unwrap(), f.perm.to_vec().unwrap());
         let (err, lmax) = lu_error(&lu, &perm, &b, n);
-        assert!(err < 3e-6 * 4.0 && lmax <= 1.0 + 1e-6, "n = {n}: {err}, {lmax}");
+        assert!(err < 3e-6 * 4.0 && lmax <= if n > 64 { 8.0 } else { 1.0 + 1e-6 }, "n = {n}: {err}, {lmax}");
         assert_ne!(perm[0], 0);
     }
 }
@@ -328,7 +330,7 @@ fn nan_input_propagates_and_shapes_are_checked() {
 #[test]
 fn tall_matrices_factor_too() {
     let ctx = Context::new().unwrap();
-    for &(n, m) in &[(1usize, 5usize), (5, 20), (40, 100), (70, 300), (33, 65), (100, 130), (5, 3), (40, 20), (100, 60), (300, 130)] {
+    for &(n, m) in &[(1usize, 5usize), (5, 20), (40, 100), (70, 300), (33, 65), (100, 130), (5, 3), (40, 20), (100, 60), (300, 130), (32, 600), (20, 1100), (13, 2600), (33, 1500), (64, 1100)] {
         let a = values(n * m, 5 + (n * 3 + m) as u64, -1.0, 1.0);
         let f = mat(&ctx, &a, n, m, 1).lu();
         assert_eq!(f.lu.shape().dims(), [n, m, 1, 1]);
@@ -364,4 +366,35 @@ fn infinite_entries_do_not_hang_or_poison() {
         };
         assert!(spd_inf.iter().any(|v| !v.is_finite()), "n = {n}: Cholesky of an infinite entry is finite");
     }
+}
+
+/// Panels of more than 512 rows pick their pivot rows by a tournament between chunks of rows
+/// (and the pivots of a matrix bigger than that are not always the largest of the column): the
+/// factors must still reproduce `P A`, with multipliers that stay small, for random matrices and
+/// for matrices whose rows differ in scale by orders of magnitude.
+#[test]
+fn big_matrices_factor_with_small_residuals() {
+    let ctx = Context::new().unwrap();
+    for &n in &[513usize, 700, 1100] {
+        let a = random(n, 40 + n as u64);
+        let scaled: Vec<f32> = a.iter().enumerate().map(|(k, &v)| v * 10f32.powi((k / n % 7) as i32 - 3)).collect();
+        for (label, a) in [("random", a), ("row scaled", scaled)] {
+            let f = mat(&ctx, &a, n, n, 1).lu();
+            let (lu, perm) = (f.lu.to_vec().unwrap(), f.perm.to_vec().unwrap());
+            assert!(is_permutation(&perm), "n = {n} {label}: not a permutation");
+            let (err, lmax) = lu_error(&lu, &perm, &a, n);
+            assert!(err < 2e-5, "n = {n} {label}: ||PA - LU|| / ||A|| = {err}");
+            assert!(lmax <= 8.0, "n = {n} {label}: |l| = {lmax}");
+        }
+    }
+    // Near singular: the last column is the sum of two others, plus rounding noise.
+    let n = 600usize;
+    let mut a = random(n, 77);
+    for i in 0..n {
+        a[i * n + n - 1] = a[i * n] + a[i * n + 1] + 1e-6 * a[i * n + 2];
+    }
+    let f = mat(&ctx, &a, n, n, 1).lu();
+    let (lu, perm) = (f.lu.to_vec().unwrap(), f.perm.to_vec().unwrap());
+    let (err, _) = lu_error(&lu, &perm, &a, n);
+    assert!(err < 2e-5, "near singular: ||PA - LU|| / ||A|| = {err}");
 }

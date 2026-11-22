@@ -832,11 +832,26 @@ impl Context {
     /// context and holds the compiled kernels only, never a handle to a context, so it dies with
     /// it and a finished context gives its device back to the pool.
     pub(crate) fn keyed_kernel(&self, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        self.keyed_kernel_with(key, make, |source| self.kernel(source).label(label).build())
+    }
+
+    /// [`Context::keyed_kernel`] for a kernel whose every access is in bounds by construction: built
+    /// without the per-access bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller vouches that every storage and workgroup access of the kernel is in bounds.
+    pub(crate) unsafe fn keyed_kernel_unchecked(&self, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        // SAFETY: the caller vouches for the bounds of every access of the kernel.
+        self.keyed_kernel_with(key, make, |source| unsafe { self.kernel(source).label(label).unchecked_bounds() }.build())
+    }
+
+    fn keyed_kernel_with(&self, key: &str, make: impl FnOnce() -> String, build: impl FnOnce(&str) -> Result<crate::Kernel>) -> Result<crate::Kernel> {
         let cached = self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned();
         if let Some(core) = cached {
             return Ok(crate::Kernel::from_core(self, core));
         }
-        let kernel = self.kernel(&make()).label(label).build()?;
+        let kernel = build(&make())?;
         self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.to_owned(), kernel.core());
         Ok(kernel)
     }
