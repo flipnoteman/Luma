@@ -32,7 +32,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | --- | --- |
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
-| `prod()` / `product()` | the product; `1` for no elements, NaN if any element is NaN, `u32` / `i32` products wrap around |
+| `prod()` / `product()` | the product; NaN if any element is NaN, `u32` / `i32` products wrap around |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares`, `Product` (one to four) in one pass, as an `N`-element array |
 | `norm_p(Norm)` | `One`, `Two`, `Inf`, `P(p)`, `Frobenius` and the matrix `MatrixOne` / `MatrixInf` norms, `f32` (`f64` except `P`) |
 | `sum_where(&cond)` | the sum of the elements where a `bool` (or non-zero `u32`) condition is true, in one pass |

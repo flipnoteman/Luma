@@ -199,19 +199,16 @@ fn product_along_axes() {
 }
 
 #[test]
-fn empty_product_is_one() {
+fn zero_sized_arrays_do_not_exist_and_one_element_products_are_the_element() {
     let ctx = Context::new().unwrap();
-    // An empty array is an error or the neutral value.
-    if let Ok(empty) = Array::<f32>::zeros_on(&ctx, 0)
-        && let Ok(value) = empty.prod().item()
-    {
-        assert_eq!(value, 1.0);
+    // Arrays have no zero-sized dimension, so there is no empty product to take (the identity 1 is what
+    // the idle invocations of a kernel start from); a single element is its own product.
+    assert!(Array::<f32>::zeros_on(&ctx, 0).is_err());
+    for value in [3.5f32, -0.0, f32::NAN] {
+        let x = Array::from_slice_on(&ctx, &[value], 1).unwrap();
+        assert_eq!(x.prod().item().unwrap().to_bits(), value.to_bits());
     }
-    if let Ok(empty) = Array::<u32>::zeros_on(&ctx, 0)
-        && let Ok(value) = empty.prod().item()
-    {
-        assert_eq!(value, 1);
-    }
+    assert_eq!(Array::from_slice_on(&ctx, &[7u32], 1).unwrap().prod().item().unwrap(), 7);
 }
 
 #[test]

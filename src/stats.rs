@@ -432,8 +432,7 @@ impl Array<f64> {
 }
 
 impl<T: Numeric> Array<T> {
-    /// The product along `axis`; the result has extent 1 along it (`1` for a line of no
-    /// elements). Fused like [`Array::sum_axis`]: a pending operand is computed inside the first
+    /// The product along `axis`; the result has extent 1 along it. Fused like [`Array::sum_axis`]: a pending operand is computed inside the first
     /// pass of the reduction. See [`Array::prod`] for the semantics of float and integer
     /// products.
     #[track_caller]

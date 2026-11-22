@@ -469,9 +469,8 @@ impl<T: Numeric> Array<T> {
         self.reduce_at([Reduction::Max], "max", Location::caller())
     }
 
-    /// The product of all elements, as a lazy one-element array (see [`Array::sum`]): `1` for an
-    /// empty array, NaN if any element is NaN, and (as for the sum) `u32` and `i32` products wrap
-    /// around. Float products combine in trees like sums do, so the rounding error stays that
+    /// The product of all elements, as a lazy one-element array (see [`Array::sum`]): NaN if any
+    /// element is NaN, and (as for the sum) `u32` and `i32` products wrap around. Float products combine in trees like sums do, so the rounding error stays that
     /// of `n` multiplications; a partial product that leaves the range of the type becomes
     /// infinity (or 0) even where later factors would bring it back, and which partial products
     /// there are depends on the grouping. Fuses with the expression behind it
@@ -778,7 +777,7 @@ pub enum Reduction {
     Max,
     /// The sum of the squared elements.
     SumOfSquares,
-    /// The product of the elements (1 for none; a NaN anywhere gives NaN, integers wrap around).
+    /// The product of the elements (a NaN anywhere gives NaN, integers wrap around).
     Product,
 }
 
