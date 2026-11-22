@@ -144,3 +144,68 @@ fn fast_nothing_and_errors() {
     let cube = Array::<f32>::zeros_on(&ctx, [8, 8, 2]).unwrap();
     assert!(cube.fast(20.0, 9, true, 0.1, 3).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// homography
+// ---------------------------------------------------------------------------------------------
+
+use luma::{homography, HomographyMethod};
+
+/// Points under `h` (row-major), with every `outlier_every`-th destination replaced by noise.
+fn warp(h: &[f64; 9], n: usize, outlier_every: usize, seed: u64) -> [Vec<f32>; 4] {
+    let r = values(4 * n, seed, 0.0, 1.0);
+    let (mut xs, mut ys, mut xd, mut yd) = (vec![], vec![], vec![], vec![]);
+    for i in 0..n {
+        let (x, y) = (f64::from(r[i]) * 300.0, f64::from(r[n + i]) * 200.0);
+        let w = h[6] * x + h[7] * y + h[8];
+        let (u, v) = ((h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w);
+        xs.push(x as f32);
+        ys.push(y as f32);
+        if outlier_every > 0 && i % outlier_every == 0 {
+            xd.push(r[2 * n + i] * 300.0);
+            yd.push(r[3 * n + i] * 200.0);
+        } else {
+            xd.push(u as f32);
+            yd.push(v as f32);
+        }
+    }
+    [xs, ys, xd, yd]
+}
+
+#[test]
+fn homography_recovers_a_perspective_transform_among_outliers() {
+    let ctx = ctx();
+    let truth = [1.1, 0.1, 5.0, -0.05, 0.95, -3.0, 0.0004, 0.0002, 1.0];
+    let n = 200;
+    let [xs, ys, xd, yd] = warp(&truth, n, 5, 99);
+    let up = |v: &[f32]| Array::from_slice_on(&ctx, v, v.len()).unwrap();
+    let outliers = (0..n).filter(|i| i % 5 == 0).count();
+    for method in [HomographyMethod::Ransac, HomographyMethod::Lmeds] {
+        let (h, inliers) = homography(&up(&xs), &up(&ys), &up(&xd), &up(&yd), method, 1.0, 500);
+        assert_eq!(h.shape().dims(), [3, 3, 1, 1]);
+        let h = h.to_vec().unwrap();
+        for k in 0..9 {
+            let tol = if k >= 6 { 5e-5 } else { 5e-3 * truth[k].abs().max(1.0) };
+            assert!((f64::from(h[k]) - truth[k]).abs() <= tol, "{method:?} h[{k}] = {} want {}", h[k], truth[k]);
+        }
+        let inliers = inliers.item().unwrap() as usize;
+        // The robust threshold of the median method is not a hard bound on numerical noise.
+        assert!(inliers >= (n - outliers) * 9 / 10 && inliers <= n, "{method:?}: {inliers} inliers");
+    }
+}
+
+#[test]
+fn homography_is_deterministic_and_checks_arguments() {
+    let ctx = ctx();
+    let truth = [1.0, 0.0, 2.0, 0.0, 1.0, 3.0, 0.0, 0.0, 1.0];
+    let [xs, ys, xd, yd] = warp(&truth, 40, 0, 5);
+    let up = |v: &[f32]| Array::from_slice_on(&ctx, v, v.len()).unwrap();
+    let a = homography(&up(&xs), &up(&ys), &up(&xd), &up(&yd), HomographyMethod::Ransac, 0.5, 100);
+    let b = homography(&up(&xs), &up(&ys), &up(&xd), &up(&yd), HomographyMethod::Ransac, 0.5, 100);
+    assert_eq!(a.0.to_vec().unwrap(), b.0.to_vec().unwrap());
+    assert_eq!(a.1.item().unwrap(), 40);
+    let few = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
+    assert!(homography(&few, &few, &few, &few, HomographyMethod::Ransac, 1.0, 10).0.to_vec().is_err());
+    assert!(homography(&up(&xs), &up(&ys), &up(&xd), &up(&yd), HomographyMethod::Ransac, 1.0, 0).1.item().is_err());
+    assert!(homography(&up(&xs), &up(&ys), &up(&xd), &few, HomographyMethod::Ransac, 1.0, 10).1.item().is_err());
+}

@@ -39,32 +39,30 @@ pub(crate) struct Kernel {
 /// The ring of the detector, as offsets along axis 0 and 1, clockwise from the top.
 const RING: [(i32, i32); 16] = [(3, 0), (3, 1), (2, 2), (1, 3), (0, 3), (-1, 3), (-2, 2), (-3, 1), (-3, 0), (-3, -1), (-2, -2), (-1, -3), (0, -3), (1, -3), (2, -2), (3, -1)];
 
-/// The WGSL of a kernel. Arguments of the counting kernel: image, counts, uniform; of the
-/// scattering one: image, offsets (the scanned counts), `x`, `y`, `score`, uniform.
+/// The WGSL of a kernel.
 pub(crate) fn source(k: Kernel) -> String {
+    if k.scatter {
+        scatter_source()
+    } else {
+        detect_source(k.arc)
+    }
+}
+
+/// The detection kernel. Arguments: image, counts (one per tile), the score image (the score of
+/// the corners that stay, 0 elsewhere), uniform.
+fn detect_source(arc: u8) -> String {
     let (halo_in, halo_sc) = (4u32, 1u32);
     let (iw, ih) = (TX + 2 * halo_in, TY + 2 * halo_in);
     let (sw, sh) = (TX + 2 * halo_sc, TY + 2 * halo_sc);
     let mut s = String::new();
     s.push_str("struct Params { h: u32, w: u32, thr: f32, edge: u32, tiles_x: u32, cap: u32, nonmax: u32, c: u32 }\n");
     s.push_str("@group(1) @binding(0) var<storage, read> src: array<f32>;\n");
-    if k.scatter {
-        s.push_str("@group(1) @binding(1) var<storage, read> offs: array<u32>;\n");
-        s.push_str("@group(1) @binding(2) var<storage, read_write> out_x: array<f32>;\n");
-        s.push_str("@group(1) @binding(3) var<storage, read_write> out_y: array<f32>;\n");
-        s.push_str("@group(1) @binding(4) var<storage, read_write> out_s: array<f32>;\n");
-        s.push_str("@group(1) @binding(5) var<uniform> p: Params;\n");
-    } else {
-        s.push_str("@group(1) @binding(1) var<storage, read_write> counts: array<u32>;\n");
-        s.push_str("@group(1) @binding(2) var<uniform> p: Params;\n");
-    }
+    s.push_str("@group(1) @binding(1) var<storage, read_write> counts: array<u32>;\n");
+    s.push_str("@group(1) @binding(2) var<storage, read_write> img: array<f32>;\n");
+    s.push_str("@group(1) @binding(3) var<uniform> p: Params;\n");
     let _ = writeln!(s, "var<workgroup> tile: array<f32, {}>;", iw * ih);
     let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", sw * sh);
-    if k.scatter {
-        s.push_str("var<workgroup> rank: array<u32, 256>;\nvar<workgroup> tot: u32;\n");
-    } else {
-        s.push_str("var<workgroup> cnt: atomic<u32>;\n");
-    }
+    s.push_str("var<workgroup> cnt: atomic<u32>;\n");
     // The score of the pixel at (cx, cy) of the staged tile.
     let off = |v: &str, d: i32| if d >= 0 { format!("{v} + {d}u") } else { format!("{v} - {}u", -d) };
     let at = |d0: i32, d1: i32| format!("tile[({}) * {iw}u + {}]", off("cy", d1), off("cx", d0));
@@ -105,11 +103,10 @@ pub(crate) fn source(k: Kernel) -> String {
     }
     let _ = writeln!(s, "    var b2 = bm | (bm << 16u); var d2 = dm | (dm << 16u);");
     let _ = writeln!(s, "    var tb = b2; var td = d2;");
-    for i in 1..k.arc {
+    for i in 1..arc {
         let _ = writeln!(s, "    tb &= b2 >> {i}u; td &= d2 >> {i}u;");
     }
     s.push_str("    var out = 0.0;\n    if ((tb & 65535u) != 0u) { out = sb; }\n    if ((td & 65535u) != 0u) { out = max(out, sd); }\n    return out;\n}\n");
-    // The kernel.
     let _ = write!(
         s,
         "@compute @workgroup_size(256)
@@ -119,16 +116,8 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     let o1 = i32(wid.y) * {TY} - {halo_in};
     let h = i32(p.h);
     let w = i32(p.w);
-"
-    );
-    if k.scatter {
-        s.push_str("    if (t == 0u) { tot = offs[tile_id + 1u] - offs[tile_id]; }\n    workgroupBarrier();\n    if (workgroupUniformLoad(&tot) == 0u) { return; }\n");
-    } else {
-        s.push_str("    if (t == 0u) { atomicStore(&cnt, 0u); }\n");
-    }
-    let _ = write!(
-        s,
-        "    for (var i = t; i < {total}u; i += 256u) {{
+    if (t == 0u) {{ atomicStore(&cnt, 0u); }}
+    for (var i = t; i < {total}u; i += 256u) {{
         let cx = i % {iw}u;
         let cy = i / {iw}u;
         let a0 = o0 + i32(cx);
@@ -159,43 +148,67 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
             && s0 > sc[base + {sw}u] && s0 > sc[base + {sw}u + 2u]
             && s0 > sc[base + 2u * {sw}u] && s0 > sc[base + 2u * {sw}u + 1u] && s0 > sc[base + 2u * {sw}u + 2u];
     }}
+    if (keep) {{ atomicAdd(&cnt, 1u); }}
+    let g0 = i32(wid.x) * {TX} + i32(tx);
+    let g1 = i32(wid.y) * {TY} + i32(ty);
+    if (g0 < h && g1 < w) {{ img[u32(g0) + p.h * u32(g1)] = select(0.0, s0, keep); }}
+    workgroupBarrier();
+    if (t == 0u) {{ counts[tile_id] = atomicLoad(&cnt); }}
+}}
 ",
         total = iw * ih,
         sc_total = sw * sh,
         d = halo_in - halo_sc
     );
-    if k.scatter {
-        s.push_str(
-            "    rank[t] = select(0u, 1u, keep);
+    s
+}
+
+/// The kernel writing the points. Arguments: the score image, the offsets (the scanned counts),
+/// `x`, `y`, `score`, uniform.
+fn scatter_source() -> String {
+    format!(
+        "struct Params {{ h: u32, w: u32, thr: f32, edge: u32, tiles_x: u32, cap: u32, nonmax: u32, c: u32 }}
+@group(1) @binding(0) var<storage, read> img: array<f32>;
+@group(1) @binding(1) var<storage, read> offs: array<u32>;
+@group(1) @binding(2) var<storage, read_write> out_x: array<f32>;
+@group(1) @binding(3) var<storage, read_write> out_y: array<f32>;
+@group(1) @binding(4) var<storage, read_write> out_s: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+var<workgroup> rank: array<u32, 256>;
+var<workgroup> tot: u32;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
+    let tile_id = wid.x + wid.y * p.tiles_x;
+    if (t == 0u) {{ tot = offs[tile_id + 1u] - offs[tile_id]; }}
     workgroupBarrier();
-    for (var d = 1u; d < 256u; d = d << 1u) {
+    if (workgroupUniformLoad(&tot) == 0u) {{ return; }}
+    let tx = t & 31u;
+    let ty = t >> 5u;
+    let g0 = wid.x * {TX}u + tx;
+    let g1 = wid.y * {TY}u + ty;
+    var s0 = 0.0;
+    if (g0 < p.h && g1 < p.w) {{ s0 = img[g0 + p.h * g1]; }}
+    let keep = s0 > 0.0;
+    rank[t] = select(0u, 1u, keep);
+    workgroupBarrier();
+    for (var d = 1u; d < 256u; d = d << 1u) {{
         var add = 0u;
-        if (t >= d) { add = rank[t - d]; }
+        if (t >= d) {{ add = rank[t - d]; }}
         workgroupBarrier();
         rank[t] = rank[t] + add;
         workgroupBarrier();
-    }
-    if (keep) {
+    }}
+    if (keep) {{
         let k = offs[tile_id] + rank[t] - 1u;
-        if (k < p.cap) {
-            out_x[k] = f32(i32(wid.y) * 8 + i32(ty));
-            out_y[k] = f32(i32(wid.x) * 32 + i32(tx));
+        if (k < p.cap) {{
+            out_x[k] = f32(g1);
+            out_y[k] = f32(g0);
             out_s[k] = s0;
-        }
-    }
-}
-",
-        );
-    } else {
-        s.push_str(
-            "    if (keep) { atomicAdd(&cnt, 1u); }
-    workgroupBarrier();
-    if (t == 0u) { counts[tile_id] = atomicLoad(&cnt); }
-}
-",
-        );
-    }
-    s
+        }}
+    }}
+}}
+"
+    )
 }
 
 impl Array<f32> {
@@ -261,18 +274,25 @@ fn run(image: &Array<f32>, threshold: f32, arc: u32, non_max: bool, ratio: f32, 
     let xs = Array::<f32>::alloc(ctx, Shape::from(cap))?;
     let ys = Array::<f32>::alloc(ctx, Shape::from(cap))?;
     let scores = Array::<f32>::alloc(ctx, Shape::from(cap))?;
+    let img = Array::<f32>::alloc(ctx, image.shape())?;
     let params = [to_u32(h, "height")?, to_u32(w, "width")?, threshold.to_bits(), to_u32(edge, "edge")?, tiles_x, to_u32(cap, "feature limit")?, u32::from(non_max), 0];
     {
         let (src, src_bytes) = image.ready()?;
         let counts_pin = counts.ready()?;
+        let img_pin = img.ready()?;
         let kernel = ctx.builtin(Builtin::Vision(Any::Fast(Kernel { arc: arc as u8, scatter: false })), "f32")?;
-        let args = [RawArg::read(src.buffer(), src_bytes), RawArg::write(counts_pin.0.buffer(), counts_pin.1), RawArg::Uniform(bytemuck::bytes_of(&params))];
-        ctx.launch(&kernel, grid, [h as u32, w as u32, 1], &args)?;
-        scan_counts(ctx, &counts_pin, tiles)?;
-        let kernel = ctx.builtin(Builtin::Vision(Any::Fast(Kernel { arc: arc as u8, scatter: true })), "f32")?;
-        let (x_pin, y_pin, s_pin) = (xs.ready()?, ys.ready()?, scores.ready()?);
         let args = [
             RawArg::read(src.buffer(), src_bytes),
+            RawArg::write(counts_pin.0.buffer(), counts_pin.1),
+            RawArg::write(img_pin.0.buffer(), img_pin.1),
+            RawArg::Uniform(bytemuck::bytes_of(&params)),
+        ];
+        ctx.launch(&kernel, grid, [h as u32, w as u32, 1], &args)?;
+        scan_counts(ctx, &counts_pin, tiles)?;
+        let kernel = ctx.builtin(Builtin::Vision(Any::Fast(Kernel { arc: 0, scatter: true })), "f32")?;
+        let (x_pin, y_pin, s_pin) = (xs.ready()?, ys.ready()?, scores.ready()?);
+        let args = [
+            RawArg::read(img_pin.0.buffer(), img_pin.1),
             RawArg::read(counts_pin.0.buffer(), counts_pin.1),
             RawArg::write(x_pin.0.buffer(), x_pin.1),
             RawArg::write(y_pin.0.buffer(), y_pin.1),

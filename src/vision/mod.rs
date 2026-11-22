@@ -12,6 +12,7 @@
 //! without a feature is `None`, since luma has no arrays without elements.
 
 mod fast;
+mod homography;
 
 // The implementation groups; each owns its file (and a directory of submodules).
 mod corners;
@@ -22,6 +23,7 @@ mod regions;
 
 // Public items of the groups.
 pub use corners::*;
+pub use homography::*;
 pub use descriptors::*;
 pub use edges::*;
 pub use matching::*;
@@ -78,7 +80,6 @@ impl Keypoints {
 }
 
 /// The error of a failed operation as the error every result carries.
-#[allow(dead_code)]
 pub(crate) fn poison(failure: Failure, op: &'static str, location: &'static Location<'static>) -> Arc<LumaError> {
     match failure {
         Failure::Inherited(error) => error,
@@ -110,6 +111,8 @@ pub(crate) enum Kernel {
     ScanCounts,
     /// The FAST detector, see [`fast`].
     Fast(fast::Kernel),
+    /// Homography estimation, see [`homography`].
+    Homography(homography::Kernel),
     /// Harris, SUSAN, difference of Gaussians.
     Corners(corners::Kernel),
     /// Template matching, nearest neighbours, Hamming matcher.
@@ -127,6 +130,7 @@ pub(crate) fn source(kernel: Kernel) -> String {
     match kernel {
         Kernel::ScanCounts => scan_counts_source(),
         Kernel::Fast(k) => fast::source(k),
+        Kernel::Homography(k) => homography::source(k),
         Kernel::Corners(k) => corners::source(k),
         Kernel::Matching(k) => matching::source(k),
         Kernel::Edges(k) => edges::source(k),
