@@ -381,8 +381,8 @@ fn calu_lu(wp: usize, parts: usize, row: &str, sg: bool) -> String {
 {
     let k0 = select(key(x0), 0u, done);
     let m = subgroupMax(k0);
-    let first = subgroupMin(select(0xffffffffu, t, k0 == m));
-    if (lane == 0u) { s1v[t / 32u] = m; s1i[t / 32u] = first; }
+    if (lane == 0u) { s1v[t / 32u] = m; }
+    if (lane == firstTrailingBit(subgroupBallot(k0 == m).x)) { s1i[t / 32u] = t; }
 }
 workgroupBarrier();
 ";
@@ -397,7 +397,7 @@ workgroupBarrier();
     var ki = 0xffffffffu;
     if (lane < NP) {{ kv = s1v[lane]; ki = s1i[lane]; }}
     let m2 = subgroupMax(kv);
-    let pv = subgroupMin(select(0xffffffffu, ki, kv == m2));
+    let pv = subgroupShuffle(ki, firstTrailingBit(subgroupBallot(kv == m2).x));
     if (t == pv) {{
         done = true;
         piv[{j}] = {row};
@@ -443,8 +443,8 @@ workgroupBarrier();
     {{
         let kk = select(key({next}), 0u, done);
         let m = subgroupMax(kk);
-        let first = subgroupMin(select(0xffffffffu, t, kk == m));
-        if (lane == 0u) {{ s1v[t / 32u] = m; s1i[t / 32u] = first; }}
+        if (lane == 0u) {{ s1v[t / 32u] = m; }}
+        if (lane == firstTrailingBit(subgroupBallot(kk == m).x)) {{ s1i[t / 32u] = t; }}
     }}
     workgroupBarrier();
 }}
