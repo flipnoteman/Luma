@@ -100,11 +100,33 @@ fn invert_text() -> String {
             var s0 = 0.0;
             var s1 = 0.0;
             var q = t;
-            for (; q + 1u < i; q = q + 2u) {{
-                s0 = fma(dt[o + q], iv[q * {LP}u + t], s0);
-                s1 = fma(dt[o + q + 1u], iv[(q + 1u) * {LP}u + t], s1);
+            for (; q + 8u <= i; q = q + 8u) {{
+                let d0 = dt[o + q];
+                let d1 = dt[o + q + 1u];
+                let d2 = dt[o + q + 2u];
+                let d3 = dt[o + q + 3u];
+                let d4 = dt[o + q + 4u];
+                let d5 = dt[o + q + 5u];
+                let d6 = dt[o + q + 6u];
+                let d7 = dt[o + q + 7u];
+                let y0 = iv[q * {LP}u + t];
+                let y1 = iv[(q + 1u) * {LP}u + t];
+                let y2 = iv[(q + 2u) * {LP}u + t];
+                let y3 = iv[(q + 3u) * {LP}u + t];
+                let y4 = iv[(q + 4u) * {LP}u + t];
+                let y5 = iv[(q + 5u) * {LP}u + t];
+                let y6 = iv[(q + 6u) * {LP}u + t];
+                let y7 = iv[(q + 7u) * {LP}u + t];
+                s0 = fma(d0, y0, s0);
+                s1 = fma(d1, y1, s1);
+                s0 = fma(d2, y2, s0);
+                s1 = fma(d3, y3, s1);
+                s0 = fma(d4, y4, s0);
+                s1 = fma(d5, y5, s1);
+                s0 = fma(d6, y6, s0);
+                s1 = fma(d7, y7, s1);
             }}
-            if (q < i) {{ s0 = fma(dt[o + q], iv[q * {LP}u + t], s0); }}
+            for (; q < i; q = q + 1u) {{ s0 = fma(dt[o + q], iv[q * {LP}u + t], s0); }}
             iv[i * {LP}u + t] = -(s0 + s1) * rd[i];
         }}
     }}
@@ -120,7 +142,9 @@ fn source(kc: usize, inv: bool) -> String {
     let mut fma = String::new();
     for c in 0..kc {
         zero += &format!("    var p{c} = 0.0;\n");
-        fma += &format!("            p{c} = fma(lq, xs[q * {ap}u + {c}u], p{c});\n");
+        for w in 0..4 {
+            fma += &format!("            p{c} = fma(lq{w}, xs[(q + {w}u) * {ap}u + {c}u], p{c});\n");
+        }
     }
     // The partial sums of the segments go to `red` (the tile buffer in inverse mode: it is free by then), and
     // every entry of `acc` starts from the right-hand side and takes all of them away.
@@ -200,8 +224,36 @@ fn source(kc: usize, inv: bool) -> String {
         let c = sg * {cpt}u + {u}u;
         if (c < {kc}u && rr < rows) {{
             var s0 = 0.0;
-            for (var q = 0u; q <= rr; q = q + 1u) {{ s0 = fma(iv[rr * {LP}u + q], acc[q * {ap}u + c], s0); }}
-            xs[rr * {ap}u + c] = s0;
+            var s1 = 0.0;
+            var q = 0u;
+            for (; q + 8u <= rr + 1u; q = q + 8u) {{
+                let l0 = iv[rr * {LP}u + q];
+                let l1 = iv[rr * {LP}u + q + 1u];
+                let l2 = iv[rr * {LP}u + q + 2u];
+                let l3 = iv[rr * {LP}u + q + 3u];
+                let l4 = iv[rr * {LP}u + q + 4u];
+                let l5 = iv[rr * {LP}u + q + 5u];
+                let l6 = iv[rr * {LP}u + q + 6u];
+                let l7 = iv[rr * {LP}u + q + 7u];
+                let x0 = acc[q * {ap}u + c];
+                let x1 = acc[(q + 1u) * {ap}u + c];
+                let x2 = acc[(q + 2u) * {ap}u + c];
+                let x3 = acc[(q + 3u) * {ap}u + c];
+                let x4 = acc[(q + 4u) * {ap}u + c];
+                let x5 = acc[(q + 5u) * {ap}u + c];
+                let x6 = acc[(q + 6u) * {ap}u + c];
+                let x7 = acc[(q + 7u) * {ap}u + c];
+                s0 = fma(l0, x0, s0);
+                s1 = fma(l1, x1, s1);
+                s0 = fma(l2, x2, s0);
+                s1 = fma(l3, x3, s1);
+                s0 = fma(l4, x4, s0);
+                s1 = fma(l5, x5, s1);
+                s0 = fma(l6, x6, s0);
+                s1 = fma(l7, x7, s1);
+            }}
+            for (; q <= rr; q = q + 1u) {{ s0 = fma(iv[rr * {LP}u + q], acc[q * {ap}u + c], s0); }}
+            xs[rr * {ap}u + c] = s0 + s1;
         }}
     }}\n"
         );
@@ -281,8 +333,11 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 {pre}{zero}    for (var j = 0u; j < blk; j = j + 1u) {{
         workgroupBarrier();
 {stores}{next_tile}{xload}        workgroupBarrier();
-        for (var q = sg * {SEGW}u; q < sg * {SEGW}u + {SEGW}u; q = q + 1u) {{
-            let lq = lt[rr * {LP}u + q];
+        for (var q = sg * {SEGW}u; q < sg * {SEGW}u + {SEGW}u; q = q + 4u) {{
+            let lq0 = lt[rr * {LP}u + q];
+            let lq1 = lt[rr * {LP}u + q + 1u];
+            let lq2 = lt[rr * {LP}u + q + 2u];
+            let lq3 = lt[rr * {LP}u + q + 3u];
 {fma}        }}
     }}
 {tail}{publish}    for (var e = t; e < rows * {kc}u; e = e + {T}u) {{
@@ -301,6 +356,9 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bo
     let ctx = l.context();
     let n = l.shape().dims()[1];
     let k = b.shape().dims()[0];
+    // The inverse of the first block is on the chain whatever the size, 10 us or so a launch: substitution is faster
+    // below a few blocks (`LUMA_TRSV_INV_MIN` rows, 768).
+    let inverse = inverse && n >= std::env::var("LUMA_TRSV_INV_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(768);
     let nblocks = n.div_ceil(NB);
     let kc = group_columns(k.next_power_of_two());
     let ncg = k.div_ceil(kc);
