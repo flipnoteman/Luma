@@ -737,7 +737,11 @@ impl CudaShared {
         let (major, minor) = self.cc;
         // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
         let meta = [major as u8, minor as u8, self.nvvm.version.0 as u8, self.nvvm.version.1 as u8, 8];
-        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        // The NVVM IR text is part of the key, so an emitter change that alters it changes the key; the
+        // revision of the sources covers what the text does not show (the NVVM options, the PTX
+        // post-processing).
+        let revision = cuda_code_revision();
+        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ revision.rotate_left(29);
         let stem = format!("ptx-{hash:016x}");
         let load = |text: String| self.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
         let dump = |ptx: &str| {
@@ -1744,4 +1748,20 @@ mod tests {
     fn open_backend() -> Result<CudaBackend, BackendError> {
         CudaBackend::new()
     }
+}
+
+/// Revision of the code generator, a hash of the sources that emit and compile the NVVM IR.
+fn cuda_code_revision() -> u64 {
+    static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *REVISION.get_or_init(|| {
+        cache::source_revision(&[
+            include_str!("codegen/mod.rs"),
+            include_str!("codegen/ops.rs"),
+            include_str!("codegen/fb.rs"),
+            include_str!("codegen/conv.rs"),
+            include_str!("nvvm.rs"),
+            include_str!("ptx.rs"),
+            include_str!("backend.rs"),
+        ])
+    })
 }
