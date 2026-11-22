@@ -1,3 +1,31 @@
+experimental = ["setup-scripts"]
+
+# Every test is its own process. On a GPU backend each process opens the device first, and the NVIDIA
+# driver serializes that across processes: creating a CUDA context takes about 65-70 ms of kernel
+# time and a Vulkan instance and device about 130 ms, the exit another stretch, and none of it
+# overlaps with the same work of another process. Measured on an RTX 3090 (32 threads): a context
+# opened alone takes 130 ms, 8 at once take 570 ms, 32 at once 3100 ms, so the whole suite takes the
+# time of 1056 opens (120-150 s) whatever the number of test threads, and more threads only add
+# contention for the driver's lock (CUDA, whole suite: 8 threads 121 s, 16 threads 127 s, 32 threads
+# 143 s; wgpu 143 / 152 / 178 s; 4 or 6 threads are no faster). 8 threads is also what the CPU
+# backend's suite needs (its tests are milliseconds of host work). `--test-threads N` overrides.
+[profile.default]
+test-threads = 8
+
+# A CUDA context creates one hardware queue per "connection" (8 by default on Ampere) and that is
+# most of what it costs: with a single one a context takes 30 ms of kernel time instead of 65 and a
+# test process lives 70 ms instead of 135 (CUDA driver 13.4, RTX 3090 and 3080 Laptop). Nothing the
+# tests check depends on kernels of different streams overlapping, so the test processes use one;
+# the library itself leaves the driver's default alone (a captured graph's independent branches
+# run concurrently on several connections). A value set in the environment wins.
+[scripts.setup.cuda-connections]
+command = ['sh', '-c', '[ -n "${CUDA_DEVICE_MAX_CONNECTIONS-}" ] || echo CUDA_DEVICE_MAX_CONNECTIONS=1 >> "$NEXTEST_ENV"']
+
+[[profile.default.scripts]]
+platform = 'cfg(unix)'
+filter = 'all()'
+setup = 'cuda-connections'
+
 # The flush test measures wall-clock time on the GPU (tests/flush.rs): the kernels of tests in
 # other binaries share the device and stretch its calibration unpredictably, so it runs alone.
 [[profile.default.overrides]]

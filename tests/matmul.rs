@@ -6,17 +6,34 @@ mod common;
 use common::values;
 use luma::{matmul, Array, Context, ContextOptions, LumaError};
 
-/// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` in `f64`.
+/// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` in `f64`. Every element is summed in order of `k`, as
+/// ever; the rows of a large product are spread over threads (they are independent), which keeps
+/// the host reference of the big shapes off the critical path of the test.
 fn host(a: &[f32], b: &[f32], k: usize, m: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0f64; n * m];
-    for row in 0..m {
-        for kk in 0..k {
-            let x = f64::from(a[kk + k * row]);
-            let line = &b[n * kk..n * (kk + 1)];
-            for (out, &y) in c[n * row..n * (row + 1)].iter_mut().zip(line) {
-                *out += x * f64::from(y);
+    let threads = if n * m * k < 1 << 22 { 1 } else { std::thread::available_parallelism().map_or(1, |t| t.get()).min(8) };
+    let rows_each = m.div_ceil(threads).max(1);
+    let product = |first_row: usize, rows: &mut [f64]| {
+        for (r, out_row) in rows.chunks_mut(n).enumerate() {
+            let row = first_row + r;
+            for kk in 0..k {
+                let x = f64::from(a[kk + k * row]);
+                let line = &b[n * kk..n * (kk + 1)];
+                for (out, &y) in out_row.iter_mut().zip(line) {
+                    *out += x * f64::from(y);
+                }
             }
         }
+    };
+    if threads == 1 {
+        product(0, &mut c);
+    } else {
+        std::thread::scope(|scope| {
+            for (part, rows) in c.chunks_mut(rows_each * n).enumerate() {
+                let product = &product;
+                scope.spawn(move || product(part * rows_each, rows));
+            }
+        });
     }
     c
 }
@@ -24,9 +41,19 @@ fn host(a: &[f32], b: &[f32], k: usize, m: usize, n: usize) -> Vec<f64> {
 /// Compares with relative tolerance 1e-4, and an absolute one scaled by the size of the sums for
 /// entries near zero.
 fn check(got: &[f32], want: &[f64], k: usize, a: &[f32], b: &[f32], what: &str) {
+    check_scaled(got, want, k, max_abs(a), max_abs(b), what);
+}
+
+/// The largest magnitude in `v`.
+fn max_abs(v: &[f32]) -> f64 {
+    v.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()))
+}
+
+/// [`check`] with the largest magnitudes of the operands given (the tolerance of a sampled check
+/// of a huge product must not scan the operands for every sample).
+fn check_scaled(got: &[f32], want: &[f64], k: usize, max_a: f64, max_b: f64, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
-    let max = |v: &[f32]| v.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()));
-    let abs = (k as f64).sqrt() * max(a) * max(b) * 1e-6;
+    let abs = (k as f64).sqrt() * max_a * max_b * 1e-6;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         let tolerance = abs.max(1e-4 * w.abs());
         assert!((f64::from(g) - w).abs() <= tolerance, "{what}: index {i}: got {g}, want {w} (tolerance {tolerance})");
@@ -99,9 +126,10 @@ fn a_tall_product_folds_its_tiles_over_the_grid() {
             }
             let got = c.to_vec().unwrap();
             assert_eq!(got.len(), n * m, "{what}");
+            let (max_a, max_b) = (max_abs(a), max_abs(b));
             for &row in &rows {
                 let want = host(&a[row * k..(row + 1) * k], b, k, 1, n);
-                check(&got[row * n..(row + 1) * n], &want, k, a, b, &format!("{what} k {k} row {row}"));
+                check_scaled(&got[row * n..(row + 1) * n], &want, k, max_a, max_b, &format!("{what} k {k} row {row}"));
             }
             true
         };
@@ -313,10 +341,11 @@ fn a_small_output_over_a_long_k_matches_the_host_product() {
         let case = Case::new(k, m, n);
         let what = format!("k {k} m {m} n {n}");
         let want = host(&case.a, &case.b, k, m, n);
+        let (max_a, max_b) = (max_abs(&case.a), max_abs(&case.b));
         let c = case.lhs().matmul(&case.rhs());
         assert_eq!(c.shape().dims(), [n, m, 1, 1], "{what}");
         let got = c.to_vec().unwrap();
-        check(&got, &want, k, &case.a, &case.b, &what);
+        check_scaled(&got, &want, k, max_a, max_b, &what);
         // The sum order is fixed: the same product gives the same bits.
         assert_eq!(got, case.lhs().matmul(&case.rhs()).to_vec().unwrap(), "{what}: not reproducible");
         // Operands stored the other way round and read through views.
@@ -324,9 +353,9 @@ fn a_small_output_over_a_long_k_matches_the_host_product() {
         let b_t: Vec<f32> = (0..n * k).map(|i| case.b[(i % k) * n + i / k]).collect();
         let lhs = Array::from_slice_on(&case.ctx, &a_t, [m, k]).unwrap().transpose();
         let rhs = Array::from_slice_on(&case.ctx, &b_t, [k, n]).unwrap().transpose();
-        check(&lhs.matmul(&case.rhs()).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} lhs view"));
-        check(&case.lhs().matmul(&rhs).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} rhs view"));
-        check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} both views"));
+        check_scaled(&lhs.matmul(&case.rhs()).to_vec().unwrap(), &want, k, max_a, max_b, &format!("{what} lhs view"));
+        check_scaled(&case.lhs().matmul(&rhs).to_vec().unwrap(), &want, k, max_a, max_b, &format!("{what} rhs view"));
+        check_scaled(&lhs.matmul(&rhs).to_vec().unwrap(), &want, k, max_a, max_b, &format!("{what} both views"));
         // Lazy operands.
         let (a2, b2): (Vec<f32>, Vec<f32>) = (case.a.iter().map(|&x| x * 2.0 + 1.0).collect(), case.b.iter().map(|&x| x * 0.5 - 0.25).collect());
         let both = (&case.lhs() * 2.0 + 1.0).matmul(&(&case.rhs() * 0.5 - 0.25));
