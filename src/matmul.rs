@@ -132,8 +132,16 @@ impl Array<f32> {
     /// product of an `M x K` and a `K x N` matrix (axis 0, the fastest, is the column index).
     /// One-dimensional operands count as having extent 1 on axis 1.
     ///
+    /// **Precision.** On the CUDA backend with tensor cores (compute capability 8.0 and up) this
+    /// is [`Array::matmul_tf32`] unless the context turned that off
+    /// ([`ContextOptions::tf32_matmul`](crate::ContextOptions::tf32_matmul), `LUMA_TF32_MATMUL=0`):
+    /// the operands are rounded to TF32 (a 10-bit mantissa) and the sums are `f32`, an error of
+    /// about 2e-4 of the RMS of the product (at most 1.5e-3 of the sum of the absolute terms of
+    /// an entry). Use [`Array::matmul_f32`] where full `f32` precision matters; every other
+    /// backend, and every product the tensor cores do not take, is the `f32` product.
+    ///
     /// Operands that are lazy expressions are fused into the kernel's loads instead of being
-    /// evaluated first. The product is recorded when this is called and the result is an
+    /// evaluated first (the tensor-core product evaluates them first). The product is recorded when this is called and the result is an
     /// evaluated array: what consumes it runs as its own kernels.
     ///
     /// Products with few output tiles and a long `K` are split over `K` and summed in a second
@@ -162,21 +170,20 @@ impl Array<f32> {
         matmul(self, rhs)
     }
 
-    /// [`Array::matmul`] on the tensor cores of the device, with the operands rounded to TF32
-    /// (a 10-bit mantissa, the range of `f32`) and the products accumulated in `f32`: the result
-    /// differs from the `f32` product by about `2^-11` of the magnitudes summed (a relative error
-    /// of 1e-3 to 1e-4 for sums of random signs), which is the precision of PyTorch's
-    /// `allow_tf32`. Opt-in: [`Array::matmul`] never rounds its operands. (An infinite operand
-    /// makes the entries it meets NaN instead of infinite, and an operand within 2^-11 of the
-    /// largest `f32` rounds up to NaN: the rounding is an integer addition.)
+    /// [`Array::matmul`] on the tensor cores of the device, whatever the context's
+    /// [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says: the operands are rounded to TF32
+    /// (a 10-bit mantissa, the range of `f32`) and the products accumulated in `f32`, so the
+    /// result differs from the `f32` product by up to 1.5e-3 of the sum of the absolute terms of
+    /// an entry (about 2e-4 of the RMS of the product for operands of random sign), the
+    /// precision of PyTorch's `allow_tf32`. Infinities and NaNs go through as in the `f32`
+    /// product, and an operand within 3.4e-4 of the largest `f32` becomes an infinity.
     ///
     /// Only the CUDA backend on a device with tensor cores of compute capability 8.0 or higher
     /// runs it, and only for products whose `M`, `N` and `K` are multiples of 4 and at least 32
     /// (operands that are transposed views are read in place, other expressions evaluated
     /// first, as for any native product); every other product, and every other backend, computes
-    /// the plain `f32` product, so a program that calls this gives the same results as `matmul`
-    /// up to rounding wherever tensor cores are not available. Like `matmul`, the result is
-    /// reproducible (the sum order is fixed).
+    /// the plain `f32` product. Like `matmul`, the result is reproducible (the sum order is
+    /// fixed).
     ///
     /// # Errors
     ///
@@ -185,25 +192,44 @@ impl Array<f32> {
     pub fn matmul_tf32(&self, rhs: &Array<f32>) -> Array<f32> {
         matmul_tf32(self, rhs)
     }
+
+    /// [`Array::matmul`] in full `f32` precision on every backend, whatever the context's
+    /// [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says: each entry is a sum of `f32`
+    /// products accumulated with fused multiply-adds in a fixed order. Slower than the tensor
+    /// cores of `matmul` where those apply (about 1.7x on large products on an RTX 3090).
+    ///
+    /// # Errors
+    ///
+    /// As [`Array::matmul`].
+    #[track_caller]
+    pub fn matmul_f32(&self, rhs: &Array<f32>) -> Array<f32> {
+        matmul_f32(self, rhs)
+    }
 }
 
 /// [`Array::matmul`] as a function: the product of `lhs` (`[K, M]`) and `rhs` (`[N, K]`) as an
 /// array of shape `[N, M]`.
 #[track_caller]
 pub fn matmul(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    product(lhs, rhs, false)
+    product(lhs, rhs, None)
 }
 
 /// [`Array::matmul_tf32`] as a function.
 #[track_caller]
 pub fn matmul_tf32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    product(lhs, rhs, true)
+    product(lhs, rhs, Some(true))
+}
+
+/// [`Array::matmul_f32`] as a function.
+#[track_caller]
+pub fn matmul_f32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(lhs, rhs, Some(false))
 }
 
 #[track_caller]
-fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Array<f32> {
+fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32> {
     let location = Location::caller();
-    let result = run(lhs, rhs, tf32 || lhs.context().tf32_matmul());
+    let result = run(lhs, rhs, tf32.unwrap_or_else(|| lhs.context().tf32_matmul()));
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     Array::resolve(lhs.context(), shape, result, "matmul", location)

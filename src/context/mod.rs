@@ -185,12 +185,15 @@ pub struct ContextOptions {
     /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
     /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
     pub fast_math: bool,
-    /// Makes [`Array::matmul`](crate::Array::matmul) what [`Array::matmul_tf32`](crate::Array::matmul_tf32)
-    /// is: on a device with tensor cores (the CUDA backend, compute capability 8.0 and up) the
+    /// Runs [`Array::matmul`](crate::Array::matmul) as [`Array::matmul_tf32`](crate::Array::matmul_tf32)
+    /// does: on a device with tensor cores (the CUDA backend, compute capability 8.0 and up) the
     /// operands of the products it can take are rounded to TF32 (a 10-bit mantissa) and the
     /// products accumulated in `f32`, which costs about `2^-11` of the magnitudes summed in
-    /// accuracy and gains up to 1.4x on large products and several times on small ones. Off by
-    /// default: a product is then the `f32` one on every backend. `LUMA_TF32_MATMUL=1`.
+    /// accuracy (2e-4 of the RMS of a product of random operands) and gains up to 1.7x on large
+    /// products and several times on small ones. On by default; `false` (`LUMA_TF32_MATMUL=0`)
+    /// makes `matmul` the `f32` product on every backend, as does calling
+    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product. No effect on other
+    /// backends, whose products are `f32` anyway.
     pub tf32_matmul: bool,
     /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
     /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
@@ -211,7 +214,7 @@ impl Default for ContextOptions {
             check_finite: false,
             calibrate: true,
             fast_math: false,
-            tf32_matmul: false,
+            tf32_matmul: true,
             df_fma: None,
         }
     }
@@ -268,8 +271,8 @@ impl ContextOptions {
         self
     }
 
-    /// Runs the matrix products on tensor cores in TF32 where the device has them (see
-    /// [`ContextOptions::tf32_matmul`]).
+    /// Runs the matrix products on tensor cores in TF32 where the device has them (the default),
+    /// or with `false` always in `f32` (see [`ContextOptions::tf32_matmul`]).
     pub fn tf32_matmul(mut self, on: bool) -> Self {
         self.tf32_matmul = on;
         self
@@ -279,8 +282,9 @@ impl ContextOptions {
     /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
     /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
-    /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` and `LUMA_TF32_MATMUL` likewise for
-    /// [`ContextOptions::fast_math`] and [`ContextOptions::tf32_matmul`], `LUMA_CALIBRATE` = `0` |
+    /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
+    /// [`ContextOptions::fast_math`], `LUMA_TF32_MATMUL` = `0` | `off` | `false` to turn
+    /// [`ContextOptions::tf32_matmul`] off, `LUMA_CALIBRATE` = `0` |
     /// `off` | `false` to skip calibration.
     pub fn from_env() -> ContextOptions {
         let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_ascii_lowercase());
@@ -318,8 +322,8 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             fast_math: std::env::var("LUMA_FAST_MATH")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
-            tf32_matmul: std::env::var("LUMA_TF32_MATMUL")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            tf32_matmul: !std::env::var("LUMA_TF32_MATMUL")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" => Some(true),
                 "0" | "off" | "false" => Some(false),
@@ -507,8 +511,9 @@ impl Context {
         self.inner.fast_math
     }
 
-    /// Whether matrix products run on tensor cores where they can.
-    pub(crate) fn tf32_matmul(&self) -> bool {
+    /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can
+    /// (see [`ContextOptions::tf32_matmul`]).
+    pub fn tf32_matmul(&self) -> bool {
         self.inner.tf32_matmul
     }
 

@@ -6,6 +6,12 @@ mod common;
 use common::values;
 use luma::{matmul, Array, Context, ContextOptions, LumaError};
 
+/// A context whose products are `f32` on every backend (tensor cores round their operands, which
+/// these tests compare to a host product to 1e-4; `tests/matmul_tf32.rs` covers those).
+fn exact() -> Result<Context, LumaError> {
+    Context::with_options(ContextOptions::from_env().tf32_matmul(false))
+}
+
 /// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` in `f64`.
 fn host(a: &[f32], b: &[f32], k: usize, m: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0f64; n * m];
@@ -47,7 +53,7 @@ impl Case {
     fn new(k: usize, m: usize, n: usize) -> Self {
         let a = values(k * m, 1 + (k * 31 + m) as u64, -1.0, 1.0);
         let b = values(n * k, 2 + (n * 17 + k) as u64, -1.0, 1.0);
-        Case { ctx: Context::new().unwrap(), k, m, n, a, b }
+        Case { ctx: exact().unwrap(), k, m, n, a, b }
     }
 
     fn lhs(&self) -> Array<f32> {
@@ -192,7 +198,7 @@ fn a_lazy_operand_and_a_lazy_transposed_operand_mix() {
 
 #[test]
 fn a_lazy_operand_is_not_evaluated_separately() {
-    let ctx = Context::new().unwrap();
+    let ctx = exact().unwrap();
     if !ctx.profiling_supported() {
         return;
     }
@@ -217,7 +223,7 @@ fn a_lazy_operand_is_not_evaluated_separately() {
 
 #[test]
 fn shape_errors_poison_the_result() {
-    let ctx = Context::new().unwrap();
+    let ctx = exact().unwrap();
     let a = Array::<f32>::zeros_on(&ctx, [4, 3]).unwrap();
     let b = Array::<f32>::zeros_on(&ctx, [5, 6]).unwrap();
     let c = a.matmul(&b);
@@ -231,7 +237,7 @@ fn shape_errors_poison_the_result() {
 
 #[test]
 fn a_poisoned_operand_passes_its_error_on() {
-    let ctx = Context::new().unwrap();
+    let ctx = exact().unwrap();
     let a = Array::<f32>::zeros_on(&ctx, [4, 3]).unwrap();
     let bad = Array::<f32>::zeros_on(&ctx, [5, 6]).unwrap().matmul(&Array::zeros_on(&ctx, [9, 9]).unwrap());
     let c = a.matmul(&bad);
@@ -241,8 +247,8 @@ fn a_poisoned_operand_passes_its_error_on() {
 
 #[test]
 fn operands_of_two_contexts_poison_the_result() {
-    let first = Context::new().unwrap();
-    let second = Context::new().unwrap();
+    let first = exact().unwrap();
+    let second = exact().unwrap();
     let a = Array::<f32>::zeros_on(&first, [4, 3]).unwrap();
     let b = Array::<f32>::zeros_on(&second, [5, 4]).unwrap();
     let c = a.matmul(&b);
@@ -252,7 +258,7 @@ fn operands_of_two_contexts_poison_the_result() {
 #[test]
 fn a_gram_matrix_of_a_lazy_expression_reads_it_through_a_transposed_view() {
     for (features, samples) in [(64, 1 << 14), (33, 1000), (130, 70), (8, 5000)] {
-        let ctx = Context::new().unwrap();
+        let ctx = exact().unwrap();
         let x = values(features * samples, 9 + samples as u64, -1.0, 1.0);
         let standard = |v: f32| (v - 0.25) * 1.5;
         let xs: Vec<f32> = x.iter().map(|&v| standard(v)).collect();
@@ -268,7 +274,7 @@ fn a_gram_matrix_of_a_lazy_expression_reads_it_through_a_transposed_view() {
 #[test]
 fn operands_or_a_result_split_over_several_buffers_poison_the_result() {
     // Buffers of 4096 bytes: 1024 `f32`.
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(4096)).unwrap();
+    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(4096).tf32_matmul(false)).unwrap();
     let array = |e: usize, f: usize| Array::<f32>::zeros_on(&ctx, [e, f]).unwrap();
     let chunked = |c: &Array<f32>| match c.error().map(LumaError::root) {
         Some(LumaError::Chunked(_)) => Some(true),
@@ -339,7 +345,7 @@ fn a_small_output_over_a_long_k_matches_the_host_product() {
 #[test]
 fn class_sums_through_a_lazy_one_hot_matrix_match_the_host() {
     for (n, d, classes) in [(100_000usize, 32usize, 10usize), (20_001, 256, 10), (50_000, 7, 3), (30_000, 33, 11)] {
-        let ctx = Context::new().unwrap();
+        let ctx = exact().unwrap();
         let x = values(n * d, 5 + d as u64, -1.0, 1.0);
         let codes: Vec<u32> = values(n, 6, 0.0, classes as f32).iter().map(|&v| (v as u32).min(classes as u32 - 1)).collect();
         let xs = Array::from_slice_on(&ctx, &x, [d, n]).unwrap();

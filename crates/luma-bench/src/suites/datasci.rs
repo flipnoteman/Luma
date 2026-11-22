@@ -1705,7 +1705,8 @@ fn pivot_extra_cases(h: &mut Harness) {
         for (i, &l) in hl.iter().enumerate() {
             want[dim * i..dim * (i + 1)].copy_from_slice(&hw[dim * l as usize..dim * (l as usize + 1)]);
         }
-        check("pivot/onehot_matmul", &run().to_vec().unwrap(), &want, 1e-5, 1e-5);
+        // The weights go through TF32 where the product runs on tensor cores (a one-hot gather loses 2^-11 of them).
+        check("pivot/onehot_matmul", &run().to_vec().unwrap(), &want, 1e-3, 1e-3);
         case_trim(h, "pivot/onehot_matmul", &format!("{rows}x{classes}x{dim}"), Work::Flops(2.0 * (rows * classes * dim) as f64), &mut || run().eval().unwrap());
     }
 }

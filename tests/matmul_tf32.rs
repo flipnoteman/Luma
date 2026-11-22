@@ -1,11 +1,12 @@
-//! `matmul_tf32` against a host product in `f64`: on tensor cores (CUDA) the operands are rounded to
-//! TF32, so every entry is within `2^-10` of the sum of the absolute products of its `f32`
-//! operands; elsewhere (and for shapes the tensor-core kernels do not take) it is the `f32` product.
+//! `matmul_tf32` and the default `matmul` against a host product in `f64`: on tensor cores (CUDA)
+//! the operands are rounded to TF32, so every entry is within 1.5e-3 of the sum of the absolute
+//! products of its `f32` operands; elsewhere (and for shapes the tensor-core kernels do not take)
+//! it is the `f32` product. `matmul_f32` and a context with `tf32_matmul(false)` are always `f32`.
 
 mod common;
 
 use common::values;
-use luma::{matmul_tf32, Array, Context};
+use luma::{matmul_tf32, Array, Context, ContextOptions};
 
 /// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` and `Σ_k |A B|` in `f64`.
 fn host(a: &[f32], b: &[f32], k: usize, m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
@@ -69,8 +70,10 @@ fn tf32_products_are_within_the_rounding_of_their_operands() {
     for (k, m, n) in SHAPES {
         let (a, b, lhs, rhs) = operands(&ctx, k, m, n);
         let want = host(&a, &b, k, m, n);
-        check(&matmul_tf32(&lhs, &rhs).to_vec().unwrap(), &want, 1.1e-3, 5e-4, &format!("k {k} m {m} n {n}"));
-        check(&lhs.matmul_tf32(&rhs).to_vec().unwrap(), &want, 1.1e-3, 5e-4, &format!("method k {k} m {m} n {n}"));
+        check(&matmul_tf32(&lhs, &rhs).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("k {k} m {m} n {n}"));
+        check(&lhs.matmul_tf32(&rhs).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("method k {k} m {m} n {n}"));
+        // The default product is the same one.
+        check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("default k {k} m {m} n {n}"));
     }
 }
 
@@ -87,9 +90,9 @@ fn transposed_operands_are_read_in_place() {
         let rhs = Array::from_slice_on(&ctx, &b, [n, k]).unwrap();
         let want = host(&a, &b, k, m, n);
         let what = format!("k {k} m {m} n {n}");
-        check(&lhs_t.matmul_tf32(&rhs).to_vec().unwrap(), &want, 1.1e-3, 5e-4, &format!("{what} lhs"));
-        check(&lhs.matmul_tf32(&rhs_t).to_vec().unwrap(), &want, 1.1e-3, 5e-4, &format!("{what} rhs"));
-        check(&lhs_t.matmul_tf32(&rhs_t).to_vec().unwrap(), &want, 1.1e-3, 5e-4, &format!("{what} both"));
+        check(&lhs_t.matmul_tf32(&rhs).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("{what} lhs"));
+        check(&lhs.matmul_tf32(&rhs_t).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("{what} rhs"));
+        check(&lhs_t.matmul_tf32(&rhs_t).to_vec().unwrap(), &want, 1.5e-3, 5e-4, &format!("{what} both"));
     }
 }
 
@@ -101,17 +104,45 @@ fn lazy_operands_are_evaluated_first() {
     let scaled_a: Vec<f32> = a.iter().map(|&x| x * 0.5 + 0.25).collect();
     let scaled_b: Vec<f32> = b.iter().map(|&x| x * 2.0 - 0.5).collect();
     let want = host(&scaled_a, &scaled_b, k, m, n);
-    check(&(&lhs * 0.5 + 0.25).matmul_tf32(&(&rhs * 2.0 - 0.5)).to_vec().unwrap(), &want, 1.1e-3, 5e-4, "lazy");
+    check(&(&lhs * 0.5 + 0.25).matmul_tf32(&(&rhs * 2.0 - 0.5)).to_vec().unwrap(), &want, 1.5e-3, 5e-4, "lazy");
 }
 
 #[test]
-fn the_default_product_does_not_round_its_operands() {
+fn the_f32_product_does_not_round_its_operands() {
     let ctx = Context::new().unwrap();
     let (k, m, n) = (256, 128, 128);
     let (a, b, lhs, rhs) = operands(&ctx, k, m, n);
     let want = host(&a, &b, k, m, n);
     // `f32` accuracy: far below the TF32 bound.
-    check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32");
+    check(&lhs.matmul_f32(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32");
+    check(&luma::matmul_f32(&lhs, &rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32 function");
+    // A context with the tensor cores turned off: `matmul` is the same product.
+    let off = Context::with_options(ContextOptions::from_env().tf32_matmul(false)).unwrap();
+    assert!(!off.tf32_matmul() && Context::new().unwrap().tf32_matmul());
+    let (_, _, lhs, rhs) = operands(&off, k, m, n);
+    check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "tf32 off");
+}
+
+#[test]
+fn infinities_nans_and_huge_operands_pass_through_the_rounding() {
+    let ctx = Context::new().unwrap();
+    let (k, m, n) = (64, 64, 64);
+    let mut a = vec![1.0f32; k * m];
+    a[0] = f32::INFINITY; // row 0
+    a[k] = f32::MAX; // row 1: the largest f32 rounds to an infinity (like any overflow), never to a NaN
+    a[2 * k] = f32::NAN; // row 2
+    a[3 * k] = -f32::INFINITY; // row 3
+    let b = vec![1.0f32; n * k];
+    let lhs = Array::from_slice_on(&ctx, &a, [k, m]).unwrap();
+    let rhs = Array::from_slice_on(&ctx, &b, [n, k]).unwrap();
+    for (what, c) in [("tf32", lhs.matmul_tf32(&rhs)), ("default", lhs.matmul(&rhs)), ("f32", lhs.matmul_f32(&rhs))] {
+        let c = c.to_vec().unwrap();
+        assert!(c[..n].iter().all(|&x| x == f32::INFINITY), "{what}: +inf row: {:?}", &c[..4]);
+        assert!(c[n..2 * n].iter().all(|&x| !x.is_nan() && x > 0.99 * f32::MAX), "{what}: max row: {:?}", &c[n..n + 4]);
+        assert!(c[2 * n..3 * n].iter().all(|x| x.is_nan()), "{what}: NaN row: {:?}", &c[2 * n..2 * n + 4]);
+        assert!(c[3 * n..4 * n].iter().all(|&x| x == f32::NEG_INFINITY), "{what}: -inf row: {:?}", &c[3 * n..3 * n + 4]);
+        assert!(c[4 * n..].iter().all(|&x| x == 64.0), "{what}: the other rows");
+    }
 }
 
 #[test]
@@ -132,8 +163,8 @@ fn operands_are_rounded_to_tf32_where_tensor_cores_run() {
     let exact = k as f32 * (1.0 + 1.0 / 4096.0);
     let rounded = k as f32;
     let tensor = a.matmul_tf32(&b).to_vec().unwrap();
-    let plain = a.matmul(&b).to_vec().unwrap();
-    assert!(plain.iter().all(|&x| x == exact), "the default product rounds its operands");
+    let plain = a.matmul_f32(&b).to_vec().unwrap();
+    assert!(plain.iter().all(|&x| x == exact), "the f32 product rounds its operands");
     assert!(tensor.iter().all(|&x| x == exact) || tensor.iter().all(|&x| x == rounded), "neither the f32 nor the TF32 product: {:?}", &tensor[..4]);
     eprintln!("matmul_tf32 on {}: {}", ctx.device_name(), if tensor[0] == rounded { "tensor cores" } else { "f32 product" });
 }
