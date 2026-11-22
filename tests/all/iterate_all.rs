@@ -356,7 +356,9 @@ fn an_unrolled_loop_over_several_states_and_captured_arrays_matches_the_step_by_
 
 #[test]
 fn a_shifted_step_runs_in_fewer_launches_than_steps_where_the_planner_fuses_them() {
-    let ctx = Context::new().unwrap();
+    // Uncalibrated: the fusion decision follows the cost model, and costs measured on a GPU busy
+    // with other tests' kernels changed it from run to run (seen on the RTX 3080 Laptop).
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
     if ctx.backend() == BackendKind::Cpu {
         return;
     }
