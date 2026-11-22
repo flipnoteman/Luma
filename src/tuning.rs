@@ -73,6 +73,10 @@ impl Coarsen {
     }
 }
 
+/// [`Tuning::axis_defer_cells`] of the wgpu backend: above the 131072 cells at which leaving the reductions pending lost 9 % and below the
+/// 1048576 at which it won 7 % (an RTX 3090, `ml/train`); where in between they cross is not measured.
+const AXIS_DEFER_CELLS: usize = 1 << 19;
+
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LineSolver {
@@ -126,6 +130,13 @@ pub(crate) struct Tuning {
     /// 4-operation description and a layer norm gained less than they lost to the deferral); all-pairs forces, whose three
     /// components share a long chain, run 3x faster. Zero on GPU backends: always deferred.
     pub(crate) axis_defer_weight: u32,
+    /// Fewest cells of the operand of an `f32` axis reduction for it to be left pending to be recorded with its siblings (see
+    /// `Array::defer_axis`); smaller operands are reduced when the call is made. Recording a reduction late moves its kernel behind
+    /// the ones recorded after its operands and, because the group has to wait for its last member, behind the work that follows
+    /// it: where kernels are short that costs more than sharing the pass saves (`ml/train/sgd_medium` on an RTX 3090, three bias
+    /// gradients of 131072 cells or fewer: 0.606 ms recorded at once, 0.662 ms left pending; at 1048576 cells, `sgd_large`, pending
+    /// is 1.405 against 1.306 ms). Zero on the CPU backend, which judges by [`Tuning::axis_defer_weight`], and on CUDA and Metal, where it was not measured.
+    pub(crate) axis_defer_cells: usize,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -232,6 +243,7 @@ impl Tuning {
         reduce_multi: 16,
         reduce_multi_after: 0,
         axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -268,6 +280,7 @@ impl Tuning {
         reduce_multi: 16,
         reduce_multi_after: 0,
         axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -306,6 +319,7 @@ impl Tuning {
         reduce_multi: 16,
         reduce_multi_after: 0,
         axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -383,6 +397,8 @@ impl Tuning {
             .unwrap_or(if info.backend == BackendKind::Cuda { 4 } else { 0 });
         if info.backend == BackendKind::Cpu {
             tuning.axis_defer_weight = 12;
+        } else if info.backend == BackendKind::Wgpu {
+            tuning.axis_defer_cells = AXIS_DEFER_CELLS;
         }
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,

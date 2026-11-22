@@ -497,8 +497,12 @@ fn axis_siblings(ctx: &Context, dims: &[usize], axis: usize) -> Vec<Array<f32>> 
 
 #[test]
 fn sibling_axis_reductions_are_recorded_in_one_kernel_with_the_bits_of_each_alone() {
-    // Every group is merged, however light its operands (the CPU backend's default defers only heavy ones).
-    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.axis_defer_weight = 0).unwrap();
+    // Every group is merged, however light or small its operands (the defaults defer only heavy ones on the CPU backend, large ones on the others).
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.axis_defer_weight = 0;
+        tuning.axis_defer_cells = 0;
+    })
+    .unwrap();
     ctx.set_cost_model(CostModel::TEST);
     // The same program on a context that records every axis reduction on its own: the bits to match.
     let alone_ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi = 1).unwrap();
