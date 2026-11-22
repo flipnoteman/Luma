@@ -243,3 +243,228 @@ fn anisotropic_diffusion_properties() {
     assert!(img.anisotropic_diffusion(0.1, 0.0, 1, FluxFunction::Exponential, DiffusionEq::Gradient).to_vec().is_err());
     assert!(img.anisotropic_diffusion(f32::NAN, 1.0, 1, FluxFunction::Exponential, DiffusionEq::Gradient).to_vec().is_err());
 }
+
+// -- Canny --
+
+const G: [f32; 5] = [0.11021, 0.23691, 0.30576, 0.23691, 0.11021];
+
+/// The suppressed gradient magnitudes of one `[h, w]` plane (ArrayFire's CUDA pipeline, in the
+/// operation order of the kernels).
+fn canny_suppressed(img: &[f32], h: usize, w: usize, fast: bool) -> Vec<f32> {
+    let at = |i: i64, j: i64| if i < 0 || j < 0 || i >= h as i64 || j >= w as i64 { 0.0 } else { img[i as usize + h * j as usize] };
+    let mut hs = vec![0.0f32; h * w];
+    for j in 0..w as i64 {
+        for i in 0..h as i64 {
+            hs[i as usize + h * j as usize] = G[0] * (at(i - 2, j) + at(i + 2, j)) + G[1] * (at(i - 1, j) + at(i + 1, j)) + G[2] * at(i, j);
+        }
+    }
+    let at2 = |i: i64, j: i64| if i < 0 || j < 0 || i >= h as i64 || j >= w as i64 { 0.0 } else { hs[i as usize + h * j as usize] };
+    let mut sm = vec![0.0f32; h * w];
+    for j in 0..w as i64 {
+        for i in 0..h as i64 {
+            sm[i as usize + h * j as usize] = G[0] * (at2(i, j - 2) + at2(i, j + 2)) + G[1] * (at2(i, j - 1) + at2(i, j + 1)) + G[2] * at2(i, j);
+        }
+    }
+    let refl = |p: i64, n: i64| if p < 0 { -p } else if p >= n { 2 * (n - 1) - p } else { p };
+    let s = |i: i64, j: i64| sm[refl(i, h as i64) as usize + h * refl(j, w as i64) as usize];
+    let mut gx = vec![0.0f32; h * w];
+    let mut gy = vec![0.0f32; h * w];
+    let mut mag = vec![0.0f32; h * w];
+    for j in 0..w as i64 {
+        for i in 0..h as i64 {
+            let dx = (s(i + 1, j - 1) + s(i + 1, j + 1) + 2.0 * s(i + 1, j)) - (s(i - 1, j - 1) + s(i - 1, j + 1) + 2.0 * s(i - 1, j));
+            let dy = (s(i - 1, j + 1) + s(i + 1, j + 1) + 2.0 * s(i, j + 1)) - (s(i - 1, j - 1) + s(i + 1, j - 1) + 2.0 * s(i, j - 1));
+            let k = i as usize + h * j as usize;
+            gx[k] = dx;
+            gy[k] = dy;
+            mag[k] = if fast { dx.abs() + dy.abs() } else { (dx * dx + dy * dy).sqrt() };
+        }
+    }
+    let m = |i: usize, j: usize| mag[i + h * j];
+    let mut out = vec![0.0f32; h * w];
+    for j in 1..w - 1 {
+        for i in 1..h - 1 {
+            let k = i + h * j;
+            let (dx, dy, c) = (gx[k], gy[k], mag[k]);
+            if c <= 0.0 {
+                continue;
+            }
+            let (se, nw, ea, we, ne, sw, no, so) = (m(i + 1, j + 1), m(i - 1, j - 1), m(i + 1, j), m(i - 1, j), m(i + 1, j - 1), m(i - 1, j + 1), m(i, j - 1), m(i, j + 1));
+            let (a1, a2, b1, b2, alpha);
+            if dx >= 0.0 {
+                if dy >= 0.0 {
+                    let big = dx - dy >= 0.0;
+                    (a1, a2, b1, b2) = (if big { ea } else { so }, if big { we } else { no }, se, nw);
+                    alpha = if big { dy / dx } else { dx / dy };
+                } else {
+                    let big = dx + dy >= 0.0;
+                    (a1, a2, b1, b2) = (if big { ea } else { no }, if big { we } else { so }, ne, sw);
+                    alpha = if big { -dy / dx } else { dx / -dy };
+                }
+            } else if dy >= 0.0 {
+                let big = dx + dy >= 0.0;
+                (a1, a2, b1, b2) = (if big { so } else { we }, if big { no } else { ea }, sw, ne);
+                alpha = if big { -dx / dy } else { dy / -dx };
+            } else {
+                let big = -dx + dy >= 0.0;
+                (a1, a2, b1, b2) = (if big { we } else { no }, if big { ea } else { so }, nw, se);
+                alpha = if big { dy / dx } else { dx / dy };
+            }
+            let (m1, m2) = ((1.0 - alpha) * a1 + alpha * b1, (1.0 - alpha) * a2 + alpha * b2);
+            if c > m1 && c > m2 {
+                out[k] = c;
+            }
+        }
+    }
+    out
+}
+
+/// Hysteresis of one plane: strong `>= hi`, weak `>= lo`, 8-connected, interior only.
+fn hysteresis(sup: &[f32], h: usize, w: usize, lo: f32, hi: f32) -> Vec<bool> {
+    let interior = |i: usize, j: usize| i >= 1 && j >= 1 && i + 1 < h && j + 1 < w;
+    let mut out = vec![false; h * w];
+    let mut stack = Vec::new();
+    for j in 0..w {
+        for i in 0..h {
+            if interior(i, j) && sup[i + h * j] >= hi {
+                out[i + h * j] = true;
+                stack.push((i, j));
+            }
+        }
+    }
+    while let Some((i, j)) = stack.pop() {
+        for dj in -1i64..=1 {
+            for di in -1i64..=1 {
+                let (a, b) = ((i as i64 + di) as usize, (j as i64 + dj) as usize);
+                if a < h && b < w && interior(a, b) && !out[a + h * b] && sup[a + h * b] >= lo {
+                    out[a + h * b] = true;
+                    stack.push((a, b));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Otsu's threshold (as ArrayFire: `floor(max)` bins, zeros counted, first maximum).
+fn otsu(sup: &[f32], max: f32) -> f32 {
+    let nb = (max as usize).clamp(1, 16384);
+    let step = max / nb as f32;
+    let mut hist = vec![0u64; nb];
+    for &v in sup {
+        hist[((v / step) as usize).min(nb - 1)] += 1;
+    }
+    let n = sup.len() as f64;
+    let total: f64 = hist.iter().enumerate().map(|(i, &c)| i as f64 * c as f64).sum();
+    let (mut n0, mut s0, mut best, mut bi) = (0.0f64, 0.0f64, -1.0f64, 0usize);
+    for i in 0..nb - 1 {
+        n0 += hist[i] as f64;
+        s0 += i as f64 * hist[i] as f64;
+        let n1 = n - n0;
+        if n0 > 0.0 && n1 > 0.0 {
+            let (mu0, mu1) = (s0 / n0, (total - s0) / n1);
+            let sb = (n0 / n) * (n1 / n) * (mu0 - mu1) * (mu0 - mu1);
+            if sb > best * (1.0 + 1e-9) {
+                best = sb;
+                bi = i;
+            }
+        }
+    }
+    bi as f32 * step
+}
+
+/// An image with edges: smooth blobs plus a little noise.
+fn blobs(h: usize, w: usize, planes: usize, seed: u64) -> Vec<f32> {
+    let noise = values(h * w * planes, seed, 0.0, 12.0);
+    (0..h * w * planes)
+        .map(|k| {
+            let (i, j, p) = ((k % h) as f32, ((k / h) % w) as f32, (k / (h * w)) as f32);
+            let a = ((i * 0.21 + p).sin() + (j * 0.17 - p).cos() + ((i + j) * 0.09).sin()) * 70.0 + 128.0;
+            let b = if ((i as usize / 13 + j as usize / 17 + p as usize) % 2) == 0 { 60.0 } else { 0.0 };
+            a * 0.6 + b + noise[k]
+        })
+        .collect()
+}
+
+fn canny_ref(data: &[f32], h: usize, w: usize, planes: usize, otsu_mode: bool, low: f32, high: f32, fast: bool) -> Vec<bool> {
+    let sups: Vec<Vec<f32>> = (0..planes).map(|p| canny_suppressed(&data[p * h * w..(p + 1) * h * w], h, w, fast)).collect();
+    let max = sups.iter().flatten().copied().fold(0.0f32, f32::max);
+    let mut out = Vec::new();
+    for sup in &sups {
+        let (lo, hi) = if otsu_mode {
+            let t = otsu(sup, max);
+            (low * t, t)
+        } else {
+            (low * max, high * max)
+        };
+        out.extend(hysteresis(sup, h, w, lo, hi));
+    }
+    out
+}
+
+fn mismatches(a: &[bool], b: &[bool]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+#[test]
+fn canny_matches_the_pipeline() {
+    use luma::CannyThreshold;
+    let ctx = ctx();
+    for (shape, otsu_mode, low, high, fast) in [
+        ([48, 48, 1, 1], false, 0.1f32, 0.3f32, false),
+        ([40, 50, 1, 1], false, 0.1, 0.3, true),
+        ([33, 65, 1, 1], false, 0.2, 0.5, false),
+        ([100, 70, 1, 1], true, 0.3, 0.0, false),
+        ([64, 64, 1, 1], true, 0.5, 0.0, true),
+        ([50, 45, 3, 1], false, 0.1, 0.3, false),
+        ([37, 41, 2, 2], true, 0.3, 0.0, false),
+        ([70, 70, 1, 1], false, 0.0, 0.0, false),
+    ] {
+        let (h, w, planes) = (shape[0], shape[1], shape[2] * shape[3]);
+        let data = blobs(h, w, planes, 5 + h as u64);
+        let img = Array::from_slice_on(&ctx, &data, shape).unwrap();
+        let mode = if otsu_mode { CannyThreshold::AutoOtsu } else { CannyThreshold::Manual };
+        let got = img.canny(mode, low, high, 3, fast).to_vec().unwrap();
+        let want = canny_ref(&data, h, w, planes, otsu_mode, low, high, fast);
+        assert!(want.iter().filter(|&&b| b).count() > 20, "the case has edges");
+        let bad = mismatches(&got, &want);
+        assert!(bad == 0, "{shape:?} otsu {otsu_mode} {low} {high} fast {fast}: {bad} of {} edge pixels differ ({} wanted)", got.iter().filter(|&&b| b).count(), want.iter().filter(|&&b| b).count());
+    }
+}
+
+#[test]
+fn canny_edge_cases() {
+    use luma::CannyThreshold;
+    let ctx = ctx();
+    // Images without an interior and bad arguments.
+    for shape in [[2, 8, 1, 1], [5, 2, 1, 1], [1, 1, 1, 1]] {
+        let img = Array::<f32>::full_on(&ctx, shape, 3.0).unwrap();
+        let out = img.canny(CannyThreshold::Manual, 0.1, 0.3, 3, false).to_vec().unwrap();
+        assert!(out.iter().all(|&b| !b), "{shape:?}");
+    }
+    let img = Array::from_slice_on(&ctx, &blobs(30, 30, 1, 2), [30, 30]).unwrap();
+    for window in [1, 5, 7] {
+        assert!(img.canny(CannyThreshold::Manual, 0.1, 0.3, window, false).to_vec().is_err());
+    }
+    assert!(img.canny(CannyThreshold::Manual, f32::NAN, 0.3, 3, false).to_vec().is_err());
+    // The ring is never an edge, even with thresholds 0 (every interior pixel is one).
+    let out = img.canny(CannyThreshold::Manual, 0.0, 0.0, 3, false).to_vec().unwrap();
+    for j in 0..30 {
+        for i in 0..30 {
+            assert_eq!(out[i + 30 * j], i > 0 && j > 0 && i < 29 && j < 29);
+        }
+    }
+    // A constant image has edges near the border only (the smoothing pads with zeros; ArrayFire's fails on it).
+    let flat = Array::<f32>::full_on(&ctx, [20, 20], 7.0).unwrap();
+    let out = flat.canny(CannyThreshold::Manual, 0.1, 0.3, 3, false).to_vec().unwrap();
+    assert_eq!(out, canny_ref(&vec![7.0; 400], 20, 20, 1, false, 0.1, 0.3, false));
+    assert!(!out[10 + 20 * 10]);
+    // A planes of a batch with different contrast: the thresholds follow the strongest of all.
+    let a = blobs(40, 40, 1, 9);
+    let faint: Vec<f32> = a.iter().map(|v| v * 0.1).collect();
+    let both: Vec<f32> = a.iter().chain(&faint).copied().collect();
+    let img = Array::from_slice_on(&ctx, &both, [40, 40, 2]).unwrap();
+    let out = img.canny(CannyThreshold::Manual, 0.1, 0.3, 3, false).to_vec().unwrap();
+    assert_eq!(out, canny_ref(&both, 40, 40, 2, false, 0.1, 0.3, false));
+    assert!(out[1600..].iter().filter(|&&b| b).count() < out[..1600].iter().filter(|&&b| b).count());
+}
