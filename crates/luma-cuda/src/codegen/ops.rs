@@ -560,8 +560,16 @@ pub(crate) fn lane_id(fb: &mut Fb) -> Op {
     fb.def("call i32 asm sideeffect \"mov.u32 $0, %laneid;\", \"=r\"()")
 }
 
-fn active_mask(fb: &mut Fb) -> Op {
-    fb.def("call i32 asm sideeffect \"activemask.b32 $0;\", \"=r\"()")
+/// Every subgroup instruction is `convergent`: the optimizer must not move one into a branch
+/// (or out of one, or copy it into the predecessors of its block), as that changes which lanes
+/// execute it together.
+pub(crate) fn active_mask(fb: &mut Fb) -> Op {
+    fb.def("call i32 asm sideeffect \"activemask.b32 $0;\", \"=r\"() convergent")
+}
+
+/// Waits until every lane of `mask` has got here (`bar.warp.sync`).
+pub(crate) fn warp_sync(fb: &mut Fb, mask: &Op) {
+    fb.ins(&format!("call void asm sideeffect \"bar.warp.sync $0;\", \"r\"(i32 {mask}) convergent"));
 }
 
 /// The mask of the lanes a warp-wide operation involves: all of them when `converged` (see
@@ -577,7 +585,7 @@ pub(crate) fn ballot(fb: &mut Fb, pred: Option<&Op>, converged: bool) -> Op {
         None => "1".to_string(),
     };
     fb.def(&format!(
-        "call i32 asm sideeffect \"{{ .reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.ballot.b32 $0, p, $2; }}\", \"=r,r,r\"(i32 {p}, i32 {mask})"
+        "call i32 asm sideeffect \"{{ .reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.ballot.b32 $0, p, $2; }}\", \"=r,r,r\"(i32 {p}, i32 {mask}) convergent"
     ))
 }
 
@@ -585,7 +593,7 @@ pub(crate) fn ballot(fb: &mut Fb, pred: Option<&Op>, converged: bool) -> Op {
 fn shfl32(fb: &mut Fb, kind: &str, v: &Op, lane: &Op, mask: &Op) -> Op {
     let c = if kind == "up" { "0" } else { "31" };
     fb.def(&format!(
-        "call i32 asm sideeffect \"shfl.sync.{kind}.b32 $0, $1, $2, $3, $4;\", \"=r,r,r,r,r\"(i32 {v}, i32 {lane}, i32 {c}, i32 {mask})"
+        "call i32 asm sideeffect \"shfl.sync.{kind}.b32 $0, $1, $2, $3, $4;\", \"=r,r,r,r,r\"(i32 {v}, i32 {lane}, i32 {c}, i32 {mask}) convergent"
     ))
 }
 
@@ -722,7 +730,7 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, converged: bool, name
             h.ret(&format!("ret {t} {x}"));
             if converged {
                 let params = if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") };
-                return (format!("define internal {t} @{name}({params}) alwaysinline nounwind {{\n"), h);
+                return (format!("define internal {t} @{name}({params}) alwaysinline nounwind convergent {{\n"), h);
             }
             // Partial warp: fold the active lanes in ascending order.
             h.start(&pl);
@@ -755,7 +763,7 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, converged: bool, name
             let r = sel(&mut h, &l0, t, &zero(s), &ex);
             h.ret(&format!("ret {t} {r}"));
             if converged {
-                return (format!("define internal {t} @{name}({}) alwaysinline nounwind {{\n", if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") }), h);
+                return (format!("define internal {t} @{name}({}) alwaysinline nounwind convergent {{\n", if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") }), h);
             }
             // Partial warp: sum of the active lanes below this one.
             h.start(&pl);
@@ -770,7 +778,7 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, converged: bool, name
         (IrSubgroupOp::Ballot, _) => unreachable!(),
     }
     let params = if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") };
-    let head = format!("define internal {t} @{name}({params}) alwaysinline nounwind {{\n");
+    let head = format!("define internal {t} @{name}({params}) alwaysinline nounwind convergent {{\n");
     (head, h)
 }
 
@@ -786,8 +794,8 @@ pub(crate) fn subgroup(fb: &mut Fb, op: IrSubgroupOp, s: ScalarTy, v: &Op, lane:
     }
     let t = llty(s);
     match lane {
-        Some(l) => fb.def(&format!("call {t} @{name}({t} {v}, i32 {l})")),
-        None => fb.def(&format!("call {t} @{name}({t} {v})")),
+        Some(l) => fb.def(&format!("call {t} @{name}({t} {v}, i32 {l}) convergent")),
+        None => fb.def(&format!("call {t} @{name}({t} {v}) convergent")),
     }
 }
 

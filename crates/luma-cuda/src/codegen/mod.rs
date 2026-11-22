@@ -19,7 +19,7 @@ mod fb;
 mod ops;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use luma_core::BindingKind;
 use luma_core::kir::*;
@@ -354,7 +354,7 @@ struct Em<'a> {
     helpers: BTreeMap<String, String>,
     jumps: Vec<Jump>,
     /// The subgroup operations every lane of the warp reaches (see [`conv`]).
-    converged: HashSet<*const Expr>,
+    conv: conv::Convergence,
 }
 
 // ----- small value helpers ---------------------------------------------------------------
@@ -1011,7 +1011,7 @@ impl<'a> Em<'a> {
                 scalar_val(*ty, ops::atomic_load(fb, *ty, &p))
             }
             Expr::Subgroup { op, arg, lane, .. } => {
-                let converged = self.converged.contains(&(e as *const Expr));
+                let converged = self.conv.ops.contains(&(e as *const Expr));
                 let a = arg.as_ref().map(|a| self.expr(fb, a, cx));
                 let l = lane.as_ref().map(|l| one(&self.expr(fb, l, cx)).1);
                 if *op == IrSubgroupOp::Ballot {
@@ -1206,7 +1206,18 @@ impl<'a> Em<'a> {
         fb.store(&cx.local_ptrs[local.0 as usize], 0, s, v, true);
     }
 
+    /// A statement that splits the warp and is followed by a subgroup operation that takes
+    /// `activemask` (see [`conv::Convergence::reconverge`]) ends with a warp barrier on the lanes
+    /// that entered it, so that they are together again when the operation reads the mask.
     fn stmt(&mut self, fb: &mut Fb, s: &Stmt, cx: &FnCx) {
+        let entered = self.conv.reconverge.contains(&(s as *const Stmt)).then(|| ops::active_mask(fb));
+        self.stmt_inner(fb, s, cx);
+        if let Some(mask) = entered {
+            ops::warp_sync(fb, &mask);
+        }
+    }
+
+    fn stmt_inner(&mut self, fb: &mut Fb, s: &Stmt, cx: &FnCx) {
         let m = self.m;
         match s {
             Stmt::Let { local, init } if cx.ssa[local.0 as usize] => {
@@ -1793,7 +1804,7 @@ pub fn emit_with_options(module: &KernelModule, used: Option<&[bool]>, initializ
         decls: BTreeSet::new(),
         helpers: BTreeMap::new(),
         jumps: Vec::new(),
-        converged: conv::convergent_subgroups(module),
+        conv: conv::analyse(module),
     }
     .run()
 }
@@ -1972,6 +1983,34 @@ mod tests {
         // `x` and `s` are values; only the loop counter has a stack slot.
         assert_eq!(t.source.matches("alloca").count(), 1, "{}", t.source);
         // Dynamically indexed accesses keep the byte form (see `Fb::typed_ptr`).
+    }
+
+    /// `if lid < 5 { store }` (the warp splits and merges), then `if lid < 5 { sum }`, whose
+    /// operation takes `activemask`.
+    fn splitting_module() -> KernelModule {
+        let mut m = reducing_module();
+        let div = || Expr::Binary { op: IrBinOp::Lt, lhs: local(0), rhs: lit(5), ty: KirType::BOOL };
+        let total = Expr::Subgroup { op: IrSubgroupOp::Add, arg: Some(Box::new(Expr::Cast { kind: CastKind::Convert, expr: local(2), src_ty: KirType::U32, dst_ty: KirType::F32 })), lane: None, ty: KirType::F32 };
+        m.entry_body = vec![
+            let_(2, add(local(0), lit(1))),
+            Stmt::If { cond: div(), then_body: vec![Stmt::Store { binding: 0, index: *local(0), val: *local(2) }], else_body: vec![] },
+            Stmt::If { cond: div(), then_body: vec![Stmt::Let { local: LocalId(4), init: total }], else_body: vec![] },
+        ];
+        m
+    }
+
+    #[test]
+    fn a_split_before_an_operation_on_activemask_ends_in_a_warp_barrier() {
+        let t = emit(&splitting_module(), None);
+        // The lanes that enter the first `if` meet again at its end, so that `activemask` in the
+        // second sees all of the branch; the second `if` has nothing after it.
+        assert_eq!(t.source.matches("bar.warp.sync").count(), 1, "{}", t.source);
+        let at = |needle: &str| t.source.find(needle).unwrap_or_else(|| panic!("no {needle} in {}", t.source));
+        assert!(at("activemask") < at("bar.warp.sync"), "{}", t.source);
+        // Every subgroup instruction is convergent: the optimizer may not move one across a branch.
+        assert!(t.source.lines().filter(|l| l.contains("asm sideeffect")).all(|l| l.contains("mov.u32 $0, %laneid") || l.ends_with("convergent")), "{}", t.source);
+        // Fully converged code has neither.
+        assert!(!emit(&reducing_module(), None).source.contains("bar.warp.sync"));
     }
 
     #[test]

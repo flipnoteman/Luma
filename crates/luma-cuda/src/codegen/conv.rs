@@ -20,30 +20,50 @@
 //!   `continue` out of an enclosing construct, while others went on.
 //!
 //! Warp-uniform values are literals, uniform-buffer reads, `workgroup_id`, `num_workgroups`,
-//! `subgroup_size`, `local_invocation_index / 32` (and `>> 5`), and what is computed from those
-//! only by locals that are assigned uniform values at converged points. Anything loaded from
-//! memory or computed from a thread id is divergent. Subgroup operations in helper functions are
-//! never converged (their callers are not analysed).
+//! `subgroup_size`, `local_invocation_index / 32` (and `>> 5`), the results of the subgroup
+//! operations that give every lane the same value (ballots, reductions, broadcasts from a uniform
+//! lane), and what is computed from those only by locals that are assigned uniform values at
+//! converged points. A loop that exits on a ballot or a reduction (a spin on a flag) is therefore
+//! converged. Anything loaded from memory or computed from a thread id is divergent. Subgroup
+//! operations in helper functions are never converged (their callers are not analysed).
+//!
+//! The operations that are not provably converged take `activemask` as their member mask, which
+//! is the set of lanes that are *physically* together at that point: after a branch or a loop
+//! that split the warp, the lanes that left first may run ahead of the others (Volta and later
+//! do not reconverge by themselves), and the operation would see only some of the lanes that
+//! WGSL has active there. So a divergent `if`, `switch` or `loop` that every lane that entered
+//! also leaves, and that is followed by such an operation, is bracketed by `activemask` and
+//! `bar.warp.sync` on it (see [`Convergence::reconverge`]): the lanes of a warp are together at
+//! every point that is not inside a split, and `activemask` is then the logically active set.
 
 use std::collections::HashSet;
 
 use luma_core::kir::*;
 
-/// The subgroup operations (by address) of `m`'s entry body that every lane of the warp reaches.
-pub(super) fn convergent_subgroups(m: &KernelModule) -> HashSet<*const Expr> {
-    let [wx, wy, wz] = m.workgroup_size;
-    if !(wx * wy * wz).is_multiple_of(32) {
-        return HashSet::new();
-    }
+/// What the analysis found about the entry body of a module (by address of the nodes).
+pub(super) struct Convergence {
+    /// The subgroup operations every lane of the warp reaches.
+    pub ops: HashSet<*const Expr>,
+    /// The `if`, `switch` and `loop` statements that split the warp, merge it again, and are
+    /// followed by a subgroup operation that is not in `ops`: the lanes that entered are made to
+    /// meet at the end (see [`reconverge`](super)), so that `activemask` there is the set of lanes
+    /// that are logically active.
+    pub reconverge: HashSet<*const Stmt>,
+}
+
+pub(super) fn analyse(m: &KernelModule) -> Convergence {
     let mut any = false;
     walk_stmts(&m.entry_body, &mut |s| {
         s.for_each_expr(&mut |e| e.walk(&mut |x| any |= matches!(x, Expr::Subgroup { .. })));
     });
     if !any {
-        return HashSet::new();
+        return Convergence { ops: HashSet::new(), reconverge: HashSet::new() };
     }
+    let [wx, wy, wz] = m.workgroup_size;
+    // Without whole warps no point is converged: the last warp is partial.
+    let whole = (wx * wy * wz).is_multiple_of(32);
     let n = m.entry_locals.len();
-    let mut a = An { div: vec![false; n], lid: vec![false; n], lid_vec: vec![false; n], sg_size: vec![false; n], one_d: wy * wz == 1, changed: false, collect: false, out: HashSet::new() };
+    let mut a = An { div: vec![false; n], lid: vec![false; n], lid_vec: vec![false; n], sg_size: vec![false; n], one_d: wy * wz == 1, changed: false, collect: false, uload: false, out: HashSet::new() };
     for (b, l) in &m.entry_builtins {
         let l = l.0 as usize;
         match b {
@@ -63,14 +83,16 @@ pub(super) fn convergent_subgroups(m: &KernelModule) -> HashSet<*const Expr> {
     // Divergence only grows, so this ends.
     loop {
         a.changed = false;
-        a.block(&m.entry_body, true);
+        a.block(&m.entry_body, whole);
         if !a.changed {
             break;
         }
     }
     a.collect = true;
-    a.block(&m.entry_body, true);
-    a.out
+    a.block(&m.entry_body, whole);
+    let mut reconverge = HashSet::new();
+    a.reconverge(&m.entry_body, false, &mut reconverge);
+    Convergence { ops: std::mem::take(&mut a.out), reconverge }
 }
 
 struct An {
@@ -84,6 +106,8 @@ struct An {
     one_d: bool,
     changed: bool,
     collect: bool,
+    /// The statement being analysed is the `let` of a `workgroupUniformLoad` (between two barriers).
+    uload: bool,
     out: HashSet<*const Expr>,
 }
 
@@ -139,7 +163,15 @@ impl An {
                 AccessStep::Index(i) => self.uniform(i),
                 AccessStep::Field(_) => true,
             }),
-            Expr::FnParam(_) | Expr::Private(_) | Expr::Load { .. } | Expr::StorageRead { .. } | Expr::SharedLoad { .. } | Expr::SharedRead { .. } | Expr::Call { .. } | Expr::AtomicLoad { .. } | Expr::Subgroup { .. } | Expr::Texture { .. } => false,
+            Expr::FnParam(_) | Expr::Private(_) | Expr::Load { .. } | Expr::StorageRead { .. } | Expr::SharedLoad { .. } | Expr::SharedRead { .. } | Expr::Call { .. } | Expr::AtomicLoad { .. } | Expr::Texture { .. } => false,
+            // A subgroup operation that every lane reaches gives every lane the same result for these
+            // (`stmt` makes the local that takes it divergent where the lanes are not together).
+            Expr::Subgroup { op, lane, .. } => match op {
+                IrSubgroupOp::Add | IrSubgroupOp::Min | IrSubgroupOp::Max | IrSubgroupOp::Ballot => true,
+                // `subgroupBroadcastFirst`, or a broadcast from one lane.
+                IrSubgroupOp::Shuffle => lane.as_ref().is_none_or(|l| self.uniform(l)),
+                IrSubgroupOp::ExclusiveAdd => false,
+            },
             Expr::Access { base, step, .. } => {
                 self.uniform(base)
                     && match step {
@@ -158,7 +190,15 @@ impl An {
                     (IrBinOp::Div, Expr::Local(l)) => self.sg_size[l.0 as usize],
                     _ => false,
                 };
-                (by_warp && self.is_lid(lhs)) || (self.uniform(lhs) && self.uniform(rhs))
+                // `local_invocation_index < 32 * k` holds for all of a warp or none of it (and its
+                // `>=`, `<=` and `>` forms), as warps are runs of 32 consecutive indices.
+                let warp_cut = self.is_lid(lhs)
+                    && match (op, &**rhs) {
+                        (IrBinOp::Lt | IrBinOp::Ge, Expr::LitU32(c)) => c % 32 == 0,
+                        (IrBinOp::Le | IrBinOp::Gt, Expr::LitU32(c)) => c % 32 == 31,
+                        _ => false,
+                    };
+                (by_warp && self.is_lid(lhs)) || warp_cut || (self.uniform(lhs) && self.uniform(rhs))
             }
             Expr::Ternary { a, b, c, .. } => self.uniform(a) && self.uniform(b) && self.uniform(c),
             Expr::Cast { expr, .. } => self.uniform(expr),
@@ -237,10 +277,78 @@ impl An {
 
     fn block(&mut self, b: &[Stmt], conv: bool) -> bool {
         let mut c = conv;
-        for s in b {
+        let barrier = |s: Option<&Stmt>| matches!(s, Some(Stmt::Barrier(BarrierScope::Workgroup | BarrierScope::StorageAndWorkgroup)));
+        for (i, s) in b.iter().enumerate() {
+            // `workgroupUniformLoad`: a barrier, the read, a barrier. Nobody writes meanwhile and the
+            // location is the same for the whole workgroup (when the place is), so the value is.
+            self.uload = i > 0 && barrier(b.get(i - 1)) && barrier(b.get(i + 1));
             c = self.stmt(s, c);
+            self.uload = false;
         }
         c
+    }
+
+    /// Whether `e` is a read of workgroup memory at a warp-uniform place.
+    fn uniform_shared_read(&self, e: &Expr) -> bool {
+        match e {
+            Expr::SharedRead { path, .. } => path.iter().all(|s| match s {
+                AccessStep::Index(i) => self.uniform(i),
+                AccessStep::Field(_) => true,
+            }),
+            Expr::SharedLoad { index, .. } => self.uniform(index),
+            _ => false,
+        }
+    }
+
+    fn has_unconverged_op(&self, b: &[Stmt]) -> bool {
+        let mut found = false;
+        walk_stmts(b, &mut |s| {
+            s.for_each_expr(&mut |e| {
+                e.walk(&mut |x| {
+                    if matches!(x, Expr::Subgroup { .. }) && !self.out.contains(&(x as *const Expr)) {
+                        found = true;
+                    }
+                })
+            })
+        });
+        found
+    }
+
+    /// Finds the statements of `b` to reconverge after (see [`Convergence::reconverge`]);
+    /// `after`: a subgroup operation that is not converged can run once `b` is done.
+    fn reconverge(&self, b: &[Stmt], after: bool, out: &mut HashSet<*const Stmt>) {
+        let mut later = after;
+        for s in b.iter().rev() {
+            let one = std::slice::from_ref(s);
+            let splits_and_merges = match s {
+                Stmt::If { cond, .. } => !self.uniform(cond) && !self.ret_splits(one, false) && !self.jump_splits(one, false, false),
+                Stmt::Switch { selector, .. } => !self.uniform(selector) && !self.ret_splits(one, false) && !self.jump_splits(one, false, true),
+                Stmt::Loop { body, continuing, break_if } => !self.loop_uniform(body, continuing, break_if.as_ref()) && !self.ret_splits(one, false),
+                _ => false,
+            };
+            if splits_and_merges && later {
+                out.insert(s as *const Stmt);
+            }
+            let inside = later || (matches!(s, Stmt::Loop { .. }) && self.has_unconverged_op(one));
+            match s {
+                Stmt::If { then_body, else_body, .. } => {
+                    self.reconverge(then_body, inside, out);
+                    self.reconverge(else_body, inside, out);
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for (_, body, _) in cases {
+                        self.reconverge(body, inside, out);
+                    }
+                    self.reconverge(default, inside, out);
+                }
+                Stmt::Loop { body, continuing, .. } => {
+                    self.reconverge(continuing, inside, out);
+                    self.reconverge(body, inside, out);
+                }
+                _ => {}
+            }
+            later |= self.has_unconverged_op(one);
+        }
     }
 
     /// Analyses `s` reached with `conv`; returns whether the lanes are together after it.
@@ -248,7 +356,7 @@ impl An {
         match s {
             Stmt::Let { local, init } => {
                 self.exprs(s, conv);
-                if !conv || !self.uniform(init) {
+                if !conv || !(self.uniform(init) || (self.uload && self.uniform_shared_read(init))) {
                     self.taint(*local);
                 }
                 conv
@@ -363,7 +471,7 @@ mod tests {
     }
 
     fn count(m: &KernelModule) -> usize {
-        convergent_subgroups(m).len()
+        analyse(m).ops.len()
     }
 
     #[test]
@@ -435,6 +543,99 @@ mod tests {
         // A return that splits the warp inside a loop: nothing after is converged.
         let body = vec![Stmt::Loop { body: vec![Stmt::If { cond: lt(lid(), 5), then_body: vec![Stmt::Return(None)], else_body: vec![] }], continuing: vec![], break_if: Some(Expr::LitBool(true)) }, sg(2)];
         assert_eq!(count(&module([64, 1, 1], body, 1)), 0);
+    }
+
+    /// `local 2 = (u32) <op>(1.0)`.
+    fn sg_op(op: IrSubgroupOp, lane: Option<Expr>) -> Stmt {
+        let e = Expr::Subgroup { op, arg: Some(Box::new(Expr::LitF32(1.0))), lane: lane.map(Box::new), ty: KirType::F32 };
+        Stmt::Var { local: LocalId(2), init: Some(Expr::Cast { kind: CastKind::Convert, expr: Box::new(e), src_ty: KirType::F32, dst_ty: KirType::U32 }) }
+    }
+
+    /// `loop { <divergent inner loop>; body; break_if local 2 < 5 }`
+    fn spin_on(body: Stmt) -> Vec<Stmt> {
+        let inner = Stmt::Loop { body: vec![], continuing: vec![], break_if: Some(lt(lid(), 5)) };
+        vec![
+            Stmt::Var { local: LocalId(2), init: Some(Expr::LitU32(0)) },
+            Stmt::Loop { body: vec![inner, body], continuing: vec![], break_if: Some(lt(Box::new(Expr::Local(LocalId(2))), 5)) },
+        ]
+    }
+
+    #[test]
+    fn a_loop_exiting_on_a_subgroup_result_is_converged() {
+        use IrSubgroupOp::*;
+        // The exit is a reduction or a ballot every lane takes part in: all lanes leave together, so the
+        // operation behind a loop that splits the warp is still reached by all of them.
+        for op in [Add, Min, Max, Ballot] {
+            assert_eq!(count(&module([64, 1, 1], spin_on(sg_op(op, None)), 1)), 1, "{op:?}");
+        }
+        // A broadcast of the first lane, or from a uniform lane, is the same in every lane.
+        assert_eq!(count(&module([64, 1, 1], spin_on(sg_op(Shuffle, None)), 1)), 1);
+        assert_eq!(count(&module([64, 1, 1], spin_on(sg_op(Shuffle, Some(Expr::LitU32(3)))), 1)), 1);
+        // A shuffle from the lane's own place, or a scan, differs between lanes.
+        assert_eq!(count(&module([64, 1, 1], spin_on(sg_op(Shuffle, Some(Expr::Local(LocalId(0))))), 1)), 0);
+        assert_eq!(count(&module([64, 1, 1], spin_on(sg_op(ExclusiveAdd, None)), 1)), 0);
+    }
+
+    #[test]
+    fn a_subgroup_result_taken_where_the_lanes_are_apart_is_divergent() {
+        // `if lid < 5 { v = sum }  if v < 5 { sum }`: the first sum is not converged, so `v` differs.
+        let v = || Box::new(Expr::Local(LocalId(2)));
+        let body = vec![
+            Stmt::Var { local: LocalId(2), init: Some(Expr::LitU32(0)) },
+            Stmt::If { cond: lt(lid(), 5), then_body: vec![sg(2)], else_body: vec![] },
+            Stmt::If { cond: lt(v(), 5), then_body: vec![sg(3)], else_body: vec![] },
+        ];
+        assert_eq!(count(&module([64, 1, 1], body, 2)), 0);
+    }
+
+    #[test]
+    fn a_cut_of_the_thread_index_at_a_warp_boundary_is_uniform() {
+        let at = |op: IrBinOp, c: u32| module([64, 1, 1], vec![Stmt::If { cond: *bin(op, lid(), lit(c), KirType::BOOL), then_body: vec![sg(2)], else_body: vec![] }], 1);
+        assert_eq!(count(&at(IrBinOp::Lt, 32)), 1);
+        assert_eq!(count(&at(IrBinOp::Ge, 32)), 1);
+        assert_eq!(count(&at(IrBinOp::Le, 31)), 1);
+        assert_eq!(count(&at(IrBinOp::Gt, 31)), 1);
+        assert_eq!(count(&at(IrBinOp::Lt, 16)), 0);
+        assert_eq!(count(&at(IrBinOp::Le, 32)), 0);
+        assert_eq!(count(&at(IrBinOp::Eq, 32)), 0);
+    }
+
+    #[test]
+    fn a_workgroup_uniform_load_is_uniform() {
+        let barrier = || Stmt::Barrier(BarrierScope::Workgroup);
+        let load = Stmt::Let { local: LocalId(2), init: Expr::SharedRead { shared: 0, path: vec![], ty: KirType::U32 } };
+        let branch = || Stmt::If { cond: lt(Box::new(Expr::Local(LocalId(2))), 5), then_body: vec![sg(3)], else_body: vec![] };
+        assert_eq!(count(&module([64, 1, 1], vec![barrier(), load.clone(), barrier(), branch()], 2)), 1);
+        // A plain read of workgroup memory can differ from lane to lane.
+        assert_eq!(count(&module([64, 1, 1], vec![load.clone(), branch()], 2)), 0);
+        assert_eq!(count(&module([64, 1, 1], vec![barrier(), load, branch()], 2)), 0);
+    }
+
+    #[test]
+    fn a_split_followed_by_an_unconverged_operation_reconverges() {
+        let div = || lt(lid(), 5);
+        let split = || Stmt::If { cond: div(), then_body: vec![Stmt::Barrier(BarrierScope::Workgroup)], else_body: vec![] };
+        let inner = || Stmt::If { cond: div(), then_body: vec![sg(2)], else_body: vec![] };
+        // `split; if lid < 5 { sg }`: the operation takes `activemask`, which must see the whole branch.
+        let m = module([64, 1, 1], vec![split(), inner()], 1);
+        let c = analyse(&m);
+        assert_eq!(c.ops.len(), 0);
+        assert_eq!(c.reconverge, HashSet::from([&m.entry_body[0] as *const Stmt]));
+        // Nothing after the split takes the mask: nothing to do.
+        let m = module([64, 1, 1], vec![inner(), split()], 1);
+        assert!(analyse(&m).reconverge.is_empty());
+        // The operation behind the split is converged (it is full-mask): nothing to do.
+        let m = module([64, 1, 1], vec![split(), sg(2)], 1);
+        assert!(analyse(&m).reconverge.is_empty());
+        // A split that lets lanes leave cannot be waited for.
+        let leave = Stmt::If { cond: div(), then_body: vec![Stmt::Return(None)], else_body: vec![] };
+        let m = module([64, 1, 1], vec![leave, inner()], 1);
+        assert!(analyse(&m).reconverge.is_empty());
+        // In a loop an operation of the next iteration is after both (the branch with the operation too).
+        let m = module([64, 1, 1], vec![Stmt::Loop { body: vec![inner(), split()], continuing: vec![], break_if: Some(lt(lid(), 5)) }], 1);
+        let c = analyse(&m);
+        let Stmt::Loop { body, .. } = &m.entry_body[0] else { unreachable!() };
+        assert_eq!(c.reconverge, HashSet::from([&body[0] as *const Stmt, &body[1] as *const Stmt]));
     }
 
     #[test]

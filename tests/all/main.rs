@@ -62,6 +62,7 @@ mod search;
 mod segments;
 mod smallint;
 mod sort;
+mod subgroup_divergence;
 mod sparse;
 mod spill;
 mod threads;
