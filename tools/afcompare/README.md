@@ -37,6 +37,12 @@ the same ArrayFire install.)
   (`ew small reduce matmul bmm fft sort scan hist gather stencil filter mlp`).
 * `afcompare cold [--reps N] [--only CASE] [--out DIR]`: first-call (cold) times, each
   measurement in a fresh process (`DIR/cold.md`).
+* `AFCOMPARE_KERNELS=1` prints luma's per-kernel GPU time of every timed luma call (a profiled call).
+* `afcompare diag` (luma only, no ArrayFire): GPU time and kernels of every product of the MLP step
+  with the operand kinds the step gives it (stored, lazy, transposed), of its reductions and softmax
+  pieces. `afcompare sweep`: GPU time of `matmul_f32` / `matmul_tf32` (stored and left-transposed
+  operands) over product shapes, for comparing planner settings; run it after a warm-up (it wakes
+  the GPU for 400 ms first) and compare only runs of one job.
 
 ## Method
 

@@ -18,7 +18,10 @@
 //! invocations the small output does not need take other `k`; a second launch sums the slices of
 //! K as above.
 //!
-//! An operand that is a pending expression is not evaluated first: its program is flattened
+//! On a backend with its own gemm kernels (CUDA, see [`run`]) the shapes they take (`M`, `K` and `N`
+//! multiples of 4 and at least 32, or a few columns, see [`padded_product`]) are multiplied by them,
+//! reading the operands as stored (a transposed view is read in place) and evaluating an operand
+//! that is an expression first, once ([`gemm_operand`]). Otherwise, with the shader kernels, an operand that is a pending expression is not evaluated first: its program is flattened
 //! into the kernel (`jit::program::Tail::Matmul`), which calls it as `luma_lhs(i)` /
 //! `luma_rhs(i)` where a buffer kernel indexes `a` / `b`. A transposed operand is such an
 //! expression (a view), and the kernel then divides its slices so that neighbouring invocations
@@ -37,6 +40,7 @@ use crate::error::LumaError;
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::ops::{fold_grid, Outcome};
 use crate::tuning::Tuning;
+use crate::view::PadMode;
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -205,6 +209,79 @@ impl Array<f32> {
     pub fn matmul_f32(&self, rhs: &Array<f32>) -> Array<f32> {
         matmul_f32(self, rhs)
     }
+
+    /// `self` times the transpose of `rhs` ([`Array::matmul`] of `self` and `rhs.transpose()`, which
+    /// is `A Bᵀ` of the row-major matrices): `self` has shape `[K, M]`, `rhs` `[K, N]` (the row-major
+    /// `N x K` matrix) and the result `[N, M]`. `rhs` is read in place by the backend's own
+    /// kernels (no transposed copy) when it is a stored array, and evaluated first, once, when it
+    /// is an expression. Precision as [`Array::matmul`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Array::matmul`] for the shapes `self` `[K, M]` and `rhs.transpose()` `[N, K]`.
+    #[track_caller]
+    pub fn matmul_nt(&self, rhs: &Array<f32>) -> Array<f32> {
+        matmul_nt(self, rhs)
+    }
+
+    /// The transpose of `self` times `rhs` (`Aᵀ B` of the row-major matrices): `self` has shape
+    /// `[M, K]` (the row-major `K x M` matrix), `rhs` `[N, K]` and the result `[N, M]`. Operands are
+    /// read in place as for [`Array::matmul_nt`]; precision as [`Array::matmul`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Array::matmul`] for the shapes `self.transpose()` `[K, M]` and `rhs` `[N, K]`.
+    #[track_caller]
+    pub fn matmul_tn(&self, rhs: &Array<f32>) -> Array<f32> {
+        matmul_tn(self, rhs)
+    }
+
+    /// The transpose of `self` times the transpose of `rhs` (`Aᵀ Bᵀ` of the row-major matrices):
+    /// `self` has shape `[M, K]`, `rhs` `[K, N]` and the result `[N, M]`. Operands are read in
+    /// place as for [`Array::matmul_nt`]; precision as [`Array::matmul`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Array::matmul`] for the shapes `self.transpose()` `[K, M]` and `rhs.transpose()` `[N, K]`.
+    #[track_caller]
+    pub fn matmul_tt(&self, rhs: &Array<f32>) -> Array<f32> {
+        matmul_tt(self, rhs)
+    }
+
+    /// The dot product of the elements of `self` and `rhs`, which have the same shape, as a lazy
+    /// one-element array (`(self * rhs).sum()`: one fused reduction that reads both once).
+    ///
+    /// # Errors
+    ///
+    /// The result is poisoned with [`LumaError::ShapeMismatch`] if the shapes differ.
+    #[track_caller]
+    pub fn dot(&self, rhs: &Array<f32>) -> Array<f32> {
+        dot(self, rhs)
+    }
+}
+
+/// [`Array::matmul_nt`] as a function.
+#[track_caller]
+pub fn matmul_nt(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(lhs, &rhs.transpose(), None)
+}
+
+/// [`Array::matmul_tn`] as a function.
+#[track_caller]
+pub fn matmul_tn(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(&lhs.transpose(), rhs, None)
+}
+
+/// [`Array::matmul_tt`] as a function.
+#[track_caller]
+pub fn matmul_tt(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(&lhs.transpose(), &rhs.transpose(), None)
+}
+
+/// [`Array::dot`] as a function.
+#[track_caller]
+pub fn dot(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    (lhs * rhs).sum()
 }
 
 /// [`Array::matmul`] as a function: the product of `lhs` (`[K, M]`) and `rhs` (`[N, K]`) as an
@@ -425,30 +502,61 @@ static OWN_F32_KERNELS_OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new
 
 /// Tiles per multiprocessor a tensor-core product aims for.
 const GEMM_HALF_TILES_PER_SM: u32 = 4;
-/// Smallest `M`, `N` and `K` of a product of the backend's own kernels (below it the tiles are
-/// mostly padding).
+/// Smallest `M` and `K` of a product of the backend's own kernels (below it the tiles are mostly
+/// padding), and of its `N`, except for a product of at most [`SMALL_N_MAX_M`] rows, whose few
+/// columns (the classes of a classifier head) fill part of a 32-wide tile but still beat the
+/// shader kernels, which launch two workgroups for them.
 const GEMM_MIN_EXTENT: usize = 32;
+/// Smallest `N` of a product of at most [`SMALL_N_MAX_M`] rows.
+const SMALL_N_MIN: usize = 4;
+/// Most rows of a product with `N` below [`GEMM_MIN_EXTENT`] that runs on the backend's own
+/// kernels (more rows have enough tiles for the shader kernels' skinny and staged plans).
+const SMALL_N_MAX_M: usize = 4096;
+/// Fewest rows of such a product: with 64 rows the extra launches (the padded operand) cost more than the shader kernels
+/// (`train/sgd_small`, `adam_small` of the `ml` suite, batch 64, 11 % slower on an RTX 3080 Laptop).
+const SMALL_N_MIN_M: usize = 128;
 
 /// The `M`, `N` and `K` of the product of `lhs` and `rhs` if the backend's own kernels take its
 /// shapes: all multiples of 4 and at least [`GEMM_MIN_EXTENT`] (the extents are checked again by
 /// [`run`]).
 fn gemm_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> Option<[u32; 3]> {
     let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
-    let ok = |extent: usize| u32::try_from(extent).ok().filter(|_| extent >= GEMM_MIN_EXTENT && extent.is_multiple_of(4));
+    let ok = |extent: usize, least: usize| u32::try_from(extent).ok().filter(|_| extent >= least && extent.is_multiple_of(4));
     if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
         return None;
     }
-    Some([ok(ld[1])?, ok(rd[0])?, ok(ld[0])?])
+    let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&ld[1]) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
+    Some([ok(ld[1], GEMM_MIN_EXTENT)?, ok(rd[0], few_columns)?, ok(ld[0], GEMM_MIN_EXTENT)?])
 }
 
-/// Whether the product reads `array` as it is stored (a buffer, or a transpose of one), without
-/// evaluating an expression first: the backend's own kernels cannot fuse an operand's expression.
-fn stored_operand(array: &Array<f32>) -> bool {
-    match transposed_source(array) {
-        Some(Src::Buffer(_)) => true,
-        Some(Src::Node(node)) => !node.is_pending(),
-        _ => array.pending().is_none(),
+/// The product of a few columns that is not a multiple of 4 (the 10 classes of a classifier head),
+/// padded with zero columns up to one on the backend's own kernels and sliced back: `None` if the
+/// product is not of that kind. The padded operand is an expression, evaluated first like any
+/// other (a copy of a few thousand elements); the slice of the result is a lazy view.
+fn padded_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Option<Outcome<Array<f32>>> {
+    let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+    let (k, m, n) = (ld[0], ld[1], rd[0]);
+    let padded = n.next_multiple_of(4);
+    if n.is_multiple_of(4) || !(2..GEMM_MIN_EXTENT).contains(&n) || !(SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) || !m.is_multiple_of(4) || k < GEMM_MIN_EXTENT || !k.is_multiple_of(4) {
+        return None;
     }
+    if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) || !ctx.same_as(rhs.context()) {
+        return None;
+    }
+    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || ctx.hal().gemm_tiles(!tf32).is_empty() {
+        return None;
+    }
+    let wide = rhs.pad([(0, padded - n), (0, 0)], PadMode::Zero);
+    Some(run(lhs, &wide, tf32).map(|out| out.slice(0, ..n)))
+}
+
+/// Whether the backend's own kernels can take `array` as an operand: they read buffers (or the
+/// transpose of one), so an operand that is an expression is evaluated first, once, which beats
+/// fusing it into the old shader kernels (`relu(z) W` of 256 x 512 x 512 takes 85 us fused and 3 + 20
+/// evaluated first on an RTX 3090) and lets its other readers use the buffer. Arrays split over
+/// several buffers are left to the shader kernels.
+fn gemm_operand(ctx: &Context, array: &Array<f32>) -> bool {
+    array.pending().is_none_or(|node| node.len() as u64 * 4 <= ctx.segment_bytes())
 }
 
 /// Output tiles below which a long K of an `f32` product of the backend's own kernels is split
@@ -458,16 +566,32 @@ fn stored_operand(array: &Array<f32>) -> bool {
 /// `128 x 262144 x 128` 0.63 ms with 1024 workgroups, 1.4 with 124.
 const F32_SPLIT_TILES: u32 = 128;
 const F32_SPLIT_GROUPS: u32 = 1024;
-const F32_SPLIT_MIN_SLICE: u32 = 512;
-/// Shortest K that is split.
+/// Longest slice of K a split product of the backend's own kernels covers at least: an eighth of K
+/// between [`GEMM_SPLIT_SLICE_MIN`] and `..._MAX` (measured on an RTX 3090 for `f32` / TF32: 256 x 512 x 12
+/// 18.4 / 19.2 us unsplit, 9.2 in 4 slices of 128; 2048 x 2048 x 64 95 us unsplit, 70 in 8 slices of
+/// 256, 83 in 16 of 128; 128 x 4096 x 4096 236 us in 8 slices of 512, 258 in 16 of 256; 64 x 8192 x 64
+/// TF32 34 us unsplit, 10 in slices of 128; 256 x 784 x 512 28 / 28 us, 24 / 20 split).
+const GEMM_SPLIT_SLICE_DIV: u32 = 8;
+const GEMM_SPLIT_SLICE_MIN: u32 = 128;
+const F32_SPLIT_SLICE_MAX: u32 = 512;
+const GEMM_TF32_SPLIT_SLICE_MAX: u32 = 1024;
+/// Shortest K that is split: 512 for a product of at most [`GEMM_SPLIT_FEW_TILES`] output tiles (a
+/// few workgroups would idle most of the device and the fold of the slices is cheap against their
+/// share of K), else 4096 (`f32`) / 2048 and slices of 1024 (TF32): a product of 32 to 128 tiles over
+/// a K of 512 to 2048 is 5 to 40 % slower split (256 x 512 x 512 20 us unsplit, 24 split; 256 x 1024 x
+/// 1024 TF32 35 us, 44 split).
+const GEMM_SPLIT_MIN_K: u32 = 512;
+const GEMM_SPLIT_FEW_TILES: u32 = 16;
 const F32_SPLIT_MIN_K: u32 = 4096;
 
 /// The slices an `f32` product of `tiles` output tiles over `k` is split into and their length.
 fn f32_split(tuning: &Tuning, tiles: u32, k: u32, bytes: u64, max_bytes: u64) -> Option<(u32, u32)> {
-    if tiles >= tuning.scaled_up(F32_SPLIT_TILES) || k < F32_SPLIT_MIN_K {
+    let min_k = if tiles <= tuning.scaled_up(GEMM_SPLIT_FEW_TILES) { GEMM_SPLIT_MIN_K } else { F32_SPLIT_MIN_K };
+    if tiles >= tuning.scaled_up(F32_SPLIT_TILES) || k < min_k {
         return None;
     }
-    let wanted = tuning.scaled_up(F32_SPLIT_GROUPS).div_ceil(tiles).min(k / F32_SPLIT_MIN_SLICE);
+    let slice = (k / GEMM_SPLIT_SLICE_DIV).clamp(GEMM_SPLIT_SLICE_MIN, F32_SPLIT_SLICE_MAX);
+    let wanted = tuning.scaled_up(F32_SPLIT_GROUPS).div_ceil(tiles).min(k / slice);
     if wanted < 2 {
         return None;
     }
@@ -527,9 +651,12 @@ fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &
     let split = if exact {
         f32_split(tuning, tile_count, k, out_bytes, max_bytes)
     } else {
-        (tile_count < wanted && k >= 2 * NATIVE_SPLIT_SLICE)
+        let few = tile_count <= tuning.scaled_up(GEMM_SPLIT_FEW_TILES);
+        let slice = if few { (k / GEMM_SPLIT_SLICE_DIV).clamp(GEMM_SPLIT_SLICE_MIN, GEMM_TF32_SPLIT_SLICE_MAX) } else { NATIVE_SPLIT_SLICE };
+        let min_k = if few { GEMM_SPLIT_MIN_K } else { 2 * NATIVE_SPLIT_SLICE };
+        (tile_count < wanted && k >= min_k)
             .then(|| {
-                let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
+                let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / slice)).next_multiple_of(SLICE);
                 (k.div_ceil(kc), kc)
             })
             .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * out_bytes <= max_bytes)
@@ -639,6 +766,9 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
     if let Some(out) = host_product(ctx, lhs, rhs) {
         return Ok(out);
     }
+    if let Some(out) = padded_product(ctx, lhs, rhs, tf32) {
+        return out;
+    }
     // Operands first, so that a poisoned one reports its own error.
     let cores = ctx.tuning().native_gemm;
     let shape = gemm_shape(lhs, rhs).filter(|_| ctx.same_as(rhs.context()));
@@ -646,7 +776,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
     // The default product runs on the backend's own `f32` kernels when it reads its operands as
     // they are stored and is not one of the skinny shapes (see `skinny_plan`).
     let exact_tiles = match shape {
-        Some([m, n, k]) if tensor_tiles.is_empty() && cores == 0 && !*OWN_F32_KERNELS_OFF && stored_operand(lhs) && stored_operand(rhs) => {
+        Some([m, n, k]) if tensor_tiles.is_empty() && cores == 0 && !*OWN_F32_KERNELS_OFF && gemm_operand(ctx, lhs) && gemm_operand(ctx, rhs) => {
             let along_k = lhs.pending().is_none_or(|node| jit::stored_along_k(&jit::MatmulSide::Pending(Arc::clone(node)), [k, m]));
             let skinny = skinny_plan(m, n, k, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some();
             if skinny { &[] } else { ctx.hal().gemm_tiles(true) }
@@ -1518,9 +1648,12 @@ mod tests {
         // On 48 multiprocessors the same product gets the same tile; 256 x 1024 outputs take the smallest.
         assert_eq!(plan(1024, 1024, 1024, 48).tile, tile(64, 128));
         assert_eq!(plan(256, 1024, 1024, 82).tile, tile(32, 32));
-        // Few outputs and a short K: the smallest tile, never split below 2048.
+        // Few output tiles over a K of 512 or more are split too (an attention `P V` of 2048 x 2048 x 64 takes 95 us unsplit, 70 in 8 slices of 256);
+        // a short K over more tiles is not (256 x 1024 x 1024 has 256 tiles of 32 x 32).
         let p = plan(2048, 64, 2048, 82);
-        assert_eq!((p.tile, p.slices), (tile(32, 32), 1));
+        assert_eq!((p.tile, p.slices), (tile(128, 64), 8));
+        assert_eq!(plan(256, 1024, 1024, 82).slices, 1);
+        assert_eq!(plan(256, 12, 512, 82).slices, 4);
         // Long K over few outputs splits to about a thousand workgroups, a few times the multiprocessors' worth.
         assert!(plan(64, 64, 1 << 20, 82).slices > 1);
         let p = plan(32, 4096, 4096, 82);

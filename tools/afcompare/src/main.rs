@@ -4,6 +4,7 @@ mod afx;
 mod bench;
 mod cases;
 mod cold;
+mod diag;
 mod lumax;
 mod mlp;
 mod util;
@@ -35,12 +36,14 @@ fn main() {
             "--only" => only = args.next(),
             "--out" => out = args.next().expect("--out DIR"),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).expect("--reps N"),
-            "cold" | "child" => mode = a,
+            "cold" | "child" | "diag" | "sweep" => mode = a,
             _ => rest.push(a),
         }
     }
     match mode.as_str() {
         "child" => return cold::child(&rest[0], &rest[1]),
+        "diag" => return diag::run(),
+        "sweep" => return diag::sweep(),
         "cold" => {
             std::fs::create_dir_all(&out).unwrap();
             let md = cold::orchestrate(reps, only.as_deref());

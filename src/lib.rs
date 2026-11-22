@@ -139,7 +139,7 @@ pub use linalg::{
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use bmm::matmul_batched;
-pub use matmul::{matmul, matmul_f32, matmul_tf32};
+pub use matmul::{dot, matmul, matmul_f32, matmul_nt, matmul_tf32, matmul_tn, matmul_tt};
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};
 pub use reduce::Reduction;
