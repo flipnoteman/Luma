@@ -218,3 +218,40 @@ fn set_operations_match_the_host() {
     let c = Array::from_slice_on(&ctx, &[5u32, 1, 5, 1, 9], 5).unwrap();
     assert_eq!(c.set_unique(false).unwrap().to_vec().unwrap(), [1, 5, 9]);
 }
+
+/// Sorted distinct inputs of a few hundred thousand elements (hundreds of merge tiles): the
+/// union and the intersection against host sets, for every key type.
+#[test]
+fn set_operations_on_large_sorted_inputs_match_host_sets() {
+    let ctx = Context::new().unwrap();
+    let mut rng = Rng(77);
+    for (na, nb, range) in [(300_000usize, 250_000usize, 700_000u32), (5000, 400_000, 1_000_000), (100_000, 100_000, 100_000_000), (70_001, 70_000, 71_000)] {
+        let mut a: Vec<u32> = (0..na).map(|_| rng.next() % range).collect();
+        let mut b: Vec<u32> = (0..nb).map(|_| rng.next() % range).collect();
+        a.sort_unstable();
+        a.dedup();
+        b.sort_unstable();
+        b.dedup();
+        let sb: std::collections::HashSet<u32> = b.iter().copied().collect();
+        let both: Vec<u32> = a.iter().copied().filter(|x| sb.contains(x)).collect();
+        let mut all = a.clone();
+        all.extend_from_slice(&b);
+        all.sort_unstable();
+        all.dedup();
+        let (xa, xb) = (Array::from_slice_on(&ctx, &a, a.len()).unwrap(), Array::from_slice_on(&ctx, &b, b.len()).unwrap());
+        assert_eq!(xa.set_union(&xb, true).unwrap().to_vec().unwrap(), all, "u32 union {na} {nb}");
+        assert_eq!(xa.set_intersect(&xb, true).unwrap().map(|r| r.to_vec().unwrap()).unwrap_or_default(), both, "u32 intersect {na} {nb}");
+        // The same as i32 (negatives sort first).
+        let shift = |v: &[u32]| v.iter().map(|&x| x as i32 - (range / 2) as i32).collect::<Vec<i32>>();
+        let (ia, ib) = (shift(&a), shift(&b));
+        let (xia, xib) = (Array::from_slice_on(&ctx, &ia, ia.len()).unwrap(), Array::from_slice_on(&ctx, &ib, ib.len()).unwrap());
+        assert_eq!(xia.set_union(&xib, true).unwrap().to_vec().unwrap(), shift(&all), "i32 union {na} {nb}");
+        assert_eq!(xia.set_intersect(&xib, true).unwrap().map(|r| r.to_vec().unwrap()).unwrap_or_default(), shift(&both));
+        // Disjoint.
+        let evens: Vec<u32> = a.iter().map(|x| x * 2).collect();
+        let odds: Vec<u32> = b.iter().map(|x| x * 2 + 1).collect();
+        let (xe, xo) = (Array::from_slice_on(&ctx, &evens, evens.len()).unwrap(), Array::from_slice_on(&ctx, &odds, odds.len()).unwrap());
+        assert!(xe.set_intersect(&xo, true).unwrap().is_none());
+        assert_eq!(xe.set_union(&xo, true).unwrap().len(), evens.len() + odds.len());
+    }
+}

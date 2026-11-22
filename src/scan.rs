@@ -91,8 +91,17 @@ const WARP_MIN_LINES: u32 = 128;
 const SHORT_STRIDED: u32 = 256;
 /// A strided pass with this many lines or more has enough invocations without blocks.
 const WIDE_LINES: u32 = 1 << 16;
-/// Invocations a blocked strided pass aims for.
-const TARGET_THREADS: u64 = 1 << 20;
+/// Invocations per compute unit a blocked strided pass aims for.
+const THREADS_PER_UNIT: u64 = 1536;
+
+/// The invocations a blocked strided pass aims for: [`THREADS_PER_UNIT`] per compute unit (about the
+/// threads a unit keeps resident). Fewer, longer blocks mean fewer partial results for the second
+/// pass to read back: a strided sum, product or mean of 4096 x 4096 over axis 1 takes 0.101 ms on an
+/// RTX 3090 with a million invocations, 0.094 ms with 262144 (ArrayFire 0.096), and on an RTX 3080
+/// Laptop 0.221 ms with a million, 0.195 ms with 65536 (ArrayFire 0.203).
+fn target_threads(tuning: &crate::tuning::Tuning) -> u64 {
+    u64::from(tuning.compute_units.max(1)) * THREADS_PER_UNIT
+}
 /// Fewest cells of a line one invocation of a blocked strided pass walks.
 const MIN_BLOCK: u32 = 16;
 
@@ -902,11 +911,11 @@ enum Input<'b> {
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
 /// are short or numerous enough for one invocation each.
-fn strided_block(n: u32, lines: u32) -> Option<u32> {
+fn strided_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
     if lines >= WIDE_LINES || n <= SHORT_STRIDED {
         return None;
     }
-    let block = (u64::from(n) * u64::from(lines)).div_ceil(TARGET_THREADS).clamp(u64::from(MIN_BLOCK), u64::from(n));
+    let block = (u64::from(n) * u64::from(lines)).div_ceil(threads).clamp(u64::from(MIN_BLOCK), u64::from(n));
     Some(block as u32)
 }
 
@@ -920,9 +929,9 @@ const FEW_LINES: u32 = 1024;
 const FEW_LINES_MIN_CELLS: u32 = 64;
 
 /// [`strided_block`] for a reduction: blocked also for short lines when there are few of them.
-fn reduce_block(n: u32, lines: u32) -> Option<u32> {
-    strided_block(n, lines).or_else(|| {
-        (lines < FEW_LINES && n > FEW_LINES_MIN_CELLS).then(|| (u64::from(n) * u64::from(lines)).div_ceil(TARGET_THREADS).clamp(u64::from(MIN_BLOCK), u64::from(n)) as u32)
+fn reduce_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
+    strided_block(n, lines, threads).or_else(|| {
+        (lines < FEW_LINES && n > FEW_LINES_MIN_CELLS).then(|| (u64::from(n) * u64::from(lines)).div_ceil(threads).clamp(u64::from(MIN_BLOCK), u64::from(n)) as u32)
     })
 }
 
@@ -1149,7 +1158,7 @@ impl<'a> Lines<'a> {
             self.scan(totals, nb, 1, lines, prefix)?;
             return self.launch(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix));
         }
-        let Some(k) = strided_block(n, lines) else {
+        let Some(k) = strided_block(n, lines, target_threads(self.ctx.tuning())) else {
             return self.launch(Pass::Seq, seq, out, input, None);
         };
         let nb = n.div_ceil(k);
@@ -1176,7 +1185,7 @@ impl<'a> Lines<'a> {
             let nb = n.div_ceil(REDUCE_CHUNK);
             (Pass::ChunkReduce, [n, 1, lines, nb, REDUCE_CHUNK], nb)
         } else {
-            let k = reduce_block(n, lines).unwrap_or(n);
+            let k = reduce_block(n, lines, target_threads(self.ctx.tuning())).unwrap_or(n);
             let nb = n.div_ceil(k);
             (Pass::Fold, [n, stride, lines, nb, k], nb)
         };

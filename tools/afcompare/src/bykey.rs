@@ -124,6 +124,105 @@ pub fn bykey(b: &mut Bench) {
                 afx::sync();
             },
         );
+        // The other reductions; a value of 0 or 1 for any / all.
+        let (lk, lv) = vl.product_by_key(&kl).unwrap();
+        let (ak, av) = af::product_by_key(&ka, &va, 0);
+        let v = exact(&as_f32(&lumax::host(&lk)), &as_f32(&afx::host(&ak))).and(exact(&lumax::host(&lv), &afx::host(&av)));
+        b.run(
+            "14 product_by_key f32, u32 keys",
+            &human(n),
+            v,
+            "runs of about 100 equal keys; +-1 values (exact products); luma: scan_by_key with * read at the run ends",
+            &mut || {
+                let (_k, s) = vl.product_by_key(&kl).unwrap();
+                luma::eval_all(&[&s]).unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let (k, s) = af::product_by_key(&ka, &va, 0);
+                k.eval();
+                s.eval();
+                afx::sync();
+            },
+        );
+        let (lk, lv) = vl.min_by_key(&kl).unwrap();
+        let (ak, av) = af::min_by_key(&ka, &va, 0);
+        let v = exact(&as_f32(&lumax::host(&lk)), &as_f32(&afx::host(&ak))).and(exact(&lumax::host(&lv), &afx::host(&av)));
+        b.run(
+            "14 min_by_key f32, u32 keys",
+            &human(n),
+            v,
+            "runs of about 100 equal keys",
+            &mut || {
+                let (_k, s) = vl.min_by_key(&kl).unwrap();
+                luma::eval_all(&[&s]).unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let (k, s) = af::min_by_key(&ka, &va, 0);
+                k.eval();
+                s.eval();
+                afx::sync();
+            },
+        );
+        let bits: Vec<f32> = vals.iter().enumerate().map(|(i, &x)| if keys[i] % 3 == 0 { 1.0 } else if x > 0.0 { 1.0 } else { 0.0 }).collect();
+        let (bl, ba) = (lumax::arr(&ctx, &bits, n), afx::arr(&bits, &[n as u64]));
+        let (lk, lv) = bl.any_true_by_key(&kl).unwrap();
+        let lv: Vec<f32> = lumax::host(&lv).iter().map(|&x| f32::from(u8::from(x))).collect();
+        let want: Vec<f32> = keys
+            .chunk_by(|a, b| a == b)
+            .scan(0usize, |at, run| {
+                let part = &bits[*at..*at + run.len()];
+                *at += run.len();
+                Some(f32::from(u8::from(part.iter().any(|&x| x != 0.0))))
+            })
+            .collect();
+        let v = exact(&as_f32(&lumax::host(&lk)), &as_f32(&afx::host(&af::any_true_by_key(&ka, &ba, 0).0))).and(exact(&lv, &want));
+        b.run(
+            "14 any_true_by_key f32 0/1 values, u32 keys",
+            &human(n),
+            v,
+            "runs of about 100 equal keys; luma checked against a host reference (ArrayFire's result type is not read back)",
+            &mut || {
+                let (_k, s) = bl.any_true_by_key(&kl).unwrap();
+                luma::eval_all(&[&s]).unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let (k, s) = af::any_true_by_key(&ka, &ba, 0);
+                k.eval();
+                s.eval();
+                afx::sync();
+            },
+        );
+        let (lk, lv) = bl.all_true_by_key(&kl).unwrap();
+        let lv: Vec<f32> = lumax::host(&lv).iter().map(|&x| f32::from(u8::from(x))).collect();
+        let want: Vec<f32> = keys
+            .chunk_by(|a, b| a == b)
+            .scan(0usize, |at, run| {
+                let part = &bits[*at..*at + run.len()];
+                *at += run.len();
+                Some(f32::from(u8::from(part.iter().all(|&x| x != 0.0))))
+            })
+            .collect();
+        let v = exact(&as_f32(&lumax::host(&lk)), &as_f32(&afx::host(&af::all_true_by_key(&ka, &ba, 0).0))).and(exact(&lv, &want));
+        b.run(
+            "14 all_true_by_key f32 0/1 values, u32 keys",
+            &human(n),
+            v,
+            "runs of about 100 equal keys; luma checked against a host reference (ArrayFire's result type is not read back)",
+            &mut || {
+                let (_k, s) = bl.all_true_by_key(&kl).unwrap();
+                luma::eval_all(&[&s]).unwrap();
+                ctx.sync().unwrap();
+            },
+            &mut || {
+                let (k, s) = af::all_true_by_key(&ka, &ba, 0);
+                k.eval();
+                s.eval();
+                afx::sync();
+            },
+        );
         drop((kl, ka, vl, va));
         // Sets of u32 below 2^24 (exact in f32 for the comparison).
         let m = 4_000_000usize;
