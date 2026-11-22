@@ -6,7 +6,7 @@ before/after on both GPUs. Files I own: src/sampler.rs, src/image/warp.rs, src/i
 luma-wgpu (texture parts), tools/afcompare/src/signal.rs.
 
 ## Measured (baseline, before any change) -- afcompare signal_approx + signal_image, AFCOMPARE_KERNELS=1
-Binary: ~/Documents/lp-tex-bin/base (same path on remote 192.168.1.88). Outputs: handoff-data/base-3090-*.md,
+Binary: ~/Documents/lp-tex-bin/base (same path on remote 192.168.1.88). Outputs: handoff-data/base-3090-*.md (laptop was unreachable by ssh at handoff time; its baseline is the tail in handoff-data/baseline-afcompare-job-5220.log and full files on the laptop under ~/Documents/lp-tex-bin/out-base-*/results.md),
 base-3080L-*.md (result tables per GPU, never mix), logs handoff-data/baseline-afcompare-job-*.log (gpuq jobs
 0-20261122-105430-31641 = 3090, -5220 = 3080 Laptop; both finished status 0).
 3090 rows to close (AF/luma): approx2 bicubic 1080p 0.83 / 4K 0.82 (luma GPU 0.220 ms vs AF 0.184 at 4K), approx2
