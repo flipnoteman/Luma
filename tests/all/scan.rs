@@ -213,3 +213,73 @@ fn reductions_are_exact_around_block_boundaries() {
         assert_eq!(x.max_axis(axis).to_vec().unwrap(), host_lines(d, axis, &data, false, u32::max), "max {what}");
     }
 }
+
+/// Many lines of one length along axis 0: on a device whose subgroups have 32 invocations they are
+/// scanned by one subgroup each (`Pass::Warp`), in vectors of 4, 2 or 1 cells by how the length
+/// divides, with steps of 32 vectors (the lengths cross the edges of a step: 127, 128, 129, ...).
+const MANY_LINES: usize = 700;
+const WARP_LENGTHS: [usize; 14] = [256, 257, 258, 259, 300, 511, 512, 513, 1000, 1024, 4096, 4097, 4098, 6001];
+
+#[test]
+fn many_lines_scan_exactly() {
+    let ctx = Context::new().unwrap();
+    for &n in &WARP_LENGTHS {
+        let len = n * MANY_LINES;
+        let data = counts(len, n as u32 + 3);
+        let x = Array::from_slice_on(&ctx, &data, [n, MANY_LINES]).unwrap();
+        let d = shape4(&[n, MANY_LINES]);
+        assert_eq!(x.cumsum(0).to_vec().unwrap(), host_lines(d, 0, &data, true, u32::wrapping_add), "u32 cumsum n = {n}");
+        assert_eq!(x.scan(0, |a, b| a.minimum(b)).to_vec().unwrap(), host_lines(d, 0, &data, true, u32::min), "u32 min n = {n}");
+        assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec().unwrap(), host_lines(d, 0, &data, true, u32::max), "u32 max n = {n}");
+        // Associative but not commutative: the first cell of the line wins, so an order of the
+        // operands other than left to right is wrong.
+        #[allow(clippy::eq_op)]
+        let first = x.scan(0, |a, b| a + &(b - b)).to_vec().unwrap();
+        assert_eq!(first, host_lines(d, 0, &data, true, |a, _| a), "u32 first n = {n}");
+        #[allow(clippy::eq_op)]
+        let last = x.scan(0, |a, b| b + &(a - a)).to_vec().unwrap();
+        assert_eq!(last, host_lines(d, 0, &data, true, |_, b| b), "u32 last n = {n}");
+        let signed: Vec<i32> = data.iter().map(|&v| v.wrapping_mul(2654435761) as i32).collect();
+        let xs = Array::from_slice_on(&ctx, &signed, [n, MANY_LINES]).unwrap();
+        let mut host = signed.clone();
+        for line in host.chunks_mut(n) {
+            for i in 1..n {
+                line[i] = line[i - 1].wrapping_add(line[i]);
+            }
+        }
+        assert_eq!(xs.cumsum(0).to_vec().unwrap(), host, "i32 cumsum n = {n}");
+        // Sums of +-1 are exact in `f32`, whatever the grouping.
+        let ones: Vec<f32> = data.iter().map(|&v| if v & 1 == 0 { 1.0 } else { -1.0 }).collect();
+        let xf = Array::from_slice_on(&ctx, &ones, [n, MANY_LINES]).unwrap();
+        let mut host = ones.clone();
+        for line in host.chunks_mut(n) {
+            for i in 1..n {
+                line[i] += line[i - 1];
+            }
+        }
+        assert_eq!(xf.cumsum(0).to_vec().unwrap(), host, "f32 cumsum n = {n}");
+    }
+}
+
+/// Float sums keep a fixed grouping: the same bits on every run, and close to the sum in `f64`.
+#[test]
+fn many_line_float_sums_are_reproducible() {
+    let ctx = Context::new().unwrap();
+    for &n in &[257usize, 4096, 4099] {
+        let data = values(n * MANY_LINES, n as u64, -1.0, 1.0);
+        let x = Array::from_slice_on(&ctx, &data, [n, MANY_LINES]).unwrap();
+        let first = x.cumsum(0).to_vec().unwrap();
+        for _ in 0..3 {
+            let again = x.cumsum(0).to_vec().unwrap();
+            assert!(first.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()), "n = {n}: another run differs");
+        }
+        let mut want: Vec<f64> = data.iter().map(|&v| f64::from(v)).collect();
+        for line in want.chunks_mut(n) {
+            for i in 1..n {
+                line[i] += line[i - 1];
+            }
+        }
+        let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+        assert_close(&first, &want, 1e-3, 1e-3);
+    }
+}
