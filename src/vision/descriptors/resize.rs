@@ -10,9 +10,10 @@ use crate::context::RawArg;
 use crate::ops::Outcome;
 use crate::vision::{tile_grid, to_u32, Kernel as Any};
 
-/// The WGSL: arguments source, destination, uniform `{ih, iw, oh, ow, sy, sx, 0, 0}`.
+/// The WGSL: arguments source, destination, uniform `{ih, iw, oh, ow, sy, sx, src_off, dst_off}` (the offsets are in elements, for planes of
+/// a stack).
 pub(crate) fn source() -> String {
-    "struct Params { ih: u32, iw: u32, oh: u32, ow: u32, sy: f32, sx: f32, a: u32, b: u32 }
+    "struct Params { ih: u32, iw: u32, oh: u32, ow: u32, sy: f32, sx: f32, so: u32, dofs: u32 }
 @group(1) @binding(0) var<storage, read> src: array<f32>;
 @group(1) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(1) @binding(2) var<uniform> p: Params;
@@ -33,19 +34,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let a = yf - f32(iy);
     let ix2 = select(ix, ix + 1, ix + 1 < ih);
     let iy2 = select(iy, iy + 1, iy + 1 < iw);
-    let p1 = src[u32(ix) + p.ih * u32(iy)];
-    let p2 = src[u32(ix) + p.ih * u32(iy2)];
-    let p3 = src[u32(ix2) + p.ih * u32(iy)];
-    let p4 = src[u32(ix2) + p.ih * u32(iy2)];
+    let p1 = src[p.so + u32(ix) + p.ih * u32(iy)];
+    let p2 = src[p.so + u32(ix) + p.ih * u32(iy2)];
+    let p3 = src[p.so + u32(ix2) + p.ih * u32(iy)];
+    let p4 = src[p.so + u32(ix2) + p.ih * u32(iy2)];
     let v = ((1.0 - a) * (1.0 - b)) * p1 + (a * (1.0 - b)) * p2 + ((1.0 - a) * b) * p3 + (a * b) * p4;
-    dst[ox + p.oh * oy] = v;
+    dst[p.dofs + ox + p.oh * oy] = v;
 }
 "
     .to_string()
 }
 
 /// Records `dst` (`[oh, ow]`) as the bilinear resize of `src` (`[ih, iw]`).
-pub(crate) fn launch(src: &Array<f32>, [ih, iw]: [usize; 2], dst: &Array<f32>, [oh, ow]: [usize; 2]) -> Outcome<()> {
+pub(crate) fn launch(src: &Array<f32>, dims_in: [usize; 2], dst: &Array<f32>, dims_out: [usize; 2]) -> Outcome<()> {
+    launch_at(src, 0, dims_in, dst, 0, dims_out)
+}
+
+/// [`launch`] between the planes at element offsets `src_off` of `src` and `dst_off` of `dst`.
+pub(crate) fn launch_at(src: &Array<f32>, src_off: usize, [ih, iw]: [usize; 2], dst: &Array<f32>, dst_off: usize, [oh, ow]: [usize; 2]) -> Outcome<()> {
     let ctx = src.context();
     let (src_pin, src_bytes) = src.ready()?;
     let (dst_pin, dst_bytes) = dst.ready()?;
@@ -56,8 +62,8 @@ pub(crate) fn launch(src: &Array<f32>, [ih, iw]: [usize; 2], dst: &Array<f32>, [
         to_u32(ow, "width")?,
         (ih as f32 / oh as f32).to_bits(),
         (iw as f32 / ow as f32).to_bits(),
-        0,
-        0,
+        to_u32(src_off, "offset")?,
+        to_u32(dst_off, "offset")?,
     ];
     let kernel = ctx.builtin(Builtin::Vision(Any::Descriptors(Descriptors::Resize)), "f32")?;
     let args = [RawArg::read(src_pin.buffer(), src_bytes), RawArg::write(dst_pin.buffer(), dst_bytes), RawArg::Uniform(bytemuck::bytes_of(&params))];

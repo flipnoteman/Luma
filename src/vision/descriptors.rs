@@ -4,6 +4,7 @@
 mod orb;
 mod orb_pattern;
 mod resize;
+mod sift;
 
 /// One kernel of this group (part of the key of its cache entry in the context).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -12,11 +13,14 @@ pub(crate) enum Kernel {
     Resize,
     /// A kernel of ORB.
     Orb(orb::Kernel),
+    /// A kernel of SIFT and GLOH.
+    Sift(sift::Kernel),
 }
 
 pub(crate) fn source(kernel: Kernel) -> String {
     match kernel {
         Kernel::Resize => resize::source(),
         Kernel::Orb(k) => orb::source(k),
+        Kernel::Sift(k) => sift::source(k),
     }
 }
