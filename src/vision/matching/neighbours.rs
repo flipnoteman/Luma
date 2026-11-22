@@ -242,15 +242,16 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     s
 }
 
-/// Merges the partial lists of the fused kernel: a thread per query takes the `k` smallest of
-/// its `stride` entries one after the other. Arguments: keys, indices (both consumed), indices
-/// out, distances out (`[k, query]`), uniform `{nq, k, stride}`.
+/// Merges the partial lists of the fused kernel: a thread per query inserts the entries of its
+/// `stride / k` sorted lists into a sorted array of the `k` smallest, leaving a list at its first
+/// entry that does not belong. Arguments: keys, indices, indices out, distances out (`[k,
+/// query]`), uniform `{nq, k, stride}`.
 fn merge_source(elem: Elem) -> String {
-    let out = word_of(elem, "bk");
+    let out = word_of(elem, "lk[r]");
     format!(
         "struct P {{ nq: u32, k: u32, stride: u32, a: u32 }}
-@group(1) @binding(0) var<storage, read_write> pk: array<u32>;
-@group(1) @binding(1) var<storage, read_write> pi: array<u32>;
+@group(1) @binding(0) var<storage, read> pk: array<u32>;
+@group(1) @binding(1) var<storage, read> pi: array<u32>;
 @group(1) @binding(2) var<storage, read_write> oi: array<u32>;
 @group(1) @binding(3) var<storage, read_write> od: array<u32>;
 @group(1) @binding(4) var<uniform> p: P;
@@ -260,19 +261,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let q = gid.x;
     if (q >= p.nq) {{ return; }}
     let base = q * p.stride;
-    for (var r = 0u; r < p.k; r++) {{
-        var bk = 0xffffffffu;
-        var bi = 0xffffffffu;
-        var pos = 0u;
-        for (var c = 0u; c < p.stride; c++) {{
-            let kk = pk[base + c];
-            let ii = pi[base + c];
-            if (lt(kk, ii, bk, bi)) {{ bk = kk; bi = ii; pos = c; }}
+    let last = p.k - 1u;
+    var lk: array<u32, {FUSED_MAX}>;
+    var li: array<u32, {FUSED_MAX}>;
+    for (var r = 0u; r < p.k; r++) {{ lk[r] = 0xffffffffu; li[r] = 0xffffffffu; }}
+    for (var l = 0u; l < p.stride; l += p.k) {{
+        for (var r = 0u; r < p.k; r++) {{
+            let kk = pk[base + l + r];
+            let ii = pi[base + l + r];
+            if (!lt(kk, ii, lk[last], li[last])) {{ break; }}
+            var pos = last;
+            while (pos > 0u && lt(kk, ii, lk[pos - 1u], li[pos - 1u])) {{
+                lk[pos] = lk[pos - 1u];
+                li[pos] = li[pos - 1u];
+                pos--;
+            }}
+            lk[pos] = kk;
+            li[pos] = ii;
         }}
-        oi[q * p.k + r] = bi;
+    }}
+    for (var r = 0u; r < p.k; r++) {{
+        oi[q * p.k + r] = li[r];
         od[q * p.k + r] = {out};
-        pk[base + pos] = 0xffffffffu;
-        pi[base + pos] = 0xffffffffu;
     }}
 }}
 "
@@ -438,8 +448,8 @@ pub(crate) fn run<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_dim: us
             let merge = kernel_of(Kernel::Merge { elem })?;
             let params = [nq32, k32, stride, 0];
             let args = [
-                RawArg::write(&keys, partial_bytes),
-                RawArg::write(&ids, partial_bytes),
+                RawArg::read(&keys, partial_bytes),
+                RawArg::read(&ids, partial_bytes),
                 RawArg::write(idx_pin.buffer(), idx_bytes),
                 RawArg::write(dist_pin.buffer(), dist_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&params)),

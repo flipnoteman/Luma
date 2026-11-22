@@ -139,7 +139,10 @@ pub fn run(h: &mut Harness) {
                 let (q, t) = (values(n * len, 51, 0.0, 1.0), values(n * len, 52, 0.0, 1.0));
                 let (qa, ta) = (upload(h, &q, [len, n]), upload(h, &t, [len, n]));
                 let flops = Work::Flops(2.0 * (n as f64) * (n as f64) * len as f64);
-                for k in [1usize, 2, 8] {
+                for k in [1usize, 2, 8, 16, 64] {
+                    if k > 8 && (len != 64 || n > 10_000) {
+                        continue;
+                    }
                     h.case(&format!("matching/nearest_neighbour_ssd_k{k}_len{len}"), &format!("{n}x{n}"), flops, &mut || {
                         let (i, d) = nearest_neighbour(&qa, &ta, 0, k, DistType::Ssd).unwrap();
                         eval_all(&[&d]).unwrap();

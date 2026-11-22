@@ -21,6 +21,11 @@ fn bits(n: usize, seed: u64) -> Vec<u32> {
     (0..n).map(|_| (r.next_u64() >> 32) as u32).collect()
 }
 
+/// The `[len, n]` matrix of columns as `[n, len]` (the features as rows).
+fn transposed(data: &[f32], len: usize, n: usize) -> Vec<f32> {
+    (0..n * len).map(|p| data[(p % n) * len + p / n]).collect()
+}
+
 pub fn rows(b: &mut Bench) {
     b.guarded("vision/matching", |b| {
         let ctx = b.ctx.clone();
@@ -58,34 +63,42 @@ pub fn rows(b: &mut Bench) {
         for &n in counts {
             for len in [64usize, 128] {
                 let (qd, td) = (uniform(n * len, 611, 0.0, 1.0), uniform(n * len, 612, 0.0, 1.0));
-                let (ql, tl) = (lumax::arr(&ctx, &qd, [len, n]), lumax::arr(&ctx, &td, [len, n]));
-                let (qa, ta) = (afx::arr(&qd, &[len as u64, n as u64]), afx::arr(&td, &[len as u64, n as u64]));
-                for k in [1usize, 2] {
-                    if n > 10_000 && k > 1 {
+                for dist_dim in [0usize, 1] {
+                    // `dist_dim` 1: the features are the rows of `[n, len]`.
+                    let dims = if dist_dim == 0 { [len as u64, n as u64] } else { [n as u64, len as u64] };
+                    let (qd, td) = if dist_dim == 0 { (qd.clone(), td.clone()) } else { (transposed(&qd, len, n), transposed(&td, len, n)) };
+                    if dist_dim == 1 && (len != 64 || n != 10_000) {
                         continue;
                     }
-                    let size = format!("{n}x{n} len {len}");
-                    let name = format!("44 nearest_neighbour ssd k={k}");
-                    let lf = || luma::nearest_neighbour(&ql, &tl, 0, k, luma::DistType::Ssd).unwrap();
-                    let mut l = || {
-                        let (i, d) = lf();
-                        i.eval().unwrap();
-                        d.eval().unwrap();
-                        sync();
-                    };
-                    let Some(_) = attempt(|| af::nearest_neighbour(&qa, &ta, 0, k as u32, af::MatchType::SSD)) else {
-                        b.run_one(&name, &size, Some(&mut l), None, "ArrayFire fails (memory)");
-                        continue;
-                    };
-                    let (li, ld) = lf();
-                    let (ai, ad) = af::nearest_neighbour(&qa, &ta, 0, k as u32, af::MatchType::SSD);
-                    let v = compare(&lumax::host(&ld), &afx::host(&ad), 1e-4, 1e-4).and(exact(&as_f32(&lumax::host(&li)), &as_f32(&afx::host(&ai))));
-                    let mut a = || {
-                        let r = af::nearest_neighbour(&qa, &ta, 0, k as u32, af::MatchType::SSD);
-                        r.1.eval();
-                        afx::sync();
-                    };
-                    b.run(&name, &size, v, "ties: smaller train index first (as ArrayFire CUDA)", &mut l, &mut a);
+                    let (ql, tl) = (lumax::arr(&ctx, &qd, [dims[0] as usize, dims[1] as usize]), lumax::arr(&ctx, &td, [dims[0] as usize, dims[1] as usize]));
+                    let (qa, ta) = (afx::arr(&qd, &dims), afx::arr(&td, &dims));
+                    for k in [1usize, 2, 8, 16] {
+                        if (n > 10_000 && k > 1) || (dist_dim == 1 && k > 1) || (k > 2 && len != 64) {
+                            continue;
+                        }
+                        let size = format!("{n}x{n} len {len}");
+                        let name = format!("44 nearest_neighbour ssd k={k} dim {dist_dim}");
+                        let lf = || luma::nearest_neighbour(&ql, &tl, dist_dim, k, luma::DistType::Ssd).unwrap();
+                        let mut l = || {
+                            let (i, d) = lf();
+                            i.eval().unwrap();
+                            d.eval().unwrap();
+                            sync();
+                        };
+                        let Some(_) = attempt(|| af::nearest_neighbour(&qa, &ta, dist_dim as i64, k as u32, af::MatchType::SSD)) else {
+                            b.run_one(&name, &size, Some(&mut l), None, "ArrayFire fails (memory)");
+                            continue;
+                        };
+                        let (li, ld) = lf();
+                        let (ai, ad) = af::nearest_neighbour(&qa, &ta, dist_dim as i64, k as u32, af::MatchType::SSD);
+                        let v = compare(&lumax::host(&ld), &afx::host(&ad), 1e-4, 1e-4).and(exact(&as_f32(&lumax::host(&li)), &as_f32(&afx::host(&ai))));
+                        let mut a = || {
+                            let r = af::nearest_neighbour(&qa, &ta, dist_dim as i64, k as u32, af::MatchType::SSD);
+                            r.1.eval();
+                            afx::sync();
+                        };
+                        b.run(&name, &size, v, "ties: smaller train index first (as ArrayFire CUDA)", &mut l, &mut a);
+                    }
                 }
             }
             // 256-bit descriptors, the Hamming matcher.
