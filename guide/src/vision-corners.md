@@ -52,7 +52,10 @@ assert_eq!(corners.count(), 4);
 luma computes all of this in one kernel per tile of 32 x 8 pixels (the tile of pixels, the
 derivatives, the window passes and the decision in workgroup memory; the response is never
 stored), then scans the per-tile counts and gathers the corners: three launches and one read of
-the count. The ranking is `topk` of the corners' responses.
+the count. The ranking of `max_corners` is one more launch with a single workgroup (a radix
+select of the `max_corners`-th largest response, then a bitonic sort of the selected corners in
+workgroup memory; ties rank in the order of the corners, like a stable sort); for a limit above
+1024 or more than a million corners it is `topk`.
 
 Differences from ArrayFire, besides the element types: the corners that are not ranked are
 listed tile by tile (ArrayFire's CPU backend by column, its CUDA backend in the order its

@@ -217,7 +217,8 @@ impl Array<f32> {
     /// (ArrayFire's `harris` takes `f32` and `f64`).
     ///
     /// The number of corners is read back, so this **synchronizes** once; everything before is
-    /// recorded as a fused detection kernel, a scan of the per-tile counts and a gather.
+    /// recorded as a fused detection kernel, a scan of the per-tile counts and a gather (and, with
+    /// `max_corners`, one kernel that selects and sorts the strongest).
     ///
     /// ```
     /// use luma::Array;
