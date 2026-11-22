@@ -218,6 +218,20 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
     }
 }
 
+/// Whether the WGSL of `instr` calls a function of the complex library
+/// (`builtin::complex_library`): the product, quotient, modulus, equality test, `exp` and `sqrt`
+/// of `C32` values.
+pub(super) fn calls_complex_library(instr: &Instr) -> bool {
+    let c32 = instr.op.ty == ElemTy::C32;
+    match instr.op.kind {
+        OpKind::Unary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Binary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Compare(_) => c32,
+        OpKind::Part(part) => part.expr().contains("c_"),
+        _ => false,
+    }
+}
+
 /// Whether the WGSL of `instr` calls a function of the double-float math library
 /// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh`, `log1p`, `expm1` and `powf` of a `Df32`.
 pub(super) fn calls_df_math(instr: &Instr) -> bool {

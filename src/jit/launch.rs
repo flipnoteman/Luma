@@ -1597,9 +1597,9 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
 
 /// The finite check (see `ContextOptions::check_finite`): fails with [`LumaError::NonFinite`] if
 /// `storage`, holding elements of type `ty`, contains a NaN or an infinity. Does nothing unless
-/// the option is on and the elements are `f32` or `Df32`. Waits for the GPU (once per segment).
+/// the option is on and the elements are `f32`, `Df32` or `C32`. Waits for the GPU (once per segment).
 pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty: ElemTy) -> Result<(), LumaError> {
-    if !ctx.check_finite() || !matches!(ty, ElemTy::F32 | ElemTy::Df32) {
+    if !ctx.check_finite() || !matches!(ty, ElemTy::F32 | ElemTy::Df32 | ElemTy::C32) {
         return Ok(());
     }
     let core = ctx.builtin(Builtin::NonFinite, "u32")?;
