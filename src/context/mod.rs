@@ -30,6 +30,9 @@ pub(crate) const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
     .union(BufferUsage::COPY_DST)
     .union(BufferUsage::COPY_SRC);
 
+/// Kernels of library modules by (module, variant, entry point).
+type ModuleKernels = std::collections::HashMap<(&'static str, usize, &'static str), Arc<KernelCore>>;
+
 #[derive(Debug)]
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
@@ -40,7 +43,7 @@ struct Inner {
     kernels: BuildCache<KernelKey, Arc<KernelCore>>,
     /// Kernels of library modules that write their WGSL themselves (see [`Context::cached_kernel`]),
     /// by (module, variant, entry point).
-    module_kernels: Mutex<std::collections::HashMap<(&'static str, usize, &'static str), Arc<KernelCore>>>,
+    module_kernels: Mutex<ModuleKernels>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.

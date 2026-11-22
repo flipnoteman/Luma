@@ -270,3 +270,18 @@ fn a_batch_taller_than_the_grid_limit_runs_flat() {
         }
     }
 }
+
+#[test]
+fn sampling_reads_views_like_arrays() {
+    let x = values(60, 42, -1.0, 1.0);
+    let a = Array::from_slice(&x, 60).unwrap();
+    let pos = Array::from_slice(&[0.5f32, 3.25, 10.0, 20.5, 39.0], 5).unwrap();
+    let got = a.slice(0, 10..50).approx1(&pos, Interp::Linear, 0.0).to_vec().unwrap();
+    let want: Vec<f64> = [0.5f32, 3.25, 10.0, 20.5, 39.0].iter().map(|&q| axis(40, f64::from(q), Interp::Linear, &|i| f64::from(x[10 + i]))).collect();
+    close(&got, &want, 2e-5, "slice");
+    // A view of the positions.
+    let long = Array::from_slice(&[9.0f32, 9.0, 0.5, 3.25, 10.0], 5).unwrap();
+    let got = a.approx1(&long.slice(0, 2..5), Interp::Linear, 0.0).to_vec().unwrap();
+    let want: Vec<f64> = [0.5f32, 3.25, 10.0].iter().map(|&q| axis(60, f64::from(q), Interp::Linear, &|i| f64::from(x[i]))).collect();
+    close(&got, &want, 2e-5, "position slice");
+}

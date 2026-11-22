@@ -218,3 +218,26 @@ fn iir_errors() {
     assert_eq!(got[0], 1.0);
     assert!(got[1..].iter().all(|v| v.is_nan()));
 }
+
+#[test]
+fn filters_read_views_like_arrays() {
+    let x = values(100, 40, -1.0, 1.0);
+    let a = Array::from_slice(&x, 100).unwrap();
+    let taps = Array::from_slice(&[0.5f32, 0.25, 0.125], 3).unwrap();
+    // A slice, a flip and a transposed matrix are views of a buffer.
+    let sliced = a.slice(0, 10..60).fir(&taps).to_vec().unwrap();
+    close(&sliced, &fir_ref(&x[10..60], &[0.5, 0.25, 0.125]), 1e-5, "slice");
+    let flipped = a.flip(0).fir(&taps).to_vec().unwrap();
+    let rev: Vec<f32> = x.iter().rev().copied().collect();
+    close(&flipped, &fir_ref(&rev, &[0.5, 0.25, 0.125]), 1e-5, "flip");
+    let m = Array::from_slice(&values(12, 41, -1.0, 1.0), [4, 3]).unwrap();
+    let t = m.transpose();
+    let got = t.iir(&[1.0], &[1.0, -0.5]).to_vec().unwrap();
+    let host = m.to_vec().unwrap();
+    let mut want = vec![];
+    for r in 0..4 {
+        let row: Vec<f32> = (0..3).map(|c| host[r + 4 * c]).collect();
+        want.extend(iir_ref(&row, &[1.0], &[1.0, -0.5]));
+    }
+    close(&got, &want, 1e-5, "transpose");
+}
