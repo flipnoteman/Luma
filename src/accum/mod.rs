@@ -46,7 +46,7 @@ pub use comoments::{CoMoments, CoMomentsBuilder, Covariance};
 pub use hist::{Histogram, Histogram2d};
 pub use moments::{Accumulator, AccumulatorBuilder};
 pub use topk::TopK;
-pub use wide::{AccumInput, Wide};
+pub use wide::{AccumCore, AccumInput, Wide};
 
 use crate::error::{LumaError, Result};
 

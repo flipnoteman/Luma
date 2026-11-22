@@ -6,7 +6,7 @@ use std::ops::{Add, Div, Mul, Sub};
 use crate::array::Array;
 use crate::context::Context;
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{Df32, Numeric};
+use crate::gpu_type::{Df32, Numeric, ScalarType};
 use crate::ops::select;
 use crate::reduce::Reduction;
 
@@ -271,10 +271,38 @@ impl<W: Wide> Mul<f64> for V<W> {
     }
 }
 
-/// The element types a batch can have. `u32`, `i32`, `f32`, `f64` (devices with 64-bit shader
-/// floats) and [`Df32`] are implemented; integers are exact in counts, sums, extrema and the
-/// difference from the pivot (see the module documentation).
-pub trait AccumInput: Numeric {
+/// The element types a batch can have: `u32`, `i32`, `f32`, `f64` (devices with 64-bit shader
+/// floats) and [`Df32`](crate::Df32). A type is pushed as its [`AccumCore`] type (itself, or for
+/// the narrow integer types the `i32` their cast fuses into the reduction), so adding an element
+/// type is one `impl` of this trait.
+pub trait AccumInput: ScalarType {
+    /// The type the batch is processed as.
+    #[doc(hidden)]
+    type Core: AccumCore;
+    /// The batch as that type (a lazy cast where it differs).
+    #[doc(hidden)]
+    fn to_core(a: &Array<Self>) -> Array<Self::Core>;
+}
+
+macro_rules! accum_input_self {
+    ($($t:ty),*) => {$(
+        impl AccumInput for $t {
+            type Core = $t;
+            fn to_core(a: &Array<Self>) -> Array<Self> {
+                a.clone()
+            }
+        }
+    )*};
+}
+
+accum_input_self!(u32, i32, f32, f64, Df32);
+
+/// What the accumulators need of an element type to process it: conversions to the wide types,
+/// the pivot shift, the identities of the extrema and the index passes. Implemented for `u32`,
+/// `i32`, `f32`, `f64` and `Df32`; other element types are cast to one of them (see
+/// [`AccumInput`]).
+#[doc(hidden)]
+pub trait AccumCore: Numeric {
     /// The value as `f32`.
     #[doc(hidden)]
     fn to_f32(a: &Array<Self>) -> Array<f32>;
@@ -336,7 +364,7 @@ macro_rules! arg_impls_atomic {
     };
 }
 
-impl AccumInput for f32 {
+impl AccumCore for f32 {
     fn to_host_f64(self) -> f64 {
         self as f64
     }
@@ -364,7 +392,7 @@ impl AccumInput for f32 {
     arg_impls_atomic!();
 }
 
-impl AccumInput for u32 {
+impl AccumCore for u32 {
     fn to_host_f64(self) -> f64 {
         f64::from(self)
     }
@@ -392,7 +420,7 @@ impl AccumInput for u32 {
     arg_impls_atomic!();
 }
 
-impl AccumInput for i32 {
+impl AccumCore for i32 {
     fn to_host_f64(self) -> f64 {
         f64::from(self)
     }
@@ -420,7 +448,7 @@ impl AccumInput for i32 {
     arg_impls_atomic!();
 }
 
-impl AccumInput for f64 {
+impl AccumCore for f64 {
     fn to_host_f64(self) -> f64 {
         self
     }
@@ -460,7 +488,7 @@ impl AccumInput for f64 {
     }
 }
 
-impl AccumInput for Df32 {
+impl AccumCore for Df32 {
     fn to_host_f64(self) -> f64 {
         Df32::to_f64(self)
     }

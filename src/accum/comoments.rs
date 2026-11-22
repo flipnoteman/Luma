@@ -15,7 +15,7 @@ use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
 use super::moments::reduce_folded;
-use super::wide::{check_wide, AccumInput, Wide, V};
+use super::wide::{check_wide, AccumCore, AccumInput, Wide, V};
 use super::{folded_extent, invalid, kept_dims, Fold, NanPolicy};
 
 const KIND_CO: u8 = 2;
@@ -133,7 +133,7 @@ struct CoState<W: Wide> {
     merged_once: bool,
 }
 
-fn first_sample<T: AccumInput>(batch: &Array<T>, axes: &[usize]) -> Array<f32> {
+fn first_sample<T: AccumCore>(batch: &Array<T>, axes: &[usize]) -> Array<f32> {
     let first = axes.iter().fold(batch.clone(), |a, &ax| a.slice(ax, ..1));
     let first = T::to_f32(&first);
     T::tidy_pivot(select(&first.is_finite(), &first, 0.0f32))
@@ -156,15 +156,15 @@ impl<W: Wide> CoMoments<W> {
 
     /// Folds in the pairs `(x[i], y[i])`; the arrays have one shape.
     pub fn push<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>) -> Result<()> {
-        self.push_impl(x, y, None)
+        self.push_impl(&T::to_core(x), &U::to_core(y), None)
     }
 
     /// Folds in the pairs where `mask` is true.
     pub fn push_where<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>, mask: &Array<bool>) -> Result<()> {
-        self.push_impl(x, y, Some(mask))
+        self.push_impl(&T::to_core(x), &U::to_core(y), Some(mask))
     }
 
-    fn push_impl<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>, user_mask: Option<&Array<bool>>) -> Result<()> {
+    fn push_impl<T: AccumCore, U: AccumCore>(&self, x: &Array<T>, y: &Array<U>, user_mask: Option<&Array<bool>>) -> Result<()> {
         x.check()?;
         y.check()?;
         if x.shape() != y.shape() {
@@ -472,7 +472,7 @@ impl<W: Wide> CoState<W> {
         Ok(())
     }
 
-    fn partial<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>, mask: Option<&Array<bool>>, axes: &[usize]) -> Result<CoPartial<W>> {
+    fn partial<T: AccumCore, U: AccumCore>(&self, x: &Array<T>, y: &Array<U>, mask: Option<&Array<bool>>, axes: &[usize]) -> Result<CoPartial<W>> {
         let ctx = &self.ctx;
         let dims = x.shape().dims();
         let epoch = self.epoch.as_ref().expect("the epoch is open");

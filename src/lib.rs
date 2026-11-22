@@ -133,7 +133,7 @@ mod until;
 mod view;
 mod image;
 
-pub use accum::{AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
+pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;

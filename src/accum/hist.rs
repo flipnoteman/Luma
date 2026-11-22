@@ -10,7 +10,7 @@ use crate::ops::{eval_all, select};
 use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
-use super::wide::{check_wide, AccumInput, Wide, V};
+use super::wide::{check_wide, AccumCore, AccumInput, Wide, V};
 use super::{invalid, kept_dims, split_plan, state_index, Fold};
 
 const KIND_HIST: u8 = 4;
@@ -200,15 +200,15 @@ impl<W: Wide> Histogram<W> {
 
     /// Counts a batch (of any element type; integers are binned by their `f32` value).
     pub fn push<T: AccumInput>(&self, batch: &Array<T>) -> Result<()> {
-        self.push_impl(batch, None)
+        self.push_impl(&T::to_core(batch), None)
     }
 
     /// Counts the elements where `mask` is true.
     pub fn push_where<T: AccumInput>(&self, batch: &Array<T>, mask: &Array<bool>) -> Result<()> {
-        self.push_impl(batch, Some(mask))
+        self.push_impl(&T::to_core(batch), Some(mask))
     }
 
-    fn push_impl<T: AccumInput>(&self, batch: &Array<T>, mask: Option<&Array<bool>>) -> Result<()> {
+    fn push_impl<T: AccumCore>(&self, batch: &Array<T>, mask: Option<&Array<bool>>) -> Result<()> {
         batch.check()?;
         if let Some(mask) = mask {
             mask.check()?;
@@ -423,15 +423,15 @@ impl<W: Wide> Histogram2d<W> {
 
     /// Counts the pairs `(x[i], y[i])`.
     pub fn push<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>) -> Result<()> {
-        self.push_impl(x, y, None)
+        self.push_impl(&T::to_core(x), &U::to_core(y), None)
     }
 
     /// Counts the pairs where `mask` is true.
     pub fn push_where<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>, mask: &Array<bool>) -> Result<()> {
-        self.push_impl(x, y, Some(mask))
+        self.push_impl(&T::to_core(x), &U::to_core(y), Some(mask))
     }
 
-    fn push_impl<T: AccumInput, U: AccumInput>(&self, x: &Array<T>, y: &Array<U>, mask: Option<&Array<bool>>) -> Result<()> {
+    fn push_impl<T: AccumCore, U: AccumCore>(&self, x: &Array<T>, y: &Array<U>, mask: Option<&Array<bool>>) -> Result<()> {
         x.check()?;
         y.check()?;
         if x.shape() != y.shape() {

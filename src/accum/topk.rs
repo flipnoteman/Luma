@@ -11,7 +11,7 @@ use crate::sort::SortKey;
 use crate::view::concat;
 
 use super::blob::{Reader, Writer};
-use super::wide::{check_wide, AccumInput, Wide, V};
+use super::wide::{check_wide, AccumCore, Wide, V};
 use super::invalid;
 
 const KIND: u8 = 6;
@@ -41,17 +41,17 @@ fn ranges_is_whole(a: usize, b: usize, n: usize) -> bool {
 /// assert_eq!(TopK::<f32, Df32>::to_f64(&top.indices()?)?, [1.0, 4.0, 3.0]);
 /// # Ok::<(), luma::LumaError>(())
 /// ```
-pub struct TopK<T: SortKey + AccumInput, W: Wide = Df32> {
+pub struct TopK<T: SortKey + AccumCore, W: Wide = Df32> {
     k: usize,
     largest: bool,
     inner: Mutex<Inner<T, W>>,
 }
 
-struct Inner<T: SortKey + AccumInput, W: Wide> {
+struct Inner<T: SortKey + AccumCore, W: Wide> {
     state: Option<State<T, W>>,
 }
 
-struct State<T: SortKey + AccumInput, W: Wide> {
+struct State<T: SortKey + AccumCore, W: Wide> {
     ctx: Context,
     values: Array<T>,
     /// Global indices as wide numbers, `-1` for an empty slot.
@@ -68,7 +68,7 @@ struct State<T: SortKey + AccumInput, W: Wide> {
 const FLUSH_EVERY: usize = 16;
 const FLUSH_ELEMENTS: usize = 1 << 24;
 
-impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
+impl<T: SortKey + AccumCore, W: Wide> TopK<T, W> {
     /// The `k` largest elements.
     pub fn largest(k: usize) -> TopK<T, W> {
         TopK { k, largest: true, inner: Mutex::new(Inner { state: None }) }
@@ -317,7 +317,7 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
     }
 }
 
-impl<T: SortKey + AccumInput, W: Wide> std::fmt::Debug for TopK<T, W> {
+impl<T: SortKey + AccumCore, W: Wide> std::fmt::Debug for TopK<T, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TopK").field("k", &self.k).field("largest", &self.largest).field("wide", &W::NAME).finish()
     }

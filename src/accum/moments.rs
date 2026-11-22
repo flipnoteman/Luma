@@ -13,7 +13,7 @@ use crate::reduce::Reduction;
 use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
-use super::wide::{reduce_axes, reduce_flat, AccumInput, Wide, V};
+use super::wide::{reduce_axes, reduce_flat, AccumCore, AccumInput, Wide, V};
 use super::{folded_extent, invalid, is_flat, kept_dims, split_plan, state_index, Fold, NanPolicy};
 
 const KIND: u8 = 1;
@@ -377,27 +377,27 @@ impl<W: Wide> Accumulator<W> {
     /// may be split over several buffers; the shape along the position axes must be the same
     /// at every push.
     pub fn push<T: AccumInput>(&self, batch: &Array<T>) -> Result<()> {
-        self.push_impl(batch, None, None)
+        self.push_impl(&T::to_core(batch), None, None)
     }
 
     /// Folds in the elements where `mask` (of the batch's shape) is true.
     pub fn push_where<T: AccumInput>(&self, batch: &Array<T>, mask: &Array<bool>) -> Result<()> {
-        self.push_impl(batch, Some(mask), None)
+        self.push_impl(&T::to_core(batch), Some(mask), None)
     }
 
     /// Folds a batch into per-group states: `labels` has one `u32` label per sample (the extent
     /// of the folded axis, or one per element when the whole batch is folded). Labels of
     /// [`groups`](AccumulatorBuilder::groups) or more are skipped.
     pub fn push_grouped<T: AccumInput>(&self, batch: &Array<T>, labels: &Array<u32>) -> Result<()> {
-        self.push_impl(batch, None, Some(labels))
+        self.push_impl(&T::to_core(batch), None, Some(labels))
     }
 
     /// [`push_grouped`](Self::push_grouped) of the elements where `mask` is true.
     pub fn push_grouped_where<T: AccumInput>(&self, batch: &Array<T>, labels: &Array<u32>, mask: &Array<bool>) -> Result<()> {
-        self.push_impl(batch, Some(mask), Some(labels))
+        self.push_impl(&T::to_core(batch), Some(mask), Some(labels))
     }
 
-    fn push_impl<T: AccumInput>(&self, batch: &Array<T>, user_mask: Option<&Array<bool>>, labels: Option<&Array<u32>>) -> Result<()> {
+    fn push_impl<T: AccumCore>(&self, batch: &Array<T>, user_mask: Option<&Array<bool>>, labels: Option<&Array<u32>>) -> Result<()> {
         batch.check()?;
         if let Some(mask) = user_mask {
             mask.check()?;
@@ -722,7 +722,7 @@ struct Snapshot<W: Wide> {
 }
 
 /// The user's mask and the NaN policy as one mask.
-fn effective_mask<T: AccumInput>(cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>) -> Option<Array<bool>> {
+fn effective_mask<T: AccumCore>(cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>) -> Option<Array<bool>> {
     let not_nan = (cfg.nan == NanPolicy::Skip).then(|| T::not_nan(batch)).flatten();
     match (mask, not_nan) {
         (Some(m), Some(n)) => Some(m & &n),
@@ -782,7 +782,7 @@ fn reduce_pieces<T: crate::gpu_type::Numeric>(x: &Array<T>, real: &[usize], ops:
 }
 
 impl<W: Wide> State<W> {
-    fn new<T: AccumInput>(cfg: &Config, ctx: &Context, batch: &Array<T>, axes: &[usize], kept: [usize; 4]) -> Result<State<W>> {
+    fn new<T: AccumCore>(cfg: &Config, ctx: &Context, batch: &Array<T>, axes: &[usize], kept: [usize; 4]) -> Result<State<W>> {
         let mut dims_g = kept;
         if let Some(groups) = cfg.groups {
             dims_g[axes[0]] = groups;
@@ -837,14 +837,14 @@ impl<W: Wide> State<W> {
     }
 
     /// One push's reductions.
-    fn partial<T: AccumInput>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, labels: Option<&Array<u32>>, axes: &[usize]) -> Result<Partial<W>> {
+    fn partial<T: AccumCore>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, labels: Option<&Array<u32>>, axes: &[usize]) -> Result<Partial<W>> {
         match labels {
             Some(labels) => self.partial_grouped(cfg, batch, mask, labels, axes),
             None => self.partial_plain(cfg, batch, mask, axes),
         }
     }
 
-    fn partial_plain<T: AccumInput>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, axes: &[usize]) -> Result<Partial<W>> {
+    fn partial_plain<T: AccumCore>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, axes: &[usize]) -> Result<Partial<W>> {
         let ctx = &self.ctx;
         let dims = batch.shape().dims();
         let epoch = self.epoch.as_ref().expect("the epoch is open");
@@ -988,7 +988,7 @@ impl<W: Wide> State<W> {
         Ok(Partial { n, s, min, max, imin, imax })
     }
 
-    fn partial_grouped<T: AccumInput>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, labels: &Array<u32>, axes: &[usize]) -> Result<Partial<W>> {
+    fn partial_grouped<T: AccumCore>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, labels: &Array<u32>, axes: &[usize]) -> Result<Partial<W>> {
         let ctx = &self.ctx;
         let dims = batch.shape().dims();
         let groups = cfg.groups.expect("grouped push");
