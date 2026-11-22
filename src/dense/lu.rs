@@ -326,14 +326,14 @@ fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, by_index: b
 /// to `piv[j]`; the others eliminate with the row from `lu`. The next pivot comes from the keys
 /// the invocations have just updated: they are in `cv`, one invocation per part reduces its part
 /// and everybody reduces the parts (three barriers per column, no loop over the row's columns).
-fn calu_declarations(rows: usize, wp: usize) -> String {
-    let parts = calu_parts(rows);
+fn calu_declarations(rows: usize, wp: usize, sg: bool) -> String {
+    let parts = if sg { rows / 32 } else { calu_parts(rows) };
+    let cv = if sg { String::new() } else { format!("var<workgroup> cv: array<u32, {rows}>;\n") };
     format!(
         "const R: u32 = {rows}u;
 const NP: u32 = {parts}u;
 const PER: u32 = {per}u;
-var<workgroup> cv: array<u32, {rows}>;
-var<workgroup> s1v: array<u32, {parts}>;
+{cv}var<workgroup> s1v: array<u32, {parts}>;
 var<workgroup> s1i: array<u32, {parts}>;
 var<workgroup> lu: array<f32, {size}>;
 var<workgroup> piv: array<u32, {wp}>;
@@ -345,45 +345,83 @@ var<workgroup> rank: array<u32, {wp}>;
 // The key of a magnitude: larger is bigger (NaN above all), 0 is for a row that is done.
 fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
 
-fn stage1(t: u32) {{
+{stage1}",
+        per = rows / parts,
+        size = wp * wp,
+        stage1 = if sg {
+            String::new()
+        } else {
+            format!(
+                "fn stage1(t: u32) {{
     if (t < NP) {{
-{stage1}        s1v[t] = bv;
+{}        s1v[t] = bv;
         s1i[t] = bi;
     }}
 }}
 ",
-        per = rows / parts,
-        size = wp * wp,
-        stage1 = reduce_text(&format!("cv[t + {{k}}u * {parts}u]"), &format!("t + {{k}}u * {parts}u"), rows / parts, "bv", "bi", false, "        ")
+                reduce_text(&format!("cv[t + {{k}}u * {parts}u]"), &format!("t + {{k}}u * {parts}u"), rows / parts, "bv", "bi", false, "        ")
+            )
+        }
     )
 }
 
 /// The LU of the rows in `x0 ..` as statements for the body of a kernel, not a function (the CPU
 /// backend splits its phases at the barriers of the entry function only), unrolled over the
 /// columns: `row` is the number of the invocation's row in the panel, `n` and `w` are in scope.
-fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
-    let abl: u32 = std::env::var("X_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+///
+/// Where the device has subgroups of 32 (`sg`; `lane` is the invocation's place in its subgroup)
+/// every subgroup reduces the keys of its rows with subgroup operations, writes its best to
+/// `s1v` and `s1i`, and after a barrier every subgroup reduces those the same way, so everybody
+/// knows the pivot: two barriers a column. Without, the keys go to `cv`, 16 or 32 invocations
+/// reduce a part each, the first subgroup alone reduces the parts: four.
+fn calu_lu(wp: usize, parts: usize, row: &str, sg: bool) -> String {
     let mut text = String::new();
-    text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
+    if sg {
+        text += "var done = t >= n;
+{
+    let k0 = select(key(x0), 0u, done);
+    let m = subgroupMax(k0);
+    let first = subgroupMin(select(0xffffffffu, t, k0 == m));
+    if (lane == 0u) { s1v[t / 32u] = m; s1i[t / 32u] = first; }
+}
+workgroupBarrier();
+";
+    } else {
+        text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
+    }
     for j in 0..wp {
-        // The first warp alone picks the pivot from the parts (every warp doing it is most of the
-        // instructions of a column), the invocation that holds the row copies it, the others
-        // eliminate, the parts are reduced again.
-        text += &format!(
-            "if (w > {j}u) {{
+        if sg {
+            text += &format!(
+                "if (w > {j}u) {{
+    var kv = 0u;
+    var ki = 0xffffffffu;
+    if (lane < NP) {{ kv = s1v[lane]; ki = s1i[lane]; }}
+    let m2 = subgroupMax(kv);
+    let pv = subgroupMin(select(0xffffffffu, ki, kv == m2));
+    if (t == pv) {{
+        done = true;
+        piv[{j}] = {row};
+"
+            );
+        } else {
+            // The first subgroup alone picks the pivot from the parts (every warp doing it is most
+            // of the instructions of a column), the invocation that holds the row copies it, the
+            // others eliminate, the parts are reduced again.
+            text += &format!(
+                "if (w > {j}u) {{
     if (t < 32u) {{
-{reduce}        if (t == 0u) {{ pvs = {bi}; }}
+{reduce}        if (t == 0u) {{ pvs = bi; }}
     }}
     workgroupBarrier();
     if (t == pvs) {{
         done = true;
         piv[{j}] = {row};
 ",
-            reduce = if abl & 1 != 0 { String::new() } else { reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", true, "        ") },
-            bi = if abl & 1 != 0 { format!("{j}u") } else { "bi".to_string() }
-        );
+                reduce = reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", true, "        ")
+            );
+        }
         for c in 0..wp {
-            if abl & 4 == 0 { text += &format!("        lu[{}] = x{c};\n", j * wp + c); }
+            text += &format!("        lu[{}] = x{c};\n", j * wp + c);
         }
         text += &format!(
             "    }}
@@ -396,20 +434,33 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
             d = j * wp + j
         );
         for c in j + 1..wp {
-            if abl & 2 == 0 { text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c); }
+            text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c);
         }
         let next = if j + 1 < wp { format!("x{}", j + 1) } else { "0.0".to_string() };
-        text += &format!(
-            "    }}
-    {cvw}
-    workgroupBarrier();
-    {st1}
+        if sg {
+            text += &format!(
+                "    }}
+    {{
+        let kk = select(key({next}), 0u, done);
+        let m = subgroupMax(kk);
+        let first = subgroupMin(select(0xffffffffu, t, kk == m));
+        if (lane == 0u) {{ s1v[t / 32u] = m; s1i[t / 32u] = first; }}
+    }}
     workgroupBarrier();
 }}
-",
-            cvw = if abl & 8 != 0 { String::new() } else { format!("cv[t] = select(key({next}), 0u, done);") },
-            st1 = if abl & 8 != 0 { "" } else { "stage1(t);" }
-        );
+"
+            );
+        } else {
+            text += &format!(
+                "    }}
+    cv[t] = select(key({next}), 0u, done);
+    workgroupBarrier();
+    stage1(t);
+    workgroupBarrier();
+}}
+"
+            );
+        }
     }
     text
 }
@@ -430,7 +481,7 @@ fn calu_load(wp: usize, row: &str) -> String {
 
 /// First round of the tournament: workgroup `g` factors the rows `g * rc ..` of the panel (at least
 /// `w` of them) and writes the panel rows that won, in pivot order.
-fn calu_chunks_source(rows: usize, wp: usize) -> String {
+fn calu_chunks_source(rows: usize, wp: usize, sg: bool) -> String {
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -441,7 +492,7 @@ fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 {decl}
 @compute @workgroup_size({rows})
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32{lane_arg}) {{
     let g = wid.x;
     let w = p.w;
     let first = g * p.rc;
@@ -449,9 +500,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 {load}{lu}    if (t < w) {{ win[g * w + t] = piv[t]; }}
 }}
 ",
-        decl = calu_declarations(rows, wp),
+        decl = calu_declarations(rows, wp, sg),
+        lane_arg = if sg { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" },
         load = calu_load(wp, "first + t"),
-        lu = calu_lu(wp, calu_parts(rows), "first + t")
+        lu = calu_lu(wp, calu_parts(rows), "first + t", sg)
     )
 }
 
@@ -459,7 +511,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 /// again from the original rows until one group is left, whose factors of the winners are the
 /// top of `f` and whose order is the first `w` entries of `perm`. The winners of a group replace
 /// the sets of the group in `win` (the sets of a group lie at or after the place of its winners).
-fn calu_final_source(rows: usize, wp: usize, fence: &str) -> String {
+fn calu_final_source(rows: usize, wp: usize, fence: &str, sg: bool) -> String {
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -472,7 +524,7 @@ fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 {decl}
 @compute @workgroup_size({rows})
-fn main(@builtin(local_invocation_index) t: u32) {{
+fn main(@builtin(local_invocation_index) t: u32{lane_arg}) {{
     let w = p.w;
     let per_group = R / w;
     var count = p.g;
@@ -519,9 +571,10 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     if (t < w && piv[t] >= w) {{ perm[piv[t]] = lost[rank[t]]; }}
 }}
 ",
-        decl = calu_declarations(rows, wp),
+        decl = calu_declarations(rows, wp, sg),
+        lane_arg = if sg { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" },
         load = calu_load(wp, "panel_row"),
-        lu = calu_lu(wp, calu_parts(rows), "panel_row")
+        lu = calu_lu(wp, calu_parts(rows), "panel_row", sg)
     )
 }
 
@@ -618,17 +671,114 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
     };
     let fence = fence(ctx);
     let wp = d.cols.next_multiple_of(8);
+    let sg = ctx.tuning().subgroup32;
     let tail_groups = (d.rows - d.cols).div_ceil(CALU_TAIL) as u32;
-    let result = launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}"), "lu_calu_chunks", || calu_chunks_source(rows, wp), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
+    let result = launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}/{}", u8::from(sg)), "lu_calu_chunks", || calu_chunks_source(rows, wp, sg), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
         .and_then(|()| {
             let args: [KernelArg<'_>; 5] = [view(a), (&mut win).into(), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-            launch(ctx, &format!("lu_calu_final/{rows2}/{wp}/{}", fence.len()), "lu_calu_final", || calu_final_source(rows2, wp, fence), [1, 1, 1], &args)
+            launch(ctx, &format!("lu_calu_final/{rows2}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_final", || calu_final_source(rows2, wp, fence, sg), [1, 1, 1], &args)
         })
         .and_then(|()| launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &[view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)]));
     Some(match result {
         Ok(()) => Lu { lu: f, perm },
         Err(e) => poisoned(e),
     })
+}
+
+/// Rows of the triangle a substitution leaf solves, and the most rows of a leaf's `L`.
+const LEAF: usize = 32;
+
+#[derive(encase::ShaderType)]
+struct LeafParams {
+    n: u32,
+    k: u32,
+}
+
+/// The substitution leaf: `X = L⁻¹ B` for a lower triangular `L` of `n <= np` rows (`np` a multiple
+/// of 8: the rows past `n` are absent) and `k` columns of `B`, an invocation per column with its
+/// column in registers, the triangle in workgroup memory (every invocation reads the same entry),
+/// unrolled: no loads or stores on the dependent chain of the substitution.
+fn leaf_solve_source(np: usize, unit: bool) -> String {
+    let mut body = String::new();
+    for i in 0..np {
+        body += &format!("    var x{i} = 0.0;\n    if ({i}u < n) {{ x{i} = ldb({i}u, c); }}\n");
+    }
+    for j in 0..np {
+        if !unit {
+            body += &format!("    x{j} = x{j} / ls[{}];\n", j * np + j);
+        }
+        for i in j + 1..np {
+            body += &format!("    x{i} = fma(-ls[{}], x{j}, x{i});\n", i * np + j);
+        }
+    }
+    for i in 0..np {
+        body += &format!("    if ({i}u < n) {{ x[c + k * {i}u] = x{i}; }}\n");
+    }
+    let mut load = String::new();
+    for e in 0..np * np / 64 {
+        load += &format!(
+            "    {{
+        let idx = t + {}u;
+        let i = idx / {np}u;
+        let j = idx - i * {np}u;
+        let ok = i < n && j < n && j <= i;
+        let v = l[select(0u, luma_view_idx3(lv, j, i, 0u), ok)];
+        ls[idx] = select(select(0.0, 1.0, i == j), v, ok);
+    }}
+",
+            e * 64
+        );
+    }
+    format!(
+        "struct Params {{ n: u32, k: u32 }}
+@group(1) @binding(0) var<storage, read> l: array<f32>;
+@group(1) @binding(1) var<uniform> lv: LumaView;
+@group(1) @binding(2) var<storage, read> b: array<f32>;
+@group(1) @binding(3) var<uniform> bv: LumaView;
+@group(1) @binding(4) var<storage, read_write> x: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+fn ldb(i: u32, c: u32) -> f32 {{ return b[luma_view_idx3(bv, c, i, 0u)]; }}
+
+var<workgroup> ls: array<f32, {size}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p.n;
+    let k = p.k;
+{load}    workgroupBarrier();
+    let c = wid.x * 64u + t;
+    if (c >= k) {{ return; }}
+{body}}}
+",
+        size = np * np
+    )
+}
+
+/// `L X = B` for the `[n, n]` lower triangle `l` (`unit`: with ones on the diagonal, not read) and
+/// `[k, n]` right-hand sides `b`: leaves of [`LEAF`] rows by [`leaf_solve_source`], bigger triangles
+/// split about in half with a [`matmul_f32`] product, as in [`super::tri`].
+fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    let ctx = l.context();
+    let [_, n, ..] = l.shape().dims();
+    let [k, ..] = b.shape().dims();
+    if n > LEAF {
+        let h = super::tri::split(n).min(n - 1);
+        let x1 = solve_lower(&block(l, 0..h, 0..h), &block(b, 0..h, 0..k), unit, op, loc).cache();
+        let update = &block(b, h..n, 0..k) - &matmul_f32(&block(l, h..n, 0..h), &x1);
+        let x2 = solve_lower(&block(l, h..n, h..n), &update, unit, op, loc);
+        return concat(1, [&x1, &x2]);
+    }
+    let mut x = match Array::<f32>::alloc(ctx, b.shape()) {
+        Ok(x) => x,
+        Err(e) => return fail(ctx, b.shape(), e, op, loc),
+    };
+    let np = n.next_multiple_of(8);
+    let params = LeafParams { n: n as u32, k: k as u32 };
+    let args: [KernelArg<'_>; 4] = [view(l), view(b), (&mut x).into(), uniform(&params)];
+    match launch(ctx, &format!("lu_leaf_solve/{np}/{}", u8::from(unit)), "lu_leaf_solve", || leaf_solve_source(np, unit), [k.div_ceil(64) as u32, 1, 1], &args) {
+        Ok(()) => x,
+        Err(e) => fail(ctx, b.shape(), e, op, loc),
+    }
 }
 
 /// The widest matrix (in columns) a leaf of `m` rows factors in one launch.
@@ -684,7 +834,7 @@ fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) ->
     let right = gather_rows(&block(a, 0..m, n1..w), &p1, loc);
     let a12 = block(&right, 0..n1, 0..n2);
     let a22 = block(&right, n1..m, 0..n2);
-    let u12 = lower_left(&block(&f1, 0..n1, 0..n1), &a12, true, op, loc).cache();
+    let u12 = solve_lower(&block(&f1, 0..n1, 0..n1), &a12, true, op, loc).cache();
     let l21 = block(&f1, n1..m, 0..n1);
     let s = &a22 - &matmul_f32(&l21.cache(), &u12);
     let Lu { lu: f2, perm: p2 } = recurse(&s, op, loc);
@@ -703,7 +853,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
             // Wide: factor the square left block, then U12 = L11⁻¹ (P A12).
             let left = factor(&a.slice(0, 0..d.rows), op, loc);
             let right = gather_rows(&a.slice(0, d.rows..d.cols), &left.perm, loc);
-            let u12 = lower_left(&left.lu, &right, true, op, loc);
+            let u12 = solve_lower(&left.lu, &right, true, op, loc);
             return Lu { lu: concat(0, [&left.lu, &u12]), perm: left.perm };
         }
         Err(e) => return Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, Shape::from(1), Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) },
