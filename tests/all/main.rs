@@ -85,3 +85,6 @@ mod svd;
 mod eigh;
 mod qr;
 mod accum;
+mod filters;
+mod image_warp;
+mod interp;

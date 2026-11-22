@@ -10,6 +10,7 @@
 - [Fourier transforms](fft.md)
 - [Sparse matrices](sparse.md)
 - [Dense linear algebra](linear-algebra.md)
+- [Interpolation, image transforms and filters](signal.md)
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)

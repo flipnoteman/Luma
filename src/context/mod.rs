@@ -30,6 +30,9 @@ pub(crate) const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
     .union(BufferUsage::COPY_DST)
     .union(BufferUsage::COPY_SRC);
 
+/// Kernels of library modules by (module, variant, entry point).
+type ModuleKernels = std::collections::HashMap<(&'static str, usize, &'static str), Arc<KernelCore>>;
+
 #[derive(Debug)]
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
@@ -40,6 +43,9 @@ struct Inner {
     jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: BuildCache<KernelKey, Arc<KernelCore>>,
+    /// Kernels of library modules that write their WGSL themselves (see [`Context::cached_kernel`]),
+    /// by (module, variant, entry point).
+    module_kernels: Mutex<ModuleKernels>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
@@ -588,6 +594,7 @@ impl Context {
                 chirps: Mutex::new(std::collections::HashMap::new()),
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
+                module_kernels: Mutex::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
@@ -800,6 +807,20 @@ impl Context {
     /// `true` if both handles refer to the same device.
     pub(crate) fn same_as(&self, other: &Context) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The kernel `entry` of the WGSL `source()` of a library module (`name`, one of `variant`s),
+    /// built on the first call: later calls find it by the short key without generating, cloning
+    /// or hashing the source, which for a source of kilobytes is a few microseconds of every launch.
+    pub(crate) fn cached_kernel(&self, name: &'static str, variant: usize, entry: &'static str, source: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        let key = (name, variant, entry);
+        let cached = self.inner.module_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned();
+        if let Some(core) = cached {
+            return Ok(crate::Kernel::from_core(self, core));
+        }
+        let kernel = self.kernel(&source()).entry(entry).build()?;
+        self.inner.module_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, kernel.core());
+        Ok(kernel)
     }
 
     /// The cache of custom kernels (see [`KernelBuilder::build`]).

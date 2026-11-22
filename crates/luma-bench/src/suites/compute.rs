@@ -13,6 +13,8 @@
 //! * `imageops`: the image operations of `luma` (convolutions, rank and morphological filters,
 //!   Sobel, bilateral, summed-area tables, colour conversions, `unwrap`) at 1080p and 4K, 3-D filters;
 //! * `visionops`: the feature detectors, matchers and image analysis of `luma::vision` at 1080p and 4K;
+//! * `approx`, `warp`, `filters`: `approx1`/`approx2` interpolation, `resize`/`rotate`/`transform`
+//!   image warps, and `fir` / `iir` filters (see `resample`);
 //! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`);
 //! * `structure`: `tile`, `diag`, `identity`, `lower`/`upper`, `iota`, `replace` and `diff1`/`diff2` as
 //!   kernels of their own (the structural half of ArrayFire's array API).
@@ -28,6 +30,7 @@ mod dense;
 mod dense_svd;
 mod linalg;
 mod physics;
+mod resample;
 mod scans;
 mod signal;
 mod special;
@@ -108,6 +111,7 @@ pub fn run(h: &mut Harness) {
     imageops::run(h);
     visionops::run(h);
     spectral::run(h);
+    resample::run(h);
     crypto::run(h);
     special::run(h);
     structure::run(h);

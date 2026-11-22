@@ -17,6 +17,7 @@ mod mlp;
 mod smallops;
 mod sparse;
 mod stats;
+mod signal;
 mod util;
 mod vision;
 
@@ -73,7 +74,7 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let mut b = bench::Bench::new(ctx.clone(), only, quick, Some(&format!("{out}/results.jsonl")));
     wake(&ctx);
-    let groups: [(&str, fn(&mut bench::Bench)); 23] = [
+    let groups: [(&str, fn(&mut bench::Bench)); 24] = [
         ("ew", cases::elementwise),
         ("small", cases::small_ops),
         ("reduce", cases::reductions),
@@ -96,6 +97,7 @@ fn main() {
         ("vision", vision::vision),
         ("linalg", linalg::linalg),
         ("accum", accum::accumulate),
+        ("signal", signal::signal),
         ("end", |_| ()),
     ];
     for (_, g) in groups {
