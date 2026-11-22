@@ -30,7 +30,7 @@
 
 use std::panic::Location;
 
-use super::{fail, launch};
+use super::{fail, launch_unchecked};
 use crate::array::Array;
 use crate::kernel::{uniform, view, KernelArg};
 
@@ -311,7 +311,7 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bo
     };
     let params = Params { n: n as u32, k: k as u32, unit: u32::from(unit), nblocks: nblocks as u32, ncg: ncg as u32 };
     let args: [KernelArg<'_>; 5] = [view(l), view(b), (&mut out).into(), (&mut st).into(), uniform(&params)];
-    match launch(ctx, &format!("trsv/{kc}/{}", u8::from(inverse)), "trsv", || source(kc, inverse), [(nblocks * ncg) as u32, 1, 1], &args) {
+    match launch_unchecked(ctx, &format!("trsv/{kc}/{}", u8::from(inverse)), "trsv", || source(kc, inverse), [(nblocks * ncg) as u32, 1, 1], &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
