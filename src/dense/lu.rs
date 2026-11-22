@@ -4,10 +4,19 @@
 //! permutation vector `perm` (row `i` of `P A` is row `perm[i]` of `A`).
 //!
 //! Matrices up to 64 rows (a batch of them in one launch) are factored by a workgroup each in
-//! workgroup memory; a tall panel of up to 32 columns by one workgroup in place; anything
-//! bigger by recursion on the columns (Toledo): factor the left half, apply its row swaps to the
-//! right half, `U12 = L11⁻¹ A12` (a triangular solve), update `A22 - L21 U12` with one
-//! [`matmul_f32`] and factor that.
+//! workgroup memory; a batch of tall panels of up to 32 columns by one workgroup each in place;
+//! anything bigger by recursion on the columns (Toledo): factor the left half, apply its row
+//! swaps to the right half, `U12 = L11⁻¹ A12` (a triangular solve), update `A22 - L21 U12` with
+//! one [`matmul_f32`] and factor that.
+//!
+//! The leaves of that recursion, tall panels of up to 32 columns of one matrix, are factored by a
+//! tournament (CALU), which puts every multiprocessor to work where the panel kernel streams the
+//! whole panel through one: workgroups pick `w` pivot rows in chunks of up to 512 rows (a row in
+//! the registers of an invocation), one workgroup plays the winners of the chunks off against one
+//! another until `w` are left, and every row of the panel gets its multipliers `A21 U11⁻¹` in
+//! parallel. A panel of one chunk (up to 512 rows) is pivoted exactly as partial pivoting does;
+//! of several, by the tournament, whose multipliers can exceed 1 (mildly: a growth bound a little
+//! worse than partial pivoting's, and the same results on every backend).
 
 use std::panic::Location;
 
@@ -341,6 +350,8 @@ var<workgroup> pvs: u32;
 var<workgroup> wins: array<u32, {wp}>;
 var<workgroup> lost: array<u32, {wp}>;
 var<workgroup> rank: array<u32, {wp}>;
+var<workgroup> slots: array<u32, {wp}>;
+var<workgroup> lbs: array<u32, {wp}>;
 
 // The key of a magnitude: larger is bigger (NaN above all), 0 is for a row that is done.
 fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
@@ -488,7 +499,7 @@ fn calu_chunks_source(rows: usize, wp: usize, fence: &str, sg: bool, single: boo
             "@group(1) @binding(2) var<storage, read_write> f: array<f32>;
 @group(1) @binding(3) var<storage, read_write> perm: array<u32>;
 @group(1) @binding(4) var<uniform> p: Params;",
-            calu_epilogue(wp, fence),
+            calu_epilogue(wp, fence, single),
         )
     } else {
         (
@@ -522,8 +533,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
 /// The end of a tournament panel, after its last LU: the factors of the winners are the top of `f`
 /// and the permutation is the winners on top, in order; the winners that were below the top take
-/// the places of the top rows that did not win, in order of both; the others stay.
-fn calu_epilogue(wp: usize, fence: &str) -> String {
+/// the places of the top rows that did not win, in order of both; the others stay. With `rows`
+/// (the panel is one chunk, all its rows are in the registers of the workgroup) the multipliers
+/// of the other rows, which the elimination has left in their registers, are written too, each
+/// to its place in the permutation: the panel is done.
+fn calu_epilogue(wp: usize, fence: &str, rows: bool) -> String {
+    let multipliers = if rows {
+        format!(
+            "    if (t < n && !done) {{
+        var dest = t;
+        if (t < w) {{ dest = slots[lbs[t]]; }}
+{}    }}
+",
+            (0..wp).map(|c| format!("        if ({c}u < w) {{ f[dest * w + {c}u] = x{c}; }}\n")).collect::<String>()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "    for (var e = t; e < w * w; e = e + R) {{
         let i = e / w;
@@ -544,13 +570,14 @@ fn calu_epilogue(wp: usize, fence: &str) -> String {
             lost_before = lost_before + 1u - wins[k];
             outside_before = outside_before + select(0u, 1u, piv[k] >= w);
         }}
-        if (wins[t] == 0u) {{ lost[lost_before] = t; }}
+        if (wins[t] == 0u) {{ lost[lost_before] = t; lbs[t] = lost_before; }}
         rank[t] = outside_before;
+        if (piv[t] >= w) {{ slots[outside_before] = piv[t]; }}
     }}
     {fence}
     workgroupBarrier();
     if (t < w && piv[t] >= w) {{ perm[piv[t]] = lost[rank[t]]; }}
-",
+{multipliers}",
     )
 }
 
@@ -593,7 +620,7 @@ fn main(@builtin(local_invocation_index) t: u32{lane_arg}) {{
 ",
         decl = calu_declarations(rows, wp, sg),
         lane_arg = if sg { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" },
-        epilogue = calu_epilogue(wp, fence),
+        epilogue = calu_epilogue(wp, fence, false),
         load = calu_load(wp, "panel_row"),
         lu = calu_lu(wp, calu_parts(rows), "panel_row", sg)
     )
@@ -696,10 +723,7 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
     let tail_groups = (d.rows - d.cols).div_ceil(CALU_TAIL) as u32;
     let result = if chunks == 1 {
         let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-        launch(ctx, &format!("lu_calu_single/{rows}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_single", || calu_chunks_source(rows, wp, fence, sg, true), [1, 1, 1], &args).and_then(|()| {
-            let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-            launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &args)
-        })
+        launch(ctx, &format!("lu_calu_single/{rows}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_single", || calu_chunks_source(rows, wp, fence, sg, true), [1, 1, 1], &args)
     } else {
         launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}/{}", u8::from(sg)), "lu_calu_chunks", || calu_chunks_source(rows, wp, fence, sg, false), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
             .and_then(|()| {
