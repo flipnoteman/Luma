@@ -82,6 +82,7 @@ mod guide {
 // The derive emits `::luma::` paths, also inside this crate.
 extern crate self as luma;
 
+mod accum;
 mod arg;
 mod array;
 mod builtin;
@@ -127,6 +128,7 @@ mod until;
 mod view;
 mod image;
 
+pub use accum::{AccumInput, Accumulator, AccumulatorBuilder, Fold, NanPolicy, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;

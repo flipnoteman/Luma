@@ -64,3 +64,4 @@ mod tridiagonal;
 mod vector_reductions;
 mod views;
 mod image;
+mod accum;
