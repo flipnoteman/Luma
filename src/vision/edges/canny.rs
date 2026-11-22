@@ -584,21 +584,20 @@ impl Array<f32> {
     /// of a plateau (flat steps) can differ. A constant image makes ArrayFire fail; here
     /// it has edges near the border only (the smoothing pads with zeros) and none inside.
     ///
-    /// Lazy: nothing is read back; 8 launches with Otsu thresholds, 6 with manual ones (the
+    /// Lazy: nothing is read back; 7 launches with Otsu thresholds, 6 with manual ones (the
     /// working buffers are an `H x W` plane of `f32` per plane, the same of parents and a few
     /// bit masks).
     ///
     /// ```
     /// use luma::{Array, CannyThreshold};
     /// # fn main() -> Result<(), luma::LumaError> {
-    /// // A vertical step edge between columns 9 and 10 of a 20 x 20 image.
-    /// let mut data = vec![0.0f32; 20 * 20];
-    /// for j in 10..20 { for i in 0..20 { data[i + 20 * j] = 200.0; } }
+    /// // A soft vertical edge near column 9 of a 20 x 20 image (a perfectly symmetric profile
+    /// // would tie between two columns and have no strict maximum).
+    /// let data: Vec<f32> = (0..400).map(|k| 100.0 * (1.0 + (((k / 20) as f32 - 9.2) / 1.5).tanh())).collect();
     /// let img = Array::from_slice(&data, [20, 20])?;
     /// let edges = img.canny(CannyThreshold::Manual, 0.2, 0.5, 3, false).to_vec()?;
-    /// // Every interior row has an edge pixel next to the step.
-    /// for i in 1..19 {
-    ///     assert!(edges[i + 20 * 9] || edges[i + 20 * 10]);
+    /// for i in 3..17 {
+    ///     assert!(edges[i + 20 * 9], "row {i}");
     ///     assert!(!edges[i + 20 * 5]);
     /// }
     /// # Ok(()) }
