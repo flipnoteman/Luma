@@ -507,7 +507,7 @@ pub fn fft(b: &mut Bench) {
             let (l, a) = (flat_l(l), flat_a(a));
             compare(&l, &a, 0.0, 5e-5 * rms(&a))
         };
-        for n in [1_000_000usize, 16_000_000, 1_000_003] {
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
             let c = cplx(n, 33);
             let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
             let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
@@ -543,7 +543,7 @@ pub fn fft(b: &mut Bench) {
                 },
             );
         }
-        for n in [1_000_000usize, 16_000_000, 1_000_003] {
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
             let r = uniform(n, 37, -1.0, 1.0);
             let (xl, xa) = (lumax::arr(&ctx, &r, n), afx::arr(&r, &[n as u64]));
             let v = agree(&lumax::host(&xl.rfft()), &afx::host(&af::fft_r2c(&xa, 1.0, 0)));
@@ -578,6 +578,38 @@ pub fn fft(b: &mut Bench) {
         let (xl, xa) = (lumax::arr(&ctx, &lc, [n, n, n]), afx::arr(&ac, &[n as u64, n as u64, n as u64]));
         let v = agree(&lumax::host(&xl.fft3()), &afx::host(&af::fft3(&xa, 1.0, 0, 0, 0)));
         b.run("6 FFT 3D complex c2c (forward)", "256^3", v, "luma fft3 vs AF fft3", &mut || { xl.fft3().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::fft3(&xa, 1.0, 0, 0, 0).eval(); afx::sync(); });
+        // FFT convolution in two and three dimensions (same-size output, odd kernels).
+        for (sd, kd) in [([2048usize, 2048, 1], [15usize, 15, 1]), ([4096, 4096, 1], [31, 31, 1]), ([256, 256, 256], [9, 9, 9])] {
+            let three = sd[2] > 1;
+            let (sl, kl) = (sd.iter().product::<usize>(), kd.iter().product::<usize>());
+            let x = uniform(sl, 51, -1.0, 1.0);
+            let kern = uniform(kl, 52, -1.0, 1.0);
+            let ldims: Vec<usize> = if three { sd.to_vec() } else { sd[..2].to_vec() };
+            let kdims: Vec<usize> = if three { kd.to_vec() } else { kd[..2].to_vec() };
+            let shape = |d: &[usize]| luma::Shape::from([d[0], d[1], *d.get(2).unwrap_or(&1), 1]);
+            let (xl, kl_) = (lumax::arr(&ctx, &x, shape(&ldims)), lumax::arr(&ctx, &kern, shape(&kdims)));
+            let adims = |d: &[usize]| d.iter().map(|&v| v as u64).collect::<Vec<_>>();
+            let (xa, ka) = (afx::arr(&x, &adims(&ldims)), afx::arr(&kern, &adims(&kdims)));
+            let luma_conv = |x: &luma::Array<f32>, k: &luma::Array<f32>| if three { x.fft_convolve3(k, luma::ConvMode::Same) } else { x.fft_convolve2(k, luma::ConvMode::Same) };
+            let af_conv = |x: &af::Array<f32>, k: &af::Array<f32>| if three { af::fft_convolve3(x, k, af::ConvMode::DEFAULT) } else { af::fft_convolve2(x, k, af::ConvMode::DEFAULT) };
+            let (lo, ao) = (lumax::host(&luma_conv(&xl, &kl_)), afx::host(&af_conv(&xa, &ka)));
+            let v = compare(&lo, &ao, 0.0, 2e-4 * rms(&ao));
+            let size = format!("{} (x) {}", ldims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"), kdims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"));
+            b.run(
+                if three { "6 FFT convolution 3D (real)" } else { "6 FFT convolution 2D (real)" },
+                &size,
+                v,
+                "luma fft_convolve (same) vs AF fft_convolve (cuFFT)",
+                &mut || {
+                    luma_conv(&xl, &kl_).eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af_conv(&xa, &ka).eval();
+                    afx::sync();
+                },
+            );
+        }
     });
 }
 

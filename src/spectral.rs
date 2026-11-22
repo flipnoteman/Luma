@@ -336,50 +336,55 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 
 /// The kernel of [`Builtin::RealStage`]: the step between a half-size complex transform and the
 /// spectrum of a real signal (`forward`: unpack `h + 1` frequencies from `h` values; else pack
-/// them, doubled, for the inverse). Bindings: `src`, `dst`, `Params { total, h, inner, scale }`.
+/// them, doubled, for the inverse; with `table`, multiplying the spectrum by a table first).
+/// An invocation handles the frequencies `k` and `h - k`, which share their intermediate
+/// results. Bindings: `src`, `dst`, `tab` if any, `Params { outer, h, inner, scale }`.
 pub(crate) fn real_stage_source(forward: bool, table: bool) -> String {
+    let (read_a, read_b, binding) = if table {
+        (
+            "cmul(src[xb + k * p.inner], tab[ii + k * p.inner])",
+            "cmul(src[xb + (p.h - k) * p.inner], tab[ii + (p.h - k) * p.inner])",
+            "@group(1) @binding(2) var<storage, read> tab: array<vec2<f32>>;\n@group(1) @binding(3) var<uniform> p: Params;",
+        )
+    } else {
+        ("src[xb + k * p.inner]", "src[xb + (p.h - k) * p.inner]", "@group(1) @binding(2) var<uniform> p: Params;")
+    };
     let body = if forward {
-        // Z[k mod h] and conj(Z[(h - k) mod h]) give the even and odd samples' spectra E and O;
-        // X[k] = E + W^k O.
-        "let total = p.outer * (p.h + 1u) * p.inner;
-    if (i >= total) { return; }
-    let ii = i % p.inner;
-    let k = (i / p.inner) % (p.h + 1u);
-    let o = i / (p.inner * (p.h + 1u));
-    let base = o * p.h * p.inner + ii;
-    let zk = src[base + (k % p.h) * p.inner];
-    let z2 = src[base + ((p.h - k) % p.h) * p.inner];
+        // E = (Z[k] + conj Z[h - k]) / 2, O = -i (Z[k] - conj Z[h - k]) / 2: X[k] = E + W^k O and
+        // X[h - k] = conj(E - W^k O).
+        "let zb = o * p.h * p.inner + ii;
+    let zk = src[zb + (k % p.h) * p.inner];
+    let z2 = src[zb + ((p.h - k) % p.h) * p.inner];
     let zc = vec2<f32>(z2.x, -z2.y);
     let e = (zk + zc) * 0.5;
     let d = zk - zc;
-    let od = vec2<f32>(d.y, -d.x) * 0.5;
-    dst[i] = (e + cmul(tw(k, 2u * p.h), od)) * p.scale;"
+    let od = cmul(tw(k, 2u * p.h), vec2<f32>(d.y, -d.x) * 0.5);
+    let ob = o * (p.h + 1u) * p.inner + ii;
+    let a = e + od;
+    let b = e - od;
+    dst[ob + k * p.inner] = a * p.scale;
+    if (2u * k != p.h) { dst[ob + (p.h - k) * p.inner] = vec2<f32>(b.x, -b.y) * p.scale; }"
+            .to_string()
     } else {
-        "let total = p.outer * p.h * p.inner;
-    if (i >= total) { return; }
-    let ii = i % p.inner;
-    let k = (i / p.inner) % p.h;
-    let o = i / (p.inner * p.h);
-    let base = o * (p.h + 1u) * p.inner + ii;
-    let xk = TAB_K;
-    let x2 = TAB_X2;
+        // E = X[k] + conj X[h - k], u = i (X[k] - conj X[h - k]) conj(W^k): Z[k] = E + u and
+        // Z[h - k] = conj(E - u).
+        format!(
+            "let xb = o * (p.h + 1u) * p.inner + ii;
+    let xk = {read_a};
+    let x2 = {read_b};
     let xc = vec2<f32>(x2.x, -x2.y);
     let e = xk + xc;
     let d = xk - xc;
     let w = tw(k, 2u * p.h);
-    let od = cmul(d, vec2<f32>(w.x, -w.y));
-    dst[i] = (e + vec2<f32>(-od.y, od.x)) * p.scale;"
-    };
-    let (xk, x2, binding) = if table {
-        (
-            "cmul(src[base + k * p.inner], tab[ii + k * p.inner])",
-            "cmul(src[base + (p.h - k) * p.inner], tab[ii + (p.h - k) * p.inner])",
-            "@group(1) @binding(2) var<storage, read> tab: array<vec2<f32>>;\n@group(1) @binding(3) var<uniform> p: Params;",
+    let t = cmul(d, vec2<f32>(w.x, -w.y));
+    let u = vec2<f32>(-t.y, t.x);
+    let ob = o * p.h * p.inner + ii;
+    let a = e + u;
+    let b = e - u;
+    dst[ob + k * p.inner] = a * p.scale;
+    if (k > 0u && 2u * k != p.h) {{ dst[ob + (p.h - k) * p.inner] = vec2<f32>(b.x, -b.y) * p.scale; }}"
         )
-    } else {
-        ("src[base + k * p.inner]", "src[base + (p.h - k) * p.inner]", "@group(1) @binding(2) var<uniform> p: Params;")
     };
-    let body = body.replace("TAB_K", xk).replace("TAB_X2", x2);
     format!(
         "struct Params {{ outer: u32, h: u32, inner: u32, scale: f32 }}
 @group(1) @binding(0) var<storage, read> src: array<vec2<f32>>;
@@ -389,6 +394,11 @@ pub(crate) fn real_stage_source(forward: bool, table: bool) -> String {
 @compute @workgroup_size({WORKGROUP})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
     let i = gid.x + gid.y * nwg.x * {WORKGROUP}u;
+    let half = p.h / 2u + 1u;
+    if (i >= p.outer * half * p.inner) {{ return; }}
+    let ii = i % p.inner;
+    let k = (i / p.inner) % half;
+    let o = i / (p.inner * half);
     {body}
 }}
 "
@@ -513,44 +523,9 @@ pub(crate) fn run_axis(
     if io.load == LoadKind::RealPair || io.store == StoreKind::RealPair || io.store_table.is_some() || io.load_table.is_some() {
         return Err(LumaError::InvalidShape("internal: Bluestein with packed or tabled ends".into()));
     }
-    let m = pow2_at_least(2 * n - 1)?;
-    let chirp = scratch.take(u64::from(n) * 8)?;
-    let padded = scratch.take(u64::from(m) * 8)?;
-    {
-        let params = [n, m, (if inverse { 1.0f32 } else { -1.0 }).to_bits(), 0];
-        let kernel = ctx.builtin(Builtin::Chirp, "f32")?;
-        let groups = fold_workgroups(ctx, m.div_ceil(WORKGROUP))?;
-        ctx.launch(
-            &kernel,
-            groups,
-            [m, 1, 1],
-            &[RawArg::write(&chirp, u64::from(n) * 8), RawArg::write(&padded, u64::from(m) * 8), RawArg::Uniform(bytemuck::bytes_of(&params))],
-        )?;
-    }
+    let tables = chirp_tables(ctx, n, inverse)?;
+    let (m, chirp, b_hat) = (tables.m, &tables.chirp, &tables.b_hat);
     let size_bytes = |len: u32| u64::from(outer) * u64::from(len) * u64::from(inner) * 8;
-    // The spectrum of the padded conj(chirp): one line, shared by every batch.
-    let b_hat = scratch.take(u64::from(m) * 8)?;
-    run_lines(
-        ctx,
-        scratch,
-        &Lines {
-            outer: 1,
-            n: m,
-            inner: 1,
-            src: (&padded, u64::from(m) * 8),
-            dst: (&b_hat, u64::from(m) * 8),
-            inverse: false,
-            scale: 1.0,
-            load: LoadKind::Complex,
-            load_table: None,
-            n_in: None,
-            n_lim: None,
-            n_full: 0,
-            store: StoreKind::Complex,
-            store_table: None,
-            n_out: None,
-        },
-    )?;
     // Spectrum of the weighted, zero-padded signal times the chirp's.
     let spectrum = scratch.take(size_bytes(m))?;
     run_lines(
@@ -565,12 +540,12 @@ pub(crate) fn run_axis(
             inverse: false,
             scale: 1.0,
             load: io.load,
-            load_table: Some((&chirp, u64::from(n) * 8, Table::Line)),
+            load_table: Some((chirp, u64::from(n) * 8, Table::Line)),
             n_in: Some(io.n_in.unwrap_or(n)),
             n_lim: Some(n),
             n_full: io.n_full,
             store: StoreKind::Complex,
-            store_table: Some((&b_hat, u64::from(m) * 8, Table::Line)),
+            store_table: Some((b_hat, u64::from(m) * 8, Table::Line)),
             n_out: None,
         },
     )?;
@@ -591,10 +566,68 @@ pub(crate) fn run_axis(
             n_lim: None,
             n_full: 0,
             store: io.store,
-            store_table: Some((&chirp, u64::from(n) * 8, Table::Line)),
+            store_table: Some((chirp, u64::from(n) * 8, Table::Line)),
             n_out: Some(io.n_out.unwrap_or(n)),
         },
     )
+}
+
+/// The tables of Bluestein's algorithm for one length and direction, kept by the context: the
+/// chirp `w[j] = e^(+-i pi j^2 / n)` and the spectrum, of the padded length `m`, of `conj(w)`.
+#[derive(Debug)]
+pub(crate) struct ChirpTables {
+    m: u32,
+    chirp: luma_core::Buffer,
+    b_hat: luma_core::Buffer,
+}
+
+/// The tables for `n` points (built and recorded on first use).
+fn chirp_tables(ctx: &Context, n: u32, inverse: bool) -> Result<std::sync::Arc<ChirpTables>, LumaError> {
+    if let Some(found) = ctx.chirps().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(n, inverse)) {
+        return Ok(found.clone());
+    }
+    let m = pow2_at_least(2 * n - 1)?;
+    let chirp = ctx.alloc_buffer(u64::from(n) * 8, crate::context::STORAGE_USAGE)?;
+    let b_hat = ctx.alloc_buffer(u64::from(m) * 8, crate::context::STORAGE_USAGE)?;
+    let mut scratch = Scratch::new(ctx);
+    let padded = scratch.take(u64::from(m) * 8)?;
+    let params = [n, m, (if inverse { 1.0f32 } else { -1.0 }).to_bits(), 0];
+    let kernel = ctx.builtin(Builtin::Chirp, "f32")?;
+    let groups = fold_workgroups(ctx, m.div_ceil(WORKGROUP))?;
+    ctx.launch(
+        &kernel,
+        groups,
+        [m, 1, 1],
+        &[RawArg::write(&chirp, u64::from(n) * 8), RawArg::write(&padded, u64::from(m) * 8), RawArg::Uniform(bytemuck::bytes_of(&params))],
+    )?;
+    run_lines(
+        ctx,
+        &mut scratch,
+        &Lines {
+            outer: 1,
+            n: m,
+            inner: 1,
+            src: (&padded, u64::from(m) * 8),
+            dst: (&b_hat, u64::from(m) * 8),
+            inverse: false,
+            scale: 1.0,
+            load: LoadKind::Complex,
+            load_table: None,
+            n_in: None,
+            n_lim: None,
+            n_full: 0,
+            store: StoreKind::Complex,
+            store_table: None,
+            n_out: None,
+        },
+    )?;
+    let tables = std::sync::Arc::new(ChirpTables { m, chirp, b_hat });
+    let mut cache = ctx.chirps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    cache.insert((n, inverse), tables.clone());
+    Ok(tables)
 }
 
 fn check_axis(axis: usize) -> Result<(), LumaError> {
@@ -614,7 +647,7 @@ fn launch_real_stage(
     dst: (&luma_core::Buffer, u64),
     table: Option<(&luma_core::Buffer, u64)>,
 ) -> Result<(), LumaError> {
-    let total = u64::from(outer) * u64::from(h + u32::from(forward)) * u64::from(inner);
+    let total = u64::from(outer) * u64::from(h / 2 + 1) * u64::from(inner);
     let total = u32::try_from(total).map_err(|_| too_large(total as usize))?;
     let params = [outer, h, inner, scale.to_bits()];
     let kernel = ctx.builtin(Builtin::RealStage(forward, table.is_some()), "f32")?;

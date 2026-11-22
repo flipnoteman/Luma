@@ -341,6 +341,18 @@ fn store_value(pass: &DftPass) -> String {
     s
 }
 
+/// `body` (which uses `e`) for every element `e` of a tile of `tile` elements that invocation
+/// `lid` handles, written out one after the other so that the loads of all of them are issued
+/// before any of their results is waited for.
+fn unrolled(tile: u32, body: &str) -> String {
+    let mut out = String::new();
+    for i in 0..tile.div_ceil(WORKGROUP) {
+        let guard = if (i + 1) * WORKGROUP <= tile { String::new() } else { format!("if (e < {tile}u) ") };
+        let _ = writeln!(out, "{{ let e = lid + {}u; {guard}{{\n{body}\n}} }}", i * WORKGROUP);
+    }
+    out
+}
+
 /// The WGSL source of `pass`. Bindings in order: `src`, `dst`, then `ltab` and `stab` if the
 /// pass has those tables, then the parameters.
 pub(crate) fn source(pass: &DftPass) -> String {
@@ -420,10 +432,8 @@ fn main(
     );
     // Load.
     let (r_load, d_load) = if pass.in_fast { (format!("e % {c}u"), format!("e / {c}u")) } else { (format!("e / {d}u"), format!("e % {d}u")) };
-    let _ = write!(
-        src,
-        "for (var e = lid; e < {tile}u; e = e + {WORKGROUP}u) {{
-    let r = {r_load}; let d = {d_load};
+    let load_body = format!(
+        "let r = {r_load}; let d = {d_load};
     var v = vec2<f32>(0.0, 0.0);
     if ((rho0 + r) < p.rows) {{
         let gi = in_base + r * p.in_rs + d * p.in_ds;
@@ -432,13 +442,12 @@ fn main(
         {}
         v.y = v.y * p.cj;
     }}
-    sh[{}] = v;
-}}
-workgroupBarrier();
-",
+    sh[{}] = v;",
         load_value(pass),
         at(pass, "d", "r")
     );
+    src.push_str(&unrolled(tile, &load_body));
+    src.push_str("workgroupBarrier();\n");
     for s in 0..pass.stages as usize {
         src.push_str(&stage(pass, s));
     }
@@ -452,22 +461,19 @@ workgroupBarrier();
         let _ = writeln!(reverse, "pos = pos + (kk % {r}u) * {}u; kk = kk / {r}u;", d / done);
     }
     let twiddle = if pass.twiddle { "let mrow = m0 + r * p.mrs; v = cmul(v, tw(k * mrow, p.den));\n" } else { "" };
-    let _ = write!(
-        src,
-        "for (var e = lid; e < {tile}u; e = e + {WORKGROUP}u) {{
-    let r = {r_store}; let k = {k_store};
+    let store_body = format!(
+        "let r = {r_store}; let k = {k_store};
     if ((rho0 + r) < p.rows) {{
         let ob = o + select(0u, r, p.j == 1u);
         {reverse}var v = sh[{}];
         {twiddle}v.y = v.y * p.cj;
         {}
-    }}
-}}
-}}
-",
+    }}",
         at(pass, "pos", "r"),
         store_value(pass)
     );
+    src.push_str(&unrolled(tile, &store_body));
+    src.push_str("}\n");
     src
 }
 

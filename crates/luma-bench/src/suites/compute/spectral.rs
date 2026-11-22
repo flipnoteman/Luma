@@ -89,5 +89,28 @@ pub fn run(h: &mut Harness) {
         let bins = vec![vec![0, 0, 0], vec![1, 2, 3], vec![cube - 1, cube / 2, 1]];
         verify("spectral/fft3", &a.fft3(), &x, &[cube, cube, cube], false, &bins);
         h.case("spectral/fft3", &format!("{cube}^3"), Work::Items((cube * cube * cube) as f64, "Mpoints/s"), &mut || a.fft3().eval().unwrap());
+        // FFT convolution, same-size output, checked at a few outputs against the direct sums.
+        let (side, taps) = pick(h, (256usize, 7usize), (2048, 15));
+        let x = values(side * side, 53, -1.0, 1.0);
+        let k = values(taps * taps, 54, -1.0, 1.0);
+        let a = Array::from_slice_on(&h.ctx, &x, [side, side]).unwrap();
+        let kk = Array::from_slice_on(&h.ctx, &k, [taps, taps]).unwrap();
+        a.eval().unwrap();
+        kk.eval().unwrap();
+        let got = a.fft_convolve2(&kk, ConvMode::Same).to_vec().unwrap();
+        for &(px, py) in &[(0usize, 0usize), (side / 2, side / 3), (side - 1, side - 1), (5, side - 2)] {
+            let mut want = 0.0f64;
+            for j1 in 0..taps {
+                for j0 in 0..taps {
+                    // Output (px, py) is element (px, py) + taps / 2 of the full convolution.
+                    let (c0, c1) = ((px + taps / 2) as isize - j0 as isize, (py + taps / 2) as isize - j1 as isize);
+                    if c0 >= 0 && c1 >= 0 && (c0 as usize) < side && (c1 as usize) < side {
+                        want += f64::from(x[c0 as usize + side * c1 as usize]) * f64::from(k[j0 + taps * j1]);
+                    }
+                }
+            }
+            assert!((f64::from(got[px + side * py]) - want).abs() < 1e-3, "spectral/fft_convolve2: ({px}, {py}): {} against {want}", got[px + side * py]);
+        }
+        h.case("spectral/fft_convolve2", &format!("{side}x{side} * {taps}x{taps}"), Work::Items((side * side) as f64, "Mpoints/s"), &mut || a.fft_convolve2(&kk, ConvMode::Same).eval().unwrap());
     });
 }

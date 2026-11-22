@@ -7,6 +7,7 @@
 - [Views and writes](views.md)
 - [Reductions and scans](reductions.md)
 - [Matrices, statistics and grouping](data.md)
+- [Fourier transforms](fft.md)
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)
