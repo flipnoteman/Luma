@@ -62,6 +62,22 @@ fn warm(f: &mut dyn FnMut()) -> f64 {
     start.elapsed().as_secs_f64() * 1e3 / f64::from(n)
 }
 
+/// A kernel label without the debug dump of its view specs: every `Name { .. }` block is cut to `Name`.
+fn compact(label: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.chars().take(200).collect()
+}
+
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -153,7 +169,7 @@ impl Bench {
             if kernels {
                 println!("  luma kernels of {case} [{size}]:");
                 for k in &p.kernels {
-                    println!("    {:>9.1} us x{:<3} {}", k.total.as_secs_f64() * 1e6, k.launches, k.label.chars().take(120).collect::<String>());
+                    println!("    {:>9.1} us x{:<3} {}", k.total.as_secs_f64() * 1e6, k.launches, compact(&k.label));
                 }
             }
             format!("luma: {} launches, {:.3} ms GPU", p.launches(), p.total().as_secs_f64() * 1e3)

@@ -92,7 +92,7 @@ impl Case {
     }
 }
 
-const SHAPES: [(usize, usize, usize); 15] = [
+const SHAPES: [(usize, usize, usize); 18] = [
     (16, 128, 128),
     (1000, 1000, 1000),
     (64, 1 << 16, 64),
@@ -111,7 +111,50 @@ const SHAPES: [(usize, usize, usize); 15] = [
     (36, 132, 196),
     (1028, 260, 44),
     (16388, 36, 40),
+    // A few columns that are not a multiple of 4 (a classifier head), with and without a transposed left operand.
+    (512, 256, 10),
+    (256, 512, 10),
+    (64, 96, 30),
 ];
+
+#[test]
+fn products_with_a_transposed_operand_match_the_host() {
+    for (k, m, n) in [(64, 96, 80), (200, 150, 140), (36, 132, 64), (512, 256, 10), (256, 512, 10), (300, 64, 3), (1028, 260, 44)] {
+        let case = Case::new(k, m, n);
+        // The same operands, stored the other way round: `a_t` is `[M, K]`, `b_t` is `[K, N]`.
+        let a_t: Vec<f32> = (0..k * m).map(|i| case.a[(i % m) * k + i / m]).collect();
+        let b_t: Vec<f32> = (0..n * k).map(|i| case.b[(i % k) * n + i / k]).collect();
+        let a_t = Array::from_slice_on(&case.ctx, &a_t, [m, k]).unwrap();
+        let b_t = Array::from_slice_on(&case.ctx, &b_t, [k, n]).unwrap();
+        let want = host(&case.a, &case.b, k, m, n);
+        let what = format!("k {k} m {m} n {n}");
+        let nt = case.lhs().matmul_nt(&b_t);
+        assert_eq!(nt.shape().dims(), [n, m, 1, 1], "{what} nt shape");
+        check(&nt.to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} nt"));
+        check(&a_t.matmul_tn(&case.rhs()).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} tn"));
+        check(&a_t.matmul_tt(&b_t).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} tt"));
+        check(&luma::matmul_nt(&case.lhs(), &b_t).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} nt function"));
+        // Lazy operands are evaluated first and read in place too.
+        let lazy = &a_t * 2.0;
+        let want2: Vec<f64> = want.iter().map(|w| w * 2.0).collect();
+        check(&lazy.matmul_tn(&case.rhs()).to_vec().unwrap(), &want2, k, &case.a, &case.b, &format!("{what} tn lazy"));
+    }
+}
+
+#[test]
+fn the_dot_product_sums_the_products_of_two_arrays() {
+    let ctx = exact().unwrap();
+    let n = 10_000;
+    let (a, b) = (values(n, 7, -1.0, 1.0), values(n, 8, -1.0, 1.0));
+    let want: f64 = a.iter().zip(&b).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
+    let (x, y) = (Array::from_slice_on(&ctx, &a, n).unwrap(), Array::from_slice_on(&ctx, &b, n).unwrap());
+    let got = f64::from(x.dot(&y).item().unwrap());
+    assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+    assert!((f64::from(luma::dot(&x, &y).item().unwrap()) - want).abs() < 1e-3);
+    let short = Array::from_slice_on(&ctx, &b[..n - 1], n - 1).unwrap();
+    let c = x.dot(&short);
+    assert!(matches!(c.error().map(LumaError::root), Some(LumaError::ShapeMismatch { .. })), "{:?}", c.error());
+}
 
 #[test]
 fn matches_the_host_product_for_every_kernel_shape() {
@@ -243,8 +286,9 @@ fn a_lazy_operand_is_not_evaluated_separately() {
     a.eval().unwrap();
     b.eval().unwrap();
     ctx.flush().unwrap();
-    // A backend with native products (the CPU one) computes lazy operands first, together.
-    let native = ctx.backend() == luma::BackendKind::Cpu && std::env::var("LUMA_NATIVE_GEMM").as_deref().map(str::trim) != Ok("off");
+    // A backend with native products (the CPU one, or CUDA's own kernels) computes lazy operands first, together.
+    let own_gemm = std::env::var("LUMA_OWN_GEMM").as_deref().map(str::trim) != Ok("off");
+    let native = (ctx.backend() == luma::BackendKind::Cpu && std::env::var("LUMA_NATIVE_GEMM").as_deref().map(str::trim) != Ok("off")) || (ctx.backend() == luma::BackendKind::Cuda && own_gemm);
     let lazy = &a * 2.0;
     let (c, profile) = ctx.profile(|| lazy.matmul(&b)).unwrap();
     assert_eq!(profile.launches(), if native { 2 } else { 1 }, "{profile}");

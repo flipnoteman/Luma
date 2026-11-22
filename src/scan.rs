@@ -792,6 +792,22 @@ fn strided_block(n: u32, lines: u32) -> Option<u32> {
     Some(block as u32)
 }
 
+/// Strided lines of at most [`SHORT_STRIDED`] cells are walked by one invocation each (see
+/// [`strided_block`]), which leaves the device idle when there are few of them: the bias gradient
+/// of a batch of 256 over 10 classes is 10 invocations of 256 cells each and took 38 us on an
+/// RTX 3090 with its operand recomputed inside (the weights of 512 units, 512 invocations: 11 us),
+/// against a block of 16 cells and a second pass that folds the 16 partial results of a line. Lines
+/// of up to [`FEW_LINES_MIN_CELLS`] cells (and the many-lined ones) keep one invocation each.
+const FEW_LINES: u32 = 1024;
+const FEW_LINES_MIN_CELLS: u32 = 64;
+
+/// [`strided_block`] for a reduction: blocked also for short lines when there are few of them.
+fn reduce_block(n: u32, lines: u32) -> Option<u32> {
+    strided_block(n, lines).or_else(|| {
+        (lines < FEW_LINES && n > FEW_LINES_MIN_CELLS).then(|| (u64::from(n) * u64::from(lines)).div_ceil(TARGET_THREADS).clamp(u64::from(MIN_BLOCK), u64::from(n)) as u32)
+    })
+}
+
 /// The invocations of a workgroup of the short-line pass, which is the most lines it stages at
 /// once: 64 lines of up to 63 cells fill the tile, longer lines leave room for fewer.
 fn rows_width(n: u32) -> u32 {
@@ -1037,7 +1053,7 @@ impl<'a> Lines<'a> {
             let nb = n.div_ceil(REDUCE_CHUNK);
             (Pass::ChunkReduce, [n, 1, lines, nb, REDUCE_CHUNK], nb)
         } else {
-            let k = strided_block(n, lines).unwrap_or(n);
+            let k = reduce_block(n, lines).unwrap_or(n);
             let nb = n.div_ceil(k);
             (Pass::Fold, [n, stride, lines, nb, k], nb)
         };
