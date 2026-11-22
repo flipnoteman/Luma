@@ -27,6 +27,7 @@ pub(crate) mod chol;
 pub(crate) mod eigh;
 pub(crate) mod lu;
 pub(crate) mod svd;
+pub(crate) mod qr;
 pub(crate) mod tri;
 
 /// Which triangle of a matrix an operation reads.

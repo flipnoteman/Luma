@@ -68,3 +68,4 @@ mod cholesky;
 mod lu;
 mod svd;
 mod eigh;
+mod qr;

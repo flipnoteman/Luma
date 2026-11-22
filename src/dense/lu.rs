@@ -113,59 +113,95 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     )
 }
 
+/// Invocations of a panel kernel for a matrix of `m` rows: more rows mean more loads in flight (the
+/// kernel is bound by the latency of its global loads, not by arithmetic), capped by the device.
+pub(crate) fn panel_threads(ctx: &crate::Context, m: usize) -> usize {
+    let limits = &ctx.info().limits;
+    let cap = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize;
+    let want = if m <= 64 { 64 } else if m <= 512 { 256 } else { 1024 };
+    want.min(cap / 32 * 32).max(32)
+}
+
 /// Global-memory kernel: one workgroup factors a tall panel of up to [`PANEL`] columns in place.
-fn panel_source(fence: &str) -> String {
-    const T: usize = 256;
+/// Invocation `(g, c) = (t / 32, t % 32)` owns column `c` of rows `g, g + G, ...`, so a warp reads
+/// and writes a row segment. Per column: swap the pivot row in, then one pass over the rows below
+/// that updates the other columns with the multiplier (the column itself is scaled after the last
+/// one), four rows per step with all their loads issued first, in which the lanes of the next column
+/// also keep the largest entry they have updated: the next pivot comes from a reduction over the
+/// row groups, no separate scan of the column. (An RTX 3090 spent 60 us per column on this loop
+/// with one row per step and 256 invocations: 8 loads in flight per row group.)
+fn panel_source(fence: &str, threads: usize) -> String {
+    let t = threads;
+    let g = threads / 32;
     format!(
         "struct Params {{ m: u32, w: u32, batch: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<storage, read_write> f: array<f32>;
 @group(1) @binding(2) var<storage, read_write> perm: array<u32>;
 @group(1) @binding(3) var<uniform> p: Params;
-var<workgroup> rv: array<f32, {T}>;
-var<workgroup> ri: array<u32, {T}>;
+var<workgroup> rv: array<f32, {g}>;
+var<workgroup> ri: array<u32, {g}>;
 
-@compute @workgroup_size({T})
+fn next_pivot() -> u32 {{
+    var bv = -2.0;
+    var bidx = 0xffffffffu;
+    for (var q = 0u; q < {g}u; q = q + 1u) {{
+        if (rv[q] > bv || (rv[q] == bv && ri[q] < bidx)) {{ bv = rv[q]; bidx = ri[q]; }}
+    }}
+    return bidx;
+}}
+
+@compute @workgroup_size({t})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let mi = wid.x + wid.y * nwg.x;
     let m = select(0u, p.m, mi < p.batch);
     let w = p.w;
     let base = mi * p.m * w;
     let pb = mi * p.m;
-    for (var idx = t; idx < m * w; idx = idx + {T}u) {{
-        f[base + idx] = a[base + idx];
+    let g = t / 32u;
+    let c = t % 32u;
+    var best = -1.0;
+    var bi = 0u;
+    if (c < w) {{
+        var i = g;
+        for (; i + {g3}u < m; i = i + {g4}u) {{
+            let r0 = base + i * w + c;
+            let v0 = a[r0];
+            let v1 = a[r0 + {g1}u * w];
+            let v2 = a[r0 + {g2}u * w];
+            let v3 = a[r0 + {g3}u * w];
+            f[r0] = v0;
+            f[r0 + {g1}u * w] = v1;
+            f[r0 + {g2}u * w] = v2;
+            f[r0 + {g3}u * w] = v3;
+            if (c == 0u) {{
+                if (abs(v0) > best) {{ best = abs(v0); bi = i; }}
+                if (abs(v1) > best) {{ best = abs(v1); bi = i + {g1}u; }}
+                if (abs(v2) > best) {{ best = abs(v2); bi = i + {g2}u; }}
+                if (abs(v3) > best) {{ best = abs(v3); bi = i + {g3}u; }}
+            }}
+        }}
+        for (; i < m; i = i + {g1}u) {{
+            let v = a[base + i * w + c];
+            f[base + i * w + c] = v;
+            if (c == 0u && abs(v) > best) {{ best = abs(v); bi = i; }}
+        }}
     }}
-    for (var i = t; i < m; i = i + {T}u) {{
+    for (var i = t; i < m; i = i + {t}u) {{
         perm[pb + i] = i;
     }}
+    if (c == 0u) {{ rv[g] = best; ri[g] = bi; }}
     {fence}
     workgroupBarrier();
+    var pv = next_pivot();
     for (var j = 0u; j < min(m, w); j = j + 1u) {{
-        var best = -1.0;
-        var bi = j;
-        for (var i = j + t; i < m; i = i + {T}u) {{
-            let v = abs(f[base + i * w + j]);
-            if (v > best) {{ best = v; bi = i; }}
-        }}
-        rv[t] = best;
-        ri[t] = bi;
-        workgroupBarrier();
-        for (var h = {half}u; h > 0u; h = h >> 1u) {{
-            if (t < h) {{
-                let ov = rv[t + h];
-                let oi = ri[t + h];
-                if (ov > rv[t] || (ov == rv[t] && oi < ri[t])) {{ rv[t] = ov; ri[t] = oi; }}
-            }}
-            workgroupBarrier();
-        }}
-        let pv = ri[0];
         if (pv != j) {{
             if (t < w) {{
                 let x = f[base + j * w + t];
                 f[base + j * w + t] = f[base + pv * w + t];
                 f[base + pv * w + t] = x;
             }}
-            if (t == {T}u - 1u) {{
+            if (t == 0u) {{
                 let x = perm[pb + j];
                 perm[pb + j] = perm[pb + pv];
                 perm[pb + pv] = x;
@@ -173,22 +209,64 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         }}
         {fence}
         workgroupBarrier();
-        let rj = base + j * w;
-        let piv = f[rj + j];
-        for (var i = j + 1u + t; i < m; i = i + {T}u) {{
-            let ro = base + i * w;
-            let l = select(0.0, f[ro + j] / piv, piv != 0.0);
-            f[ro + j] = l;
-            for (var c = j + 1u; c < w; c = c + 1u) {{
-                f[ro + c] = fma(-l, f[rj + c], f[ro + c]);
+        let piv = f[base + j * w + j];
+        let rpiv = select(0.0, 1.0 / piv, piv != 0.0);
+        let prow = select(0.0, f[base + j * w + c], c < w);
+        let act = c > j && c < w;
+        best = -1.0;
+        bi = j + 1u;
+        var i = j + 1u + g;
+        for (; i + {g3}u < m; i = i + {g4}u) {{
+            let r0 = base + i * w;
+            let l0 = f[r0 + j] * rpiv;
+            let l1 = f[r0 + {g1}u * w + j] * rpiv;
+            let l2 = f[r0 + {g2}u * w + j] * rpiv;
+            let l3 = f[r0 + {g3}u * w + j] * rpiv;
+            if (act) {{
+                let x0 = fma(-l0, prow, f[r0 + c]);
+                let x1 = fma(-l1, prow, f[r0 + {g1}u * w + c]);
+                let x2 = fma(-l2, prow, f[r0 + {g2}u * w + c]);
+                let x3 = fma(-l3, prow, f[r0 + {g3}u * w + c]);
+                f[r0 + c] = x0;
+                f[r0 + {g1}u * w + c] = x1;
+                f[r0 + {g2}u * w + c] = x2;
+                f[r0 + {g3}u * w + c] = x3;
+                if (c == j + 1u) {{
+                    if (abs(x0) > best) {{ best = abs(x0); bi = i; }}
+                    if (abs(x1) > best) {{ best = abs(x1); bi = i + {g1}u; }}
+                    if (abs(x2) > best) {{ best = abs(x2); bi = i + {g2}u; }}
+                    if (abs(x3) > best) {{ best = abs(x3); bi = i + {g3}u; }}
+                }}
             }}
         }}
+        for (; i < m; i = i + {g1}u) {{
+            let ro = base + i * w;
+            let l = f[ro + j] * rpiv;
+            if (act) {{
+                let nv = fma(-l, prow, f[ro + c]);
+                f[ro + c] = nv;
+                if (c == j + 1u && abs(nv) > best) {{ best = abs(nv); bi = i; }}
+            }}
+        }}
+        if (c == j + 1u) {{ rv[g] = best; ri[g] = bi; }}
         {fence}
         workgroupBarrier();
+        pv = next_pivot();
+    }}
+    // The multipliers are scaled last: the invocations of a warp read the column they scale
+    // while the others update, so nothing may write it before the loop is done.
+    for (var i = g; i < m; i = i + {g1}u) {{
+        if (c < min(m, w) && i > c) {{
+            let piv = f[base + c * w + c];
+            if (piv != 0.0) {{ f[base + i * w + c] = f[base + i * w + c] * (1.0 / piv); }}
+        }}
     }}
 }}
 ",
-        half = T / 2
+        g1 = g,
+        g2 = 2 * g,
+        g3 = 3 * g,
+        g4 = 4 * g
     )
 }
 
@@ -206,7 +284,7 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
     let result = if d.rows <= SMALL {
         launch(ctx, &small_source(), "lu_small", per_matrix(ctx, d.batch), &args)
     } else {
-        launch(ctx, &panel_source(fence(ctx)), "lu_panel", per_matrix(ctx, d.batch), &args)
+        launch(ctx, &panel_source(fence(ctx), panel_threads(ctx, d.rows)), "lu_panel", per_matrix(ctx, d.batch), &args)
     };
     match result {
         Ok(()) => Lu { lu: f, perm },
@@ -287,18 +365,22 @@ impl Array<f32> {
         factor(self, "lu", Location::caller())
     }
 
-    /// Solves `A X = B` for a square `A` (`self`) by LU with partial pivoting; `b` is `[k, n]`
-    /// (`[k, n, batch]`) or a vector (see [`Array::solve_triangular`]). A singular matrix gives
-    /// `Inf` / `NaN`.
+    /// Solves `A X = B` (`self` is `A`) by LU with partial pivoting for a square `A`; `b` is
+    /// `[k, n]` (`[k, n, batch]`) or, for a square `A`, a vector (see [`Array::solve_triangular`]).
+    /// A singular matrix gives `Inf` / `NaN`. A tall `A` (more rows than columns) gives the
+    /// least-squares solution ([`Array::lstsq`]), a wide one the minimum norm solution (by QR of
+    /// the transpose), as ArrayFire's `solve` does.
     ///
     /// # Errors
     ///
-    /// The result is poisoned if `A` is not square or `b` does not match it.
+    /// The result is poisoned if `b` does not match `A`.
     #[track_caller]
     pub fn solve(&self, b: &Array<f32>) -> Array<f32> {
         let loc = Location::caller();
-        match Dims::square(self) {
-            Ok(_) => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+        match Dims::of(self) {
+            Ok(d) if d.rows == d.cols => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+            Ok(d) if d.rows > d.cols => super::qr::Qr::lstsq(&self.qr(), b),
+            Ok(_) => super::qr::min_norm(self, b, "solve", loc),
             Err(e) => fail(self.context(), b.shape(), e, "solve", loc),
         }
     }
