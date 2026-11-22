@@ -21,6 +21,7 @@ use luma::{Array as LA, Sparse, SparseFormat};
 use crate::afx;
 use crate::bench::Bench;
 use crate::cases::{attempt, human, A, L};
+use crate::cusparse::{self, AI};
 use crate::lumax;
 use crate::util::*;
 
@@ -116,12 +117,25 @@ fn up_i32(v: &[u32]) -> Vec<i32> {
     v.iter().map(|&x| x as i32).collect()
 }
 
-/// A matrix on both sides, in CSR (and COO for the luma triplets).
+/// A matrix on both sides: luma's three formats, and ArrayFire's CSR arrays.
 struct Both {
     l_csr: Sparse,
     l_coo: Sparse,
     l_csc: Sparse,
-    a_csr: A,
+    a_ptr: AI,
+    a_col: AI,
+    a_val: A,
+}
+
+impl Both {
+    /// ArrayFire's sparse array over the CSR arrays (no copy). Creating it works; the operations
+    /// on it are what may crash.
+    fn af_csr(&self, a: &Csr) -> A {
+        let s = af::sparse(a.rows as u64, a.cols as u64, &self.a_val, &self.a_ptr, &self.a_col, af::SparseFormat::CSR);
+        s.eval();
+        afx::sync();
+        s
+    }
 }
 
 fn build(ctx: &luma::Context, a: &Csr) -> Both {
@@ -133,11 +147,8 @@ fn build(ctx: &luma::Context, a: &Csr) -> Both {
         settle(s);
     }
     ctx.sync().unwrap();
-    let (ap, ac, av) = (afx::arr(&up_i32(&a.ptr), &[a.rows as u64 + 1]), afx::arr(&up_i32(&a.col), &[a.nnz() as u64]), afx::arr(&a.val, &[a.nnz() as u64]));
-    let a_csr = af::sparse(a.rows as u64, a.cols as u64, &av, &ap, &ac, af::SparseFormat::CSR);
-    a_csr.eval();
-    afx::sync();
-    Both { l_csr, l_coo, l_csc, a_csr }
+    let (a_ptr, a_col, a_val) = (afx::arr(&up_i32(&a.ptr), &[a.rows as u64 + 1]), afx::arr(&up_i32(&a.col), &[a.nnz() as u64]), afx::arr(&a.val, &[a.nnz() as u64]));
+    Both { l_csr, l_coo, l_csc, a_ptr, a_col, a_val }
 }
 
 fn settle(s: &Sparse) {
@@ -167,124 +178,145 @@ fn size_label(a: &Csr) -> String {
 pub fn sparse(b: &mut Bench) {
     b.guarded("sparse", |b| {
         let ctx = b.ctx.clone();
+        let cs = cusparse::Cusparse::open();
+        match &cs {
+            Ok(_) => println!("cuSPARSE reference: libcusparse.so.12 loaded"),
+            Err(e) => println!("cuSPARSE reference unavailable: {e}"),
+        }
+        let cs = cs.ok();
         let mut mats: Vec<(&str, Csr)> = vec![("banded", banded(200_000, 2, 11)), ("powerlaw", power_law(100_000, 1 << 17, 31))];
         if !b.quick {
             mats.push(("banded", banded(2_000_000, 2, 12)));
             mats.push(("powerlaw", power_law(800_000, 1 << 17, 32)));
         }
         for (kind, a) in &mats {
-            products(b, &ctx, kind, a);
+            products(b, &ctx, cs.as_ref(), kind, a);
         }
         // Conversions and constructors on the big power-law matrix.
         let (_, big) = mats.last().unwrap();
-        conversions(b, &ctx, big);
+        conversions(b, &ctx, cs.as_ref(), big);
         dense_forms(b, &ctx);
     });
 }
 
-fn products(b: &mut Bench, ctx: &luma::Context, kind: &str, a: &Csr) {
+/// The reference side of a product row: ArrayFire's `matmul` when it survives its probe, else
+/// cuSPARSE called directly (what `matmul` calls). Returns the closures that run it once
+/// (synchronised) and read the result back as `(rows, c)` row-major (luma's layout), plus the
+/// note for the row.
+type Side<'a> = (Box<dyn FnMut() + 'a>, Box<dyn Fn() -> Vec<f32> + 'a>, &'static str);
+
+#[allow(clippy::too_many_arguments)]
+fn reference_product<'a>(
+    m: &'a Both,
+    a: &Csr,
+    cs: Option<&'a cusparse::Cusparse>,
+    xa: &'a A,
+    c: usize,
+    transposed_op: bool,
+    af_sparse: Option<&'a A>,
+) -> Option<Side<'a>> {
+    let (n_out, n_in) = if transposed_op { (a.cols, a.rows) } else { (a.rows, a.cols) };
+    let _ = n_in;
+    // ArrayFire's own product.
+    if let Some(sp) = af_sparse {
+        let run = move || af::matmul(sp, xa, if transposed_op { af::MatProp::TRANS } else { af::MatProp::NONE }, af::MatProp::NONE);
+        let read = move || {
+            let out = afx::host(&run());
+            from_col_major(&out, n_out, c)
+        };
+        return Some((
+            Box::new(move || {
+                run().eval();
+                afx::sync();
+            }),
+            Box::new(read),
+            "AF = ArrayFire matmul",
+        ));
+    }
+    // cuSPARSE directly.
+    let cs = cs?;
+    let y: &'a A = Box::leak(Box::new(afx::arr(&vec![0.0f32; n_out * c], &[n_out as u64, c as u64])));
+    let prod = cs.product(cs.csr(a.rows, a.cols, &m.a_ptr, &m.a_col, &m.a_val), xa, y, c, transposed_op);
+    let prod: &'a cusparse::Product = Box::leak(Box::new(prod));
+    let cs: &'a cusparse::Cusparse = cs;
+    Some((
+        Box::new(move || {
+            cs.run(prod);
+            cs.sync();
+        }),
+        Box::new(move || {
+            cs.run(prod);
+            cs.sync();
+            from_col_major(&afx::host(y), n_out, c)
+        }),
+        "AF column = cuSPARSE SpMV/SpMM called directly (generic API, default algorithm; ArrayFire's own sparse matmul segfaults on this install)",
+    ))
+}
+
+/// `(n, c)` column-major to `[c, n]` row-major (the layout of luma's dense operands).
+fn from_col_major(v: &[f32], n: usize, c: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; v.len()];
+    for j in 0..c {
+        for r in 0..n {
+            out[r * c + j] = v[j * n + r];
+        }
+    }
+    out
+}
+
+fn products(b: &mut Bench, ctx: &luma::Context, cs: Option<&cusparse::Cusparse>, kind: &str, a: &Csr) {
     let m = build(ctx, a);
     let size = size_label(a);
+    let af_sparse = if af_ok("matmul") && af_ok("matmul_t") && af_ok("spmm") { Some(m.af_csr(a)) } else { None };
     let n = a.cols;
-    let xh: Vec<f32> = {
-        let mut g = Gen::new(12);
-        (0..n).map(|_| g.quant()).collect()
-    };
-    let (xl, xa) = (lumax::arr(ctx, &xh, n), afx::arr(&xh, &[n as u64]));
-    let want = a.product(&xh, 1, false);
-    let want_t = a.product(&xh, 1, true);
-    for transposed in [false, true] {
-        let (name, want) = if transposed { (format!("sparse {kind} CSR A^T x (SpMV)"), &want_t) } else { (format!("sparse {kind} CSR A x (SpMV)"), &want) };
-        let luma_run = |l: &Sparse, x: &L| if transposed { l.matmul_t(x) } else { l.matmul(x) };
-        let lo = lumax::host(&luma_run(&m.l_csr, &xl));
-        let v = compare_ref("luma", &lo, want, 1e-5, 1e-4);
-        let af_run = |x: &A| af::matmul(&m.a_csr, x, if transposed { af::MatProp::TRANS } else { af::MatProp::NONE }, af::MatProp::NONE);
-        let af_out = if af_ok(if transposed { "matmul_t" } else { "matmul" }) { attempt(|| afx::host(&af_run(&xa))) } else { None };
-        match af_out {
-            Some(ao) => {
-                let v = v.and(compare_ref("AF", &ao, want, 1e-5, 1e-4));
-                b.run(
-                    &name,
-                    &size,
-                    v,
-                    "",
-                    &mut || {
-                        luma_run(&m.l_csr, &xl).eval().unwrap();
-                        ctx.sync().unwrap();
-                    },
-                    &mut || {
-                        af_run(&xa).eval();
-                        afx::sync();
-                    },
-                );
+    for (c, transposed_op) in [(1usize, false), (1, true), (16, false)] {
+        let mut g = Gen::new(12 + c as u64);
+        let n_in = if transposed_op { a.rows } else { a.cols };
+        let xh: Vec<f32> = (0..n_in * c).map(|_| g.quant()).collect();
+        let want = a.product(&xh, c, transposed_op);
+        let name = match (c, transposed_op) {
+            (1, false) => format!("sparse {kind} CSR A x (SpMV)"),
+            (1, true) => format!("sparse {kind} CSR A^T x (SpMV)"),
+            _ => format!("sparse {kind} CSR A X (SpMM, {c} columns)"),
+        };
+        // luma's operand is `[c, n]`, the reference's `(n, c)` column-major.
+        let xl = if c == 1 { lumax::arr(ctx, &xh, n_in) } else { lumax::arr(ctx, &xh, [c, n_in]) };
+        let xa = afx::arr(&transposed(&xh, n_in, c), &[n_in as u64, c as u64]);
+        let luma_run = |x: &L| if transposed_op { m.l_csr.matmul_t(x) } else { m.l_csr.matmul(x) };
+        let v = compare_ref("luma", &lumax::host(&luma_run(&xl)), &want, 1e-5, 1e-4);
+        let luma_closure = &mut || {
+            luma_run(&xl).eval().unwrap();
+            ctx.sync().unwrap();
+        };
+        match reference_product(&m, a, cs, &xa, c, transposed_op, af_sparse.as_ref()) {
+            Some((mut run, read, note)) => {
+                let v = v.and(compare_ref("AF side", &read(), &want, 1e-5, 1e-4));
+                b.run(&name, &size, v, note, luma_closure, &mut *run);
             }
-            None => b.run_one(&name, &size, Some(&mut || {
-                luma_run(&m.l_csr, &xl).eval().unwrap();
-                ctx.sync().unwrap();
-            }), None, "ArrayFire's sparse matmul crashes (segmentation fault in cusparseCreateSpMatDescr) or refuses the product: no AF row"),
+            None => b.run_one(&name, &size, Some(luma_closure), None, "no reference: ArrayFire's sparse matmul crashes and cuSPARSE could not be loaded"),
         }
     }
     // The other luma formats have no ArrayFire product (matmul takes a CSR left operand only).
+    let mut g = Gen::new(12);
+    let xh: Vec<f32> = (0..n).map(|_| g.quant()).collect();
+    let want = a.product(&xh, 1, false);
+    let xl = lumax::arr(ctx, &xh, n);
     for (tag, s) in [("COO", &m.l_coo), ("CSC", &m.l_csc)] {
         let name = format!("sparse {kind} {tag} A x (SpMV)");
-        let lo = lumax::host(&s.matmul(&xl));
-        let v = compare_ref("luma", &lo, &want, 1e-5, 1e-4);
+        let v = compare_ref("luma", &lumax::host(&s.matmul(&xl)), &want, 1e-5, 1e-4);
         if !v.ok {
             println!("!!!!!! MISMATCH in {name} [{size}]: {}", v.text);
         }
-        b.run_one(&name, &size, Some(&mut || {
-            s.matmul(&xl).eval().unwrap();
-            ctx.sync().unwrap();
-        }), None, "ArrayFire matmul needs a CSR left operand");
-    }
-
-    // SpMM: 16 dense columns.
-    let c = 16usize;
-    let xh: Vec<f32> = {
-        let mut g = Gen::new(13);
-        (0..n * c).map(|_| g.quant()).collect()
-    };
-    let xt = transposed(&xh, n, c);
-    let (xl, xa) = (lumax::arr(ctx, &xh, [c, n]), afx::arr(&xt, &[n as u64, c as u64]));
-    let want = a.product(&xh, c, false);
-    let lo = lumax::host(&m.l_csr.matmul(&xl));
-    let v = compare_ref("luma", &lo, &want, 1e-5, 1e-4);
-    let name = format!("sparse {kind} CSR A X (SpMM, {c} columns)");
-    let af_run = |x: &A| af::matmul(&m.a_csr, x, af::MatProp::NONE, af::MatProp::NONE);
-    match if af_ok("spmm") { attempt(|| afx::host(&af_run(&xa))) } else { None } {
-        Some(ao) => {
-            // ArrayFire's result is `(rows, c)` column-major: transpose it to luma's `[c, rows]`.
-            let ao = transposed(&ao, c, a.rows);
-            let ao = {
-                // `transposed(x, n, c)` maps `[n, c]` row-major to `[c, n]`; here the input is `[c, rows]` -> use the inverse.
-                let mut back = vec![0.0f32; ao.len()];
-                for j in 0..c {
-                    for r in 0..a.rows {
-                        back[r * c + j] = ao[j * a.rows + r];
-                    }
-                }
-                back
-            };
-            let v = v.and(compare_ref("AF", &ao, &want, 1e-5, 1e-4));
-            b.run(
-                &name,
-                &size,
-                v,
-                "luma X is [c, n] (row-major), AF X is (n, c) column-major",
-                &mut || {
-                    m.l_csr.matmul(&xl).eval().unwrap();
-                    ctx.sync().unwrap();
-                },
-                &mut || {
-                    af_run(&xa).eval();
-                    afx::sync();
-                },
-            );
-        }
-        None => b.run_one(&name, &size, Some(&mut || {
-            m.l_csr.matmul(&xl).eval().unwrap();
-            ctx.sync().unwrap();
-        }), None, "ArrayFire's sparse matmul crashes (segmentation fault in cusparseCreateSpMatDescr) or refuses the product: no AF row"),
+        b.run_one(
+            &name,
+            &size,
+            Some(&mut || {
+                s.matmul(&xl).eval().unwrap();
+                ctx.sync().unwrap();
+            }),
+            None,
+            "ArrayFire matmul needs a CSR left operand",
+        );
     }
 }
 
@@ -299,85 +331,93 @@ fn l_parts(s: &Sparse) -> (Vec<f32>, Vec<i32>, Vec<i32>) {
     (s.values().map(|v| v.to_vec().unwrap()).unwrap_or_default(), to_i32(s.row_idx()), to_i32(s.col_idx()))
 }
 
+fn conversions(b: &mut Bench, ctx: &luma::Context, cs: Option<&cusparse::Cusparse>, a: &Csr) {
+    let size = size_label(a);
+    let m = build(ctx, a);
+    let row = a.row_of();
+    let (rl, cl, vl) = (lumax::arr(ctx, &row, a.nnz()), lumax::arr(ctx, &a.col, a.nnz()), lumax::arr(ctx, &a.val, a.nnz()));
+    let fresh = || Sparse::from_csr(a.rows, a.cols, &m.l_csr.row_idx().unwrap(), &m.l_csr.col_idx().unwrap(), &m.l_csr.values().unwrap());
+
+    // CSR -> CSC. Reference: ArrayFire's `sparseConvertTo` if it survives its probe, else
+    // `cusparseCsr2cscEx2` (what it calls). The arrays must be identical (a stable transposition
+    // of sorted, distinct CSR).
+    let luma_csc = &mut || {
+        settle(&m.l_csr.to_format(SparseFormat::Csc));
+        ctx.sync().unwrap();
+    };
+    let lcsc = l_parts(&m.l_csr.to_format(SparseFormat::Csc));
+    if af_ok("convert_csc") {
+        let sp = m.af_csr(a);
+        let v = same_parts(lcsc, af_parts(&af::sparse_convert_to(&sp, af::SparseFormat::CSC)));
+        b.run("sparse convert CSR -> CSC", &size, v, "AF sparseConvertTo", luma_csc, &mut || {
+            af::sparse_convert_to(&sp, af::SparseFormat::CSC).eval();
+            afx::sync();
+        });
+    } else if let Some(cs) = cs {
+        let descr = cs.csr(a.rows, a.cols, &m.a_ptr, &m.a_col, &m.a_val);
+        let out = (afx::arr(&vec![0.0f32; a.nnz()], &[a.nnz() as u64]), afx::arr(&vec![0i32; a.cols + 1], &[a.cols as u64 + 1]), afx::arr(&vec![0i32; a.nnz()], &[a.nnz() as u64]));
+        let buffer = cs.csr_to_csc_setup(&descr, &m.a_ptr, &m.a_col, &m.a_val, &out);
+        cs.csr_to_csc(&descr, &m.a_ptr, &m.a_col, &m.a_val, &out, &buffer);
+        cs.sync();
+        // luma: (values, row indices, column pointer) as `l_parts` lists them for CSC = (values, row_idx = rows, col_idx = pointer).
+        let got = (afx::host(&out.0), afx::host(&out.2), afx::host(&out.1));
+        let v = same_parts(lcsc, got);
+        b.run(
+            "sparse convert CSR -> CSC",
+            &size,
+            v,
+            "AF column = cusparseCsr2cscEx2 called directly (ArrayFire's sparseConvertTo fails on this install)",
+            luma_csc,
+            &mut || {
+                cs.csr_to_csc(&descr, &m.a_ptr, &m.a_col, &m.a_val, &out, &buffer);
+                cs.sync();
+            },
+        );
+    } else {
+        b.run_one("sparse convert CSR -> CSC", &size, Some(luma_csc), None, "no reference available");
+    }
+
+    // CSR -> COO: luma expands the pointer (a fresh matrix, as the expansion is cached per matrix).
+    b.run_one(
+        "sparse convert CSR -> COO",
+        &size,
+        Some(&mut || {
+            settle(&fresh().to_format(SparseFormat::Coo));
+            ctx.sync().unwrap();
+        }),
+        None,
+        "ArrayFire sparseConvertTo CSR -> COO segfaults on this install; no reference measured",
+    );
+
+    // COO -> CSR (construction from triplets): a stable sort by row, no reference (ArrayFire's
+    // `sparse(...)` COO conversion segfaults).
+    let lo = Sparse::from_triplets(a.rows, a.cols, &rl, &cl, &vl, SparseFormat::Csr);
+    let (lv, lp, lc) = l_parts(&lo);
+    let v = if lp == up_i32(&a.ptr) && lc == up_i32(&a.col) && lv == a.val { Verdict::yes("yes (the host CSR)") } else { Verdict::no("NO: differs from the host CSR") };
+    if !v.ok {
+        println!("!!!!!! MISMATCH in sparse from triplets: {}", v.text);
+    }
+    b.run_one(
+        "sparse from triplets (COO -> CSR)",
+        &size,
+        Some(&mut || {
+            settle(&Sparse::from_triplets(a.rows, a.cols, &rl, &cl, &vl, SparseFormat::Csr));
+            ctx.sync().unwrap();
+        }),
+        None,
+        "ArrayFire's COO -> CSR conversion segfaults on this install; no reference measured",
+    );
+}
+
 fn same_parts(l: (Vec<f32>, Vec<i32>, Vec<i32>), a: (Vec<f32>, Vec<i32>, Vec<i32>)) -> Verdict {
     let ok = l.0 == a.0 && l.1 == a.1 && l.2 == a.2;
     if ok { Verdict::yes("yes (identical arrays)") } else { Verdict::no(format!("NO: arrays differ (values {}, row {}, col {})", l.0 == a.0, l.1 == a.1, l.2 == a.2)) }
 }
 
-fn conversions(b: &mut Bench, ctx: &luma::Context, a: &Csr) {
-    let size = size_label(a);
-    let m = build(ctx, a);
-    let row = a.row_of();
-    let (rl, cl, vl) = (lumax::arr(ctx, &row, a.nnz()), lumax::arr(ctx, &a.col, a.nnz()), lumax::arr(ctx, &a.val, a.nnz()));
-    let (ra, ca, va) = (afx::arr(&up_i32(&row), &[a.nnz() as u64]), afx::arr(&up_i32(&a.col), &[a.nnz() as u64]), afx::arr(&a.val, &[a.nnz() as u64]));
-
-    // CSR -> CSC and CSR -> COO.
-    for (name, lf, af_f) in [("CSR -> CSC", SparseFormat::Csc, af::SparseFormat::CSC), ("CSR -> COO", SparseFormat::Coo, af::SparseFormat::COO)] {
-        let lo = m.l_csr.to_format(lf);
-        settle(&lo);
-        let probe_name = if lf == SparseFormat::Csc { "convert_csc" } else { "convert_coo" };
-        let v = match if af_ok(probe_name) { attempt(|| af_parts(&af::sparse_convert_to(&m.a_csr, af_f))) } else { None } {
-            Some(ap) => same_parts(l_parts(&lo), ap),
-            None => Verdict::no("ArrayFire conversion failed"),
-        };
-        let name = format!("sparse convert {name}");
-        match if af_ok(probe_name) { attempt(|| {
-            af::sparse_convert_to(&m.a_csr, af_f).eval();
-            afx::sync();
-        }) } else { None } {
-            Some(()) => b.run(
-                &name,
-                &size,
-                v,
-                "luma: from a fresh clone of the CSR matrix (a CSR -> COO expansion is not cached across clones)",
-                &mut || {
-                    let fresh = Sparse::from_csr(a.rows, a.cols, &m.l_csr.row_idx().unwrap(), &m.l_csr.col_idx().unwrap(), &m.l_csr.values().unwrap());
-                    settle(&fresh.to_format(lf));
-                    ctx.sync().unwrap();
-                },
-                &mut || {
-                    af::sparse_convert_to(&m.a_csr, af_f).eval();
-                    afx::sync();
-                },
-            ),
-            None => b.run_one(&name, &size, Some(&mut || {
-                settle(&m.l_csr.to_format(lf));
-                ctx.sync().unwrap();
-            }), None, "ArrayFire conversion refused: no AF row"),
-        }
-    }
-
-    // COO -> CSR (construction from triplets).
-    let lo = Sparse::from_triplets(a.rows, a.cols, &rl, &cl, &vl, SparseFormat::Csr);
-    settle(&lo);
-    let af_build = || {
-        let coo = af::sparse(a.rows as u64, a.cols as u64, &va, &ra, &ca, af::SparseFormat::COO);
-        af::sparse_convert_to(&coo, af::SparseFormat::CSR)
-    };
-    let af_ran = if af_ok("coo_to_csr") { attempt(|| af_parts(&af_build())) } else { None };
-    let luma_build = &mut || {
-        settle(&Sparse::from_triplets(a.rows, a.cols, &rl, &cl, &vl, SparseFormat::Csr));
-        ctx.sync().unwrap();
-    };
-    match af_ran {
-        Some(ap) => b.run(
-            "sparse from triplets (COO -> CSR)",
-            &size,
-            same_parts(l_parts(&lo), ap),
-            "luma: from_triplets into CSR; AF: sparse() COO then sparse_convert_to CSR",
-            luma_build,
-            &mut || {
-                af_build().eval();
-                afx::sync();
-            },
-        ),
-        None => b.run_one("sparse from triplets (COO -> CSR)", &size, Some(luma_build), None, "ArrayFire COO -> CSR crashes or fails: no AF row"),
-    }
-}
-
 fn dense_forms(b: &mut Bench, ctx: &luma::Context) {
     let n = 4096usize;
-    // 2 % entries at random positions, multiples of 1/16.
+    // 2 % entries at random positions, multiples of 1/16; a square matrix, so that ArrayFire's
+    // column-major view of the same memory is the transpose.
     let mut g = Gen::new(71);
     let mut dh = vec![0.0f32; n * n];
     for _ in 0..n * n / 50 {
@@ -386,98 +426,105 @@ fn dense_forms(b: &mut Bench, ctx: &luma::Context) {
     }
     let held = dh.iter().filter(|&&v| v != 0.0).count();
     let size = format!("{n} x {n} dense, {} nnz", human(held));
-    let (dl, da) = (lumax::arr(ctx, &dh, [n, n]), afx::arr(&dh, &[n as u64, n as u64]));
+    let dl = lumax::arr(ctx, &dh, [n, n]);
     let ls = Sparse::from_dense(&dl, SparseFormat::Csr);
     settle(&ls);
     let oh: Vec<f32> = {
         let mut g = Gen::new(72);
         (0..n * n).map(|_| g.quant()).collect()
     };
-    let (ol, oa) = (lumax::arr(ctx, &oh, [n, n]), afx::arr(&oh, &[n as u64, n as u64]));
+    let ol = lumax::arr(ctx, &oh, [n, n]);
+    let flip = |v: &[f32]| transposed(v, n, n);
 
-    // dense -> CSR. The dense array is `[cols, rows]` in both libraries; ArrayFire reads it
-    // column-major, so its CSR matrix is the transpose of luma's (same work): the check compares
-    // the multisets of stored values.
-    let luma_from = &mut || {
-        settle(&Sparse::from_dense(&dl, SparseFormat::Csr));
-        ctx.sync().unwrap();
-    };
+    // dense -> CSR and CSR -> dense: ArrayFire's `sparse(dense)` and `dense(sparse)` crash (they
+    // call cusparse's dense conversions): luma only.
     let name = "sparse from dense (dense -> CSR)";
-    match if af_ok("from_dense") { attempt(|| af_parts(&af::sparse_from_dense(&da, af::SparseFormat::CSR)).0) } else { None } {
-        Some(mut av) => {
-            let mut lv = l_parts(&ls).0;
-            lv.sort_by(f32::total_cmp);
-            av.sort_by(f32::total_cmp);
-            let v = if lv == av { Verdict::yes("yes (same multiset of values; AF holds the transpose)") } else { Verdict::no("NO: stored values differ") };
-            b.run(name, &size, v, "AF reads the dense array column-major: its CSR matrix is the transpose of luma's", luma_from, &mut || {
-                af::sparse_from_dense(&da, af::SparseFormat::CSR).eval();
-                afx::sync();
-            });
-        }
-        None => b.run_one(name, &size, Some(luma_from), None, "ArrayFire sparse(dense) crashes or fails: no AF row"),
-    }
-
-    // CSR -> dense.
-    let name = "sparse to dense (CSR -> dense)";
-    let luma_to = &mut || {
-        ls.to_dense().eval().unwrap();
-        ctx.sync().unwrap();
-    };
     let v = exact(&lumax::host(&ls.to_dense()), &dh);
-    let a_sparse = if af_ok("from_dense") { attempt(|| {
-        let s = af::sparse_from_dense(&da, af::SparseFormat::CSR);
-        s.eval();
-        afx::sync();
-        s
-    }) } else { None };
-    match a_sparse.as_ref().filter(|_| af_ok("to_dense")) {
-        Some(sp) => {
-            let v = v.and(match attempt(|| afx::host(&af::sparse_to_dense(sp))) {
-                Some(ad) => exact(&ad, &dh),
-                None => Verdict::no("ArrayFire dense() failed"),
-            });
-            b.run(name, &size, v, "", luma_to, &mut || {
-                af::sparse_to_dense(sp).eval();
-                afx::sync();
-            });
-        }
-        None => b.run_one(name, &size, Some(luma_to), None, "ArrayFire dense() crashes or fails: no AF row"),
+    if !v.ok {
+        println!("!!!!!! MISMATCH in {name}: {}", v.text);
     }
+    b.run_one(
+        name,
+        &size,
+        Some(&mut || {
+            settle(&Sparse::from_dense(&dl, SparseFormat::Csr));
+            ctx.sync().unwrap();
+        }),
+        None,
+        "ArrayFire sparse(dense) segfaults on this install; no reference measured",
+    );
+    b.run_one(
+        "sparse to dense (CSR -> dense)",
+        &size,
+        Some(&mut || {
+            ls.to_dense().eval().unwrap();
+            ctx.sync().unwrap();
+        }),
+        None,
+        "ArrayFire dense(sparse) segfaults on this install; no reference measured",
+    );
 
-    // Elementwise with a dense matrix: product (pattern kept) and sum (dense result).
+    // Elementwise with a dense matrix, against ArrayFire's operators on a sparse array made from
+    // the CSR arrays of the same matrix (that works): the product (pattern kept) and the sum.
     let want_mul: Vec<f32> = dh.iter().zip(&oh).map(|(a, b)| a * b).collect();
-    let v = exact(&lumax::host(&ls.mul_dense(&ol).to_dense()), &want_mul);
+    let want_add: Vec<f32> = dh.iter().zip(&oh).map(|(a, b)| a + b).collect();
     let luma_mul = &mut || {
         settle(&ls.mul_dense(&ol));
         ctx.sync().unwrap();
     };
-    let af_mul = a_sparse.as_ref().filter(|_| af_ok("mul")).and_then(|sp| attempt(|| afx::host(&af::mul(sp, &oa, false))));
-    match (af_mul, a_sparse.as_ref()) {
-        (Some(ao), Some(sp)) if ao.len() == want_mul.len() => {
-            let v = v.and(exact(&ao, &want_mul));
-            b.run("sparse .* dense", &size, v, "luma: sparse result (pattern of A); AF: af::mul of a sparse and a dense array", luma_mul, &mut || {
-                af::mul(sp, &oa, false).eval();
-                afx::sync();
-            });
-        }
-        _ => b.run_one("sparse .* dense", &size, Some(luma_mul), None, "ArrayFire sparse .* dense crashes, fails or has no such operation: no AF row"),
-    }
-    let want_add: Vec<f32> = dh.iter().zip(&oh).map(|(a, b)| a + b).collect();
-    let v = exact(&lumax::host(&ls.add_dense(&ol)), &want_add);
     let luma_add = &mut || {
         ls.add_dense(&ol).eval().unwrap();
         ctx.sync().unwrap();
     };
-    let af_add = a_sparse.as_ref().filter(|_| af_ok("add")).and_then(|sp| attempt(|| afx::host(&af::add(sp, &oa, false))));
-    match (af_add, a_sparse.as_ref()) {
-        (Some(ao), Some(sp)) if ao.len() == want_add.len() => {
-            let v = v.and(exact(&ao, &want_add));
+    let v_mul = exact(&lumax::host(&ls.mul_dense(&ol).to_dense()), &want_mul);
+    let v_add = exact(&lumax::host(&ls.add_dense(&ol)), &want_add);
+    let a_sparse = (af_ok("mul") && af_ok("add")).then(|| {
+        let (mut ptr, mut col, mut val) = (vec![0i32], Vec::new(), Vec::new());
+        // ArrayFire reads `dh` column-major, so it holds the transpose: build the CSR of the
+        // matrix with ArrayFire's own (row, column) meaning from the flipped data.
+        let dt = flip(&dh);
+        for r in 0..n {
+            for c in 0..n {
+                if dt[r * n + c] != 0.0 {
+                    col.push(c as i32);
+                    val.push(dt[r * n + c]);
+                }
+            }
+            ptr.push(col.len() as i32);
+        }
+        let s = af::sparse(n as u64, n as u64, &afx::arr(&val, &[val.len() as u64]), &afx::arr(&ptr, &[ptr.len() as u64]), &afx::arr(&col, &[col.len() as u64]), af::SparseFormat::CSR);
+        s.eval();
+        afx::sync();
+        s
+    });
+    // ArrayFire's `(n, n)` column-major dense operand holding `oh` read as the matrix of luma:
+    // element (r, c) of luma's operand is at r + n * c, i.e. the flipped memory.
+    let oa = afx::arr(&flip(&oh), &[n as u64, n as u64]);
+    match &a_sparse {
+        Some(sp) => {
+            let got = attempt(|| afx::host(&af::mul(sp, &oa, false)));
+            let v = v_mul.and(match got {
+                Some(g) => exact(&flip(&g), &want_mul),
+                None => Verdict::no("af::mul failed"),
+            });
+            b.run("sparse .* dense", &size, v, "AF: af::mul(sparse, dense), dense result; luma: sparse result (pattern of A)", luma_mul, &mut || {
+                af::mul(sp, &oa, false).eval();
+                afx::sync();
+            });
+            let got = attempt(|| afx::host(&af::add(sp, &oa, false)));
+            let v = v_add.and(match got {
+                Some(g) => exact(&flip(&g), &want_add),
+                None => Verdict::no("af::add failed"),
+            });
             b.run("sparse + dense", &size, v, "dense result", luma_add, &mut || {
                 af::add(sp, &oa, false).eval();
                 afx::sync();
             });
         }
-        _ => b.run_one("sparse + dense", &size, Some(luma_add), None, "ArrayFire sparse + dense crashes, fails or has no such operation: no AF row"),
+        None => {
+            b.run_one("sparse .* dense", &size, Some(luma_mul), None, "ArrayFire sparse .* dense unavailable: no AF row");
+            b.run_one("sparse + dense", &size, Some(luma_add), None, "ArrayFire sparse + dense unavailable: no AF row");
+        }
     }
 }
 
@@ -519,8 +566,13 @@ pub fn probe(op: &str) {
         "coo_to_csr" => af::sparse_convert_to(&af::sparse(a.rows as u64, a.cols as u64, &av, &ra, &ca, af::SparseFormat::COO), af::SparseFormat::CSR).eval(),
         "from_dense" => af::sparse_from_dense(&dense, af::SparseFormat::CSR).eval(),
         "to_dense" => af::sparse_to_dense(&csr).eval(),
-        "mul" => af::mul(&csr, &afx::arr(&vec![2.0f32; a.rows * a.cols], &[a.rows as u64, a.cols as u64]), false).eval(),
-        "add" => af::add(&csr, &afx::arr(&vec![2.0f32; a.rows * a.cols], &[a.rows as u64, a.cols as u64]), false).eval(),
+        "mul" | "add" => {
+            let d = afx::arr(&vec![2.0f32; a.rows * a.cols], &[a.rows as u64, a.cols as u64]);
+            let r = if op == "mul" { af::mul(&csr, &d, false) } else { af::add(&csr, &d, false) };
+            // The result must be a dense array that can be read back.
+            assert!(af::sparse_get_format(&r) == af::SparseFormat::DENSE, "the result is sparse");
+            assert_eq!(afx::host(&r).len(), a.rows * a.cols);
+        }
         other => panic!("unknown probe {other}"),
     }
     afx::sync();

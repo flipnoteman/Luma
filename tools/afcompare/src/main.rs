@@ -4,6 +4,7 @@ mod afx;
 mod bench;
 mod cases;
 mod cold;
+mod cusparse;
 mod lumax;
 mod mlp;
 mod sparse;

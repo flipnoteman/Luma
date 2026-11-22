@@ -67,11 +67,15 @@ assert_eq!(a.matmul_t(&y).to_vec()?, vec![1.0, 0.0, 8.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-CSR `A x` and CSC `A^T x` are a gather, a product and a segmented sum over the pointer
-(`sum_segments`): two launches, no atomics, and a hub row of a power-law graph costs no more than
-its entries. The other combinations scatter the products with atomic adds, so `f32` sums can differ
-in the last bits between runs; convert (or transpose) to the compressed form that suits the product
-when the exact order matters. A pending expression as `x` is computed inside the kernel.
+CSR `A x` and CSC `A^T x` (the product whose output runs along the compressed axis) are a
+gather, a product and a segmented sum over the pointer (`sum_segments`) for a vector, two launches
+with no atomics, and a hub row of a power-law graph costs no more than its entries; for a dense
+matrix one invocation per output element walks its row, reading `c` adjacent elements of `x`
+together. The first product of any other combination (CSC `A x`, CSR `A^T x`, COO) scatters with
+atomic adds, so its `f32` sums can differ in the last bits between runs; the second converts the
+matrix once to the form that suits the product and keeps the copy (one more copy of the entries
+for the life of the matrix), and results are then reproducible. A pending expression as `x` is
+computed inside the kernel for a vector.
 
 ## Elementwise operations
 

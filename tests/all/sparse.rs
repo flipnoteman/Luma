@@ -654,3 +654,95 @@ fn large_random_matrix_round_trips() {
         }
     }
 }
+
+#[test]
+fn first_and_repeated_products_agree() {
+    // The first product that is not compressed along its output scatters with atomics, the
+    // second runs from a converted copy: both give the host result, for vectors and matrices.
+    let mut rng = Rng(16);
+    let h = Host::random(&mut rng, 150, 90, 900, true);
+    let d = h.dense();
+    let dt = transpose(&d, 150, 90);
+    for format in FORMATS {
+        for transposed in [false, true] {
+            for c in [1usize, 3, 8] {
+                let (inner, outer, host) = if transposed { (150, 90, &dt) } else { (90, 150, &d) };
+                let x = quantized(&mut rng, inner * c);
+                let xa = if c == 1 { Array::from_slice(&x, inner).unwrap() } else { Array::from_slice(&x, [c, inner]).unwrap() };
+                let want = host_matmul(host, outer, inner, &x, c);
+                let s = h.sparse(format);
+                for call in 0..3 {
+                    let y = if transposed { s.matmul_t(&xa) } else { s.matmul(&xa) };
+                    assert_eq!(y.to_vec().unwrap(), want, "{format:?} t={transposed} c={c} call {call}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matrix_products_beyond_one_dispatch_row() {
+    // rows * c above 65535 * 128 output elements: the kernel's grid has a second row.
+    let (rows, cols, c) = (140_000usize, 300usize, 64usize);
+    let mut rng = Rng(17);
+    let mut h = Host { rows, cols, r: vec![], c: vec![], v: vec![] };
+    for r in 0..rows {
+        for _ in 0..(r % 3) {
+            h.r.push(r as u32);
+            h.c.push(rng.below(cols) as u32);
+            h.v.push(rng.quant());
+        }
+    }
+    let x = quantized(&mut rng, cols * c);
+    let xa = Array::from_slice(&x, [c, cols]).unwrap();
+    let s = h.sparse(SparseFormat::Csr);
+    let y = s.matmul(&xa).to_vec().unwrap();
+    let mut want = vec![0.0f64; rows * c];
+    for k in 0..h.v.len() {
+        for j in 0..c {
+            want[h.r[k] as usize * c + j] += f64::from(h.v[k]) * f64::from(x[h.c[k] as usize * c + j]);
+        }
+    }
+    let want: Vec<f32> = want.into_iter().map(|v| v as f32).collect();
+    assert_eq!(y, want);
+}
+
+#[test]
+fn matrix_products_with_long_and_empty_rows() {
+    // Rows of 1500 and 3000 entries (long rows get a workgroup each), a first and a last row that
+    // are empty, rows of one entry, and 1, 2, 5, 16 columns.
+    let (rows, cols) = (64usize, 4000usize);
+    let mut rng = Rng(18);
+    let mut h = Host { rows, cols, r: vec![], c: vec![], v: vec![] };
+    for r in 1..rows - 1 {
+        let len = match r {
+            7 => 1500,
+            40 => 3000,
+            r if r % 5 == 0 => 0,
+            r => 1 + r % 4,
+        };
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < len {
+            let c = rng.below(cols);
+            if seen.insert(c) {
+                h.r.push(r as u32);
+                h.c.push(c as u32);
+                h.v.push(rng.quant());
+            }
+        }
+    }
+    let d = h.dense();
+    let dt = transpose(&d, rows, cols);
+    for format in FORMATS {
+        let s = h.sparse(format);
+        for c in [1usize, 2, 5, 16] {
+            for transposed in [false, true] {
+                let (inner, outer, host) = if transposed { (rows, cols, &dt) } else { (cols, rows, &d) };
+                let x = quantized(&mut rng, inner * c);
+                let xa = if c == 1 { Array::from_slice(&x, inner).unwrap() } else { Array::from_slice(&x, [c, inner]).unwrap() };
+                let y = if transposed { s.matmul_t(&xa) } else { s.matmul(&xa) };
+                assert_eq!(y.to_vec().unwrap(), host_matmul(host, outer, inner, &x, c), "{format:?} c={c} t={transposed}");
+            }
+        }
+    }
+}

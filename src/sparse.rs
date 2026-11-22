@@ -27,11 +27,15 @@
 //! # Products
 //!
 //! [`Sparse::matmul`] computes `A x` and [`Sparse::matmul_t`] `A^T x` for a vector or a dense
-//! matrix `x`. CSR `A x` and CSC `A^T x` are a gather of `x` at the stored indices, a product with
-//! the values and a segmented sum over the row (column) pointer ([`Array::sum_segments`]): two
-//! launches, no atomics, entries split evenly over the workgroups whatever the row lengths. The
-//! other combinations scatter the products with an atomic add by output index
-//! ([`Array::group_sum`]), whose rounding depends on the order in which the atomics land.
+//! matrix `x`. CSR `A x` and CSC `A^T x` (a product whose output runs along the compressed axis)
+//! are, for a vector, a gather of `x` at the stored indices, a product with the values and a
+//! segmented sum over the row (column) pointer ([`Array::sum_segments`]): two launches, no
+//! atomics, entries split evenly over the workgroups whatever the row lengths; for `c` columns
+//! one invocation per output element walks its row (a custom kernel: the `c` invocations of a row
+//! read `c` adjacent elements of `x`, so the gather is coalesced). The first product of any other
+//! combination scatters the products with an atomic add by output index ([`Array::group_sum`]),
+//! whose rounding depends on the order in which the atomics land; the second converts the matrix
+//! once to the form that runs the first way and keeps that copy (see [`Sparse::matmul`]).
 //!
 //! # Errors
 //!
@@ -42,6 +46,7 @@
 use std::fmt;
 use std::ops::{Div, Mul, Neg};
 use std::panic::Location;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::array::Array;
@@ -51,6 +56,159 @@ use crate::scatter::{bincount, AtomicElem};
 use crate::search::Side;
 use crate::shape::Shape;
 use crate::view::concat;
+
+/// Rows longer than this are not walked by the row kernels (their lanes would idle behind the one
+/// that holds the longest row): a workgroup of its own reduces each, see [`LONG_ROWS`].
+const LONG_ROW: u32 = 1024;
+/// Invocations of a workgroup of every row kernel.
+const WORKGROUP: u32 = 128;
+/// Workgroups along x of the grids of the row kernels (the dispatch limit of every backend).
+const GRID_X: u32 = 65_535;
+
+#[derive(encase::ShaderType)]
+struct RowParams {
+    /// `log2` of the lanes per row of the SpMV kernel; the columns `c` of the SpMM kernels.
+    shape: u32,
+    /// Output elements (SpMM) or rows (SpMV); long rows: how many.
+    total: u32,
+    cap: u32,
+}
+
+/// `y[r]` of the rows of at most `cap` entries, `V = 2^shape` lanes per row: lane `l` sums the
+/// entries `l, l + V, ...` of its row (the `V` lanes read consecutive entries), the lanes of a row
+/// combine in workgroup memory. Long rows are left to [`LONG_ROWS`].
+const SPMV_ROWS: &str = r#"
+struct Params { shape: u32, total: u32, cap: u32 }
+@group(1) @binding(0) var<storage, read> ptr: array<u32>;
+@group(1) @binding(1) var<storage, read> minor: array<u32>;
+@group(1) @binding(2) var<storage, read> val: array<f32>;
+@group(1) @binding(3) var<storage, read> x: array<f32>;
+@group(1) @binding(4) var<storage, read_write> y: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let lanes = 1u << p.shape;
+    let row = ((wg.y * 65535u + wg.x) * 128u + li) >> p.shape;
+    let lane = li & (lanes - 1u);
+    var acc = 0.0;
+    var mine = false;
+    if (row < p.total) {
+        let b = ptr[row];
+        let e = ptr[row + 1u];
+        if (e - b <= p.cap) {
+            mine = true;
+            var k = b + lane;
+            loop {
+                if (k >= e) { break; }
+                acc = acc + val[k] * x[minor[k]];
+                k += lanes;
+            }
+        }
+    }
+    sh[li] = acc;
+    workgroupBarrier();
+    var s = lanes >> 1u;
+    loop {
+        if (s == 0u) { break; }
+        if (lane < s) { sh[li] = sh[li] + sh[li + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    if (mine && lane == 0u) { y[row] = sh[li]; }
+}
+"#;
+
+/// `Y[j, r] = sum_k val[k] * X[j, minor[k]]` over the entries `k` of row `r` (at most `cap` of
+/// them), one invocation per output element, entries in order, four loads in flight.
+const SPMM_ROWS: &str = r#"
+struct Params { shape: u32, total: u32, cap: u32 }
+@group(1) @binding(0) var<storage, read> ptr: array<u32>;
+@group(1) @binding(1) var<storage, read> minor: array<u32>;
+@group(1) @binding(2) var<storage, read> val: array<f32>;
+@group(1) @binding(3) var<storage, read> x: array<f32>;
+@group(1) @binding(4) var<storage, read_write> y: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let t = (wg.y * 65535u + wg.x) * 128u + li;
+    if (t >= p.total) { return; }
+    let c = p.shape;
+    let r = t / c;
+    let j = t - r * c;
+    var k = ptr[r];
+    let e = ptr[r + 1u];
+    if (e - k > p.cap) { return; }
+    var acc = 0.0;
+    loop {
+        if (k + 4u > e) { break; }
+        let c0 = minor[k];
+        let c1 = minor[k + 1u];
+        let c2 = minor[k + 2u];
+        let c3 = minor[k + 3u];
+        let x0 = x[c0 * c + j];
+        let x1 = x[c1 * c + j];
+        let x2 = x[c2 * c + j];
+        let x3 = x[c3 * c + j];
+        acc = acc + val[k] * x0;
+        acc = acc + val[k + 1u] * x1;
+        acc = acc + val[k + 2u] * x2;
+        acc = acc + val[k + 3u] * x3;
+        k += 4u;
+    }
+    loop {
+        if (k >= e) { break; }
+        acc = acc + val[k] * x[minor[k] * c + j];
+        k += 1u;
+    }
+    y[t] = acc;
+}
+"#;
+
+/// The rows longer than `cap`, one workgroup per (row, column `j`): the 128 invocations stride
+/// over the entries and combine in workgroup memory. `total` is rows x columns; `shape` the columns.
+const LONG_ROWS: &str = r#"
+struct Params { shape: u32, total: u32, cap: u32 }
+@group(1) @binding(0) var<storage, read> ptr: array<u32>;
+@group(1) @binding(1) var<storage, read> minor: array<u32>;
+@group(1) @binding(2) var<storage, read> val: array<f32>;
+@group(1) @binding(3) var<storage, read> x: array<f32>;
+@group(1) @binding(4) var<storage, read_write> y: array<f32>;
+@group(1) @binding(5) var<storage, read> rows: array<u32>;
+@group(1) @binding(6) var<uniform> p: Params;
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let g = wg.y * 65535u + wg.x;
+    let c = p.shape;
+    // `total` workgroups are launched exactly (uniform: the whole group takes the same path).
+    let i = g / c;
+    let j = g - i * c;
+    let row = rows[i];
+    let b = ptr[row];
+    let e = ptr[row + 1u];
+    var acc = 0.0;
+    var k = b + li;
+    loop {
+        if (k >= e) { break; }
+        acc = acc + val[k] * x[minor[k] * c + j];
+        k += 128u;
+    }
+    sh[li] = acc;
+    workgroupBarrier();
+    var s = 64u;
+    loop {
+        if (s == 0u) { break; }
+        if (li < s) { sh[li] = sh[li] + sh[li + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    if (li == 0u) { y[row * c + j] = sh[0]; }
+}
+"#;
 
 /// How the entries of a [`Sparse`] matrix are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +262,14 @@ pub struct Sparse<T: SparseElem = f32> {
     /// The expanded pointer: the row of every entry of a CSR matrix, the column of every entry
     /// of a CSC matrix.
     expanded: OnceLock<Array<u32>>,
+    /// The CSR and CSC forms of this matrix, built by the second product that would otherwise
+    /// scatter with atomics (see [`Sparse::matmul`]).
+    as_csr: OnceLock<Box<Sparse<T>>>,
+    as_csc: OnceLock<Box<Sparse<T>>>,
+    /// Products run so far that were not compressed along their output.
+    scattered: AtomicU32,
+    /// The rows longer than [`LONG_ROW`] of a compressed matrix, found at its first product.
+    long: OnceLock<std::result::Result<Option<Array<u32>>, Arc<LumaError>>>,
     error: Option<Arc<LumaError>>,
 }
 
@@ -146,6 +312,10 @@ impl<T: SparseElem> Clone for Sparse<T> {
             col: self.col.clone(),
             val: self.val.clone(),
             expanded,
+            as_csr: OnceLock::new(),
+            as_csc: OnceLock::new(),
+            scattered: AtomicU32::new(0),
+            long: OnceLock::new(),
             error: self.error.clone(),
         }
     }
@@ -215,11 +385,11 @@ impl Sparse<f32> {
         col: Option<Array<u32>>,
         val: Array<f32>,
     ) -> Sparse {
-        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: val.len(), ptr, row, col, val: Some(val), expanded: OnceLock::new(), error: None }
+        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: val.len(), ptr, row, col, val: Some(val), expanded: OnceLock::new(), as_csr: OnceLock::new(), as_csc: OnceLock::new(), scattered: AtomicU32::new(0), long: OnceLock::new(), error: None }
     }
 
     fn poisoned(ctx: &Context, rows: usize, cols: usize, format: SparseFormat, error: Arc<LumaError>) -> Sparse {
-        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: 0, ptr: None, row: None, col: None, val: None, expanded: OnceLock::new(), error: Some(error) }
+        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: 0, ptr: None, row: None, col: None, val: None, expanded: OnceLock::new(), as_csr: OnceLock::new(), as_csc: OnceLock::new(), scattered: AtomicU32::new(0), long: OnceLock::new(), error: Some(error) }
     }
 
     /// A matrix of `rows x cols` without stored entries, in `format`, on the default context.
@@ -255,7 +425,7 @@ impl Sparse<f32> {
                 Err(e) => return Self::poisoned(ctx, rows, cols, format, failure("Sparse::empty", loc, e)),
             }
         };
-        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: 0, ptr, row: None, col: None, val: None, expanded: OnceLock::new(), error: None }
+        Sparse { ctx: ctx.clone(), rows, cols, format, nnz: 0, ptr, row: None, col: None, val: None, expanded: OnceLock::new(), as_csr: OnceLock::new(), as_csc: OnceLock::new(), scattered: AtomicU32::new(0), long: OnceLock::new(), error: None }
     }
 
     /// The non-zero entries of a dense matrix of shape `[cols, rows]` (`rows x cols`, one
@@ -587,6 +757,10 @@ impl Sparse<f32> {
             col,
             val: self.val.clone(),
             expanded,
+            as_csr: OnceLock::new(),
+            as_csc: OnceLock::new(),
+            scattered: AtomicU32::new(0),
+            long: OnceLock::new(),
             error: self.error.clone(),
         }
     }
@@ -598,6 +772,13 @@ impl Sparse<f32> {
     /// `[c, rows]`); see [`Sparse::matmul_t`] for `A^T x`. A shape that is neither poisons the
     /// result with [`LumaError::ShapeMismatch`]. `x` may be a pending expression (it is gathered
     /// from inside the kernel). See the [module documentation](self) for how each format runs.
+    ///
+    /// A product whose output is not the compressed axis of the format (CSC `A x`, CSR `A^T x`,
+    /// COO either way) scatters its products with atomic adds the first time. A second one
+    /// converts the matrix to the compressed form its output wants (a CSR copy for `A x`, a CSC
+    /// copy for `A^T x`, kept with the matrix until it is dropped, at the cost of one more copy
+    /// of the entries) and runs from that: faster on rows with many entries and reproducible
+    /// to the last bit.
     #[track_caller]
     pub fn matmul(&self, x: &Array<f32>) -> Array<f32> {
         self.product(x, false, "Sparse::matmul", Location::caller())
@@ -634,25 +815,29 @@ impl Sparse<f32> {
         if self.nnz == 0 {
             return Array::zeros_on(&self.ctx, out_shape).unwrap_or_else(|e| Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)));
         }
-        let val = self.val.as_ref().expect("entries");
         // The sum over a compressed pointer needs no atomics: CSR `A x`, CSC `A^T x`.
-        let segmented = matches!((self.format, transposed), (SparseFormat::Csr, false) | (SparseFormat::Csc, true));
-        if c == 1 {
-            let y = if segmented {
-                let minor = if self.format == SparseFormat::Csr { self.col.as_ref() } else { self.row.as_ref() };
-                (val * x.reshape(inner).take(minor.expect("entries"))).sum_segments(self.ptr.as_ref().expect("compressed"))
-            } else {
-                let (r, cc) = self.coords();
-                let (gather, scatter) = if transposed { (r, cc) } else { (cc, r) };
-                (val * x.reshape(inner).take(&gather)).group_sum(&scatter, outer)
+        let native = matches!((self.format, transposed), (SparseFormat::Csr, false) | (SparseFormat::Csc, true));
+        if !native && self.scattered.fetch_add(1, Ordering::Relaxed) >= 1 {
+            let form = if transposed { self.compressed(SparseFormat::Csc) } else { self.compressed(SparseFormat::Csr) };
+            return form.product(x, transposed, op, loc);
+        }
+        let val = self.val.as_ref().expect("entries");
+        if native {
+            let minor = if self.format == SparseFormat::Csr { self.col.as_ref() } else { self.row.as_ref() };
+            let (minor, ptr) = (minor.expect("entries"), self.ptr.as_ref().expect("compressed"));
+            return match self.rows_kernels(ptr, minor, val, x, c, outer) {
+                Ok(y) => y.reshape(out_shape),
+                Err(e) => Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
-            return y.reshape(out_shape);
+        }
+        let (r, cc) = self.coords();
+        let (gather, scatter) = if transposed { (r, cc) } else { (cc, r) };
+        if c == 1 {
+            return (val * x.reshape(inner).take(&gather)).group_sum(&scatter, outer).reshape(out_shape);
         }
         // `c` columns: the `c` values of an entry are adjacent in `x` and in the result, so an
         // entry's products are one `[c]` run of the product array, scattered with atomics.
         let nnz = self.nnz;
-        let (r, cc) = self.coords();
-        let (gather, scatter) = if transposed { (r, cc) } else { (cc, r) };
         let j = match Array::<u32>::range_on(&self.ctx, [c, nnz], 0) {
             Ok(j) => j,
             Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
@@ -660,6 +845,67 @@ impl Sparse<f32> {
         let wide = |ids: &Array<u32>| ids.reshape([1, nnz]).broadcast_to([c, nnz]) * c as u32 + &j;
         let prod = val.reshape([1, nnz]).broadcast_to([c, nnz]) * x.take(&wide(&gather));
         prod.group_sum(&wide(&scatter), outer * c).reshape(out_shape)
+    }
+
+    /// This matrix in a compressed `format` (CSR or CSC), converted once and kept.
+    fn compressed(&self, format: SparseFormat) -> &Sparse {
+        if self.format == format {
+            return self;
+        }
+        let slot = if format == SparseFormat::Csr { &self.as_csr } else { &self.as_csc };
+        slot.get_or_init(|| Box::new(self.to_format(format)))
+    }
+
+    /// The rows longer than [`LONG_ROW`] of a compressed matrix (`None` if there are none), found
+    /// once with a readback.
+    fn long_rows(&self, ptr: &Array<u32>) -> Result<Option<Array<u32>>> {
+        let plan = self.long.get_or_init(|| {
+            let n = ptr.len() - 1;
+            let len = ptr.slice(0, 1..=n) - ptr.slice(0, 0..n);
+            len.gt(LONG_ROW).nonzero().map_err(Arc::new)
+        });
+        match plan {
+            Ok(rows) => Ok(rows.clone()),
+            Err(e) => Err(LumaError::clone(e)),
+        }
+    }
+
+    /// `Y = A X` for a compressed matrix (`ptr`, the `minor` index of every entry, `val`) and a
+    /// vector or a dense `X` of shape `[c, inner]`, from the row kernels: rows of at most
+    /// [`LONG_ROW`] entries by `2^k` lanes each (a vector: `2^k` the power of two nearest the
+    /// mean row length, at most 32) or by one invocation per output element (columns: the `c`
+    /// invocations of a row read the same entry and `c` adjacent elements of `X`, so the gather is
+    /// coalesced), longer rows by a workgroup per row (and column). Sums are in entry order per
+    /// lane, so the results are the same on every run.
+    fn rows_kernels(&self, ptr: &Array<u32>, minor: &Array<u32>, val: &Array<f32>, x: &Array<f32>, c: usize, outer: usize) -> Result<Array<f32>> {
+        let shape = if c == 1 { Shape::from(outer) } else { Shape::new([c, outer, 1, 1]) };
+        shape.validate()?;
+        let total = u32::try_from(shape.len()).map_err(|_| LumaError::DimensionTooLarge { shape: shape.dims() })?;
+        let long = self.long_rows(ptr)?;
+        let mut y = Array::<f32>::alloc(&self.ctx, shape)?;
+        let grid = |groups: usize| -> Result<[u32; 3]> {
+            let groups = u32::try_from(groups).map_err(|_| LumaError::DimensionTooLarge { shape: [groups, 1, 1, 1] })?;
+            Ok([groups.min(GRID_X), groups.div_ceil(GRID_X), 1])
+        };
+        if c == 1 {
+            let avg = self.nnz as f64 / outer as f64;
+            let lanes_log = (avg.max(1.0).log2().ceil() as u32).min(5);
+            let kernel = self.ctx.kernel(SPMV_ROWS).label("sparse_spmv_rows").build()?;
+            let params = RowParams { shape: lanes_log, total: outer as u32, cap: LONG_ROW };
+            let groups = (outer << lanes_log).div_ceil(WORKGROUP as usize);
+            kernel.launch_raw(grid(groups)?, crate::args![ptr, minor, val, x, &mut y, crate::kernel::uniform(&params)])?;
+        } else {
+            let kernel = self.ctx.kernel(SPMM_ROWS).label("sparse_spmm_rows").build()?;
+            let params = RowParams { shape: c as u32, total, cap: LONG_ROW };
+            let groups = (total as usize).div_ceil(WORKGROUP as usize);
+            kernel.launch_raw(grid(groups)?, crate::args![ptr, minor, val, x, &mut y, crate::kernel::uniform(&params)])?;
+        }
+        if let Some(rows) = long {
+            let kernel = self.ctx.kernel(LONG_ROWS).label("sparse_long_rows").build()?;
+            let params = RowParams { shape: c as u32, total: (rows.len() * c) as u32, cap: LONG_ROW };
+            kernel.launch_raw(grid(rows.len() * c)?, crate::args![ptr, minor, val, x, &mut y, &rows, crate::kernel::uniform(&params)])?;
+        }
+        Ok(y)
     }
 
     // -- Elementwise --
