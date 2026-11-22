@@ -757,23 +757,22 @@ const NEXT_CHUNK: u32 = 2;
 /// columns per workgroup.
 const BLOCK_MIN: usize = 128;
 
-/// Whether a big matrix of `rr >= cc` is decomposed through the QR factorisation of its tall form
-/// (see [`preconditioned`]): from 1024 columns on, and from [`BLOCK_MIN`] columns on when it is
-/// three times taller than wide (the Jacobi sweeps then work on the square `R` instead of on
-/// columns of all the rows). `LUMA_SVD_PRECOND=off` turns it off, a number changes the 1024.
-fn precondition(rr: usize, cc: usize) -> bool {
+/// Whether a big matrix of `cc` columns (the smaller side) is decomposed through the QR factorisation of its tall form
+/// (see [`preconditioned`]): from 1024 columns on (a tall one of 512 columns and 16384 rows was
+/// slower through it: the QR panels of so many rows cost more than the sweeps save).
+/// `LUMA_SVD_PRECOND=off` turns it off, a number changes the 1024.
+fn precondition(cc: usize) -> bool {
     let setting = std::env::var("LUMA_SVD_PRECOND").ok();
     if setting.as_deref() == Some("off") {
         return false;
     }
-    let min = setting.and_then(|v| v.parse().ok()).unwrap_or(1024);
-    cc >= min || (cc >= BLOCK_MIN && rr >= 3 * cc)
+    cc >= setting.and_then(|v| v.parse().ok()).unwrap_or(1024)
 }
 
 /// Decomposes one matrix (`[cols, rows]`) in global memory.
 fn big(a: &Array<f32>, kind: Kind, vectors: bool, tol: f32) -> Result<Outputs, LumaError> {
     let [cols, rows, ..] = a.shape().dims();
-    if kind == Kind::Svd && tol == 0.0 && precondition(rows.max(cols), rows.min(cols)) {
+    if kind == Kind::Svd && tol == 0.0 && precondition(rows.min(cols)) {
         preconditioned(a, vectors)
     } else {
         plain(a, kind, vectors, tol)
