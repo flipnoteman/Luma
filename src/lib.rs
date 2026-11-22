@@ -34,6 +34,9 @@
 //! * **Custom kernels**: [`Kernel`] runs your own WGSL on arrays, in the same batch.
 //! * **GPU timing**: [`Context::profile`] measures the GPU time per kernel where the adapter
 //!   supports timestamp queries.
+//! * **Incremental accumulation**: [`Accumulator`], [`CoMoments`], [`Covariance`], [`Histogram`],
+//!   [`Histogram2d`] and [`TopK`] fold batches that arrive over time into mergeable states on the
+//!   GPU; see the guide chapter "Incremental accumulation".
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
 // exceeds the default limit on recent nightlies (future-compat lint
@@ -89,6 +92,8 @@ mod guide {
     pub mod vision_regions {}
     #[doc = include_str!("../guide/src/vision-descriptors.md")]
     pub mod vision_descriptors {}
+    #[doc = include_str!("../guide/src/accumulators.md")]
+    pub mod accumulators {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]
@@ -100,6 +105,7 @@ mod guide {
 // The derive emits `::luma::` paths, also inside this crate.
 extern crate self as luma;
 
+mod accum;
 mod arg;
 mod array;
 mod builtin;
@@ -156,6 +162,7 @@ mod view;
 mod image;
 mod vision;
 
+pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;

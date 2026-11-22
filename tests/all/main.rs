@@ -83,3 +83,4 @@ mod lu;
 mod svd;
 mod eigh;
 mod qr;
+mod accum;

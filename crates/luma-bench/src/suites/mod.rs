@@ -1,6 +1,7 @@
 //! The suites, in the order they run. Each `run` verifies its cases against host references and
 //! times them through the [`Harness`](crate::harness::Harness).
 
+pub mod accum;
 pub mod cfd;
 pub mod compute;
 pub mod datasci;
@@ -21,4 +22,5 @@ pub const ALL: &[(&str, SuiteFn)] = &[
     ("compute", compute::run),
     ("jit", jit::run),
     ("sparse", sparse::run),
+    ("accum", accum::run),
 ];

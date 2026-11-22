@@ -25,6 +25,7 @@
   - [Canny edges, anisotropic diffusion, mean shift](vision-edges.md)
   - [Connected-component labelling, confidence connected components, deconvolution](vision-regions.md)
   - [ORB, SIFT and GLOH](vision-descriptors.md)
+- [Incremental accumulation](accumulators.md)
 
 # Reference
 
