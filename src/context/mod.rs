@@ -34,6 +34,8 @@ pub(crate) const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
     builtins: BuildCache<(Builtin, &'static str), Arc<KernelCore>>,
+    /// The tables of Bluestein's algorithm by (length, inverse), see [`crate::spectral`].
+    chirps: Mutex<std::collections::HashMap<(u32, bool), Arc<crate::spectral::ChirpTables>>>,
     /// Lazy-evaluation state: fused kernels and the pending expressions.
     jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
@@ -583,6 +585,7 @@ impl Context {
                 cost: OnceLock::new(),
                 reduce_counter: OnceLock::new(),
                 builtins: BuildCache::default(),
+                chirps: Mutex::new(std::collections::HashMap::new()),
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
@@ -945,6 +948,11 @@ impl Context {
     /// The kernel parameter set chosen for this context's GPU (see [`TuningProfile`]).
     pub fn tuning_profile(&self) -> TuningProfile {
         self.inner.tuning.profile
+    }
+
+    /// The cache of Bluestein tables.
+    pub(crate) fn chirps(&self) -> &Mutex<std::collections::HashMap<(u32, bool), Arc<crate::spectral::ChirpTables>>> {
+        &self.inner.chirps
     }
 
     pub(crate) fn tuning(&self) -> &Tuning {

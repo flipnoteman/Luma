@@ -28,6 +28,7 @@ mod scans;
 mod signal;
 mod special;
 mod structure;
+mod spectral;
 
 use std::time::{Duration, Instant};
 
@@ -101,6 +102,7 @@ pub fn run(h: &mut Harness) {
     physics::run(h);
     signal::run(h);
     imageops::run(h);
+    spectral::run(h);
     crypto::run(h);
     special::run(h);
     structure::run(h);

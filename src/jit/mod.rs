@@ -193,7 +193,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
-use crate::builtin::{BinOp, Class, CmpOp, UnOp};
+use crate::builtin::{BinOp, Class, CmpOp, Part, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu::built::BuildCache;
@@ -299,6 +299,9 @@ pub(crate) enum ElemTy {
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
     Df32,
+    /// Complex single precision: a `vec2<f32>` `(re, im)` with the arithmetic of
+    /// `builtin::complex_library`.
+    C32,
 }
 
 impl ElemTy {
@@ -319,6 +322,8 @@ impl ElemTy {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
             Some(ElemTy::Df32)
+        } else if id == TypeId::of::<crate::complex::C32>() {
+            Some(ElemTy::C32)
         } else {
             None
         }
@@ -334,7 +339,7 @@ impl ElemTy {
             ElemTy::U32 | ElemTy::Bool => "u32",
             ElemTy::I32 => "i32",
             ElemTy::F64 => "f64",
-            ElemTy::Df32 => "vec2<f32>",
+            ElemTy::Df32 | ElemTy::C32 => "vec2<f32>",
         }
     }
 
@@ -344,7 +349,7 @@ impl ElemTy {
         match self {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
             ElemTy::Bool => ElemLayout::PACKED,
-            ElemTy::F64 | ElemTy::Df32 => ElemLayout::plain(8),
+            ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
 
@@ -365,7 +370,7 @@ impl ElemTy {
     pub(crate) fn slots(self) -> usize {
         match self {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => 1,
-            ElemTy::Df32 => 2,
+            ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
     }
@@ -379,6 +384,7 @@ impl ElemTy {
             ElemTy::Bool => "bool",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
+            ElemTy::C32 => "C32",
         }
     }
 }
@@ -396,6 +402,10 @@ pub(crate) enum OpKind {
     Powf,
     /// `clamp(x, lo, hi)`; operands: x, lo, hi (scalars).
     Clamp,
+    /// A real quantity of a complex operand (see [`Part`]); the result is an [`ElemTy::F32`].
+    Part(Part),
+    /// `complex(re, im)`; operands: re, im (of type `F32`; the op's type); the result is a [`ElemTy::C32`].
+    Make,
     /// `cond != 0 ? a : b`; operands: condition (a `bool`, or any `u32` word: non-zero is true), a, b.
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
@@ -610,10 +620,11 @@ impl ViewMap {
 impl OpKind {
     pub(crate) fn arity(&self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Part(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
+            | OpKind::Make
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
@@ -662,6 +673,8 @@ impl Op {
     pub(crate) fn out_ty(&self) -> ElemTy {
         match self.kind {
             OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Bool,
+            OpKind::Part(_) => ElemTy::F32,
+            OpKind::Make => ElemTy::C32,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
@@ -715,11 +728,11 @@ impl Scalar {
     }
 
     /// The `f32` uniform slots (as bit patterns) this scalar occupies in a program: one for a
-    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
+    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => [self.bits as u32, 0, 0],
-            ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
+            ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
                 let a = v as f32;
@@ -1903,16 +1916,19 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
 /// the math functions and `powf` only on the CUDA and CPU backends (and needs a device with 64-bit shader floats), `Df32`
-/// only the operations of its library, and neither has generators; the bitwise operations only
+/// only the operations of its library, `C32` the field operations, `exp`, `sqrt`, equality and the
+/// real parts, and none of the three has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
 fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
-    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
+    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32 | ElemTy::C32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
-        OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool),
+        OpKind::Compare(cmp) => cmp.exists_for(op.ty),
+        OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
+        OpKind::Clamp => op.ty != ElemTy::C32,
+        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
         OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,

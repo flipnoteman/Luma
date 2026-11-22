@@ -173,6 +173,7 @@ pub(crate) fn constant<T: ScalarType>(value: f64) -> std::result::Result<T, Luma
         ElemTy::U32 => word(&(value as u32).to_ne_bytes()),
         ElemTy::I32 => word(&(value as i32).to_ne_bytes()),
         ElemTy::Bool => word(&u32::from(value != 0.0).to_ne_bytes()),
+        ElemTy::C32 => word(&[(value as f32).to_ne_bytes(), 0.0f32.to_ne_bytes()].concat()),
     })
 }
 

@@ -108,6 +108,8 @@ pub(crate) enum UnOp {
     Sigmoid,
     /// The identity: a copy of the operand (internal).
     Id,
+    /// The complex conjugate (`C32` only).
+    Conj,
     /// Bitwise complement (`u32` only).
     BitNot,
     /// Shift left by a constant amount `0..32` (`u32` only). The amount is part of the
@@ -361,6 +363,7 @@ impl UnOp {
             UnOp::Tgamma => "luma_tgamma(x)",
             UnOp::Sigmoid => "(1.0 / (1.0 + exp(-x)))",
             UnOp::Id => "x",
+            UnOp::Conj => "vec2<f32>(x.r, -x.g)",
             UnOp::BitNot => "~x",
             UnOp::Shl(k) => by_constant(0, k),
             UnOp::Shr(k) => by_constant(1, k),
@@ -405,6 +408,7 @@ impl UnOp {
             UnOp::Tgamma => "tgamma",
             UnOp::Sigmoid => "sigmoid",
             UnOp::Id => "copy",
+            UnOp::Conj => "conj",
             UnOp::BitNot => "not",
             UnOp::Shl(_) => "shl",
             UnOp::Shr(_) => "shr",
@@ -471,8 +475,16 @@ impl UnOp {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::F32 if self.is_bitwise() => None,
+            ElemTy::F32 if self.is_bitwise() || self == UnOp::Conj => None,
             ElemTy::F32 => Some(self.expr()),
+            ElemTy::C32 => match self {
+                UnOp::Neg => Some("-x"),
+                UnOp::Conj => Some(self.expr()),
+                UnOp::Sqrt => Some("c_sqrt(x)"),
+                UnOp::Exp => Some("c_exp(x)"),
+                UnOp::Id => Some("x"),
+                _ => None,
+            },
             ElemTy::F64 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
                 // The `f64` math functions exist on the backends with `f64` math (CUDA and the CPU, see
@@ -613,6 +625,12 @@ impl BinOp {
                 BinOp::Copysign => Some("luma_copysignd(x, y)"),
                 _ => None,
             },
+            ElemTy::C32 => match self {
+                BinOp::Add | BinOp::Sub => Some(self.expr()),
+                BinOp::Mul => Some("c_mul(x, y)"),
+                BinOp::Div => Some("c_div(x, y)"),
+                _ => None,
+            },
             ElemTy::Df32 => match self {
                 BinOp::Add => Some("df_add(x, y)"),
                 BinOp::Sub => Some("df_add(x, -y)"),
@@ -651,9 +669,18 @@ impl CmpOp {
 }
 
 impl CmpOp {
+    /// Whether the comparison exists for elements of type `ty`: complex numbers are only equal or not.
+    pub(crate) fn exists_for(self, ty: ElemTy) -> bool {
+        ty != ElemTy::C32 || matches!(self, CmpOp::Eq | CmpOp::Ne)
+    }
+
     /// [`CmpOp::expr`] for elements of type `ty`.
     pub(crate) fn expr_for(self, ty: ElemTy) -> &'static str {
         match ty {
+            ElemTy::C32 => match self {
+                CmpOp::Ne => "select(1u, 0u, c_eq(x, y))",
+                _ => "select(0u, 1u, c_eq(x, y))",
+            },
             ElemTy::Df32 => match self {
                 CmpOp::Lt => "select(0u, 1u, df_lt(x, y))",
                 CmpOp::Le => "select(0u, 1u, df_le(x, y))",
@@ -665,6 +692,98 @@ impl CmpOp {
             _ => self.expr(),
         }
     }
+}
+
+/// A real quantity of a complex number (see [`ElemTy::C32`]): the operation maps an element
+/// `vec2<f32>` `(re, im)` to an `f32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Part {
+    /// The real part.
+    Real,
+    /// The imaginary part.
+    Imag,
+    /// The modulus, scaled so that it neither overflows nor underflows where the result is
+    /// representable.
+    Abs,
+    /// The argument `atan2(im, re)`.
+    Arg,
+    /// `re * re + im * im`.
+    NormSqr,
+}
+
+impl Part {
+    /// The quantity as a WGSL expression of the operand `x` (its components are `r` and `g`:
+    /// [`substitute`] replaces every `x` of the template, `x.x` included).
+    pub(crate) fn expr(self) -> &'static str {
+        match self {
+            Part::Real => "x.r",
+            Part::Imag => "x.g",
+            Part::Abs => "c_abs(x)",
+            Part::Arg => "atan2(x.g, x.r)",
+            Part::NormSqr => "(x.r * x.r + x.g * x.g)",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Part::Real => "real",
+            Part::Imag => "imag",
+            Part::Abs => "abs",
+            Part::Arg => "arg",
+            Part::NormSqr => "norm_sqr",
+        }
+    }
+}
+
+/// The complex arithmetic that is not a single `f32` operation per component, on `vec2<f32>` `(re,
+/// im)`: the functions of [`BinOp::expr_for`], [`UnOp::expr_for`], [`CmpOp::expr_for`] and
+/// [`Part::expr`] for `C32`. Pure `f32` arithmetic without the guard of [`df_library`], so that the
+/// compiler fuses the products into `fma`.
+///
+/// * `c_mul`: the textbook product.
+/// * `c_div`: Smith's algorithm (the quotient of the components of the denominator scales the
+///   rest, so no intermediate overflows where the result is representable); a zero denominator
+///   gives `(re / 0, im / 0)`, infinity or `NaN` per component as `C99` Annex G has it, with no
+///   trap.
+/// * `c_abs`: the modulus from the components scaled by a power of two (exact) when the larger is
+///   above `2^62` or below `2^-62`, so no square overflows or underflows, and with no division
+///   (a fast division returns 0 for a divisor above `2^126`). Infinite if a component is.
+/// * `c_exp`: `e^re (cos im, sin im)`, the imaginary part of the result keeps the sign of a zero `im`
+///   (so `exp(inf + 0i)` is `inf + 0i`, not `NaN`).
+/// * `c_sqrt`: the principal square root, `(t, im / 2t)` with `t = sqrt((|z| + |re|) / 2)`
+///   on the right half-plane and the mirrored form on the left one (no cancellation).
+pub(crate) fn complex_library() -> &'static str {
+    "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let big = abs(b.y) <= abs(b.x);
+    let r = select(b.x / b.y, b.y / b.x, big);
+    let d = select(b.x * r + b.y, b.x + b.y * r, big);
+    let n = select(vec2<f32>(a.x * r + a.y, a.y * r - a.x), vec2<f32>(a.x + a.y * r, a.y - a.x * r), big);
+    return select(n / d, a / b.x, (b.x == 0.0) & (b.y == 0.0));
+}
+fn c_abs(a: vec2<f32>) -> f32 {
+    let x = abs(a.x); let y = abs(a.y);
+    let m = max(x, y);
+    let huge = m > 4.611686e18;
+    let tiny = m < 2.1684043e-19;
+    let down = select(select(1.0, 7.3786976e19, tiny), 1.3552527e-20, huge);
+    let up = select(select(1.0, 1.3552527e-20, tiny), 7.3786976e19, huge);
+    let r = sqrt((x * down) * (x * down) + (y * down) * (y * down)) * up;
+    return select(r, bitcast<f32>(0x7f800000u), (x > 3.4028235e38) | (y > 3.4028235e38));
+}
+fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x == b.x) & (a.y == b.y); }
+fn c_exp(a: vec2<f32>) -> vec2<f32> {
+    let e = exp(a.x);
+    return vec2<f32>(e * cos(a.y), select(e * sin(a.y), a.y, a.y == 0.0));
+}
+fn c_sqrt(a: vec2<f32>) -> vec2<f32> {
+    let t = sqrt(0.5 * (c_abs(a) + abs(a.x)));
+    let u = a.y / (2.0 * t);
+    let flipped = select(t, -t, (bitcast<u32>(a.y) & 0x80000000u) != 0u);
+    let root = select(vec2<f32>(abs(u), flipped), vec2<f32>(t, u), a.x >= 0.0);
+    return select(root, vec2<f32>(0.0, a.y), (a.x == 0.0) & (a.y == 0.0));
+}
+"
 }
 
 /// A test of what kind of floating-point value an element is, read from the bits of its
@@ -1116,6 +1235,13 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
+    /// One pass of a public FFT, see [`crate::dft_kernel`].
+    Dft(crate::dft_kernel::DftPass),
+    /// The packing step of a real FFT (`true`: unpack a spectrum after the forward transform; the second flag: multiply the spectrum by a table first, inverse only),
+    /// see [`crate::spectral`].
+    RealStage(bool, bool),
+    /// The chirp tables of Bluestein's algorithm, see [`crate::spectral`].
+    Chirp,
     /// The convergence gate between the steps of `iterate_until`; arguments: the residual, the
     /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
     /// `{tol, step, words}`.
@@ -2907,6 +3033,9 @@ impl Builtin {
             Builtin::Conv1d => BuiltinKernel::Module(conv1d_module()),
             Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
             Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
+            Builtin::Dft(pass) => wgsl(crate::dft_kernel::source(&pass)),
+            Builtin::RealStage(forward, table) => wgsl(crate::spectral::real_stage_source(forward, table)),
+            Builtin::Chirp => wgsl(crate::spectral::chirp_source()),
             Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
             Builtin::Tridiagonal { block, starts, workgroup, twisted } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup), twisted)),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {

@@ -463,7 +463,7 @@ pub fn batched(b: &mut Bench) {
 pub fn fft(b: &mut Bench) {
     b.guarded("fft", |b| {
         let ctx = b.ctx.clone();
-        // luma has no public FFT, only FFT convolution (`conv1d_fft`, built on its own FFT passes):
+        // FFT convolution (`conv1d_fft`, built on luma's convolution FFT passes):
         // compare that with ArrayFire's `fft_convolve1` (cuFFT), full linear convolution in both.
         for (n, k) in [(1_000_000usize, 4096usize), (16_000_000, 4096), (1_000_000, 1_000_000)] {
             let x = uniform(n, 31, -1.0, 1.0);
@@ -497,26 +497,120 @@ pub fn fft(b: &mut Bench) {
                 },
             );
         }
-        // ArrayFire alone: raw complex transforms, for reference (no luma API to compare with).
-        let cplx = |n: usize, seed: u64| -> Vec<af::c32> {
+        // Complex and real transforms: luma's own FFT (`fft`, `ifft`, `rfft`, `fft2`, `fft3`) against cuFFT through ArrayFire.
+        let cplx = |n: usize, seed: u64| -> Vec<(f32, f32)> {
             let (re, im) = (uniform(n, seed, -1.0, 1.0), uniform(n, seed + 1, -1.0, 1.0));
-            re.iter().zip(&im).map(|(&r, &i)| af::c32::new(r, i)).collect()
+            re.iter().zip(&im).map(|(&r, &i)| (r, i)).collect()
         };
-        for n in [1_000_000usize, 16_000_000] {
+        let flat_l = |v: &[luma::C32]| -> Vec<f32> { v.iter().flat_map(|c| [c.re, c.im]).collect() };
+        let flat_a = |v: &[af::c32]| -> Vec<f32> { v.iter().flat_map(|c| [c.re, c.im]).collect() };
+        let agree = |l: &[luma::C32], a: &[af::c32]| {
+            let (l, a) = (flat_l(l), flat_a(a));
+            compare(&l, &a, 0.0, 5e-5 * rms(&a))
+        };
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
             let c = cplx(n, 33);
-            let ca = afx::arr(&c, &[n as u64]);
-            b.run_one("6 FFT 1D complex c2c (ArrayFire only)", &human(n), None, Some(&mut || {
-                af::fft(&ca, 1.0, 0).eval();
-                afx::sync();
-            }), "luma has no FFT API: no luma row");
+            let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+            let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+            let (xl, xa) = (lumax::arr(&ctx, &lc, n), afx::arr(&ac, &[n as u64]));
+            let v = agree(&lumax::host(&xl.fft()), &afx::host(&af::fft(&xa, 1.0, 0)));
+            b.run(
+                "6 FFT 1D complex c2c (forward)",
+                &human(n),
+                v,
+                "luma fft vs AF fft (cuFFT)",
+                &mut || {
+                    xl.fft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::fft(&xa, 1.0, 0).eval();
+                    afx::sync();
+                },
+            );
+            let v = agree(&lumax::host(&xl.ifft()), &afx::host(&af::ifft(&xa, 1.0 / n as f64, 0)));
+            b.run(
+                "6 FFT 1D complex c2c (inverse)",
+                &human(n),
+                v,
+                "luma ifft vs AF ifft (cuFFT)",
+                &mut || {
+                    xl.ifft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::ifft(&xa, 1.0 / n as f64, 0).eval();
+                    afx::sync();
+                },
+            );
+        }
+        for n in [1_000_000usize, 16_000_000, 1_000_003, 1 << 20, 1 << 24] {
+            let r = uniform(n, 37, -1.0, 1.0);
+            let (xl, xa) = (lumax::arr(&ctx, &r, n), afx::arr(&r, &[n as u64]));
+            let v = agree(&lumax::host(&xl.rfft()), &afx::host(&af::fft_r2c(&xa, 1.0, 0)));
+            b.run(
+                "6 FFT 1D real-to-complex",
+                &human(n),
+                v,
+                "luma rfft vs AF fft_r2c (cuFFT R2C)",
+                &mut || {
+                    xl.rfft().eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::fft_r2c(&xa, 1.0, 0).eval();
+                    afx::sync();
+                },
+            );
         }
         let n = 2048usize;
         let c = cplx(n * n, 35);
-        let ca = afx::arr(&c, &[n as u64, n as u64]);
-        b.run_one("6 FFT 2D complex c2c (ArrayFire only)", "2048 x 2048", None, Some(&mut || {
-            af::fft2(&ca, 1.0, 0, 0).eval();
-            afx::sync();
-        }), "luma has no FFT API (no 2D convolution either): no luma row");
+        let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+        let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+        let (xl, xa) = (lumax::arr(&ctx, &lc, [n, n]), afx::arr(&ac, &[n as u64, n as u64]));
+        let v = agree(&lumax::host(&xl.fft2()), &afx::host(&af::fft2(&xa, 1.0, 0, 0)));
+        b.run("6 FFT 2D complex c2c (forward)", "2048 x 2048", v, "luma fft2 vs AF fft2", &mut || { xl.fft2().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::fft2(&xa, 1.0, 0, 0).eval(); afx::sync(); });
+        let v = agree(&lumax::host(&xl.ifft2()), &afx::host(&af::ifft2(&xa, 1.0 / (n * n) as f64, 0, 0)));
+        b.run("6 FFT 2D complex c2c (inverse)", "2048 x 2048", v, "luma ifft2 vs AF ifft2", &mut || { xl.ifft2().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::ifft2(&xa, 1.0 / (n * n) as f64, 0, 0).eval(); afx::sync(); });
+        let n = 256usize;
+        let c = cplx(n * n * n, 39);
+        let lc: Vec<luma::C32> = c.iter().map(|&(r, i)| luma::C32::new(r, i)).collect();
+        let ac: Vec<af::c32> = c.iter().map(|&(r, i)| af::c32::new(r, i)).collect();
+        let (xl, xa) = (lumax::arr(&ctx, &lc, [n, n, n]), afx::arr(&ac, &[n as u64, n as u64, n as u64]));
+        let v = agree(&lumax::host(&xl.fft3()), &afx::host(&af::fft3(&xa, 1.0, 0, 0, 0)));
+        b.run("6 FFT 3D complex c2c (forward)", "256^3", v, "luma fft3 vs AF fft3", &mut || { xl.fft3().eval().unwrap(); ctx.sync().unwrap(); }, &mut || { af::fft3(&xa, 1.0, 0, 0, 0).eval(); afx::sync(); });
+        // FFT convolution in two and three dimensions (same-size output, odd kernels).
+        for (sd, kd) in [([2048usize, 2048, 1], [15usize, 15, 1]), ([4096, 4096, 1], [31, 31, 1]), ([256, 256, 256], [9, 9, 9])] {
+            let three = sd[2] > 1;
+            let (sl, kl) = (sd.iter().product::<usize>(), kd.iter().product::<usize>());
+            let x = uniform(sl, 51, -1.0, 1.0);
+            let kern = uniform(kl, 52, -1.0, 1.0);
+            let ldims: Vec<usize> = if three { sd.to_vec() } else { sd[..2].to_vec() };
+            let kdims: Vec<usize> = if three { kd.to_vec() } else { kd[..2].to_vec() };
+            let shape = |d: &[usize]| luma::Shape::from([d[0], d[1], *d.get(2).unwrap_or(&1), 1]);
+            let (xl, kl_) = (lumax::arr(&ctx, &x, shape(&ldims)), lumax::arr(&ctx, &kern, shape(&kdims)));
+            let adims = |d: &[usize]| d.iter().map(|&v| v as u64).collect::<Vec<_>>();
+            let (xa, ka) = (afx::arr(&x, &adims(&ldims)), afx::arr(&kern, &adims(&kdims)));
+            let luma_conv = |x: &luma::Array<f32>, k: &luma::Array<f32>| if three { x.fft_convolve3(k, luma::ConvMode::Same) } else { x.fft_convolve2(k, luma::ConvMode::Same) };
+            let af_conv = |x: &af::Array<f32>, k: &af::Array<f32>| if three { af::fft_convolve3(x, k, af::ConvMode::DEFAULT) } else { af::fft_convolve2(x, k, af::ConvMode::DEFAULT) };
+            let (lo, ao) = (lumax::host(&luma_conv(&xl, &kl_)), afx::host(&af_conv(&xa, &ka)));
+            let v = compare(&lo, &ao, 0.0, 2e-4 * rms(&ao));
+            let size = format!("{} (x) {}", ldims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"), kdims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x"));
+            b.run(
+                if three { "6 FFT convolution 3D (real)" } else { "6 FFT convolution 2D (real)" },
+                &size,
+                v,
+                "luma fft_convolve (same) vs AF fft_convolve (cuFFT)",
+                &mut || {
+                    luma_conv(&xl, &kl_).eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af_conv(&xa, &ka).eval();
+                    afx::sync();
+                },
+            );
+        }
     });
 }
 

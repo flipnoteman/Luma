@@ -280,7 +280,7 @@ impl<'a> Eval<'a> {
                         let cast = cast_fn(ty, to)?;
                         zip(len, &a, &b, &c, |x, _, _| cast(x))
                     }
-                    OpKind::Generate(_) | OpKind::Shift(_) => return None,
+                    OpKind::Generate(_) | OpKind::Shift(_) | OpKind::Part(_) | OpKind::Make => return None,
                 })
             }
         }

@@ -1404,6 +1404,7 @@ assign_rhs_value!(u32);
 assign_rhs_value!(i32);
 assign_rhs_value!(bool);
 assign_rhs_value!(Df32);
+assign_rhs_value!(crate::complex::C32);
 assign_rhs_host!(f32);
 assign_rhs_host!(u32);
 assign_rhs_host!(i32);
@@ -1493,6 +1494,7 @@ view_arithmetic_values!(f32);
 view_arithmetic_values!(u32);
 view_arithmetic_values!(f64);
 view_arithmetic_values!(Df32);
+view_arithmetic_values!(crate::complex::C32);
 view_arithmetic_host!(f32);
 view_arithmetic_host!(u32);
 

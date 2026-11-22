@@ -21,7 +21,7 @@ use luma_core::kir::{
     KirType, LocalId, ModuleBuilder, ScalarTy, Val,
 };
 
-use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, UnOp, df_library, special_helpers};
+use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, Part, UnOp, complex_library, df_library, special_helpers};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
 use crate::gpu::lower::{Library, finish, library};
@@ -30,7 +30,7 @@ use crate::tuning::Tuning;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::WORKGROUP;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -52,7 +52,7 @@ pub(super) fn reg(ty: ElemTy) -> KirType {
         ElemTy::U32 | ElemTy::Bool => KirType::U32,
         ElemTy::I32 => KirType::I32,
         ElemTy::F64 => KirType::Scalar(ScalarTy::F64),
-        ElemTy::Df32 => KirType::vec(ScalarTy::F32, 2),
+        ElemTy::Df32 | ElemTy::C32 => KirType::vec(ScalarTy::F32, 2),
     }
 }
 
@@ -293,7 +293,7 @@ impl<'a> Lower<'a> {
                     let wide = |j: u32| fb.convert(self.scalar(fb, k + j), KirType::Scalar(ScalarTy::F64));
                     (wide(0) + wide(1)) + wide(2)
                 }
-                ElemTy::Df32 => fb.compose(reg(ElemTy::Df32), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
+                ElemTy::Df32 | ElemTy::C32 => fb.compose(reg(ty), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
                 ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => self.scalar(fb, k),
             },
             Ref::Tmp(k) => match f.t(k as usize) {
@@ -347,6 +347,19 @@ impl<'a> Lower<'a> {
             };
             return self.call(fb, name, &[x]);
         }
+        if ty == ElemTy::C32 {
+            return match op {
+                UnOp::Neg => fb.neg(x),
+                UnOp::Id => x,
+                UnOp::Conj => {
+                    let (re, im) = self.parts(fb, x);
+                    fb.compose(reg(ElemTy::C32), &[re, fb.neg(im)])
+                }
+                UnOp::Sqrt => self.call(fb, "c_sqrt", &[x]),
+                UnOp::Exp => self.call(fb, "c_exp", &[x]),
+                other => self.fail(fb, format!("{other:?} of a C32")),
+            };
+        }
         if ty == ElemTy::Bool {
             return match op {
                 UnOp::Id => x,
@@ -388,6 +401,7 @@ impl<'a> Lower<'a> {
             UnOp::Log1p if wide => float(IrUnOp::Log1p),
             UnOp::Expm1 if wide => float(IrUnOp::Expm1),
             UnOp::Id => x,
+            UnOp::Conj => self.fail(fb, "conj of a real number"),
             UnOp::BitNot => fb.bit_not(x),
             UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0) => x,
             UnOp::Shl(k) => fb.shl(x, lu(fb, u32::from(k))),
@@ -414,7 +428,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real and imaginary part of the complex value `z`.
+    fn parts(&self, fb: &FnBuilder<'_>, z: Val) -> (Val, Val) {
+        (fb.field(z, 0, KirType::F32), fb.field(z, 1, KirType::F32))
+    }
+
     fn binary(&self, fb: &mut FnBuilder<'_>, op: BinOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let (a, b) = (self.parts(fb, x), self.parts(fb, y));
+            let c32 = reg(ElemTy::C32);
+            return match op {
+                BinOp::Add => fb.compose(c32, &[a.0 + b.0, a.1 + b.1]),
+                BinOp::Sub => fb.compose(c32, &[a.0 - b.0, a.1 - b.1]),
+                BinOp::Mul => fb.compose(c32, &[a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0]),
+                BinOp::Div => self.call(fb, "c_div", &[x, y]),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             return match op {
                 BinOp::Add => self.call(fb, "df_add", &[x, y]),
@@ -471,6 +501,14 @@ impl<'a> Lower<'a> {
 
     /// The comparison as a `bool`.
     fn compare_cond(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let equal = self.call(fb, "c_eq", &[x, y]);
+            return match op {
+                CmpOp::Eq => equal,
+                CmpOp::Ne => fb.unary(IrUnOp::Not, equal),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             let cond = match op {
                 CmpOp::Lt => self.call(fb, "df_lt", &[x, y]),
@@ -579,6 +617,7 @@ impl<'a> Lower<'a> {
             (ElemTy::Bool, ElemTy::U32) => x,
             (ElemTy::Bool, ElemTy::F64) => fb.convert(x, f64t),
             (ElemTy::Bool, ElemTy::Df32) => fb.compose(df, &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
+            (ElemTy::Bool, ElemTy::C32) => fb.compose(reg(ElemTy::C32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ if from == to => x,
             _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
         }
@@ -591,6 +630,7 @@ impl<'a> Lower<'a> {
             ElemTy::I32 => fb.bitcast(coord, KirType::I32),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => fb.convert(coord, KirType::F32),
             ElemTy::Bool => self.fail(fb, "a generator of bools"),
+            ElemTy::C32 => self.fail(fb, "a generator of complex numbers"),
         }
     }
 
@@ -634,6 +674,18 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real quantity `part` of the complex value `x`.
+    fn part(&self, fb: &mut FnBuilder<'_>, part: Part, x: Val) -> Val {
+        let (re, im) = self.parts(fb, x);
+        match part {
+            Part::Real => re,
+            Part::Imag => im,
+            Part::Abs => self.call(fb, "c_abs", &[x]),
+            Part::Arg => fb.binary(IrBinOp::Atan2, im, re),
+            Part::NormSqr => re * re + im * im,
+        }
+    }
+
     /// The operation `op` (anything but a shift) on the operands `x`, `y` and `z`; `index` is the
     /// element it is computed at. `None` for a shift.
     pub(super) fn operation(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
@@ -643,6 +695,8 @@ impl<'a> Lower<'a> {
             OpKind::Binary(b) => self.binary(fb, b, ty, x, y),
             OpKind::Compare(c) => self.compare(fb, c, ty, x, y),
             OpKind::Classify(class) => self.classify(fb, class, ty, x),
+            OpKind::Part(part) => self.part(fb, part, x),
+            OpKind::Make => fb.compose(reg(ElemTy::C32), &[x, y]),
             OpKind::Powf if ty == ElemTy::Df32 => self.call(fb, "df_pow", &[x, y]),
             OpKind::Powf if ty == ElemTy::F64 => fb.binary(IrBinOp::Pow, x, y),
             OpKind::Powf => self.call(fb, "luma_powf", &[x, y]),
@@ -1728,6 +1782,9 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
         if instrs().any(calls_df_math) {
             text.push_str(DF_MATH_LIBRARY);
         }
+    }
+    if instrs().any(calls_complex_library) {
+        text.push_str(complex_library());
     }
     text.push_str(&generator_helpers(programs.iter().copied()));
     if edges {
