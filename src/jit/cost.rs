@@ -110,6 +110,81 @@ pub(crate) fn kernel_ns_on(cost: &CostModel, bytes: f64, ops: f64, invocations: 
     cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / (cost.f32_ops_per_ns * busy))
 }
 
+/// The 2-D reads of a kernel that could go through the texture units, as the decision of
+/// [`read_path`] sees them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextureRead {
+    /// How the kernel finds the texels it reads.
+    pub pattern: ReadPattern,
+    /// Source texels an output element combines (4 for a bilinear method, 16 for a bicubic one).
+    pub taps: u32,
+    /// Output elements.
+    pub outputs: u64,
+    /// Bytes of the source image.
+    pub src_bytes: u64,
+    /// Whether a texture over the source's own buffer is possible: no copy to make it.
+    pub zero_copy: bool,
+}
+
+/// Where the 2-D position of a read comes from, which decides how the reads of neighbouring
+/// invocations overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPattern {
+    /// A position array: any pattern, with the locality of the data (`approx2`).
+    Positions,
+    /// A map of the output pixel (`transform`, `rotate`): neighbours read neighbouring texels.
+    Warp,
+    /// The output pixel over a scale (`resize`): the taps of a column are shared by all its rows.
+    Scaled,
+}
+
+/// How the source of a [`TextureRead`] is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPath {
+    /// Loads from the buffer (on NVIDIA GPUs through the read-only data cache, which a
+    /// `read`-only binding already gets).
+    Plain,
+    /// Gathers (`textureGather`: the four texels of a bilinear footprint in one fetch) from a
+    /// texture; unfiltered, so exact.
+    Texture,
+}
+
+/// The share of a kernel's time that gathers save over loads on the texture-capable NVIDIA parts
+/// measured (RTX 3090 and RTX 3080 Laptop, `afcompare` rows of `signal_approx` and
+/// `signal_image`, best of runs; negative or noise-sized measurements are 0): a bilinear footprint
+/// is one gather instead of four loads, a bicubic one four instead of sixteen. Where a pattern
+/// is bound by memory (`approx2` bilinear at 4K runs at 90% of DRAM bandwidth) the gather saves
+/// nothing; bicubic resize reuses the taps of a column over eight rows and the gather loses.
+fn gather_saving(pattern: ReadPattern, taps: u32) -> f64 {
+    match (pattern, taps) {
+        (ReadPattern::Positions, 16) => 0.07,
+        (ReadPattern::Warp, 4) => 0.12,
+        (ReadPattern::Warp, 16) => 0.05,
+        (ReadPattern::Scaled, 4) => 0.15,
+        _ => 0.0,
+    }
+}
+
+/// Whether `read` goes through a texture: the device must have one for the data, the kernel's
+/// saving must beat the cost of making the texture. A texture over the source's own buffer costs
+/// nothing (and is kept for the array's next reader); one that copies the source costs a read and
+/// a write of it and a launch, and is made per use, so it pays only when the saving exceeds that.
+/// The saving is the table of [`gather_saving`] where measured (NVIDIA); every other device reads
+/// from the buffer.
+pub(crate) fn read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
+    if ctx.hal().texture_caps().is_none() || ctx.tuning().profile != luma_core::TuningProfile::Nvidia {
+        return ReadPath::Plain;
+    }
+    let cost = ctx.cost_model();
+    // The kernel's traffic: the source once, the output, and positions where there are some.
+    let out_bytes = read.outputs as f64 * 4.0;
+    let pos_bytes = if read.pattern == ReadPattern::Positions { read.outputs as f64 * 8.0 } else { 0.0 };
+    let work_ns = (read.src_bytes as f64 + out_bytes + pos_bytes) / cost.bandwidth_gbs;
+    let saving_ns = gather_saving(read.pattern, read.taps) * work_ns;
+    let view_ns = if read.zero_copy { 0.0 } else { cost.launch_us * 1e3 + 2.0 * read.src_bytes as f64 / cost.bandwidth_gbs };
+    if saving_ns > view_ns && saving_ns > 0.0 { ReadPath::Texture } else { ReadPath::Plain }
+}
+
 /// Times of calibration kernels are the best of this many measurements.
 const BEST_OF: usize = 5;
 /// Launches recorded before one `sync` in a measurement, amortising submission and the wait.

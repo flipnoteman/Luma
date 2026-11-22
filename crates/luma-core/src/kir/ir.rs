@@ -448,13 +448,15 @@ pub enum IrSubgroupOp {
 /// addressing is clamp-to-edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureOp {
-    /// `textureLoad(t, coords, 0)`, `coords: vec2<i32>`: the texel at integer coordinates (clamped
-    /// to the texture).
+    /// `textureLoad(t, coords, 0)`, `coords: vec2<i32>`: the texel at integer coordinates, which
+    /// must lie inside the texture (what is read outside differs between backends).
     Load,
     /// `textureGather(component, t, s, coords)`, `coords: vec2<f32>` normalized: the `component`
-    /// (0 red .. 3 alpha) of the four texels `(i, j)`, `(i + 1, j)`, `(i + 1, j + 1)`, `(i, j + 1)` in
-    /// that order (x, y, z, w) with `i = floor(coords.x * width - 0.5)` and `j` likewise,
-    /// unfiltered and exact; texels past the edge are the clamped ones.
+    /// (0 red .. 3 alpha) of the four texels `(i, j + 1)`, `(i + 1, j + 1)`, `(i + 1, j)`, `(i, j)` in
+    /// that order (x, y, z, w; WGSL's, Vulkan's and CUDA's order, checked by luma's tests on the CUDA
+    /// and wgpu backends) with `i = floor(coords.x * width - 0.5)` and `j` likewise, unfiltered and
+    /// exact; texels past the edge are the clamped ones. A coordinate at a texel corner is robust
+    /// to the hardware's fixed-point position, one at a texel centre is not.
     Gather(u8),
     /// `textureSampleLevel(t, s, coords, 0.0)`, `coords: vec2<f32>` normalized: the texture's
     /// filter ([`crate::hal::TextureFilter`]) at the point.

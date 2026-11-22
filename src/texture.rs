@@ -14,6 +14,17 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::gpu::pager::Pin;
 
+#[derive(Debug)]
+/// The texture a segment keeps for its data (see [`Context::texture_2d`]).
+pub(crate) struct Cached {
+    /// The buffer the data was in (a segment that moved to host memory and back has another one).
+    source: u64,
+    width: u32,
+    height: u32,
+    filter: TextureFilter,
+    texture: Buffer,
+}
+
 /// A texture of the first `width * height` elements of an `f32` array, rows of `width` elements.
 pub(crate) struct Texture {
     pub(crate) ctx: Context,
@@ -39,8 +50,23 @@ impl Context {
             return Ok(None);
         }
         let Ok((pin, _)) = src.ready() else { return Ok(None) };
+        // A texture that reads the buffer itself stays valid while the array changes, and is kept
+        // for the array's next reader; one that copied the data is only good for what it copied.
+        let keep = caps.aliases;
+        let segment = std::sync::Arc::clone(pin.segment());
+        let slot = segment.texture_slot();
+        if keep
+            && let Some(cached) = crate::gpu::lock(slot).as_ref()
+            && cached.source == pin.buffer().id()
+            && (cached.width, cached.height, cached.filter) == (w, h, filter)
+        {
+            return Ok(Some(Texture { ctx: self.clone(), buffer: cached.texture.clone(), pin }));
+        }
         let desc = TextureDesc { width: w, height: h, format: TextureFormat::R32Float, filter };
         let buffer = self.hal().create_texture(pin.buffer(), 0, pitch, &desc)?;
+        if keep {
+            *crate::gpu::lock(slot) = Some(Cached { source: pin.buffer().id(), width: w, height: h, filter, texture: buffer.clone() });
+        }
         Ok(Some(Texture { ctx: self.clone(), buffer, pin }))
     }
 }

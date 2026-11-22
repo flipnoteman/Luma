@@ -18,6 +18,7 @@ fn im(m: Interp) -> af::InterpType {
         Interp::Cosine => af::InterpType::LINEAR_COSINE,
         Interp::Cubic => af::InterpType::CUBIC,
         Interp::CubicSpline => af::InterpType::CUBIC_SPLINE,
+        Interp::LinearHardware => af::InterpType::LINEAR,
     }
 }
 
@@ -30,6 +31,7 @@ fn im2(m: Interp) -> af::InterpType {
         Interp::Cosine => af::InterpType::BILINEAR_COSINE,
         Interp::Cubic => af::InterpType::BICUBIC,
         Interp::CubicSpline => af::InterpType::BICUBIC_SPLINE,
+        Interp::LinearHardware => af::InterpType::BILINEAR,
     }
 }
 
@@ -184,6 +186,52 @@ fn approx(b: &mut Bench) {
                     },
                 );
             }
+            // The texture unit's own bilinear filter (an explicit opt-in of luma, weights of 8 bits
+            // of fraction) against the exact ArrayFire result.
+            let lo = lumax::host(&il.approx2(&p0l, &p1l, Interp::LinearHardware, 0.0));
+            let ao = afx::host(&af::approx2(&ia, &p0a, &p1a, im2(Interp::Linear), 0.0));
+            let v = compare_edges(&lo, &ao, 1e-2, 1e-2);
+            b.run(
+                "approx2 bilinear, hardware filter",
+                &format!("{label} image, {label} positions"),
+                v,
+                "luma opt-in `Interp::LinearHardware` (8-bit weights) vs AF bilinear; smooth warp",
+                &mut || {
+                    il.approx2(&p0l, &p1l, Interp::LinearHardware, 0.0).eval().unwrap();
+                    ctx.sync().unwrap();
+                },
+                &mut || {
+                    af::approx2(&ia, &p0a, &p1a, im2(Interp::Linear), 0.0).eval();
+                    afx::sync();
+                },
+            );
+            // Scattered positions: every pixel samples within 48 pixels of itself (data-dependent
+            // reads with 2-D locality at the scale of the cache, none of a warp's).
+            let j0 = uniform(w * h, 106, -48.0, 48.0);
+            let j1 = uniform(w * h, 107, -48.0, 48.0);
+            let s0: Vec<f32> = p0.iter().zip(&j0).map(|(p, j)| (p + j).clamp(0.0, (w - 1) as f32)).collect();
+            let s1: Vec<f32> = p1.iter().zip(&j1).map(|(p, j)| (p + j).clamp(0.0, (h - 1) as f32)).collect();
+            let (s0l, s1l) = (lumax::arr(&ctx, &s0, [w, h]), lumax::arr(&ctx, &s1, [w, h]));
+            let (s0a, s1a) = (afx::arr(&s0, &dims2(w, h)), afx::arr(&s1, &dims2(w, h)));
+            for m in [Interp::Linear, Interp::Cubic] {
+                let lo = lumax::host(&il.approx2(&s0l, &s1l, m, 0.0));
+                let ao = afx::host(&af::approx2(&ia, &s0a, &s1a, im2(m), 0.0));
+                let v = compare_edges(&lo, &ao, 1e-4, 1e-4);
+                b.run(
+                    &format!("approx2 {}, scattered", if m == Interp::Linear { "bilinear" } else { "bicubic" }),
+                    &format!("{label} image, {label} positions"),
+                    v,
+                    "positions within 48 px of the pixel, random",
+                    &mut || {
+                        il.approx2(&s0l, &s1l, m, 0.0).eval().unwrap();
+                        ctx.sync().unwrap();
+                    },
+                    &mut || {
+                        af::approx2(&ia, &s0a, &s1a, im2(m), 0.0).eval();
+                        afx::sync();
+                    },
+                );
+            }
         }
     });
 }
@@ -214,6 +262,26 @@ fn image(b: &mut Bench) {
                         },
                         &mut || {
                             af::resize(&ia, wd as i64, hd as i64, im2(m)).eval();
+                            afx::sync();
+                        },
+                    );
+                }
+                if c == 1 {
+                    // The texture unit's bilinear filter (luma opt-in, 8-bit weights) against exact ArrayFire.
+                    let lo = lumax::host(&il.resize(wd, hd, Interp::LinearHardware));
+                    let ao = afx::host(&af::resize(&ia, wd as i64, hd as i64, im2(Interp::Linear)));
+                    let v = compare_edges(&lo, &ao, 1e-2, 1e-2);
+                    b.run(
+                        "resize bilinear, hardware filter",
+                        dir,
+                        v,
+                        "luma opt-in `Interp::LinearHardware` (8-bit weights) vs AF bilinear",
+                        &mut || {
+                            il.resize(wd, hd, Interp::LinearHardware).eval().unwrap();
+                            ctx.sync().unwrap();
+                        },
+                        &mut || {
+                            af::resize(&ia, wd as i64, hd as i64, im2(Interp::Linear)).eval();
                             afx::sync();
                         },
                     );

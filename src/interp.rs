@@ -36,6 +36,16 @@ pub enum Interp {
     /// Cubic interpolation with Catmull-Rom splines (`AF_INTERP_CUBIC_SPLINE`): the same four
     /// neighbours, continuous slope.
     CubicSpline,
+    /// Bilinear interpolation by the texture unit of the device (a single fetch of the filtered
+    /// texture), an explicit opt-in: luma never picks it by itself. The hardware quantizes the
+    /// interpolation weights: NVIDIA GPUs keep 8 bits of the fraction, so along each axis a result
+    /// is off by up to `|b - a| / 256` from [`Interp::Linear`]'s for neighbouring samples `a` and
+    /// `b` (measured on an RTX 3080 Laptop: up to 0.04 on a span of 8), and other devices differ
+    /// in how many bits they keep. Where the array is not a plain 2-D image the
+    /// device can bind as a texture (or the device has none, as the CPU) this is exactly
+    /// [`Interp::Linear`]. Only two-dimensional sampling ([`Array::approx2`], the image
+    /// transforms) uses the filter; [`Array::approx1`] reads it as [`Interp::Linear`].
+    LinearHardware,
 }
 
 #[allow(non_upper_case_globals)]

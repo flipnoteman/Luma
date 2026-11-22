@@ -60,6 +60,8 @@ pub(crate) struct Segment {
     pins: AtomicU32,
     /// Value of the pager's clock at the last pin.
     stamp: AtomicU64,
+    /// The texture of this segment's data made last (see [`crate::texture`]).
+    texture: Mutex<Option<crate::texture::Cached>>,
 }
 
 /// Keeps a segment's buffer on the device while a command using it is being recorded.
@@ -70,6 +72,11 @@ pub(crate) struct Pin {
 }
 
 impl Pin {
+    /// The segment this pin keeps resident.
+    pub(crate) fn segment(&self) -> &Arc<Segment> {
+        &self.segment
+    }
+
     /// Another pin of the same segment.
     pub(crate) fn dup(&self) -> Pin {
         self.segment.pins.fetch_add(1, Ordering::Acquire);
@@ -247,6 +254,11 @@ impl Pager {
 }
 
 impl Segment {
+    /// The texture of this segment's data, see [`crate::texture`].
+    pub(crate) fn texture_slot(&self) -> &Mutex<Option<crate::texture::Cached>> {
+        &self.texture
+    }
+
     /// A segment of `bytes` bytes without a buffer; it gets one at its first pin.
     pub(crate) fn empty(ctx: &Context, bytes: u64) -> Arc<Segment> {
         Arc::new(Segment {
@@ -255,6 +267,7 @@ impl Segment {
             state: Mutex::new(State::Empty),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         })
     }
 
@@ -268,6 +281,7 @@ impl Segment {
             state: Mutex::new(State::Device(buffer)),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         });
         ctx.pager().register(&segment, size);
         segment
@@ -284,6 +298,7 @@ impl Segment {
             state: Mutex::new(State::Window(Window { pack, offset })),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         })
     }
 
@@ -436,6 +451,8 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // The texture reads the buffer: it goes before the buffer does.
+        self.texture.get_mut().unwrap_or_else(PoisonError::into_inner).take();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         if let State::Device(buffer) = std::mem::replace(state, State::Empty) {
             self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
