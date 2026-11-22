@@ -79,7 +79,7 @@ impl Array<f32> {
     ///
     /// `seeds_x[i]` and `seeds_y[i]` are the indices of seed `i` along **axis 0 and axis 1**
     /// (rows and columns; like ArrayFire's `confidenceCC` and unlike the `x` of
-    /// [`Keypoints`], so pass `keypoints.y` as `seeds_x`). The image is scaled linearly to
+    /// [`Keypoints`](crate::Keypoints), so pass `keypoints.y` as `seeds_x`). The image is scaled linearly to
     /// `[1, 2]`; mean and standard deviation of the pixels in the `(2 radius + 1)^2` windows around the seeds
     /// give the interval `[mean - multiplier sd, mean + multiplier sd]`, which is widened to contain
     /// the seed values; the segmentation is the set of pixels in the interval that are

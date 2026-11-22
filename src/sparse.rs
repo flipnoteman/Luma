@@ -464,8 +464,8 @@ pub trait SparseElem: AtomicElem {}
 
 impl SparseElem for f32 {}
 
-/// A sparse `rows x cols` matrix of `f32` in CSR, CSC or COO storage. See the [module
-/// documentation](self) for the layouts, the conventions and the errors.
+/// A sparse `rows x cols` matrix of `f32` in CSR, CSC or COO storage. See the guide chapter
+/// "Sparse matrices" for the layouts, the conventions and the errors.
 ///
 /// ```no_run
 /// use luma::{Array, Sparse, SparseFormat};
@@ -753,7 +753,7 @@ impl Sparse<f32> {
     /// A matrix from `(row, column, value)` triplets in `format`: entry `k` is `values[k]` at
     /// `(row_idx[k], col_idx[k])`. The three arrays must have the same length (else the result is
     /// poisoned with [`LumaError::LengthMismatch`]); the order is free and duplicates are kept
-    /// (they add up, see the [module documentation](self)). Into CSR (CSC) the entries are
+    /// (they add up, see the guide chapter "Sparse matrices"). Into CSR (CSC) the entries are
     /// sorted by row (column) with a stable sort: entries of one row (column) keep their input
     /// order, which is not sorted by column (row) unless the input was.
     #[track_caller]
@@ -1036,7 +1036,7 @@ impl Sparse<f32> {
     /// `[cols]`, result `[rows]`) or a matrix of `c` columns (shape `[c, cols]`, result
     /// `[c, rows]`); see [`Sparse::matmul_t`] for `A^T x`. A shape that is neither poisons the
     /// result with [`LumaError::ShapeMismatch`]. `x` may be a pending expression (it is gathered
-    /// from inside the kernel). See the [module documentation](self) for how each format runs.
+    /// from inside the kernel). See the guide chapter "Sparse matrices" for how each format runs.
     ///
     /// A product whose output is not the compressed axis of the format (CSC `A x`, CSR `A^T x`,
     /// COO either way) scatters its products with atomic adds the first time. A second one
