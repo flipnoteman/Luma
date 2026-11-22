@@ -1089,8 +1089,8 @@ pub(super) fn mapped_bindings(inputs: &[Arc<Storage>], bases: &[Arc<Storage>]) -
     bases.len() + inputs.iter().filter(|input| !bases.iter().any(|base| Arc::ptr_eq(base, input))).count()
 }
 
-/// Workgroups of a private atomic scatter (see [`Tail::ScatterAdd`]) on the reference device
-/// ([`crate::tuning::REFERENCE_COMPUTE_UNITS`], 3 per multiprocessor), scaled to the device. A
+/// Workgroups of a private atomic scatter of integers (see [`Tail::ScatterAdd`]) on the reference
+/// device ([`crate::tuning::REFERENCE_COMPUTE_UNITS`], 3 per multiprocessor), scaled to the device. A
 /// histogram of 256 bins of 10M `f32` on an RTX 3090 took 0.0632 ms with 1024 workgroups, 0.0512
 /// with 246 (2 to 4 per multiprocessor all took 0.050-0.051, 1 per multiprocessor 0.070).
 const PRIVATE_GROUPS: u32 = 246;
@@ -1142,11 +1142,13 @@ pub(super) fn run_mapped(
     match key.tail {
         // Workgroups that stay resident, each striding over the elements: merging the private
         // copies into the target (a global atomic per touched element per workgroup) is then cheap
-        // and no wave of workgroups is left half empty. The merge of `f32` on devices without
-        // native atomic adds (a compare-and-exchange loop) serialises on contended words too.
+        // and no wave of workgroups is left half empty. The merge of `f32` (a compare-and-exchange
+        // loop on devices without native atomic adds) serialises on contended words, and its
+        // accumulators want more workgroups to hide their latency: they keep 256.
         Tail::ScatterAdd { len, private: true, .. } => {
-            let groups = (n / (4 * len.max(1))).clamp(1, ctx.tuning().scaled(PRIVATE_GROUPS));
-            ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?
+            let float = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32);
+            let cap = if float { 256 } else { ctx.tuning().scaled(PRIVATE_GROUPS) };
+            ctx.launch(&core, fold_workgroups(ctx, (n / (4 * len.max(1))).clamp(1, cap))?, [n, 1, 1], &raw)?
         }
         _ => launch_1d(ctx, &core, runs.as_ref().map_or(n, |runs| runs.invocations), &raw)?,
     }

@@ -1764,6 +1764,9 @@ struct Build<'a> {
 /// 0.0502 at the workgroups of `launch::PRIVATE_GROUPS`; 16 was slower where all the elements
 /// fall in one bin (0.083 against 0.077 ms).
 const PRIVATE_UNROLL: u32 = 4;
+/// The `f32` accumulators take one: their min and max are compare-and-exchange loops on workgroup
+/// memory, which four elements in flight made slower (`group_min` / `group_max` of 10M `f32` in
+/// 1000 groups on an RTX 3080 Laptop: 0.267 ms against 0.234).
 
 /// What a private accumulator starts as for `op` on elements of type `ty`, as bits (the merge
 /// skips the elements still holding it).
@@ -2239,11 +2242,12 @@ impl<'a> Build<'a> {
         fb.barrier(BarrierScope::Workgroup);
         let (start, size, step) = (group * lu(fb, wg) + lx, fb.grid_size(0), nx * ny * lu(fb, wg));
         let last = size - lu(fb, 1);
-        fb.for_range("i", start, size, step * lu(fb, PRIVATE_UNROLL), |b, i| {
+        let unroll = if scalar == ScalarTy::F32 { 1 } else { PRIVATE_UNROLL };
+        fb.for_range("i", start, size, step * lu(fb, unroll), |b, i| {
             // The loads of all the elements come before the first atomic; elements past the end
             // read the last one (no branch around the loads) and add nothing.
-            let mut elements = Vec::with_capacity(PRIVATE_UNROLL as usize);
-            for k in 0..PRIVATE_UNROLL {
+            let mut elements = Vec::with_capacity(unroll as usize);
+            for k in 0..unroll {
                 let e = if k == 0 { i } else { b.let_val("e", i + step * lu(b, k)) };
                 let at = if k == 0 { e } else { b.let_val("ec", b.select(b.lt(e, size), e, last)) };
                 let index = self.global(b, at);
