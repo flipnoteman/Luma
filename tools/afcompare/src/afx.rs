@@ -34,7 +34,26 @@ pub fn host<T: af::HasAfEnum + Default + Clone>(a: &af::Array<T>) -> Vec<T> {
 
 pub fn info() -> String {
     let (major, minor, patch) = af::get_version();
-    format!("ArrayFire {major}.{minor}.{patch} (CUDA backend): {}", af::device_info().0.trim())
+    format!("ArrayFire {major}.{minor}.{patch} (CUDA backend): {}", device_name())
+}
+
+unsafe extern "C" {
+    fn af_device_info(name: *mut std::ffi::c_char, platform: *mut std::ffi::c_char, toolkit: *mut std::ffi::c_char, compute: *mut std::ffi::c_char) -> c_int;
+}
+
+/// The device name. Not `af::device_info`: the `arrayfire` 3.8 crate passes 10-byte buffers for
+/// the platform and compute strings, which ArrayFire 3.10 overruns (its documented minimum is 64
+/// bytes), corrupting the stack: afcompare then crashed with SIGSEGV in the next `println!`.
+fn device_name() -> String {
+    let mut bufs = [[0 as std::ffi::c_char; 256]; 4];
+    let [name, platform, toolkit, compute] = &mut bufs;
+    // SAFETY: four 256-byte buffers, past ArrayFire's 64-byte minimum for each.
+    let err = unsafe { af_device_info(name.as_mut_ptr(), platform.as_mut_ptr(), toolkit.as_mut_ptr(), compute.as_mut_ptr()) };
+    if err != 0 {
+        return format!("(af_device_info error {err})");
+    }
+    // SAFETY: ArrayFire NUL-terminates what it writes into each buffer.
+    unsafe { std::ffi::CStr::from_ptr(bufs[0].as_ptr()) }.to_string_lossy().trim().to_owned()
 }
 
 /// cuBLAS math modes of `cublasMath_t`.
