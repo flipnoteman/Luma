@@ -65,6 +65,7 @@ pub fn run(h: &mut Harness) {
     for rows in [large / 10, large] {
         h.guarded("matrix", |h| products(h, rows, "banded"));
         h.guarded("matrix", |h| products(h, rows / 2, "powerlaw"));
+        h.guarded("matrix", |h| products(h, rows / 2, "uniform"));
     }
     h.guarded("matrix", |h| conversions(h, large / 2));
     h.guarded("matrix", spmm);
@@ -74,6 +75,7 @@ pub fn run(h: &mut Harness) {
 fn matrix_of(kind: &str, rows: usize) -> Csr {
     match kind {
         "banded" => data::banded(rows, 2, 11),
+        "uniform" => data::uniform(rows, 8, 24, 21),
         _ => data::power_law(rows, 4, 2.5, rows.min(1 << 17), 31),
     }
 }

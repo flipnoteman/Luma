@@ -67,15 +67,18 @@ assert_eq!(a.matmul_t(&y).to_vec()?, vec![1.0, 0.0, 8.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-CSR `A x` and CSC `A^T x` (the product whose output runs along the compressed axis) are a
-gather, a product and a segmented sum over the pointer (`sum_segments`) for a vector, two launches
-with no atomics, and a hub row of a power-law graph costs no more than its entries; for a dense
-matrix one invocation per output element walks its row, reading `c` adjacent elements of `x`
-together. The first product of any other combination (CSC `A x`, CSR `A^T x`, COO) scatters with
-atomic adds, so its `f32` sums can differ in the last bits between runs; the second converts the
-matrix once to the form that suits the product and keeps the copy (one more copy of the entries
-for the life of the matrix), and results are then reproducible. A pending expression as `x` is
-computed inside the kernel for a vector.
+CSR `A x` and CSC `A^T x` (the product whose output runs along the compressed axis) run on kernels
+written for the format: for a vector, a thread (or a few lanes) per row when the rows are short, a
+gather and a segmented sum over the pointer (`sum_segments`) when some are long; for a dense matrix
+one invocation per output element walks its row, reading `c` adjacent elements of `x` together,
+and the few very long rows of a power-law graph are cut in pieces summed by a workgroup each. No
+atomics are used, so the results are the same on every run. The first product of any other
+combination (CSC `A x`, CSR `A^T x`, COO) scatters with atomic adds, so its `f32` sums can differ in
+the last bits between runs; the second converts the matrix once to the form that suits the product
+and keeps the copy (one more copy of the entries for the life of the matrix), and results are then
+reproducible. The first product of a matrix reads its row lengths back (one synchronization). A
+pending expression as `x` is computed inside the kernel only for the segmented sum; the row kernels
+evaluate it first.
 
 ## Elementwise operations
 

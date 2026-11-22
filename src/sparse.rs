@@ -27,15 +27,19 @@
 //! # Products
 //!
 //! [`Sparse::matmul`] computes `A x` and [`Sparse::matmul_t`] `A^T x` for a vector or a dense
-//! matrix `x`. CSR `A x` and CSC `A^T x` (a product whose output runs along the compressed axis)
-//! are, for a vector, a gather of `x` at the stored indices, a product with the values and a
-//! segmented sum over the row (column) pointer ([`Array::sum_segments`]): two launches, no
-//! atomics, entries split evenly over the workgroups whatever the row lengths; for `c` columns
-//! one invocation per output element walks its row (a custom kernel: the `c` invocations of a row
-//! read `c` adjacent elements of `x`, so the gather is coalesced). The first product of any other
-//! combination scatters the products with an atomic add by output index ([`Array::group_sum`]),
-//! whose rounding depends on the order in which the atomics land; the second converts the matrix
-//! once to the form that runs the first way and keeps that copy (see [`Sparse::matmul`]).
+//! matrix `x`. A product whose output runs along the compressed axis (CSR `A x`, CSC `A^T x`) runs
+//! on the row kernels: for a vector with rows of at most 64 entries a thread, or a few lanes
+//! combining in workgroup memory, per row; for a vector with longer rows a gather, a product and a
+//! segmented sum over the pointer ([`Array::sum_segments`], entries split evenly whatever the
+//! row lengths); for `c` dense columns one invocation per output element walks its row (the `c`
+//! invocations of a row read `c` adjacent elements of `x`, so the gather is coalesced) and rows of
+//! more than 512 entries are cut in pieces of 4096 that a workgroup each sums, the pieces added in
+//! order. None of them uses atomics: the sums are the same on every run. The first product of
+//! any other combination scatters the products with an atomic add by output index
+//! ([`Array::group_sum`]), whose rounding depends on the order in which the atomics land; the
+//! second converts the matrix once to the form that runs the first way and keeps that copy (see
+//! [`Sparse::matmul`]). The first product of a compressed matrix reads its row lengths back (one
+//! synchronization, kept with the matrix).
 //!
 //! # Errors
 //!
@@ -59,7 +63,10 @@ use crate::view::concat;
 
 /// Rows longer than this are not walked by the row kernels (their lanes would idle behind the one
 /// that holds the longest row): a workgroup of its own reduces each, see [`LONG_ROWS`].
-const LONG_ROW: u32 = 1024;
+const LONG_ROW: u32 = 512;
+/// Entries of a long row one workgroup of [`LONG_ROWS`] sums (a long row is cut into pieces of this
+/// size, whose partial sums [`LONG_SUMS`] adds up in order).
+const CHUNK: u32 = 4096;
 /// Invocations of a workgroup of every row kernel.
 const WORKGROUP: u32 = 128;
 /// Workgroups along x of the grids of the row kernels (the dispatch limit of every backend).
@@ -72,13 +79,15 @@ struct RowParams {
     /// Output elements (SpMM) or rows (SpMV); long rows: how many.
     total: u32,
     cap: u32,
+    /// Pieces per long row.
+    chunks: u32,
 }
 
 /// `y[r]` of the rows of at most `cap` entries, `V = 2^shape` lanes per row: lane `l` sums the
 /// entries `l, l + V, ...` of its row (the `V` lanes read consecutive entries), the lanes of a row
 /// combine in workgroup memory. Long rows are left to [`LONG_ROWS`].
 const SPMV_ROWS: &str = r#"
-struct Params { shape: u32, total: u32, cap: u32 }
+struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(0) var<storage, read> ptr: array<u32>;
 @group(1) @binding(1) var<storage, read> minor: array<u32>;
 @group(1) @binding(2) var<storage, read> val: array<f32>;
@@ -100,6 +109,17 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
         if (e - b <= p.cap) {
             mine = true;
             var k = b + lane;
+            loop {
+                if (k + lanes >= e) { break; }
+                let k2 = k + lanes;
+                let c0 = minor[k];
+                let c1 = minor[k2];
+                let x0 = x[c0];
+                let x1 = x[c1];
+                acc = acc + val[k] * x0;
+                acc = acc + val[k2] * x1;
+                k = k2 + lanes;
+            }
             loop {
                 if (k >= e) { break; }
                 acc = acc + val[k] * x[minor[k]];
@@ -123,7 +143,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 /// `Y[j, r] = sum_k val[k] * X[j, minor[k]]` over the entries `k` of row `r` (at most `cap` of
 /// them), one invocation per output element, entries in order, four loads in flight.
 const SPMM_ROWS: &str = r#"
-struct Params { shape: u32, total: u32, cap: u32 }
+struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(0) var<storage, read> ptr: array<u32>;
 @group(1) @binding(1) var<storage, read> minor: array<u32>;
 @group(1) @binding(2) var<storage, read> val: array<f32>;
@@ -167,15 +187,16 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 }
 "#;
 
-/// The rows longer than `cap`, one workgroup per (row, column `j`): the 128 invocations stride
-/// over the entries and combine in workgroup memory. `total` is rows x columns; `shape` the columns.
+/// The rows longer than `cap`, one workgroup per (row, column `j`, piece of [`CHUNK`] entries): the
+/// 128 invocations stride over the piece and combine in workgroup memory into `part`. `shape` is
+/// the columns, `chunks` the pieces per row; exactly rows x columns x pieces workgroups run.
 const LONG_ROWS: &str = r#"
-struct Params { shape: u32, total: u32, cap: u32 }
+struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(0) var<storage, read> ptr: array<u32>;
 @group(1) @binding(1) var<storage, read> minor: array<u32>;
 @group(1) @binding(2) var<storage, read> val: array<f32>;
 @group(1) @binding(3) var<storage, read> x: array<f32>;
-@group(1) @binding(4) var<storage, read_write> y: array<f32>;
+@group(1) @binding(4) var<storage, read_write> part: array<f32>;
 @group(1) @binding(5) var<storage, read> rows: array<u32>;
 @group(1) @binding(6) var<uniform> p: Params;
 var<workgroup> sh: array<f32, 128>;
@@ -183,17 +204,20 @@ var<workgroup> sh: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let g = wg.y * 65535u + wg.x;
+    let q = g % p.chunks;
+    let ij = g / p.chunks;
     let c = p.shape;
-    // `total` workgroups are launched exactly (uniform: the whole group takes the same path).
-    let i = g / c;
-    let j = g - i * c;
+    let i = ij / c;
+    let j = ij - i * c;
     let row = rows[i];
     let b = ptr[row];
     let e = ptr[row + 1u];
+    let lo = b + q * 4096u;
+    let hi = min(e, lo + 4096u);
     var acc = 0.0;
-    var k = b + li;
+    var k = lo + li;
     loop {
-        if (k >= e) { break; }
+        if (k >= hi) { break; }
         acc = acc + val[k] * x[minor[k] * c + j];
         k += 128u;
     }
@@ -206,7 +230,29 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
         workgroupBarrier();
         s = s >> 1u;
     }
-    if (li == 0u) { y[row * c + j] = sh[0]; }
+    if (li == 0u) { part[g] = sh[0]; }
+}
+"#;
+
+/// The sums of the pieces of every (long row, column), in order, into `y`.
+const LONG_SUMS: &str = r#"
+struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
+@group(1) @binding(0) var<storage, read> part: array<f32>;
+@group(1) @binding(1) var<storage, read> rows: array<u32>;
+@group(1) @binding(2) var<storage, read_write> y: array<f32>;
+@group(1) @binding(3) var<uniform> p: Params;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= p.total) { return; }
+    var acc = 0.0;
+    for (var q = 0u; q < p.chunks; q += 1u) {
+        acc = acc + part[t * p.chunks + q];
+    }
+    let c = p.shape;
+    let i = t / c;
+    y[rows[i] * c + (t - i * c)] = acc;
 }
 "#;
 
@@ -269,9 +315,25 @@ pub struct Sparse<T: SparseElem = f32> {
     /// Products run so far that were not compressed along their output.
     scattered: AtomicU32,
     /// The rows longer than [`LONG_ROW`] of a compressed matrix, found at its first product.
-    long: OnceLock<std::result::Result<Option<Array<u32>>, Arc<LumaError>>>,
+    long: OnceLock<std::result::Result<RowPlan, Arc<LumaError>>>,
     error: Option<Arc<LumaError>>,
 }
+
+/// What the row kernels need to know about a compressed matrix, read back once.
+#[derive(Clone)]
+struct RowPlan {
+    /// The longest row.
+    max_len: u32,
+    /// The rows longer than [`LONG_ROW`] (`None` if there are none).
+    long: Option<Array<u32>>,
+    /// Pieces of [`CHUNK`] entries of the longest row.
+    chunks: u32,
+}
+
+/// Matrices whose rows are all at most this long take the row kernel for a vector product (a
+/// thread or a few lanes per row, no scratch pass); others the segmented sum, which splits the
+/// entries evenly whatever the row lengths are.
+const SHORT_ROWS: u32 = 64;
 
 /// The arrays of a [`Sparse`] matrix as [`Sparse::info`] returns them (ArrayFire's
 /// `sparseGetInfo`).
@@ -825,7 +887,14 @@ impl Sparse<f32> {
         if native {
             let minor = if self.format == SparseFormat::Csr { self.col.as_ref() } else { self.row.as_ref() };
             let (minor, ptr) = (minor.expect("entries"), self.ptr.as_ref().expect("compressed"));
-            return match self.rows_kernels(ptr, minor, val, x, c, outer) {
+            let plan = match self.row_plan(ptr) {
+                Ok(plan) => plan,
+                Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
+            };
+            if c == 1 && plan.max_len > SHORT_ROWS {
+                return (val * x.reshape(inner).take(minor)).sum_segments(ptr).reshape(out_shape);
+            }
+            return match self.rows_kernels(plan, (ptr, minor, val), x, c, outer) {
                 Ok(y) => y.reshape(out_shape),
                 Err(e) => Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
@@ -856,16 +925,17 @@ impl Sparse<f32> {
         slot.get_or_init(|| Box::new(self.to_format(format)))
     }
 
-    /// The rows longer than [`LONG_ROW`] of a compressed matrix (`None` if there are none), found
-    /// once with a readback.
-    fn long_rows(&self, ptr: &Array<u32>) -> Result<Option<Array<u32>>> {
+    /// The row lengths of a compressed matrix (see [`RowPlan`]), read back at the first product.
+    fn row_plan(&self, ptr: &Array<u32>) -> Result<RowPlan> {
         let plan = self.long.get_or_init(|| {
             let n = ptr.len() - 1;
             let len = ptr.slice(0, 1..=n) - ptr.slice(0, 0..n);
-            len.gt(LONG_ROW).nonzero().map_err(Arc::new)
+            let max_len = len.max().item().map_err(Arc::new)?;
+            let long = if max_len > LONG_ROW { len.gt(LONG_ROW).nonzero().map_err(Arc::new)? } else { None };
+            Ok(RowPlan { max_len, long, chunks: max_len.div_ceil(CHUNK).max(1) })
         });
         match plan {
-            Ok(rows) => Ok(rows.clone()),
+            Ok(plan) => Ok(plan.clone()),
             Err(e) => Err(LumaError::clone(e)),
         }
     }
@@ -877,11 +947,11 @@ impl Sparse<f32> {
     /// invocations of a row read the same entry and `c` adjacent elements of `X`, so the gather is
     /// coalesced), longer rows by a workgroup per row (and column). Sums are in entry order per
     /// lane, so the results are the same on every run.
-    fn rows_kernels(&self, ptr: &Array<u32>, minor: &Array<u32>, val: &Array<f32>, x: &Array<f32>, c: usize, outer: usize) -> Result<Array<f32>> {
+    fn rows_kernels(&self, plan: RowPlan, (ptr, minor, val): (&Array<u32>, &Array<u32>, &Array<f32>), x: &Array<f32>, c: usize, outer: usize) -> Result<Array<f32>> {
         let shape = if c == 1 { Shape::from(outer) } else { Shape::new([c, outer, 1, 1]) };
         shape.validate()?;
         let total = u32::try_from(shape.len()).map_err(|_| LumaError::DimensionTooLarge { shape: shape.dims() })?;
-        let long = self.long_rows(ptr)?;
+        let long = plan.long.clone();
         let mut y = Array::<f32>::alloc(&self.ctx, shape)?;
         let grid = |groups: usize| -> Result<[u32; 3]> {
             let groups = u32::try_from(groups).map_err(|_| LumaError::DimensionTooLarge { shape: [groups, 1, 1, 1] })?;
@@ -889,21 +959,29 @@ impl Sparse<f32> {
         };
         if c == 1 {
             let avg = self.nnz as f64 / outer as f64;
-            let lanes_log = (avg.max(1.0).log2().ceil() as u32).min(5);
+            // Two to four entries per lane: a barrier costs more than an idle lane, a long serial
+            // walk more than a few barriers (measured on an RTX 3090: 5 entries per row best with
+            // one or two lanes, 16 with eight).
+            let lanes_log = ((avg / 3.0).max(1.0).log2().ceil() as u32).min(4);
             let kernel = self.ctx.kernel(SPMV_ROWS).label("sparse_spmv_rows").build()?;
-            let params = RowParams { shape: lanes_log, total: outer as u32, cap: LONG_ROW };
+            let params = RowParams { shape: lanes_log, total: outer as u32, cap: LONG_ROW, chunks: 1 };
             let groups = (outer << lanes_log).div_ceil(WORKGROUP as usize);
             kernel.launch_raw(grid(groups)?, crate::args![ptr, minor, val, x, &mut y, crate::kernel::uniform(&params)])?;
         } else {
             let kernel = self.ctx.kernel(SPMM_ROWS).label("sparse_spmm_rows").build()?;
-            let params = RowParams { shape: c as u32, total, cap: LONG_ROW };
+            let params = RowParams { shape: c as u32, total, cap: LONG_ROW, chunks: 1 };
             let groups = (total as usize).div_ceil(WORKGROUP as usize);
             kernel.launch_raw(grid(groups)?, crate::args![ptr, minor, val, x, &mut y, crate::kernel::uniform(&params)])?;
         }
         if let Some(rows) = long {
+            let pieces = rows.len() * c * plan.chunks as usize;
+            let mut part = Array::<f32>::alloc(&self.ctx, Shape::from(pieces))?;
             let kernel = self.ctx.kernel(LONG_ROWS).label("sparse_long_rows").build()?;
-            let params = RowParams { shape: c as u32, total: (rows.len() * c) as u32, cap: LONG_ROW };
-            kernel.launch_raw(grid(rows.len() * c)?, crate::args![ptr, minor, val, x, &mut y, &rows, crate::kernel::uniform(&params)])?;
+            let params = RowParams { shape: c as u32, total: 0, cap: LONG_ROW, chunks: plan.chunks };
+            kernel.launch_raw(grid(pieces)?, crate::args![ptr, minor, val, x, &mut part, &rows, crate::kernel::uniform(&params)])?;
+            let sums = self.ctx.kernel(LONG_SUMS).label("sparse_long_sums").build()?;
+            let params = RowParams { shape: c as u32, total: (rows.len() * c) as u32, cap: LONG_ROW, chunks: plan.chunks };
+            sums.launch([(rows.len() * c) as u32], crate::args![&part, &rows, &mut y, crate::kernel::uniform(&params)])?;
         }
         Ok(y)
     }

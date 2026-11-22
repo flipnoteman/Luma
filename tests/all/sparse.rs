@@ -746,3 +746,77 @@ fn matrix_products_with_long_and_empty_rows() {
         }
     }
 }
+
+#[test]
+fn vector_products_of_short_rows_at_every_lane_count() {
+    // Rows of at most 64 entries take the row kernel with 1, 2, 4 or 8 lanes per row by the mean
+    // row length (up to 8, 16, 32, more): row counts off the workgroup size, empty rows between.
+    let mut rng = Rng(19);
+    for (rows, per_row) in [(1000usize, 5usize), (777, 12), (333, 24), (129, 48), (1, 3)] {
+        let cols = 200usize;
+        let mut h = Host { rows, cols, r: vec![], c: vec![], v: vec![] };
+        for r in 0..rows {
+            let len = if r % 7 == 3 { 0 } else { (per_row + rng.below(per_row / 3 + 1)).min(64).min(cols) };
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < len {
+                let c = rng.below(cols);
+                if seen.insert(c) {
+                    h.r.push(r as u32);
+                    h.c.push(c as u32);
+                    h.v.push(rng.quant());
+                }
+            }
+        }
+        if h.v.is_empty() {
+            continue;
+        }
+        let d = h.dense();
+        let x = quantized(&mut rng, cols);
+        let want = host_matmul(&d, rows, cols, &x, 1);
+        let xa = Array::from_slice(&x, cols).unwrap();
+        for format in [SparseFormat::Csr, SparseFormat::Coo] {
+            let s = h.sparse(format);
+            for _ in 0..3 {
+                assert_eq!(s.matmul(&xa).to_vec().unwrap(), want, "{format:?} {rows} rows of {per_row}");
+            }
+        }
+        // And the transposed product of the CSC form of a wide matrix.
+        let y = quantized(&mut rng, rows);
+        let wantt = host_matmul(&transpose(&d, rows, cols), cols, rows, &y, 1);
+        let ya = Array::from_slice(&y, rows).unwrap();
+        for _ in 0..3 {
+            assert_eq!(h.sparse(SparseFormat::Csc).matmul_t(&ya).to_vec().unwrap(), wantt);
+        }
+    }
+}
+
+#[test]
+fn rows_cut_in_several_pieces() {
+    // A row of 9000 entries is three pieces of 4096; the rows around it are short.
+    let (rows, cols) = (6usize, 10_000usize);
+    let mut rng = Rng(20);
+    let mut h = Host { rows, cols, r: vec![], c: vec![], v: vec![] };
+    for r in 0..rows {
+        let len = if r == 2 { 9000 } else { r };
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < len {
+            let c = rng.below(cols);
+            if seen.insert(c) {
+                h.r.push(r as u32);
+                h.c.push(c as u32);
+                h.v.push(rng.quant());
+            }
+        }
+    }
+    let d = h.dense();
+    for format in FORMATS {
+        let s = h.sparse(format);
+        for c in [1usize, 4] {
+            let x = quantized(&mut rng, cols * c);
+            let xa = if c == 1 { Array::from_slice(&x, cols).unwrap() } else { Array::from_slice(&x, [c, cols]).unwrap() };
+            for _ in 0..2 {
+                assert_eq!(s.matmul(&xa).to_vec().unwrap(), host_matmul(&d, rows, cols, &x, c), "{format:?} c={c}");
+            }
+        }
+    }
+}
