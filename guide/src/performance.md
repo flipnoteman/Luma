@@ -129,9 +129,15 @@ or through the device's texture units, as exact gathers. A texture is a view of 
 free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
 where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
 saving is a share of the kernel's time that the gathers take off (per pattern, measured on an RTX
-3090 and an RTX 3080 Laptop: bicubic positions 7 %, warps 12 %, bilinear `resize` 15 %, none for
-nearest and for kernels at the memory bandwidth), and a texture is read only where the saving is
-bigger than what the view costs. So on wgpu and the CPU backend the sources are read from buffers,
+3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
+28-36 %, none for `resize`, smooth positions and nearest: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
+per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
+kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
+or data-dependent coordinates (single `take`s, lookup tables, four-tap bilinear footprints written
+as array operations, clamped windows) ran at 0.84-1.0 of the buffer's speed in texture reads on
+both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
+indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
 and on CUDA the kernels above are measurably faster; `Profile` shows no extra launch.
 
 The model also sizes loops: [`iterate_all`](loops.md#launch-sizing) cuts long register loops into

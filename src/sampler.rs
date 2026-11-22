@@ -193,13 +193,16 @@ impl Sampling<'_> {
         let max = ctx.max_workgroups_per_dimension() as usize;
         let (rows, batch) = (od[1], od[2] * od[3]);
         let c = coarsen();
-        let tile = tile();
+        // A tile of eight rows idles seven of eight invocations of an output of one row (`approx1`:
+        // 1M samples 18 -> 44 us on an RTX 3090): such outputs take a row of 256.
+        let tile = if od[1] < tile()[1] as usize { [WORKGROUP, 1] } else { tile() };
         let per_group = WORKGROUP as usize * c;
         let per_tile = tile[0] as usize * c;
         let shaped = od[0].div_ceil(per_tile) <= max && rows.div_ceil(tile[1] as usize) <= max && batch <= max;
-        let rows_ok = self.source == Source::Scaled && od[0].div_ceil(WORKGROUP as usize) <= max && rows.div_ceil(ROWS) <= max && batch <= max;
+        let rows_per = self.rows_per();
+        let rows_ok = self.source == Source::Scaled && od[0].div_ceil(WORKGROUP as usize) <= max && rows.div_ceil(rows_per) <= max && batch <= max;
         // The source as a texture, where it is one 2-D slice the device can see as one and the
-        // read path pays (see `crate::jit::cost::source_read`).
+        // read path pays (see `crate::jit::cost::read_path`).
         let read_mode = self.read_mode(ctx);
         let filter = if read_mode == Read::Sample { luma_core::TextureFilter::Linear } else { luma_core::TextureFilter::Nearest };
         let texture = match read_mode {
@@ -214,13 +217,16 @@ impl Sampling<'_> {
         if texture.is_some() {
             tests::TEXTURED.set(tests::TEXTURED.get() + 1);
         }
-        let variant = c + 8 * read_mode as usize + 64 * (tile[0] as usize + 1000 * tile[1] as usize);
+        // The kernel is specialised for the method, the kind of source and the dimensions of the grid:
+        // they are constants of its source, so each launch runs only the code it needs.
+        let spec = Spec { method: params.method, kind: params.kind, ndims: params.ndims, persp: params.persp };
+        let variant = spec.variant(c, read_mode, tile, rows_per);
         let (kernel, grid) = if rows_ok {
-            (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, tile, true, read_mode))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(ROWS))?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, tile, true, read_mode, spec, rows_per))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(rows_per))?, to_u32(batch)?])
         } else if shaped {
-            (ctx.cached_kernel("sampler", variant, "main2d", || source(c, tile, false, read_mode))?, [to_u32(od[0].div_ceil(per_tile))?, to_u32(rows.div_ceil(tile[1] as usize))?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler", variant, "main2d", || source(c, tile, false, read_mode, spec, rows_per))?, [to_u32(od[0].div_ceil(per_tile))?, to_u32(rows.div_ceil(tile[1] as usize))?, to_u32(batch)?])
         } else {
-            (ctx.cached_kernel("sampler", variant, "main", || source(c, tile, false, read_mode))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
+            (ctx.cached_kernel("sampler", variant, "main", || source(c, tile, false, read_mode, spec, rows_per))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
         };
         let mut out = Array::<f32>::alloc(ctx, self.out)?;
         let mut args: Vec<KernelArg<'_>> = Vec::with_capacity(6);
@@ -245,6 +251,24 @@ impl Sampling<'_> {
 }
 
 impl Sampling<'_> {
+    /// Image rows per invocation of the `Scaled` kernel (`main_rows`). An invocation computes the
+    /// taps of its column once for all its rows, which pays where the rows of the output share
+    /// source rows (an upscale; a bicubic one the most), and costs parallelism where they do not:
+    /// a downscale reads fresh rows for every output row, and fewer rows per invocation fill the
+    /// device's waves better (RTX 3090 and 3080 Laptop, 4K -> 1080p: bicubic 0.060 -> 0.051 ms and
+    /// 0.128 -> 0.116 ms with one row, bilinear 0.0526 -> 0.0509 ms with two; 1080p -> 4K bicubic
+    /// 0.119 -> 0.114 ms with sixteen).
+    fn rows_per(&self) -> usize {
+        let cubic = matches!(self.method, Interp::Cubic | Interp::CubicSpline);
+        if self.scale[1] < 1.0 {
+            if cubic { 1 } else { 2 }
+        } else if cubic {
+            16
+        } else {
+            8
+        }
+    }
+
     /// How this launch reads its source: [`Read::Buffer`] unless the grid is one contiguous 2-D
     /// slice and reading it through the texture units pays.
     fn read_mode(&self, ctx: &Context) -> Read {
@@ -285,14 +309,40 @@ impl Sampling<'_> {
     }
 }
 
-/// Image rows per invocation of the `Scaled` kernel (`main_rows`).
-const ROWS: usize = 8;
+/// What a launch fixes of the kernel's behaviour: its method, kind of source, grid dimensions and
+/// whether the map divides. The generic uniform holds them too, but a kernel built for them runs
+/// none of the branches over them (approx2 bilinear 4K on an RTX 3090: a third of the instructions).
+#[derive(Clone, Copy)]
+struct Spec {
+    method: u32,
+    kind: u32,
+    ndims: u32,
+    persp: u32,
+}
+
+impl Spec {
+    /// A number that tells the kernels of a launch apart (24 bits; the sizes are powers of two).
+    fn variant(self, coarsen: usize, read: Read, tile: [u32; 2], rows: usize) -> usize {
+        let bits = [
+            (coarsen.ilog2(), 2),
+            (read as u32, 2),
+            (tile[0].ilog2(), 4),
+            (tile[1].ilog2(), 4),
+            (self.method, 3),
+            (self.kind, 2),
+            (self.ndims.saturating_sub(1), 1),
+            (self.persp, 1),
+            (rows as u32, 5),
+        ];
+        bits.iter().fold((0usize, 0u32), |(word, shift), &(v, width)| (word | (v as usize) << shift, shift + width)).0
+    }
+}
 
 /// The source of the sampling kernel with `coarsen` elements per invocation in the generic
 /// entry points.
-fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read) -> String {
+fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read, spec: Spec, rows_per: usize) -> String {
     let mut w = String::new();
-    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {ROWS}u;\nconst TX: u32 = {}u;\nconst TY: u32 = {}u;", tile[0], tile[1]);
+    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {}u;\nconst TX: u32 = {}u;\nconst TY: u32 = {}u;", rows_per, tile[0], tile[1]);
     w.push_str(&bindings(rows_entry, read));
     w.push_str(
         r#"
@@ -518,7 +568,8 @@ fn main_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
         // The texture is of one 2-D slice, so the taps of an axis are texel coordinates.
         text = text.replace("p.gs0", "1u").replace("p.gs1", "1u").replace("    if (!two) { return combine1(base, ax); }\n", "");
     }
-    text
+    let consts = format!("const METHOD: u32 = {}u;\nconst KIND: u32 = {}u;\nconst NDIMS: u32 = {}u;\nconst PERSP: u32 = {}u;\n", spec.method, spec.kind, spec.ndims, spec.persp);
+    consts + &text.replace("p.method", "METHOD").replace("p.kind", "KIND").replace("p.ndims", "NDIMS").replace("p.persp", "PERSP")
 }
 
 /// How the sampling kernel reads its source grid.

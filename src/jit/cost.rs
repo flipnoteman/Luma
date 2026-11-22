@@ -150,17 +150,27 @@ pub(crate) enum ReadPath {
 }
 
 /// The share of a kernel's time that gathers save over loads on the texture-capable NVIDIA parts
-/// measured (RTX 3090 and RTX 3080 Laptop, `afcompare` rows of `signal_approx` and
-/// `signal_image`, best of runs; negative or noise-sized measurements are 0): a bilinear footprint
-/// is one gather instead of four loads, a bicubic one four instead of sixteen. Where a pattern
-/// is bound by memory (`approx2` bilinear at 4K runs at 90% of DRAM bandwidth) the gather saves
-/// nothing; bicubic resize reuses the taps of a column over eight rows and the gather loses.
+/// measured (RTX 3090 and RTX 3080 Laptop, the sampling kernel of `crate::sampler` with its
+/// per-method specialisation, best of interleaved runs; differences within 2% are noise and count
+/// as 0). A warp reads the four taps of a bilinear footprint with one gather instead of four
+/// loads (4K: `rotate` 5%, `transform` 7-13%) and sixteen bicubic taps with four (26-28%, 1080p
+/// 25-27%); scattered `approx2` positions (within 48 pixels of the pixel, the reads of neighbouring
+/// invocations overlap only in the cache) gain 28-36% at bicubic and 1-3% at bilinear. Smooth
+/// `approx2` positions and `resize` are bound by DRAM, which a texture does not touch: no
+/// difference at any method.
+///
+/// The same measurements for the kernels the JIT generates (hand-written equivalents of
+/// `take` with 2-D data-dependent coordinates, 4-tap bilinear gathers from integer or computed
+/// positions, lookup tables, clamped 3 x 3 windows, 512x512 to 4096x4096 sources, 1 to 16 outputs per
+/// texel, texture point loads and gathers against buffer loads): they are bound by DRAM or by
+/// the index arithmetic, texture reads are between 0.84 and 1.0 of the buffer's (windows: 0.71-0.97,
+/// the texture's out-of-range read is 0, so the clamp stays in the kernel) with one outlier, 1.13
+/// on a 512x512 source of the laptop part. The JIT never reads through a texture.
 fn gather_saving(pattern: ReadPattern, taps: u32) -> f64 {
     match (pattern, taps) {
-        (ReadPattern::Positions, 16) => 0.07,
-        (ReadPattern::Warp, 4) => 0.12,
-        (ReadPattern::Warp, 16) => 0.05,
-        (ReadPattern::Scaled, 4) => 0.15,
+        (ReadPattern::Positions, 16) => 0.25,
+        (ReadPattern::Warp, 4) => 0.05,
+        (ReadPattern::Warp, 16) => 0.25,
         _ => 0.0,
     }
 }
