@@ -15,6 +15,18 @@
 //! `L` do not depend on anything, so the next one is already in registers while the workgroup waits.
 //! Then the block's own triangle is solved by substitution in workgroup memory, `x_b` is published.
 //! Only where the device orders memory across workgroups ([`Tuning::lookback_scan`]; CUDA).
+//!
+//! Two ways to solve a block's own triangle: substitution (64 dependent steps, a barrier each: about
+//! 3 us of the 6.3 us a block adds to the chain on an RTX 3090), or, for the solves inside `solve` and
+//! `solve_spd` ([`super::tri::lower_left_factor`]), by the explicit inverse of the block, computed
+//! while the workgroup waits for the blocks before it (a column of the inverse an invocation) and
+//! applied by one product: the chain is then 2.8 us a block (4096 rows, 1 column: 0.18 ms, ArrayFire's
+//! `trsm` 0.2 ms). The idea is that of the inverted diagonal blocks of MAGMA's `trsm` (BSD-3, Haidar,
+//! Dong, Tomov et al. on batched `trsm` for GPUs); only the idea is taken, the kernel is written here.
+//! The inverse of a block is not backward stable for an ill-conditioned triangle, so `solve_triangular` of
+//! arbitrary data does not use it (`LUMA_TRSV_INV=1` forces it, `LUMA_TRSV=0` turns the kernel off,
+//! `LUMA_TRSV_KC` sets the columns a workgroup takes, 8 by default: more columns are more workgroups
+//! per block, which read the triangle again but do not lengthen the chain).
 
 use std::panic::Location;
 
