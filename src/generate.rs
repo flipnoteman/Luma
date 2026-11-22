@@ -156,7 +156,7 @@ fn tiled_index(ctx: &Context, dims: Shape, tiles: Shape, location: &'static Loca
     match flat {
         Some(flat) => Ok(flat),
         // Every dimension is 1: all zeros.
-        None => Ok(Array::<u32>::range_on(ctx, out, 0)? * 0u32),
+        None => Ok(Array::<u32>::range_on(ctx, out, 0)?.minimum(0u32)),
     }
 }
 

@@ -701,3 +701,67 @@ let x = Array::from_slice(&[-2.0f32, 0.5, 3.0], 3)?;
 assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
 # Ok::<(), luma::LumaError>(())
 ```
+
+## Tiles, diagonals, triangles, differences
+
+ArrayFire's structural functions are index maps and generators in luma: none is a kernel of its
+own, each fuses into the expression that reads it, and none reads or writes memory until an
+evaluation needs it. Shapes list the extents with the first dimension fastest, exactly like
+ArrayFire's `dim4`, so the dimension arguments carry over unchanged (`af::tile(a, 2, 3)` is
+`a.tile([2, 3])`, `af::diff1(a, 1)` is `a.diff1(1)`). Element `(i, j)` has `i` along dimension 0;
+diagonal `k` holds the elements with `j - i = k`.
+
+**`tile`** repeats an array along every dimension, a lazy read like a wrapping pad; **`iota`**
+counts the elements of a shape in memory order and tiles the count; **`identity`** is generated
+inside the kernel that uses it:
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+assert_eq!(a.tile([2, 2]).to_vec()?, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+assert_eq!(Array::<u32>::iota([2, 2], [1, 2])?.to_vec()?, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+let id = Array::<f32>::identity([3, 3])?;
+assert_eq!(id.to_vec()?, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`diag(k)`** extracts the `k`-th diagonal of every matrix of dimensions 0 and 1 (dimensions 2 and
+3 are batches) as a view, and **`diag_matrix(k)`** builds the matrix with a column on its
+diagonal `k`; **`lower(unit)`** and **`upper(unit)`** zero the other triangle (with `unit` the
+diagonal is one) and work on non-square matrices and batches. All of them accept every element
+type (`f32`, `i32`, `u32`, `bool`, `f64`, `Df32`), and a NaN that is not kept is zeroed, not
+propagated:
+
+```rust
+use luma::*;
+
+let m = Array::from_slice(&[1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0], [3, 3])?;
+assert_eq!(m.diag(0).to_vec()?, vec![1.0, 5.0, 9.0]);
+assert_eq!(m.diag(1).to_vec()?, vec![2.0, 6.0]);
+assert_eq!(m.diag(-1).to_vec()?, vec![4.0, 8.0]);
+assert_eq!(m.lower(false).to_vec()?, vec![1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]);
+assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0, 1.0]);
+let v = Array::from_slice(&[1.0f32, 2.0], 2)?;
+assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
+with `InvalidShape` (as `diff1` does for an extent below 2).
+
+**`replace(&cond, b)`** is `af::replace` returning a new array (`a` where `cond`, else `b`, an
+array or a scalar: `select(&cond, &a, b)`), and **`diff1(axis)`** / **`diff2(axis)`** are the first
+and second differences along an axis, one and two shorter, as a fused difference of slices that
+reads the array once:
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, f32::NAN, 4.0, 9.0], 4)?;
+assert_eq!(x.replace(&!x.is_nan(), 0.0).to_vec()?, vec![1.0, 0.0, 4.0, 9.0]);
+let y = Array::from_slice(&[0.0f32, 1.0, 4.0, 9.0, 16.0], 5)?;
+assert_eq!(y.diff1(0).to_vec()?, vec![1.0, 3.0, 5.0, 7.0]);
+assert_eq!(y.diff2(0).to_vec()?, vec![2.0, 2.0, 2.0]);
+# Ok::<(), luma::LumaError>(())
+```

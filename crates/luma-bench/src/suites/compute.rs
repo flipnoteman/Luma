@@ -10,7 +10,9 @@
 //! * `fractal`: Mandelbrot and Julia sets as `iterate_all` register loops and unrolled chains;
 //! * `fft`, `image`: FFT convolution against direct convolution, and image filters built from
 //!   shifts, slices, scans and gathers;
-//! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`).
+//! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`);
+//! * `structure`: `tile`, `diag`, `identity`, `lower`/`upper`, `iota`, `replace` and `diff1`/`diff2` as
+//!   kernels of their own (the structural half of ArrayFire's array API).
 //!
 //! Every case is checked against a host reference (`f64` where precision matters) before it is
 //! timed. Sizes shrink under `--quick` and on the CPU backend.
@@ -21,6 +23,7 @@ mod linalg;
 mod physics;
 mod scans;
 mod signal;
+mod structure;
 
 use std::time::{Duration, Instant};
 
@@ -94,4 +97,5 @@ pub fn run(h: &mut Harness) {
     physics::run(h);
     signal::run(h);
     crypto::run(h);
+    structure::run(h);
 }
