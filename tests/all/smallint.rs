@@ -854,8 +854,10 @@ fn random_program(ctx: &Context, seed: u64, n: usize, steps: usize) {
 
 #[test]
 fn random_programs_over_every_integer_type_match_the_host() {
+    // `LUMA_SMALLINT_SEEDS` runs more programs (the default is quick).
+    let seeds: u64 = std::env::var("LUMA_SMALLINT_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
     for (k, ctx) in [Context::new().unwrap(), chunked()].into_iter().enumerate() {
-        for seed in 0..40u64 {
+        for seed in 0..seeds {
             for n in [37usize, 300] {
                 // Arrays of several buffers (n = 300 on 1 KiB buffers) run per segment; keep the circular shifts of the first context.
                 if k == 1 && n == 37 {
