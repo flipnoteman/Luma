@@ -1,13 +1,22 @@
 //! Nearest neighbours: for every query feature the `k` closest train features by the sum of
 //! absolute differences, of squared differences or the Hamming distance.
 //!
-//! Two kernels: the distances of a block of 64 queries to every train feature are computed like
-//! the product of two matrices (`dist.rs` style: both operands staged 16 elements at a time in
-//! workgroup memory, every invocation accumulating 4 x 4 distances in registers) into a scratch
-//! matrix of `[train, query]`; a workgroup per query then keeps the `k` smallest in a sorted
-//! list in workgroup memory, merging in blocks of 256 distances (bitonic sort of the block that
-//! beat the list's largest entry, then a bitonic merge with the list). Queries are processed in
-//! chunks so that the scratch matrix stays within a fixed budget.
+//! Distances are computed like the product of two matrices: a workgroup takes 64 queries and 64
+//! train features at a time, stages both operands 16 elements at a time in workgroup memory and
+//! accumulates 4 x 4 distances per invocation in registers.
+//!
+//! * `k <= FUSED_MAX`: the *fused* kernel never writes the distances. Every invocation keeps the
+//!   sorted list of the `k` smallest distances of its train features (inserting a distance costs
+//!   one comparison unless it belongs in the list) and writes it out at the end; the train blocks
+//!   are split over workgroups when there are too few queries to fill the device; a second
+//!   launch merges the lists of every query.
+//! * larger `k`: the distances of a chunk of queries go to a scratch matrix of `[train, query]`
+//!   (chunks keep it within a fixed budget); a workgroup per query keeps a sorted list in
+//!   workgroup memory, merging blocks of 256 distances (a bitonic sort of the block that beat the
+//!   list's largest entry, then a bitonic merge with the list).
+//!
+//! Distances are ordered by `(distance, train index)`, so ties go to the smaller index; the sort
+//! key of a distance is a `u32` that orders like it (NaN last).
 
 use std::fmt::Write as _;
 

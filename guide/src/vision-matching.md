@@ -83,8 +83,9 @@ differences, sums wrap) or `i32` (`i32` distances). Differences from ArrayFire:
 * Ties are broken by the smaller train index. ArrayFire's CUDA backend does the same; its CPU
   backend returns equal distances in an arbitrary order.
 * NaN distances sort after all others.
-* The results are `Result`s read from arrays that are already computed; the operation does not
-  synchronize, but its errors are returned directly, not as a poisoned array.
+* The result is a `Result`: errors in the arguments are returned directly, not as poisoned arrays.
+  The two arrays are lazy like every other result (nothing waits for the GPU, the number of
+  neighbours is known beforehand).
 
 For `n_dist <= 8` one kernel does everything: a workgroup takes 64 queries and a range of train
 blocks (the ranges split over workgroups when there are few queries), computes the distances 64 x
