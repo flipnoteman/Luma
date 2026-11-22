@@ -140,16 +140,19 @@ pub(crate) fn source(kernel: Kernel) -> String {
 }
 
 /// Invocations of the workgroup of [`scan_counts_source`].
-const SCAN_GROUP: u32 = 256;
-/// Counts each invocation of [`scan_counts_source`] scans.
-const SCAN_ITEMS: u32 = 4;
+const SCAN_GROUP: u32 = 1024;
 
 /// The WGSL of the exclusive scan of `n` counts followed by their total, in one workgroup:
 /// `counts[0..n]` become the exclusive prefix sums and `counts[n]` the sum. Arguments: counts
 /// (`n + 1` words), uniform `{n}`. The counts of the tiles of a detector are turned into the
 /// offsets at which the tiles write their points.
+///
+/// Every invocation owns a contiguous chunk of the counts: it sums it, the workgroup scans the
+/// sums (ten steps), and every invocation writes the prefixes of its chunk. The counts are a few
+/// tens of kilobytes, so the strided accesses of the chunks stay in the cache, and the scan costs
+/// about twenty barriers whatever `n` is, where a scan of fixed-size rounds costs that many
+/// barriers per thousand counts.
 fn scan_counts_source() -> String {
-    let span = SCAN_GROUP * SCAN_ITEMS;
     format!(
         "struct Params {{ n: u32, a: u32, b: u32, c: u32 }}
 @group(1) @binding(0) var<storage, read_write> counts: array<u32>;
@@ -157,36 +160,27 @@ fn scan_counts_source() -> String {
 var<workgroup> sums: array<u32, {SCAN_GROUP}>;
 @compute @workgroup_size({SCAN_GROUP})
 fn main(@builtin(local_invocation_index) t: u32) {{
-    var carry = 0u;
-    for (var s0 = 0u; s0 < p.n; s0 += {span}u) {{
-        let k0 = s0 + t * {SCAN_ITEMS}u;
-        var v: array<u32, {SCAN_ITEMS}>;
-        var run = 0u;
-        for (var r = 0u; r < {SCAN_ITEMS}u; r++) {{
-            var x = 0u;
-            if (k0 + r < p.n) {{ x = counts[k0 + r]; }}
-            v[r] = x;
-            run += x;
-        }}
-        sums[t] = run;
+    let chunk = (p.n + {SCAN_GROUP}u - 1u) / {SCAN_GROUP}u;
+    let first = min(t * chunk, p.n);
+    let last = min(first + chunk, p.n);
+    var run = 0u;
+    for (var i = first; i < last; i++) {{ run += counts[i]; }}
+    sums[t] = run;
+    workgroupBarrier();
+    for (var d = 1u; d < {SCAN_GROUP}u; d = d << 1u) {{
+        var add = 0u;
+        if (t >= d) {{ add = sums[t - d]; }}
         workgroupBarrier();
-        for (var d = 1u; d < {SCAN_GROUP}u; d = d << 1u) {{
-            var add = 0u;
-            if (t >= d) {{ add = sums[t - d]; }}
-            workgroupBarrier();
-            sums[t] = sums[t] + add;
-            workgroupBarrier();
-        }}
-        var before = carry;
-        if (t > 0u) {{ before += sums[t - 1u]; }}
-        for (var r = 0u; r < {SCAN_ITEMS}u; r++) {{
-            if (k0 + r < p.n) {{ counts[k0 + r] = before; }}
-            before += v[r];
-        }}
-        carry += sums[{last}u];
+        sums[t] = sums[t] + add;
         workgroupBarrier();
     }}
-    if (t == 0u) {{ counts[p.n] = carry; }}
+    var before = sums[t] - run;
+    for (var i = first; i < last; i++) {{
+        let v = counts[i];
+        counts[i] = before;
+        before += v;
+    }}
+    if (t == {last}u) {{ counts[p.n] = sums[t]; }}
 }}
 ",
         last = SCAN_GROUP - 1

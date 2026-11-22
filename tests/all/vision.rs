@@ -97,7 +97,7 @@ fn sorted_points(k: &luma::Keypoints) -> Vec<(u32, u32, f32)> {
 #[test]
 fn fast_matches_the_definition() {
     let ctx = ctx();
-    for (h, w, arc, non_max, thr) in [(64, 80, 9, true, 20.0f32), (45, 70, 12, true, 30.0), (100, 33, 9, false, 25.0), (37, 91, 16, true, 15.0), (70, 70, 10, true, 20.0)] {
+    for (h, w, arc, non_max, thr) in [(64, 80, 9, true, 20.0f32), (45, 70, 12, true, 30.0), (100, 33, 9, false, 25.0), (37, 91, 16, true, 15.0), (70, 70, 10, true, 20.0), (290, 1010, 9, true, 20.0)] {
         let data = scene(h, w, 7 + arc as u64);
         let img = Array::from_slice_on(&ctx, &data, [h, w]).unwrap();
         let want = fast_ref(&data, h, w, thr, arc, non_max, 3);
