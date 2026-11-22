@@ -128,14 +128,14 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
         let c = i % {hw}u;
         let r = i / {hw}u;
         let o = r * {rw}u + c;
-        hs[i] = G0 * (raw[o] + raw[o + 4u]) + G1 * (raw[o + 1u] + raw[o + 3u]) + G2 * raw[o + 2u];
+        hs[i] = fma(raw[o], G0, fma(raw[o + 1u], G1, fma(raw[o + 2u], G2, fma(raw[o + 3u], G1, raw[o + 4u] * G0))));
     }}
     workgroupBarrier();
     for (var i = t; i < {sm}u; i += 256u) {{
         let c = i % {sw}u;
         let r = i / {sw}u;
         let o = r * {hw}u + c;
-        sm[i] = G0 * (hs[o] + hs[o + 4u * {hw}u]) + G1 * (hs[o + {hw}u] + hs[o + 3u * {hw}u]) + G2 * hs[o + 2u * {hw}u];
+        sm[i] = fma(hs[o], G0, fma(hs[o + {hw}u], G1, fma(hs[o + 2u * {hw}u], G2, fma(hs[o + 3u * {hw}u], G1, hs[o + 4u * {hw}u] * G0))));
     }}
     workgroupBarrier();
     for (var i = t; i < {mg}u; i += 256u) {{
@@ -153,8 +153,8 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
         let ll = sm[yu * {sw}u + xl]; let lc = sm[rr * {sw}u + xl]; let lr = sm[yd * {sw}u + xl];
         let cl = sm[yu * {sw}u + cc]; let cr = sm[yd * {sw}u + cc];
         let rl = sm[yu * {sw}u + xr]; let rc = sm[rr * {sw}u + xr]; let rd = sm[yd * {sw}u + xr];
-        let dx = (rl + rd + 2.0 * rc) - (ll + lr + 2.0 * lc);
-        let dy = (lr + rd + 2.0 * cr) - (ll + rl + 2.0 * cl);
+        let dx = ((rl + rd) - (ll + lr)) + 2.0 * (rc - lc);
+        let dy = ((lr + rd) - (ll + rl)) + 2.0 * (cr - cl);
         gxs[i] = dx;
         gys[i] = dy;
         if (p.fast != 0u) {{ mag[i] = abs(dx) + abs(dy); }} else {{ mag[i] = sqrt(dx * dx + dy * dy); }}

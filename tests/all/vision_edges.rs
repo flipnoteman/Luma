@@ -1,4 +1,5 @@
 //! Canny edges, anisotropic diffusion, mean shift: tests against host references.
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop, clippy::manual_memcpy)]
 
 use crate::common::{assert_close, values};
 use luma::{Array, Context, DiffusionEq, FluxFunction};
@@ -187,7 +188,7 @@ fn diffusion_step(data: &[f32], h: usize, w: usize, planes: usize, dt: f32, k: f
                     } else {
                         sq(db0.max(0.0)) + sq(df0.min(0.0)) + sq(db.max(0.0)) + sq(df.min(0.0))
                     };
-                    delta = prop.sqrt() * delta;
+                    delta *= prop.sqrt();
                 } else {
                     delta = cond(gf * mct) * df - cond(gb * mct) * db;
                     df = s - c;
@@ -255,14 +256,14 @@ fn canny_suppressed(img: &[f32], h: usize, w: usize, fast: bool) -> Vec<f32> {
     let mut hs = vec![0.0f32; h * w];
     for j in 0..w as i64 {
         for i in 0..h as i64 {
-            hs[i as usize + h * j as usize] = G[0] * (at(i - 2, j) + at(i + 2, j)) + G[1] * (at(i - 1, j) + at(i + 1, j)) + G[2] * at(i, j);
+            hs[i as usize + h * j as usize] = at(i - 2, j).mul_add(G[0], at(i - 1, j).mul_add(G[1], at(i, j).mul_add(G[2], at(i + 1, j).mul_add(G[1], at(i + 2, j) * G[0]))));
         }
     }
     let at2 = |i: i64, j: i64| if i < 0 || j < 0 || i >= h as i64 || j >= w as i64 { 0.0 } else { hs[i as usize + h * j as usize] };
     let mut sm = vec![0.0f32; h * w];
     for j in 0..w as i64 {
         for i in 0..h as i64 {
-            sm[i as usize + h * j as usize] = G[0] * (at2(i, j - 2) + at2(i, j + 2)) + G[1] * (at2(i, j - 1) + at2(i, j + 1)) + G[2] * at2(i, j);
+            sm[i as usize + h * j as usize] = at2(i, j - 2).mul_add(G[0], at2(i, j - 1).mul_add(G[1], at2(i, j).mul_add(G[2], at2(i, j + 1).mul_add(G[1], at2(i, j + 2) * G[0]))));
         }
     }
     let refl = |p: i64, n: i64| if p < 0 { -p } else if p >= n { 2 * (n - 1) - p } else { p };
@@ -272,8 +273,8 @@ fn canny_suppressed(img: &[f32], h: usize, w: usize, fast: bool) -> Vec<f32> {
     let mut mag = vec![0.0f32; h * w];
     for j in 0..w as i64 {
         for i in 0..h as i64 {
-            let dx = (s(i + 1, j - 1) + s(i + 1, j + 1) + 2.0 * s(i + 1, j)) - (s(i - 1, j - 1) + s(i - 1, j + 1) + 2.0 * s(i - 1, j));
-            let dy = (s(i - 1, j + 1) + s(i + 1, j + 1) + 2.0 * s(i, j + 1)) - (s(i - 1, j - 1) + s(i + 1, j - 1) + 2.0 * s(i, j - 1));
+            let dx = ((s(i + 1, j - 1) + s(i + 1, j + 1)) - (s(i - 1, j - 1) + s(i - 1, j + 1))) + 2.0 * (s(i + 1, j) - s(i - 1, j));
+            let dy = ((s(i - 1, j + 1) + s(i + 1, j + 1)) - (s(i - 1, j - 1) + s(i + 1, j - 1))) + 2.0 * (s(i, j + 1) - s(i, j - 1));
             let k = i as usize + h * j as usize;
             gx[k] = dx;
             gy[k] = dy;
@@ -419,6 +420,9 @@ fn canny_matches_the_pipeline() {
         ([50, 45, 3, 1], false, 0.1, 0.3, false),
         ([37, 41, 2, 2], true, 0.3, 0.0, false),
         ([70, 70, 1, 1], false, 0.0, 0.0, false),
+        ([9, 3, 1, 1], false, 0.0, 0.0, false),
+        ([4, 7, 2, 1], false, 0.0, 0.0, true),
+        ([3, 3, 1, 1], false, 0.0, 0.0, false),
     ] {
         let (h, w, planes) = (shape[0], shape[1], shape[2] * shape[3]);
         let data = blobs(h, w, planes, 5 + h as u64);
@@ -426,7 +430,7 @@ fn canny_matches_the_pipeline() {
         let mode = if otsu_mode { CannyThreshold::AutoOtsu } else { CannyThreshold::Manual };
         let got = img.canny(mode, low, high, 3, fast).to_vec().unwrap();
         let want = canny_ref(&data, h, w, planes, otsu_mode, low, high, fast);
-        assert!(want.iter().filter(|&&b| b).count() > 20, "the case has edges");
+        assert!(want.iter().filter(|&&b| b).count() > 0, "the case has edges");
         let bad = mismatches(&got, &want);
         assert!(bad == 0, "{shape:?} otsu {otsu_mode} {low} {high} fast {fast}: {bad} of {} edge pixels differ ({} wanted)", got.iter().filter(|&&b| b).count(), want.iter().filter(|&&b| b).count());
     }

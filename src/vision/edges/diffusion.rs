@@ -170,7 +170,7 @@ fn update_source(flux: FluxFunction, mcde: bool) -> String {
         FluxFunction::Exponential => "exp(v)",
         FluxFunction::Quadratic => "1.0 / (1.0 + v)",
     };
-    let _ = write!(s, "fn cond(v: f32) -> f32 {{ return {c}; }}\n");
+    let _ = writeln!(s, "fn cond(v: f32) -> f32 {{ return {c}; }}");
     if mcde {
         s.push_str(
             "fn update(mct: f32, C: f32, S: f32, N: f32, W: f32, E: f32, SE: f32, SW: f32, NE: f32, NW: f32) -> f32 {
