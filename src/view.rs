@@ -64,7 +64,7 @@ pub(crate) fn swapped(a: usize, b: usize) -> [usize; 4] {
 }
 
 /// The dimensions of `shape` as `u32`.
-fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
+pub(crate) fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
     let dims = shape.dims();
     let mut out = [1u32; 4];
     for (slot, &dim) in out.iter_mut().zip(&dims) {
