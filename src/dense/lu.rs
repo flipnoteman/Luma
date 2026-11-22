@@ -703,13 +703,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Option<Lu> {
     let ctx = a.context();
     let (rows, rows2) = calu_rows(ctx);
-    if d.cols > CALU_W || rows < 64 || rows2 < 2 * d.cols || d.rows < d.cols || d.rows.div_ceil(d.rows.div_ceil(rows)) < d.cols + d.rows.div_ceil(rows) {
+    if d.cols > CALU_W || rows < 64 || rows2 < 2 * d.cols || d.rows < d.cols {
         return None;
     }
     let perm_shape = Shape::from([d.rows, 1, 1]);
     let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
+    // A panel that fits a workgroup is one chunk; a taller one is split in chunks of 256 rows
+    // (a pivot takes less time in a workgroup of 8 subgroups than in one of 16).
+    let rows = if d.rows <= rows { rows } else { rows.min(256) };
     let chunks = d.rows.div_ceil(rows);
     let chunk_rows = d.rows.div_ceil(chunks);
+    // Every chunk has to hold the `w` rows it picks.
+    if d.rows - (chunks - 1) * chunk_rows < d.cols {
+        return None;
+    }
     // Workgroups as small as the rows they factor: a pivot costs a pass of the invocations.
     let (rows, rows2) = (chunk_rows.next_power_of_two().clamp(64, rows), (chunks * d.cols).next_power_of_two().clamp(64, rows2));
     let params = CaluParams { m: d.rows as u32, w: d.cols as u32, g: chunks as u32, rc: chunk_rows as u32 };
