@@ -52,3 +52,31 @@ non-maximal suppression and lists the points row by row; on its CPU backend the 
 leaves out the pixels within `edge + 2` of the border and mixes up the two axes on images that
 are not square. luma applies the limit after the suppression and suppresses everywhere inside
 `edge`.
+
+## `homography`
+
+`homography(x_src, y_src, x_dst, y_dst, method, inlier_thr, iterations)` estimates the perspective
+transform between matching points (ArrayFire's `homography`): every one of `iterations`
+hypotheses is the direct linear transform of four random point pairs and is scored over all the
+points, RANSAC by the number of points that land within `inlier_thr` of their destination, least
+median of squares (`HomographyMethod::Lmeds`) by the median of the squared errors. It returns the
+`[3, 3]` matrix (its nine values in memory order are the rows of `H`, `(x', y', 1) ~ H (x, y, 1)`,
+scaled so that `H[2][2] = 1`) and the inlier count as a one-element `u32` array: nothing is read
+back until you ask.
+
+```rust
+use luma::*;
+
+let x: Vec<f32> = (0..8).map(|i| (i * 7 % 11) as f32).collect();
+let y: Vec<f32> = (0..8).map(|i| (i * 5 % 13) as f32).collect();
+let (xd, yd): (Vec<f32>, Vec<f32>) = (x.iter().map(|v| v + 3.0).collect(), y.iter().map(|v| v - 2.0).collect());
+let up = |v: &[f32]| Array::from_slice(v, v.len());
+let (h, inliers) = homography(&up(&x)?, &up(&y)?, &up(&xd)?, &up(&yd)?, HomographyMethod::Ransac, 0.5, 50);
+assert_eq!(inliers.item()?, 8);
+assert!((h.to_vec()?[2] - 3.0).abs() < 1e-3);
+# Ok::<(), luma::LumaError>(())
+```
+
+One workgroup scores one hypothesis; the samples come from a fixed hash of the hypothesis number,
+so a call is deterministic (ArrayFire's differ: compare the recovered transform, not the
+matrices). As in ArrayFire the matrix is the best sample's, not refined over its inliers.

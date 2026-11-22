@@ -8,11 +8,13 @@ mod corners;
 mod descriptors;
 mod edges;
 mod fast;
+mod homography;
 mod matching;
 mod regions;
 
 pub fn run(h: &mut Harness) {
     fast::run(h);
+    homography::run(h);
     corners::run(h);
     matching::run(h);
     edges::run(h);
