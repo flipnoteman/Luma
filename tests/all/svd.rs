@@ -238,7 +238,7 @@ fn svd_rank_deficient() {
 fn svd_exact_zero_values_complete_u() {
     let ctx = Context::new().unwrap();
     // A matrix with a zero column and a zero row, duplicated columns: exact zero singular values.
-    for &n in &[3usize, 4, 8, 17, 32] {
+    for &n in &[3usize, 4, 8, 17, 32, 100, 130] {
         let mut a = random(n, n, 3);
         for i in 0..n {
             a[i * n + 1] = 0.0;
@@ -246,9 +246,24 @@ fn svd_exact_zero_values_complete_u() {
         }
         check_batch(&ctx, &a, n, n, 1, "zero column");
     }
-    check_batch(&ctx, &vec![0.0; 16], 4, 4, 1, "zero 4x4");
+    check_batch(&ctx, &[0.0; 16], 4, 4, 1, "zero 4x4");
     check_batch(&ctx, &[0.0], 1, 1, 1, "zero 1x1");
-    check_batch(&ctx, &vec![0.0; 6 * 3], 6, 3, 1, "zero 6x3");
+    check_batch(&ctx, &[0.0; 6 * 3], 6, 3, 1, "zero 6x3");
+    // The same on the global-memory path: zero matrices (tall, wide, square), half of the columns zero.
+    for &(m, n) in &[(100usize, 100usize), (120, 100), (100, 120)] {
+        check_batch(&ctx, &vec![0.0; m * n], m, n, 1, "zero big");
+    }
+    for &(m, n) in &[(110usize, 110usize), (130, 105), (105, 130)] {
+        let mut a = random(m, n, 9);
+        for i in 0..m {
+            for j in 0..n {
+                if (m < n && i >= m / 2) || (m >= n && j >= n / 2) {
+                    a[i * n + j] = 0.0;
+                }
+            }
+        }
+        check_batch(&ctx, &a, m, n, 1, "half zero big");
+    }
 }
 
 #[test]
@@ -378,7 +393,7 @@ fn pinv_penrose_conditions() {
     }
     pinv_checks(&ctx, &batch, 6, 4, 20, "batch");
     // Zero matrix: the zero pseudo-inverse, no NaN.
-    let z = mat(&ctx, &vec![0.0; 12], 4, 3, 1).pinv().to_vec().unwrap();
+    let z = mat(&ctx, &[0.0; 12], 4, 3, 1).pinv().to_vec().unwrap();
     assert!(z.iter().all(|&x| x == 0.0), "{z:?}");
 }
 

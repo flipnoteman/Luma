@@ -36,6 +36,7 @@ use crate::kernel::{uniform, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
 use crate::shape::Shape;
+use crate::view::concat;
 
 /// Most sweeps the workgroup kernel runs; it stops earlier when no pair is rotated.
 const MAX_SWEEPS: u32 = 30;
@@ -843,8 +844,31 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
         let args: [KernelArg<'_>; 7] = [(&v).into(), (&ord).into(), right.into(), left.into(), (&w).into(), (&sv).into(), uniform(&dims3)];
         launch(ctx, &emit_source(kind), "svd_emit", groups, &args)?;
     }
+    // Exactly zero singular values (sorted last) have no left vector: complete them to an orthonormal
+    // set, the last columns of the full Q of the others. Reading the values back costs one wait.
+    let nonzero = sv.to_vec()?.iter().take_while(|&&x| x.is_nan() || x > NULL_SIGMA).count();
+    if nonzero < cc {
+        let left = if wide { vt.transpose() } else { u.clone() };
+        let complete = if nonzero == 0 {
+            // [cc, rr]: the first columns of the identity as rows.
+            let shape = Shape::from([cc, rr]);
+            select(&Array::<u32>::range_on(ctx, shape, 0)?.eq(&Array::<u32>::range_on(ctx, shape, 1)?), 1.0f32, 0.0f32)
+        } else {
+            let kept = left.slice(0, 0..nonzero).cache();
+            let q = kept.qr().q();
+            concat(0, [&kept, &q.slice(0, nonzero..cc)])
+        };
+        if wide {
+            vt = complete.transpose().cache();
+        } else {
+            u = complete.cache();
+        }
+    }
     Ok(Outputs { s, u: Some(u), vt: Some(vt) })
 }
+
+/// Singular values at or below this (after scaling the matrix to a largest element of 1) are zero.
+const NULL_SIGMA: f32 = 1.0e-18;
 
 /// The decomposition of every matrix of `a`: the entry point of the public operations.
 pub(crate) fn decompose(a: &Array<f32>, kind: Kind, vectors: bool, op: &'static str, loc: &'static Location<'static>) -> Outputs {
