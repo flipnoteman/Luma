@@ -458,9 +458,18 @@ impl Em<'_> {
                 }
             }
             Expr::ArrayLength { binding } => format!("arrayLength(&{})", self.binding_name(*binding)),
-            // A kernel that samples a texture reaches this backend as a naga module (`compile_naga`),
-            // never through this emitter.
-            Expr::Texture { .. } => unreachable!("texture kernels are compiled from their naga module"),
+            Expr::Texture { op, binding, coords } => {
+                let (t, c) = (self.binding_name(*binding), self.expr(sc, coords));
+                let sampler = || {
+                    let at = self.m.bindings.iter().position(|d| d.kind == BindingKind::Sampler).unwrap_or(usize::MAX);
+                    self.m.bindings.get(at).map_or_else(|| "luma_missing_sampler".to_owned(), |_| self.binding_name(at as u32))
+                };
+                match op {
+                    TextureOp::Load => format!("textureLoad({t}, {c}, 0)"),
+                    TextureOp::Gather(k) => format!("textureGather({}, {t}, {}, {c})", k & 3, sampler()),
+                    TextureOp::Sample => format!("textureSampleLevel({t}, {}, {c}, 0.0)", sampler()),
+                }
+            }
         }
     }
 
@@ -1074,7 +1083,11 @@ impl Em<'_> {
                 BindingKind::Uniform => "uniform",
                 BindingKind::StorageRead => "storage, read",
                 BindingKind::StorageReadWrite => "storage, read_write",
-                BindingKind::Texture2d | BindingKind::Sampler => unreachable!("texture kernels are compiled from their naga module"),
+                BindingKind::Texture2d | BindingKind::Sampler => {
+                    let ty = if d.kind == BindingKind::Texture2d { "texture_2d<f32>" } else { "sampler" };
+                    let _ = writeln!(body, "@group(1) @binding({i}) var {}: {ty};", self.binding_name(i as u32));
+                    continue;
+                }
             };
             let mut ty = self.ty(&self.binding_root_ty_decl(d));
             if self.hardware[i] {

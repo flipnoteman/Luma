@@ -28,6 +28,29 @@ assert_eq!(x.approx1(&pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 2.0,
 Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
 them in registers. The input and the positions are evaluated first and must fit one buffer.
 
+### Reading a source through the texture units
+
+A kernel that reads a two-dimensional image at positions it computes (`approx2`, `resize`,
+`rotate`, `transform`) can fetch the four texels of a bilinear footprint, or the sixteen of a
+bicubic one as four such blocks, with the texture unit's *gather* (`textureGather` in WGSL,
+`tld4` in CUDA) instead of one load per texel. A gather is exact: it returns the texels, unfiltered,
+and the weights are computed by the kernel as before, so the results are bit for bit those of the
+loads on every backend. Luma decides by its cost model ([`read_path`](performance.md#reading-a-source-through-a-texture)):
+on an RTX 3090 and an RTX 3080 Laptop (the CUDA backend reads the source's own buffer as a pitched
+texture, a view that costs nothing and is kept with the array) the gather takes 7-10 % off `approx2`
+bicubic, 12-20 % off a bilinear `rotate` / `transform` and `resize` upwards, and it is chosen for
+those; memory-bound kernels (nearest, `approx2` bilinear) and the bicubic `resize`, whose loads
+the column of an output block shares, keep the loads. A backend that has to copy the source to
+make a texture (wgpu) reads the buffer, as does the CPU backend, which has no textures.
+Nothing in the API changes and the choice is not configurable.
+
+`Interp::LinearHardware` is the explicit opt-in to the texture unit's own bilinear *filter*: one
+fetch per output, but the hardware keeps 8 bits of the fraction of a position (the weights are
+multiples of 1/256), so along each axis a result is off from `Interp::Linear`'s by up to the
+difference of the two neighbouring samples over 256. Luma never chooses it. Where the source cannot
+be a texture (more than two dimensions, the CPU backend, a width the device cannot read in place on
+a copying backend) it is exactly `Interp::Linear`.
+
 ## Images
 
 An image is an array whose dimensions 0 and 1 are the image axes; the dimensions after them

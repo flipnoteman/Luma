@@ -1228,7 +1228,7 @@ impl Backend for WgpuBackend {
         if w == 0 || h == 0 || desc.width > caps.max_dim || desc.height > caps.max_dim {
             return Err(BackendError::Unsupported(format!("a {w}x{h} texture (up to {0}x{0} are possible)", caps.max_dim)));
         }
-        if pitch < row || pitch % u64::from(caps.pitch_align) != 0 || offset % 4 != 0 || offset + pitch * (h - 1) + row > source.size() {
+        if pitch < row || !pitch.is_multiple_of(u64::from(caps.pitch_align)) || !offset.is_multiple_of(4) || offset + pitch * (h - 1) + row > source.size() {
             return Err(BackendError::KernelBinding(format!("a {w}x{h} texture does not fit {} bytes at offset {offset} with rows {pitch} bytes apart", source.size())));
         }
         let format = match desc.format {

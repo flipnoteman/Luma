@@ -82,7 +82,7 @@ impl CudaBackend {
             return Err(BackendError::Unsupported(format!("a {w}x{h} texture (up to {0}x{0} are possible)", caps.max_dim)));
         }
         let row = w * texel;
-        if pitch < row || pitch % u64::from(caps.pitch_align) != 0 || offset + pitch * (h - 1) + row > source.size() {
+        if pitch < row || !pitch.is_multiple_of(u64::from(caps.pitch_align)) || offset + pitch * (h - 1) + row > source.size() {
             return Err(BackendError::KernelBinding(format!("a {w}x{h} texture does not fit {} bytes at offset {offset} with rows {pitch} bytes apart", source.size())));
         }
         let base = device_ptr(source)?.checked_add(offset).ok_or_else(|| BackendError::KernelBinding("texture offset overflows".into()))?;
@@ -91,7 +91,7 @@ impl CudaBackend {
         let format = sys::CUarray_format::CU_AD_FORMAT_FLOAT;
         let channels = desc.format.channels();
         let max_pitch = self.shared.ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_PITCH).map_err(gpu)? as u64;
-        let pitched = base % BASE_ALIGN == 0 && pitch % PITCH_ALIGN == 0 && pitch <= max_pitch;
+        let pitched = base.is_multiple_of(BASE_ALIGN) && pitch.is_multiple_of(PITCH_ALIGN) && pitch <= max_pitch;
         let (resource, array, key, keep) = if pitched {
             let res = sys::CUDA_RESOURCE_DESC {
                 resType: sys::CUresourcetype::CU_RESOURCE_TYPE_PITCH2D,
