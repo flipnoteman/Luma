@@ -893,7 +893,7 @@ fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc
     let ctx = l.context();
     let [_, n, ..] = l.shape().dims();
     let [k, ..] = b.shape().dims();
-    if n > BLOCK && k >= BLOCK_COLUMNS && std::env::var("LUMA_LU_INVBLOCKS").ok().is_none_or(|v| v != "0") {
+    if n > BLOCK && k >= BLOCK_COLUMNS && super::trsv::blocks_fit(ctx) && std::env::var("LUMA_LU_INVBLOCKS").ok().is_none_or(|v| v != "0") {
         return solve_blocks(l, b, unit, op, loc);
     }
     if n > LEAF {

@@ -54,7 +54,9 @@ struct Params {
 
 /// Whether `L X = B` of `n` rows and `k` columns goes to this kernel.
 pub(crate) fn applies(ctx: &crate::Context, n: usize, k: usize, batch: usize) -> bool {
-    batch == 1 && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").ok().is_none_or(|v| v != "0")
+    // The tile, the packed triangle and the inverse of inverse mode, the right-hand sides and the partial sums.
+    let need = 4 * (2 * NB * LP + NB * (NB + 1) / 2 + 2 * NB * 9) + 256;
+    batch == 1 && ctx.info().limits.max_workgroup_storage_bytes as usize >= need && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").ok().is_none_or(|v| v != "0")
 }
 
 /// The pieces that read a tile of `L` through the view into the registers `v0..` of an invocation (columns from `c0`,
@@ -367,6 +369,11 @@ pub(crate) fn invert_blocks(l: &Array<f32>, unit: bool, op: &'static str, loc: &
         Ok(()) => out,
         Err(e) => fail(ctx, shape, e, op, loc),
     }
+}
+
+/// Whether the device has the workgroup memory of [`invert_blocks`] and [`apply_inverse`] (two tiles).
+pub(crate) fn blocks_fit(ctx: &crate::Context) -> bool {
+    ctx.info().limits.max_workgroup_storage_bytes as usize >= 2 * 4 * NB * LP + 256
 }
 
 fn apply_source() -> String {
