@@ -1,6 +1,7 @@
 experimental = ["setup-scripts"]
 
-# Every test is its own process. On a GPU backend each process opens the device first, and the NVIDIA
+# `cargo test --lib --tests` runs the tests of a binary as threads of one process and is the faster way to run a GPU
+# suite (see the README). Under nextest every test is its own process. On a GPU backend each process opens the device first, and the NVIDIA
 # driver serializes that across processes: creating a CUDA context takes about 65-70 ms of kernel
 # time and a Vulkan instance and device about 130 ms, the exit another stretch, and none of it
 # overlaps with the same work of another process. Measured on an RTX 3090 (32 threads): a context
