@@ -36,6 +36,7 @@ mod filter;
 mod fusion;
 mod generators;
 mod group;
+mod half;
 mod integers_i32;
 mod iterate_all;
 mod iterate_until;

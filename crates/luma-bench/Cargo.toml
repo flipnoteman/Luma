@@ -10,6 +10,7 @@ description = "Workload benchmark suites for Luma (ML, CFD, data science, GPU co
 [dependencies]
 luma = { path = "../.." }
 libm.workspace = true
+half.workspace = true
 
 [[bin]]
 name = "luma-bench"

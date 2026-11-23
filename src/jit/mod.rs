@@ -306,6 +306,13 @@ pub(crate) enum ElemTy {
     I8,
     U16,
     I16,
+    /// Half-precision floats: [`half::f16`] and [`half::bf16`]. An `f32` register holding a value
+    /// that is always exactly representable in the type (every operation computes in `f32` and
+    /// rounds its result to the type again, to nearest even: `kirgen::Lower::round`), two
+    /// elements to a `u32` word in buffers (`ElemLayout::HALF`, the bits of the host slice). The
+    /// accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` convert at the buffer.
+    F16,
+    BF16,
     /// 64-bit float (needs `luma_core::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
@@ -337,6 +344,10 @@ impl ElemTy {
             Some(ElemTy::U16)
         } else if id == TypeId::of::<i16>() {
             Some(ElemTy::I16)
+        } else if id == TypeId::of::<half::f16>() {
+            Some(ElemTy::F16)
+        } else if id == TypeId::of::<half::bf16>() {
+            Some(ElemTy::BF16)
         } else if id == TypeId::of::<f64>() {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
@@ -354,7 +365,7 @@ impl ElemTy {
 
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
-            ElemTy::F32 => "f32",
+            ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 => "f32",
             ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => "u32",
             ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => "i32",
             ElemTy::F64 => "f64",
@@ -362,9 +373,27 @@ impl ElemTy {
         }
     }
 
+    /// Whether this is a half-precision float (see [`ElemTy::F16`]).
+    pub(crate) fn is_half(self) -> bool {
+        matches!(self, ElemTy::F16 | ElemTy::BF16)
+    }
+
     /// Whether this is an 8-bit or 16-bit integer.
-    pub(crate) fn is_small(self) -> bool {
+    pub(crate) fn is_small_int(self) -> bool {
         matches!(self, ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16)
+    }
+
+    /// Whether elements of this type are narrower than a word: the 8-bit and 16-bit integers
+    /// and the half-precision floats, which share words in buffers. Only the integers narrow
+    /// their results ([`ElemTy::is_small_int`]); a float half never goes through the sign
+    /// extension of [`ElemTy::is_small_signed`].
+    pub(crate) fn is_small(self) -> bool {
+        self.is_small_int() || self.is_half()
+    }
+
+    /// The type the arithmetic on elements of this type is done in: `F32` for the halves.
+    pub(crate) fn compute(self) -> ElemTy {
+        if self.is_half() { ElemTy::F32 } else { self }
     }
 
     /// Whether elements of this type share words in buffers: the bits of a `bool`, the small integers.
@@ -376,7 +405,7 @@ impl ElemTy {
     pub(crate) fn small_bits(self) -> u32 {
         match self {
             ElemTy::U8 | ElemTy::I8 => 8,
-            ElemTy::U16 | ElemTy::I16 => 16,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 16,
             _ => 0,
         }
     }
@@ -402,7 +431,7 @@ impl ElemTy {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
             ElemTy::Bool => ElemLayout::PACKED,
             ElemTy::U8 | ElemTy::I8 => ElemLayout::BYTE,
-            ElemTy::U16 | ElemTy::I16 => ElemLayout::HALF,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => ElemLayout::HALF,
             ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
@@ -417,7 +446,7 @@ impl ElemTy {
         match self {
             ElemTy::Bool => 0.125,
             ElemTy::U8 | ElemTy::I8 => 1.0,
-            ElemTy::U16 | ElemTy::I16 => 2.0,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 2.0,
             other => other.layout().stride() as f64,
         }
     }
@@ -425,7 +454,7 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => 1,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 1,
             ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
@@ -442,6 +471,8 @@ impl ElemTy {
             ElemTy::I8 => "i8",
             ElemTy::U16 => "u16",
             ElemTy::I16 => "i16",
+            ElemTy::F16 => "f16",
+            ElemTy::BF16 => "bf16",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
             ElemTy::C32 => "C32",
@@ -740,6 +771,27 @@ impl Op {
         }
     }
 
+    /// Whether the value of this operation, computed in `f32`, is rounded to its half-precision
+    /// element type (to nearest even) before anything reads it: every operation that can give a
+    /// value the type does not hold. Not the ones whose result is one of their operands or an
+    /// integer no larger than them (negation, absolute value, minimum, maximum, selection, the
+    /// roundings to integers, ...), nor a cast that keeps the type.
+    pub(crate) fn rounds_half(&self) -> bool {
+        if !self.out_ty().is_half() {
+            return false;
+        }
+        match self.kind {
+            OpKind::Unary(op) => !matches!(
+                op,
+                UnOp::Neg | UnOp::Abs | UnOp::Id | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::Conj
+            ),
+            OpKind::Binary(op) => !matches!(op, BinOp::Min | BinOp::Max | BinOp::Copysign),
+            OpKind::Select | OpKind::Clamp | OpKind::Shift(_) => false,
+            OpKind::Cast(to) => self.ty != to,
+            _ => true,
+        }
+    }
+
     /// The element type operand `index` must have.
     pub(crate) fn operand_ty(&self, index: usize) -> ElemTy {
         match (&self.kind, index) {
@@ -781,7 +833,15 @@ impl Scalar {
     pub(crate) fn of<T: ScalarType>(value: T) -> std::result::Result<Self, LumaError> {
         let ty = ElemTy::of::<T>()?;
         let bits = match ty.slots() {
-            1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
+            1 => {
+                let word = bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()));
+                match ty {
+                    // The register of a half holds the value widened to `f32`.
+                    ElemTy::F16 => u64::from(half::f16::from_bits(word as u16).to_f32().to_bits()),
+                    ElemTy::BF16 => u64::from(half::bf16::from_bits(word as u16).to_f32().to_bits()),
+                    _ => u64::from(word),
+                }
+            }
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
         // The register of a signed small integer holds the sign-extended value.
@@ -798,7 +858,7 @@ impl Scalar {
     /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => [self.bits as u32, 0, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => [self.bits as u32, 0, 0],
             ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
@@ -1993,7 +2053,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
         OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
         OpKind::Clamp => op.ty != ElemTy::C32,
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
-        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
+        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::F16 | ElemTy::BF16),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };

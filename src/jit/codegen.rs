@@ -45,7 +45,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
             ElemTy::Df32 | ElemTy::C32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => format!("p.s{k}"),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
@@ -61,7 +61,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
 /// `ty.wgsl()`: a bool is a `u32` of 0 or 1 there.
 pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "u32",
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => "u32",
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ty.wgsl(),
     }
 }
@@ -71,7 +71,7 @@ pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
 /// different invocations.
 pub(super) fn out_storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "atomic<u32>",
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => "atomic<u32>",
         _ => storage_ty(ty),
     }
 }
@@ -89,7 +89,9 @@ pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("(({buffer}[{j} >> 5u] >> ({j} & 31u)) & 1u)")
         }
-        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => small_load(ty, &format!("{buffer}[{} >> {}u]", operand(index), ty.small_shift()), index),
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => {
+            small_load(ty, &format!("{buffer}[{} >> {}u]", operand(index), ty.small_shift()), index)
+        }
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("{buffer}[{index}]"),
     }
 }
@@ -102,6 +104,8 @@ fn small_load(ty: ElemTy, word: &str, index: &str) -> String {
     let at = format!("(({} & {}u) * {}u)", operand(index), per_word - 1, bits);
     match ty {
         ElemTy::U8 | ElemTy::U16 => format!("(({word} >> {at}) & {}u)", (1u32 << bits) - 1),
+        ElemTy::F16 => format!("luma_half_f16_to_f32(({word} >> {at}) & 65535u)"),
+        ElemTy::BF16 => format!("luma_half_bf16_to_f32(({word} >> {at}) & 65535u)"),
         _ => format!("(bitcast<i32>({word} << (({}u - {at}))) >> {}u)", 32 - bits, 32 - bits),
     }
 }
@@ -114,7 +118,7 @@ pub(super) fn load_out(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("((atomicLoad(&{buffer}[{j} >> 5u]) >> ({j} & 31u)) & 1u)")
         }
-        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => {
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => {
             small_load(ty, &format!("atomicLoad(&{buffer}[{} >> {}u])", operand(index), ty.small_shift()), index)
         }
         _ => load(ty, buffer, index),
@@ -144,15 +148,26 @@ pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
 /// The WGSL expression of the operation `op` (anything but a shift) on the operands named `a`,
 /// `b` and `c`; `index` names the element it is computed at. `None` for a shift.
 fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
+    let value = operation_unrounded(op, a, b, c, index)?;
+    Some(if op.rounds_half() {
+        let (to, from) = if op.out_ty() == ElemTy::F16 { ("luma_half_f32_to_f16", "luma_half_f16_to_f32") } else { ("luma_half_f32_to_bf16", "luma_half_bf16_to_f32") };
+        format!("{from}({to}({value}))")
+    } else {
+        value
+    })
+}
+
+/// [`operation`] before the result is rounded to a half-precision element type.
+fn operation_unrounded(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
     let ty = op.ty;
     Some(match op.kind {
         OpKind::Unary(op) => {
             let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, "");
-            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+            if ty.is_small_int() && op.widens() { narrow_expr(ty, &value) } else { value }
         }
         OpKind::Binary(op) => {
             let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b);
-            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+            if ty.is_small_int() && op.widens() { narrow_expr(ty, &value) } else { value }
         }
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
@@ -359,6 +374,8 @@ pub(super) fn view_helpers(views: &[(ViewMap, Edge)]) -> String {
 /// value that a reassociating compiler could fold away through `luma_o` (see
 /// `builtin::df_library`), so that `x - to_df32(to_f32(x))` keeps the low word of `x`.
 fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
+    // A half is an `f32` in a register; the rounding to the type is made by `operation`.
+    let (from, to) = (from.compute(), to.compute());
     match (from, to) {
         (ElemTy::F32, ElemTy::F64) => format!("f64({value})"),
         (ElemTy::F64, ElemTy::F32) => format!("f32({value})"),
@@ -448,7 +465,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, index),
             ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({index})")),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({index})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
@@ -456,7 +473,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &format!("(({index} >> {a}) & {b})")),
             ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>(({index} >> {a}) & {b})")),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(({index} >> {a}) & {b})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { .. } | Gen::ParamRange { .. } => {
             let coord = match kind {
@@ -475,7 +492,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
                 ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &coord),
                 ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({coord})")),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
-                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({coord})"),
+                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16 => format!("f32({coord})"),
             }
         }
         Gen::Linspace => format!("({a} + f32({index}) * {b})"),
@@ -646,7 +663,7 @@ pub(super) fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
     // The bits of a `bool` result are written one at a time, not as the words they are in.
     let bytes = match ty {
-        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => return false,
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => return false,
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
         ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => 8,
     };
@@ -1478,7 +1495,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     match op.ty {
                         ElemTy::U32 => format!("u32({coord})"),
                         ElemTy::I32 => coord,
-                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(u32({coord}))"),
+                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16 => format!("f32(u32({coord}))"),
                         ElemTy::Bool => unreachable!("bool has no generators"),
                         ElemTy::U8 | ElemTy::U16 => narrow_expr(op.ty, &format!("u32({coord})")),
                         ElemTy::I8 | ElemTy::I16 => narrow_expr(op.ty, &coord),

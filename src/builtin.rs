@@ -239,6 +239,47 @@ fn luma_tgamma(x: f32) -> f32 {
     return select(select(v, bitcast<f32>(0x7fc00000u), (x < 0.0) & (x == floor(x))), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
 }
 ";
+/// The conversions of the half-precision floats, written with integer arithmetic only so that every
+/// backend rounds the same way (the bit test of `tests/all/half.rs` is the arbiter): round to
+/// nearest even, overflow to infinity, subnormals kept, a NaN as the canonical quiet one
+/// (`0x7e00` for `f16`, `0x7fc0` for `bf16`; its `f32` form is `0x7fc00000`). A half travels as
+/// the low 16 bits of a `u32`; every shift amount is below 32.
+const HALF_WGSL: &str = "
+fn luma_half_f16_to_f32(h: u32) -> f32 {
+    let sign = (h & 0x8000u) << 16u;
+    let e = (h >> 10u) & 0x1fu;
+    let m = h & 0x3ffu;
+    let sub = bitcast<f32>(bitcast<u32>(f32(m) * 5.9604645e-8) | sign);
+    let normal = bitcast<f32>(sign | ((e + 112u) << 23u) | (m << 13u));
+    let special = select(bitcast<f32>(sign | 0x7f800000u), bitcast<f32>(0x7fc00000u), m != 0u);
+    return select(select(normal, special, e == 31u), sub, e == 0u);
+}
+fn luma_half_f32_to_f16(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    let sign = (b >> 16u) & 0x8000u;
+    let a = b & 0x7fffffffu;
+    let r = a - 0x38000000u;
+    let normal = (r + 0xfffu + ((r >> 13u) & 1u)) >> 13u;
+    let e = a >> 23u;
+    let shift = min(max(126u - min(e, 126u), 1u), 31u);
+    let m = (a & 0x7fffffu) | 0x800000u;
+    let q = m >> shift;
+    let rem = m & ((1u << shift) - 1u);
+    let half = 1u << (shift - 1u);
+    let sub = q + select(0u, 1u, (rem > half) | ((rem == half) & ((q & 1u) == 1u)));
+    var v = select(sub, normal, a >= 0x38800000u);
+    v = select(v, 0u, a <= 0x33000000u);
+    v = select(v, 0x7c00u, a >= 0x477ff000u);
+    return select(sign | v, 0x7e00u, a > 0x7f800000u);
+}
+fn luma_half_bf16_to_f32(h: u32) -> f32 {
+    return select(bitcast<f32>(h << 16u), bitcast<f32>(0x7fc00000u), (h & 0x7fffu) > 0x7f80u);
+}
+fn luma_half_f32_to_bf16(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    return select((b + 0x7fffu + ((b >> 16u) & 1u)) >> 16u, 0x7fc0u, (b & 0x7fffffffu) > 0x7f800000u);
+}
+";
 const CBRT_WGSL: &str = "
 fn luma_cbrt(x: f32) -> f32 {
     let a = abs(x);
@@ -303,7 +344,8 @@ fn luma_ir_expm1(x: f64) -> f64 { return x; }
 /// The WGSL helper functions among the above that the code uses: `uses(name)` says whether a
 /// function (`luma_erf(`, with its parenthesis) is called.
 pub(crate) fn special_helpers(mut uses: impl FnMut(&str) -> bool) -> String {
-    let groups: [(&[&str], &str); 7] = [
+    let groups: [(&[&str], &str); 8] = [
+        (&["luma_half_"], HALF_WGSL),
         (&["luma_erf(", "luma_erfc("], ERF_WGSL),
         (&["luma_lgamma(", "luma_tgamma("], GAMMA_WGSL),
         (&["luma_cbrt("], CBRT_WGSL),
@@ -489,7 +531,8 @@ impl UnOp {
     /// [`UnOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it
     /// (`f64` has the exact built-ins, `Df32` the library ones, see [`df_library`]).
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
-        match ty {
+        // A half is computed as an `f32` (and rounded by the caller).
+        match ty.compute() {
             ElemTy::U32 => match self {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
@@ -512,8 +555,8 @@ impl UnOp {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::F32 if self.is_bitwise() || self == UnOp::Conj => None,
-            ElemTy::F32 => Some(self.expr()),
+            ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 if self.is_bitwise() || self == UnOp::Conj => None,
+            ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 => Some(self.expr()),
             ElemTy::C32 => match self {
                 UnOp::Neg => Some("-x"),
                 UnOp::Conj => Some(self.expr()),
@@ -640,7 +683,7 @@ impl BinOp {
 impl BinOp {
     /// [`BinOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it.
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
-        match ty {
+        match ty.compute() {
             ElemTy::U32 if self == BinOp::Mod => Some("(x % y)"),
             ElemTy::U32 => Some(self.expr()),
             ElemTy::Bool => match self {
@@ -666,7 +709,7 @@ impl BinOp {
                     _ => None,
                 }
             }
-            ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
+            ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max | BinOp::Rem | BinOp::Atan2 => Some(self.expr()),
                 BinOp::Mod => Some("luma_modd(x, y)"),

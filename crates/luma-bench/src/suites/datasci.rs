@@ -7,6 +7,7 @@
 
 use std::fmt::Debug;
 
+mod half;
 mod stats;
 
 use crate::harness::*;
@@ -36,6 +37,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("rolling", rolling_cases);
     h.guarded("pipeline", pipeline_cases);
     h.guarded("small", small_cases);
+    h.guarded("half", half::run);
 }
 
 // -------------------------------------------------------------------------------------------------

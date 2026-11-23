@@ -218,6 +218,12 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
     }
 }
 
+/// Whether `instr` reads or computes a half-precision float, and so calls the conversions of
+/// `builtin::HALF_WGSL` (the loads, stores and roundings of the type).
+pub(super) fn uses_half(instr: &Instr) -> bool {
+    instr.op.ty.is_half() || instr.op.out_ty().is_half()
+}
+
 /// Whether the WGSL of `instr` calls a function of the complex library
 /// (`builtin::complex_library`): the product, quotient, modulus, equality test, `exp` and `sqrt`
 /// of `C32` values.

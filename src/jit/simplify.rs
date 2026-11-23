@@ -21,7 +21,7 @@ pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
 }
 
 fn is_float(ty: ElemTy) -> bool {
-    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32)
+    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16)
 }
 
 /// The bit pattern of the constant `value` as a scalar of type `ty` (`Df32`: `hi` is `value`,
@@ -29,6 +29,9 @@ fn is_float(ty: ElemTy) -> bool {
 fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
         ElemTy::F32 | ElemTy::Df32 | ElemTy::C32 => u64::from((value as f32).to_bits()),
+        // The register of a half holds the value rounded to the type, widened to `f32`.
+        ElemTy::F16 => u64::from(half::f16::from_f64(value).to_f32().to_bits()),
+        ElemTy::BF16 => u64::from(half::bf16::from_f64(value).to_f32().to_bits()),
         ElemTy::F64 => value.to_bits(),
         ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => u64::from(value as u32),
         ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => u64::from(value as i32 as u32),

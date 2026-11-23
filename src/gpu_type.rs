@@ -9,6 +9,8 @@ impl sealed::Sealed for u8 {}
 impl sealed::Sealed for i8 {}
 impl sealed::Sealed for u16 {}
 impl sealed::Sealed for i16 {}
+impl sealed::Sealed for half::f16 {}
+impl sealed::Sealed for half::bf16 {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -205,12 +207,12 @@ impl GpuType for bool {
     }
 }
 
-/// `GpuType` for the 8-bit and 16-bit integers: `4` or `2` elements to a `u32` word (little
+/// `GpuType` for the 8-bit and 16-bit integers and the two 16-bit floats ([`half::f16`], [`half::bf16`]): `4` or `2` elements to a `u32` word (little
 /// endian, the bytes of the host slice), see [`ElemLayout::BYTE`] and [`ElemLayout::HALF`]. The
 /// host values go to the device as they are (a copy of the bytes, padded to a whole word, no
 /// widening) and come back the same way.
 macro_rules! small_gpu_type {
-    ($($ty:ty => $layout:ident),*) => {$(
+    ($($ty:ty => $layout:ident, $bits:ty),*) => {$(
         impl GpuType for $ty {
             type Repr = u32;
 
@@ -243,13 +245,13 @@ macro_rules! small_gpu_type {
 
             fn into_repr(self) -> Self::Repr {
                 // The word of a one-element array: the value in the low bits.
-                (self as u32) & (u32::MAX >> (32 - 8 * std::mem::size_of::<$ty>()))
+                u32::from(bytemuck::cast::<$ty, $bits>(self))
             }
         }
     )*};
 }
 
-small_gpu_type!(u8 => BYTE, i8 => BYTE, u16 => HALF, i16 => HALF);
+small_gpu_type!(u8 => BYTE, u8, i8 => BYTE, u8, u16 => HALF, u16, i16 => HALF, u16, half::f16 => HALF, u16, half::bf16 => HALF, u16);
 
 /// The element types of arithmetic: `u32`, `i32`, `f32`, `f64` and [`Df32`]. Sums, running sums,
 /// products and the generic reductions exist for these; `bool` has its own counting versions
@@ -307,6 +309,21 @@ impl ScalarType for i8 {
 impl ScalarType for i16 {
     fn wgsl_type() -> &'static str {
         "i32"
+    }
+}
+
+// The WGSL type of the register holding a half-precision float (the arithmetic is `f32`), and of
+// the words of its buffers (`GpuType::LAYOUT`, two to a `u32`): the kernels widen on load and
+// round on store (`jit::kirgen`).
+impl ScalarType for half::f16 {
+    fn wgsl_type() -> &'static str {
+        "f32"
+    }
+}
+
+impl ScalarType for half::bf16 {
+    fn wgsl_type() -> &'static str {
+        "f32"
     }
 }
 

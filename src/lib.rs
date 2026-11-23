@@ -94,6 +94,8 @@ mod guide {
     pub mod integers {}
     #[doc = include_str!("../guide/src/compact.md")]
     pub mod compact {}
+    #[doc = include_str!("../guide/src/half.md")]
+    pub mod half_floats {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
     pub mod custom_kernels {}
     #[doc = include_str!("../guide/src/performance.md")]
@@ -151,6 +153,7 @@ mod complex;
 mod dft_kernel;
 mod gpu_type;
 mod group;
+mod halves;
 mod host;
 mod image;
 mod interp;
@@ -199,6 +202,7 @@ pub use fields::Fields;
 pub use complex::C32;
 pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
+pub use half::{bf16, f16};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use image::{transform_coordinates, transform_coordinates_on, TransformMatrix};

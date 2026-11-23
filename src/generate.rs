@@ -177,6 +177,8 @@ pub(crate) fn constant<T: ScalarType>(value: f64) -> std::result::Result<T, Luma
         ElemTy::I8 => word(&u32::from(value as i8 as u8).to_ne_bytes()),
         ElemTy::U16 => word(&u32::from(value as u16).to_ne_bytes()),
         ElemTy::I16 => word(&u32::from(value as i16 as u16).to_ne_bytes()),
+        ElemTy::F16 => word(&u32::from(half::f16::from_f64(value).to_bits()).to_ne_bytes()),
+        ElemTy::BF16 => word(&u32::from(half::bf16::from_f64(value).to_bits()).to_ne_bytes()),
         ElemTy::C32 => word(&[(value as f32).to_ne_bytes(), 0.0f32.to_ne_bytes()].concat()),
     })
 }
