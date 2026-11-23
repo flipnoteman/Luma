@@ -1,0 +1,71 @@
+# NAME<TAB>kind<TAB>owner<TAB>removal<TAB>default
+# kind: user | dev (removed before 0.6.0) | test | internal. owner: spec id or RELEASE. removal: never | before-release | spec id.
+# A spec that adds or removes a LUMA_* variable edits its line here in the same PR; tools/envaudit.py checks.
+LUMA_BACKEND	user	W0	never	auto
+LUMA_BACKENDS_EXPECT	test	W0	never	unset
+LUMA_BENCH_	internal	W0	never	prefix wildcard in docs (LUMA_BENCH_*)
+LUMA_BENCH_KERNELS	test	W0	never	unset
+LUMA_BENCH_REF	test	W0	never	unset
+LUMA_BENCH_REPS	test	W0	never	auto
+LUMA_BENCH_SHAPES	test	W0	never	unset
+LUMA_BENCH_TF32	test	W0	never	unset
+LUMA_CACHE	user	W0	never	on
+LUMA_CACHE_DIR	user	W0	never	platform cache dir
+LUMA_CALIBRATE	user	W0	never	on
+LUMA_CHECK_FINITE	user	W0	never	off
+LUMA_CHOL_	internal	W0	never	prefix wildcard in docs (LUMA_CHOL_*)
+LUMA_CHOL_NB	dev	W0	before-release	auto
+LUMA_CHOL_WIDE	dev	W0	before-release	4*nb
+LUMA_CHUNK_BYTES	user	W0	never	auto
+LUMA_COARSEN	dev	W0	before-release	auto
+LUMA_COMPILE_THREADS	user	W0	never	auto
+LUMA_CPU_SPIN_US	user	W0	never	auto
+LUMA_CPU_THREADS	user	W0	never	all cores
+LUMA_CUDA_DUMP	user	W0	never	unset
+LUMA_DEVICE	user	W0	never	auto
+LUMA_DF_FMA	dev	W0	before-release	auto
+LUMA_EXIT_ORDER_CHILD	test	W0	never	unset
+LUMA_EXIT_WAIT	user	W0	never	on
+LUMA_FAST_MATH	user	W0	never	off
+LUMA_FUSION_	internal	W0	never	prefix wildcard in docs (LUMA_FUSION_*)
+LUMA_FUSION_MAX_INLINED	dev	W0	before-release	built-in limit
+LUMA_FUSION_MAX_INPUTS	dev	W0	before-release	built-in limit
+LUMA_FUSION_MAX_LIVE	dev	W0	before-release	built-in limit
+LUMA_FUSION_MAX_NODES	dev	W0	before-release	built-in limit
+LUMA_FUZZ_CASES	test	W0	never	per-test default
+LUMA_FUZZ_SEED	test	W0	never	random
+LUMA_FUZZ_VERBOSE	test	W0	never	unset
+LUMA_HAND_UNCHECKED	test	W0	never	unset (examples/datasci/hand.rs)
+LUMA_HOST_FAST	dev	W0	before-release	auto (off disables; on read by crate tests)
+LUMA_LINALG_	internal	W0	never	prefix wildcard in docs (LUMA_LINALG_*)
+LUMA_LINALG_FENCE	dev	W0	before-release	auto
+LUMA_LINALG_PANEL	dev	W0	before-release	32
+LUMA_LINALG_TF32	dev	W0	before-release	off
+LUMA_LOOKBACK_SCAN	dev	W0	before-release	auto
+LUMA_MEMORY_BUDGET	user	W0	never	auto
+LUMA_MULTI_REDUCE	dev	W0	before-release	auto
+LUMA_MULTI_REDUCE_AFTER	dev	W0	before-release	auto
+LUMA_NATIVE_	internal	W0	never	prefix wildcard in docs (LUMA_NATIVE_*)
+LUMA_NATIVE_GEMM	dev	W0	before-release	auto
+LUMA_NATIVE_SOLVE	dev	W0	before-release	auto
+LUMA_OWN_GEMM	dev	W0	before-release	on
+LUMA_PLAN_CACHE	dev	W0	before-release	on
+LUMA_QR_TSQR	dev	W0	before-release	on
+LUMA_SAMPLER_	internal	W0	never	prefix wildcard in docs (LUMA_SAMPLER_*)
+LUMA_SAMPLER_COARSEN	dev	W0	before-release	2
+LUMA_SAMPLER_TILE	dev	W0	before-release	auto
+LUMA_SINGLE_PASS_REDUCE	dev	W0	before-release	auto
+LUMA_SMALLINT_SEEDS	test	W0	never	40
+LUMA_SPECULATE	dev	W0	before-release	on
+LUMA_STAGING	dev	W0	before-release	on
+LUMA_SUBGROUPS	dev	W0	before-release	on
+LUMA_SVD_PRECOND	dev	W0	before-release	auto
+LUMA_TEST_CACHE	test	W0	never	unset
+LUMA_TF32_MATMUL	user	W0	never	on
+LUMA_TRIDIAGONAL	dev	W0	before-release	auto
+LUMA_TRSV	dev	W0	before-release	on
+LUMA_TRSV_INV	dev	W0	before-release	off
+LUMA_TRSV_INV_MIN	dev	W0	before-release	768
+LUMA_TRSV_KC	dev	W0	before-release	8
+LUMA_TUNING	dev	W0	before-release	auto by device
+LUMA_WGPU_DUMP	user	W0	never	unset
