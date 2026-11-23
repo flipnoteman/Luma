@@ -804,8 +804,9 @@ struct Flattener {
     scalar_tys: Vec<ElemTy>,
     scalars: Vec<u32>,
     /// The first slot of every distinct scalar emitted so far, by type and value: equal scalars
-    /// are one uniform field, so that the code computes what is derived from them once.
-    scalar_slots: Vec<(ElemTy, Vec<u32>, u32)>,
+    /// are one uniform field, so that the code computes what is derived from them once. The key
+    /// is the type and the [`Scalar::words`] (the unused ones are zero).
+    scalar_slots: FxMap<(ElemTy, [u32; 3]), u32>,
     /// Where the value of every item emitted so far in the program being built lives, by item
     /// (`Ref::Unused`: nowhere yet).
     emitted: Vec<Ref>,
@@ -993,21 +994,21 @@ impl Flattener {
     /// The first uniform slot of `scalar`, which comes from `source`: the slot of an equal scalar
     /// emitted before, if any.
     fn scalar(&mut self, scalar: &Scalar, source: ScalarSrc) -> Ref {
-        let words = &scalar.words()[..scalar.ty.slots()];
-        if let Some(&(.., at)) = self.scalar_slots.iter().find(|(ty, known, _)| *ty == scalar.ty && known[..] == *words) {
-            if let Some(record) = &mut self.record {
-                record.aliases.push((at, source));
-            }
-            return Ref::Scalar(at);
-        }
+        let words = scalar.words();
         let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
+        let first = *self.scalar_slots.entry((scalar.ty, words)).or_insert(at);
+        if first != at {
+            if let Some(record) = &mut self.record {
+                record.aliases.push((first, source));
+            }
+            return Ref::Scalar(first);
+        }
         // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
         let slot_ty = if scalar.ty.slots() == 1 { scalar.ty } else { ElemTy::F32 };
-        for &word in words {
+        for &word in &words[..scalar.ty.slots()] {
             self.scalar_tys.push(slot_ty);
             self.scalars.push(word);
         }
-        self.scalar_slots.push((scalar.ty, words.to_vec(), at));
         if let Some(record) = &mut self.record {
             record.scalars.push(source);
         }
@@ -2419,5 +2420,92 @@ mod validate_tests {
         let mut shifted = key(vec![instr(OpKind::Shift(ShiftKind::Linear), [Ref::Input(0), Ref::Scalar(0), Ref::Scalar(0)])], vec![]);
         shifted.in_place = vec![(0, 0)];
         assert!(check(&shifted).unwrap_err().contains("in-place"));
+    }
+}
+
+#[cfg(test)]
+mod scalar_slot_tests {
+    use super::*;
+
+    /// The scalar slots as the linear scan found them: the oracle for `Flattener::scalar`.
+    #[derive(Default)]
+    struct Linear {
+        tys: Vec<ElemTy>,
+        words: Vec<u32>,
+        known: Vec<(ElemTy, Vec<u32>, u32)>,
+        aliases: Vec<(u32, usize)>,
+        sources: Vec<usize>,
+    }
+
+    impl Linear {
+        fn scalar(&mut self, scalar: &Scalar, source: usize) -> u32 {
+            let words = &scalar.words()[..scalar.ty.slots()];
+            if let Some(&(.., at)) = self.known.iter().find(|(ty, known, _)| *ty == scalar.ty && known[..] == *words) {
+                self.aliases.push((at, source));
+                return at;
+            }
+            let at = self.words.len() as u32;
+            let slot_ty = if scalar.ty.slots() == 1 { scalar.ty } else { ElemTy::F32 };
+            for &word in words {
+                self.tys.push(slot_ty);
+                self.words.push(word);
+            }
+            self.known.push((scalar.ty, words.to_vec(), at));
+            self.sources.push(source);
+            at
+        }
+    }
+
+    /// 2 000 distinct scalars of every width, repeated in a scrambled order, with values that
+    /// differ only in type, in sign of zero or in the unused words of a narrow type: the
+    /// flattener's slots, uniform words and alias records equal the linear scan's.
+    #[test]
+    fn the_hash_index_keeps_the_first_equal_slot_of_the_linear_scan() {
+        let mut flat = Flattener { record: Some(Record::default()), ..Flattener::default() };
+        let mut oracle = Linear::default();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut distinct: Vec<Scalar> = Vec::new();
+        for i in 0..2000u64 {
+            let ty = [ElemTy::F32, ElemTy::U32, ElemTy::I32, ElemTy::F64, ElemTy::Df32, ElemTy::C32, ElemTy::Bool][(i % 7) as usize];
+            let bits = match ty {
+                ElemTy::F64 => (1.0 + i as f64 * 1e-9).to_bits(),
+                ElemTy::Df32 | ElemTy::C32 => i << 32 | (i * 3),
+                // The high half of a 4-byte scalar is not part of its value.
+                _ => i | (i % 5) << 40,
+            };
+            distinct.push(Scalar { ty, bits });
+        }
+        distinct.push(Scalar::f32(0.0));
+        distinct.push(Scalar::f32(-0.0));
+        distinct.push(Scalar::u32(0));
+        let mut source = 0usize;
+        for round in 0..6 {
+            for k in 0..distinct.len() {
+                // Round 0 emits each once (a growing table); later rounds mostly repeat.
+                let scalar = if round == 0 { distinct[k] } else { distinct[(next() % distinct.len() as u64) as usize] };
+                let got = flat.scalar(&scalar, ScalarSrc::Operand(source as u32, 0));
+                let want = oracle.scalar(&scalar, source);
+                assert_eq!(got, Ref::Scalar(want), "round {round}, scalar {k}");
+                source += 1;
+            }
+        }
+        assert_eq!(flat.scalars, oracle.words);
+        assert_eq!(flat.scalar_tys, oracle.tys);
+        let record = flat.record.unwrap();
+        assert_eq!(record.scalars.len(), oracle.sources.len());
+        for (src, want) in record.scalars.iter().zip(&oracle.sources) {
+            assert!(matches!(src, ScalarSrc::Operand(i, 0) if *i as usize == *want));
+        }
+        assert_eq!(record.aliases.len(), oracle.aliases.len());
+        for ((at, src), (want_at, want_src)) in record.aliases.iter().zip(&oracle.aliases) {
+            assert_eq!(at, want_at);
+            assert!(matches!(src, ScalarSrc::Operand(i, 0) if *i as usize == *want_src));
+        }
     }
 }
