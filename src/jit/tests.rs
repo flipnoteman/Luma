@@ -4675,6 +4675,32 @@ fn many_buffers_are_packed_and_read_through_one_binding() {
     assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
 }
 
+/// A window read through a shift or a view is bound as its range of the pack's buffer, not copied
+/// out of it: no window gets a buffer of its own, and the results are those of a copy.
+#[test]
+fn windows_read_through_shifts_and_views_are_bound_by_offset() {
+    let ctx = ctx();
+    ctx.jit().set_max_inputs(4);
+    // 256-byte windows start where every backend allows a binding to.
+    let n = 64;
+    let data: Vec<Vec<u32>> = (0..20u32).map(|k| (0..n as u32).map(|i| (i * 7 + k * 1013) ^ (k << 3)).collect()).collect();
+    let arrays: Vec<Array<u32>> = data.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+    let mut total = &arrays[0] * 1u32;
+    for a in &arrays[1..] {
+        total = &total + a;
+    }
+    let want: Vec<u32> = (0..n).map(|i| data.iter().fold(0u32, |sum, d| sum.wrapping_add(d[i]))).collect();
+    assert_eq!(total.to_vec().unwrap(), want);
+    let before = ctx.pager().window_copies();
+    for k in [9, 10, 15] {
+        let rolled = arrays[k].shift(1).to_vec().unwrap();
+        assert_eq!(rolled, (0..n).map(|i| data[k][(i + n - 1) % n]).collect::<Vec<_>>(), "shift of {k}");
+        assert_eq!(arrays[k].slice(0, 5..50).to_vec().unwrap(), data[k][5..50].to_vec(), "view of {k}");
+    }
+    assert_eq!(ctx.pager().window_copies(), before, "no window was copied out of its pack");
+    assert_eq!(total.to_vec().unwrap(), want);
+}
+
 /// The outputs of a group that has more of them than a kernel binds are written into one buffer.
 #[test]
 fn outputs_beyond_the_bindings_of_a_kernel_share_one_buffer() {

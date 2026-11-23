@@ -4,7 +4,7 @@ pub mod kir;
 pub use hal::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, TextureCaps, TextureDesc, TextureFilter, TextureFormat,
     COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, MemoryModel, DeviceInfo, DeviceKind, DeviceLimits,
-    DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTiming, KernelTrust,
+    DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTiming, MemoryNow, KernelTrust,
     LineSolveSpec, MatmulSpec, GemmSpec, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, SplitReason, TuningProfile,
 };
 pub use naga;

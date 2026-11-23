@@ -2085,13 +2085,6 @@ fn create_with(
     }
     let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
     check_supported(ctx, op, name).map_err(Failure::New)?;
-    // A shift reads its source at other elements than the one it computes, which a window cannot
-    // (see `pack`): the source gets the buffer of its own.
-    if matches!(op.kind, OpKind::Shift(_))
-        && let Some(Src::Buffer(source)) = args.first()
-    {
-        source.detach().map_err(Failure::New)?;
-    }
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));

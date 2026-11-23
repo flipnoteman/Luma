@@ -511,6 +511,7 @@ mod tests {
             max_storage_buffers: 8,
             max_uniform_bytes: 16384,
             uniform_align: 256,
+            storage_offset_align: 256,
             max_dynamic_uniforms: 8,
             max_workgroups_per_dim: 65535,
             max_workgroup_size: [256, 256, 64],

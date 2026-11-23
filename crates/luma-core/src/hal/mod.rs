@@ -740,6 +740,31 @@ impl CompiledKernel {
         Ok(())
     }
 
+    /// Checks that each storage argument's range lies within its buffer and starts at a multiple
+    /// of `align` (the device's [`DeviceLimits::storage_offset_align`]).
+    pub fn check_offsets(&self, args: &[RawArg<'_>], align: u64) -> Result<(), BackendError> {
+        for (position, arg) in self.bound(args) {
+            let RawArg::Storage { buffer, offset, bytes, .. } = arg else { continue };
+            if *offset == 0 {
+                continue;
+            }
+            if offset % align.max(1) != 0 {
+                return Err(BackendError::KernelBinding(format!(
+                    "kernel `{}` argument {position}: offset {offset} is not a multiple of the device's storage offset alignment ({align})",
+                    self.label
+                )));
+            }
+            if offset.checked_add(*bytes).is_none_or(|end| end > buffer.size()) {
+                return Err(BackendError::KernelBinding(format!(
+                    "kernel `{}` argument {position}: range {offset}+{bytes} exceeds the buffer ({} bytes)",
+                    self.label,
+                    buffer.size()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that each argument the kernel binds is of the kind of its binding, for the same
     /// reason as [`check_count`](Self::check_count).
     pub fn check_kinds(&self, args: &[RawArg<'_>]) -> Result<(), BackendError> {
@@ -767,11 +792,13 @@ impl CompiledKernel {
 /// One argument of a launch.
 #[derive(Clone, Copy, Debug)]
 pub enum RawArg<'a> {
-    /// A storage buffer, of which the kernel may reach the first `bytes`.
+    /// A storage buffer, of which the kernel may reach `bytes` bytes from `offset`.
     Storage {
         /// The buffer.
         buffer: &'a Buffer,
-        /// Bytes bound.
+        /// Byte offset of the bound range; a multiple of [`DeviceLimits::storage_offset_align`].
+        offset: u64,
+        /// Bytes bound, from `offset`.
         bytes: u64,
         /// Whether the kernel may write it.
         writable: bool,
@@ -781,13 +808,21 @@ pub enum RawArg<'a> {
 }
 
 impl<'a> RawArg<'a> {
+    /// A storage argument over the first `bytes` of `buffer`.
+    pub fn storage(buffer: &'a Buffer, bytes: u64, writable: bool) -> Self {
+        RawArg::Storage { buffer, offset: 0, bytes, writable }
+    }
+    /// A storage argument over `bytes` bytes of `buffer` from `offset`.
+    pub fn storage_at(buffer: &'a Buffer, offset: u64, bytes: u64, writable: bool) -> Self {
+        RawArg::Storage { buffer, offset, bytes, writable }
+    }
     /// A read-only storage argument.
     pub fn read(buffer: &'a Buffer, bytes: u64) -> Self {
-        RawArg::Storage { buffer, bytes, writable: false }
+        Self::storage(buffer, bytes, false)
     }
     /// A writable storage argument.
     pub fn write(buffer: &'a Buffer, bytes: u64) -> Self {
-        RawArg::Storage { buffer, bytes, writable: true }
+        Self::storage(buffer, bytes, true)
     }
 }
 
@@ -850,6 +885,8 @@ pub struct DeviceLimits {
     pub max_uniform_bytes: u64,
     /// Alignment of uniform offsets, bytes.
     pub uniform_align: u64,
+    /// Alignment of the offset of a bound storage range, bytes.
+    pub storage_offset_align: u64,
     /// Most dynamic-offset uniform bindings.
     pub max_dynamic_uniforms: u32,
     /// Most workgroups per dispatch dimension.
@@ -860,6 +897,15 @@ pub struct DeviceLimits {
     pub max_workgroup_invocations: u32,
     /// Workgroup shared memory, bytes.
     pub max_workgroup_storage_bytes: u32,
+}
+
+/// Live device memory, from [`Backend::memory_now`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryNow {
+    /// Bytes free.
+    pub free: u64,
+    /// Bytes in total.
+    pub total: u64,
 }
 
 /// What a backend knows about its device.
@@ -996,6 +1042,10 @@ pub struct GemmSpec {
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
     fn info(&self) -> &DeviceInfo;
+    /// Free and total device memory right now, where the API reports it (`None` otherwise).
+    fn memory_now(&self) -> Option<MemoryNow> {
+        None
+    }
     /// The device's on-disk cache.
     fn disk_cache(&self) -> &Arc<DiskCache>;
     /// The device's cost model, set once calibrated.

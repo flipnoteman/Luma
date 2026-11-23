@@ -89,6 +89,7 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_storage_buffers: 256,
             max_uniform_bytes: 65536,
             uniform_align: 16,
+            storage_offset_align: STORAGE_OFFSET_ALIGN,
             max_dynamic_uniforms: u32::MAX,
             max_workgroups_per_dim: 65535,
             max_workgroup_size: [1024, 1024, 64],
@@ -145,11 +146,15 @@ pub fn open() -> Result<Box<dyn Backend>, BackendError> {
     }))
 }
 
+/// Alignment of the offset of a bound storage range.
+const STORAGE_OFFSET_ALIGN: u64 = 16;
+
 /// One argument of a captured launch, owned.
 #[derive(Debug)]
 enum GraphArg {
     Storage {
         buffer: Buffer,
+        offset: u64,
         bytes: u64,
         writable: bool,
     },
@@ -395,6 +400,7 @@ impl CpuBackend {
     ) -> Result<Duration, BackendError> {
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
+        kernel.check_offsets(args, STORAGE_OFFSET_ALIGN)?;
         let native = native(kernel)?;
         if workgroups.contains(&0) {
             return Ok(Duration::ZERO);
@@ -414,8 +420,9 @@ impl CpuBackend {
         let (mut next_uniform, mut offset) = (0, 0);
         for (_, arg) in kernel.bound(args) {
             match arg {
-                RawArg::Storage { buffer, bytes, .. } => {
-                    bindings.push(raw(buffer)?.as_ptr());
+                RawArg::Storage { buffer, offset, bytes, .. } => {
+                    // SAFETY: `check_offsets` kept `offset + bytes` within the buffer.
+                    bindings.push(unsafe { raw(buffer)?.as_ptr().add(*offset as usize) });
                     binding_bytes.push(*bytes);
                 }
                 RawArg::Uniform(bytes) => {
@@ -712,10 +719,12 @@ impl Backend for CpuBackend {
                 .map(|arg| match arg {
                     GraphArg::Storage {
                         buffer,
+                        offset,
                         bytes,
                         writable,
                     } => RawArg::Storage {
                         buffer,
+                        offset: *offset,
                         bytes: *bytes,
                         writable: *writable,
                     },
@@ -839,10 +848,12 @@ impl Backend for CpuBackend {
                     .map(|arg| match *arg {
                         RawArg::Storage {
                             buffer,
+                            offset,
                             bytes,
                             writable,
                         } => GraphArg::Storage {
                             buffer: buffer.clone(),
+                            offset,
                             bytes,
                             writable,
                         },

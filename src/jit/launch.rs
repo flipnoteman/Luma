@@ -802,6 +802,35 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
     }
 }
 
+/// What a launch binds to read an input: the pinned buffer, the byte range of it, from `offset`.
+pub(super) struct InPin {
+    pin: Pin,
+    offset: u64,
+    bytes: u64,
+}
+
+impl InPin {
+    fn new(pin: Pin, bytes: u64) -> Self {
+        InPin { pin, offset: 0, bytes }
+    }
+
+    /// Pins the only segment of `input`. A window whose range starts where the device allows a
+    /// binding to is bound as that range of its pack's buffer, instead of being copied out.
+    fn of(input: &Storage) -> Result<Self, LumaError> {
+        if let Some((pack, at)) = input.window() {
+            let offset = pack.layout().bytes(at);
+            if offset % input.ctx().info().limits.storage_offset_align.max(1) == 0 {
+                return Ok(InPin { pin: pack.pin(0)?, offset, bytes: input.byte_len() });
+            }
+        }
+        Ok(InPin::new(input.pin(0)?, input.byte_len()))
+    }
+
+    pub(super) fn raw(&self) -> RawArg<'_> {
+        RawArg::storage_at(self.pin.buffer(), self.offset, self.bytes, false)
+    }
+}
+
 /// Pins what segment `j` (of `n` elements) of a launch binds as inputs, in the binding order of
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
 /// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
@@ -812,7 +841,7 @@ pub(super) fn pin_inputs(
     ids: Option<&[Vec<u32>]>,
     j: usize,
     n: u32,
-) -> Result<Vec<(Pin, u64)>, LumaError> {
+) -> Result<Vec<InPin>, LumaError> {
     let bytes = |input: &Storage| input.layout().bytes(n as usize);
     let mut pins = Vec::with_capacity(inputs.len());
     let mut stored = inputs.iter();
@@ -827,18 +856,18 @@ pub(super) fn pin_inputs(
             // An input of the length of the output is bound by segment; a single buffer of
             // another length (the source of a view) is bound whole.
             pins.push(if input.segments() > 1 {
-                (input.pin(j)?, input.segment_byte_len(j))
+                InPin::new(input.pin(j)?, input.segment_byte_len(j))
             } else {
-                (input.pin(0)?, input.byte_len())
+                InPin::of(input)?
             });
             continue;
         };
         if direct(&key.instrs, k as u32) {
-            pins.push((input.pin(j)?, bytes(input)));
+            pins.push(InPin::new(input.pin(j)?, bytes(input)));
         }
         for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
             let id = id as usize;
-            pins.push((input.pin(id)?, input.segment_byte_len(id)));
+            pins.push(InPin::new(input.pin(id)?, input.segment_byte_len(id)));
         }
     }
     Ok(pins)
@@ -882,7 +911,7 @@ pub(super) fn params<'a>(
 pub(super) struct StoreArgs<'a> {
     pub(super) n: u32,
     outs: Vec<(Pin, u64)>,
-    ins: Vec<(Pin, u64)>,
+    ins: Vec<InPin>,
     words: Cow<'a, [u32]>,
 }
 
@@ -890,7 +919,7 @@ impl StoreArgs<'_> {
     pub(super) fn raw(&self) -> Vec<RawArg<'_>> {
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(self.outs.len() + self.ins.len() + 1);
         raw.extend(self.outs.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
-        raw.extend(self.ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.extend(self.ins.iter().map(InPin::raw));
         if !self.words.is_empty() {
             raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.words)));
         }
@@ -1135,7 +1164,7 @@ pub(super) fn run_mapped(
     let words = params(&key, None, None, 0, n as usize, runs.as_ref(), &scalars)?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + ins.len() + 1);
     raw.extend(outs.iter().zip(bases).map(|(pin, base)| RawArg::write(pin.buffer(), base.byte_len())));
-    raw.extend(ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(ins.iter().map(InPin::raw));
     if !words.is_empty() {
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
     }
@@ -1313,7 +1342,7 @@ pub(super) fn reduce_fused(
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
         raw.push(RawArg::write(&out, out_bytes));
-        raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.extend(pins.iter().map(InPin::raw));
         if let Some(values) = &values {
             raw.push(RawArg::write(ctx.reduce_counter()?, 4));
             raw.push(RawArg::write(values, cell));
@@ -1410,7 +1439,7 @@ pub(super) fn reduce_and_store_fused(
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 4);
     raw.push(RawArg::write(&partial, out_bytes));
     raw.extend(store_pins.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     if let Some(values) = &values {
         raw.push(RawArg::write(ctx.reduce_counter()?, 4));
         raw.push(RawArg::write(values, cell));
@@ -1587,7 +1616,7 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
     let pins = pin_inputs(&key, inputs, None, 0, n)?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
     raw.push(RawArg::write(&out, out_bytes));
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     if single_pass {
         raw.push(RawArg::write(ctx.reduce_counter()?, 4));
         raw.push(RawArg::write(target, cell));
@@ -1823,7 +1852,7 @@ pub(crate) fn matmul(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
     raw.push(out);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend(ready.iter().flatten().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, size, &raw)?;
@@ -1863,7 +1892,7 @@ pub(crate) fn axis_reduce(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + reads.len() + 1);
     raw.extend_from_slice(outs);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, workgroups, size, &raw)?;
@@ -1973,7 +2002,7 @@ pub(crate) fn axis_reduce_planned(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
     raw.extend_from_slice(outs);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
@@ -2018,7 +2047,7 @@ pub(crate) fn radix_pass(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + writes.len() + reads.len() + 1);
     raw.extend_from_slice(writes);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, [words[0], 1, 1], &raw)?;
@@ -2092,7 +2121,7 @@ pub(crate) fn solve(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(writes.len() + pins.len() + ready.len() + 2);
     raw.extend_from_slice(writes);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend(ready.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
     raw.extend(starts);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));

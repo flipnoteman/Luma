@@ -378,6 +378,82 @@ fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
     assert_eq!(ctx.read::<u32>(&outputs[3], 256).unwrap(), vec![42; 64]);
 }
 
+/// A kernel binds byte ranges of one buffer: it reads one range and writes another of the same
+/// buffer, the bind-group cache tells two offsets of a buffer apart, and a misaligned offset is
+/// a binding error.
+#[test]
+fn a_launch_binds_byte_ranges_of_a_buffer() {
+    let ctx = ctx();
+    let core = kernel::build_core(
+        &ctx,
+        &KernelKey::new(
+            "@group(1) @binding(0) var<storage, read_write> out0: array<u32>;
+             @group(1) @binding(1) var<storage, read> in0: array<u32>;
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                 if (gid.x >= luma.size.x) { return; }
+                 out0[gid.x] = in0[gid.x] + 1u;
+             }"
+            .to_owned(),
+            "main",
+            None,
+        ),
+        Some("ranges"),
+        luma_core::KernelTrust::Trusted,
+    )
+    .unwrap();
+    let align = ctx.info().limits.storage_offset_align.max(256);
+    let words = (align / 4) as usize;
+    // [A | B | C | D]: A and C hold data, B and D are written.
+    let buffer = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
+    let a: Vec<u32> = (0..words as u32).collect();
+    let c: Vec<u32> = (0..words as u32).map(|i| i * 10).collect();
+    let mut data = vec![0u32; 4 * words];
+    data[..words].copy_from_slice(&a);
+    data[2 * words..3 * words].copy_from_slice(&c);
+    ctx.upload(&buffer, bytemuck::cast_slice(&data)).unwrap();
+    let range = |at: u64| RawArg::storage_at(&buffer, at * align, align, false);
+    let target = |at: u64| RawArg::storage_at(&buffer, at * align, align, true);
+    let size = [words as u32, 1, 1];
+    let groups = [(words as u32).div_ceil(64), 1, 1];
+    ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
+    ctx.launch(&core, groups, size, &[target(3), range(2)]).unwrap();
+    // The first launch again, so the cached bind group of (buffer, 0..) is hit after (buffer, 2..).
+    ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
+    let got = ctx.read::<u32>(&buffer, 4 * align).unwrap();
+    assert_eq!(&got[..words], &a[..], "A is untouched");
+    assert_eq!(got[words..2 * words], a.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+    assert_eq!(&got[2 * words..3 * words], &c[..], "C is untouched");
+    assert_eq!(got[3 * words..], c.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+
+    let misaligned = [RawArg::storage_at(&buffer, 2 * align + 4, 4, true), range(0)];
+    let result = ctx.launch(&core, [1, 1, 1], [1, 1, 1], &misaligned);
+    assert!(matches!(result, Err(LumaError::KernelBinding(_))), "{result:?}");
+    let outside = [RawArg::storage_at(&buffer, 3 * align, 2 * align, true), range(0)];
+    assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &outside), Err(LumaError::KernelBinding(_))));
+    // Overlapping ranges of one buffer still alias.
+    let alias = [RawArg::storage_at(&buffer, 0, 2 * align, true), range(1)];
+    assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &alias), Err(LumaError::KernelArgAlias { .. })));
+}
+
+/// The device reports its free memory on CUDA and Metal, and it drops after an allocation.
+#[test]
+fn memory_now_follows_allocations() {
+    let ctx = ctx();
+    let Some(before) = ctx.hal().memory_now() else {
+        assert!(matches!(ctx.backend(), BackendKind::Wgpu | BackendKind::Cpu));
+        assert_eq!(ctx.memory_stats().device_free_bytes, None);
+        return;
+    };
+    assert!(before.free <= before.total);
+    let held = ctx.alloc_buffer(256 << 20, STORAGE_USAGE).unwrap();
+    ctx.upload(&held, &vec![1u8; 256 << 20]).unwrap();
+    ctx.sync().unwrap();
+    let after = ctx.memory_stats().device_free_bytes.unwrap();
+    assert!(after <= before.free - (128 << 20), "free memory {after} after, {} before", before.free);
+    drop(held);
+}
+
 /// Slots for the live intervals of transient buffers: intervals that overlap, even at one
 /// command, never share a slot, and as few slots are used as the greatest number of intervals
 /// live at once.

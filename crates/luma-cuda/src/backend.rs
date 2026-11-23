@@ -24,7 +24,7 @@ use luma_core::hal::cache::{self, PTX_MAGIC};
 use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
-    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
+    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
     KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, GemmSpec, TuningProfile,
 };
 
@@ -511,6 +511,9 @@ impl Hazards {
     }
 }
 
+/// Alignment of the offset of a bound storage range (the rule for vector loads).
+const STORAGE_OFFSET_ALIGN: u64 = 16;
+
 /// Most launches looked at to find the edges a launch has through others (see [`reduce`]).
 const REDUCE_BUDGET: usize = 512;
 
@@ -623,6 +626,7 @@ impl Params {
         args: &[RawArg<'_>],
         uniform: &mut dyn FnMut(&[u8]) -> Result<u64, BackendError>,
     ) -> Result<(), BackendError> {
+        kernel.check_offsets(args, STORAGE_OFFSET_ALIGN)?;
         self.vals.clear();
         self.lens.clear();
         self.inline.clear();
@@ -634,7 +638,7 @@ impl Params {
         for ((position, arg), abi) in kernel.bound(args).zip(&native.param_abis) {
             bound += 1;
             match (abi, arg) {
-                (CudaArgAbi::DevicePtr, RawArg::Storage { buffer, .. }) => self.vals.push(device_ptr(buffer)?),
+                (CudaArgAbi::DevicePtr, RawArg::Storage { buffer, offset, .. }) => self.vals.push(device_ptr(buffer)? + offset),
                 (CudaArgAbi::InlineUniform { size }, RawArg::Uniform(bytes)) => {
                     // Each uniform starts on a 16-byte boundary, zero-padded to its size.
                     let at = self.inline.len();
@@ -852,6 +856,7 @@ impl CudaShared {
                 max_storage_buffers: 256,
                 max_uniform_bytes: 65536,
                 uniform_align: 16,
+                storage_offset_align: STORAGE_OFFSET_ALIGN,
                 max_dynamic_uniforms: u32::MAX,
                 max_workgroups_per_dim: 65535,
                 max_workgroup_size: block.map(|d| d as u32),
@@ -1336,6 +1341,11 @@ impl CudaBackend {
 }
 
 impl Backend for CudaBackend {
+    fn memory_now(&self) -> Option<MemoryNow> {
+        let (free, total) = result::mem_get_info().ok()?;
+        Some(MemoryNow { free: free as u64, total: total as u64 })
+    }
+
     fn info(&self) -> &DeviceInfo {
         &self.shared.info
     }

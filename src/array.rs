@@ -111,15 +111,6 @@ impl Storage {
         self.segments.len() == 1 && !self.layout.is_packed() && self.owner.is_none() && self.segments[0].can_adopt()
     }
 
-    /// Gives a window a buffer of its own, holding a copy of its range (see
-    /// [`Storage::window_of`]); nothing for any other storage.
-    pub(crate) fn detach(&self) -> Result<()> {
-        if self.is_window() {
-            self.pin_quiet(0)?;
-        }
-        Ok(())
-    }
-
     /// Makes this storage the elements `offset..offset + len` of `pack`, which hold its data
     /// (see [`Storage::window_of`]), and gives its buffer back. `false` if it cannot (see
     /// [`Storage::can_adopt`]).
@@ -211,6 +202,10 @@ impl Storage {
     /// Number of elements.
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    pub(crate) fn ctx(&self) -> &Context {
+        &self.ctx
     }
 
     /// How the elements sit in the buffers.

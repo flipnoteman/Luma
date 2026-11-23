@@ -304,8 +304,8 @@ impl Reduced {
     }
 
     /// The values of a reduction recorded together with others, read from the host copy of the buffer they share
-    /// (made by the first read of any of them); `None` if it was not, or its own buffer was made since (see
-    /// [`Storage::detach`]).
+    /// (made by the first read of any of them); `None` if it was not, or its own buffer was made since (a window
+    /// that is pinned gets a copy of its range, see [`Storage::window_of`]).
     pub(crate) fn packed_values<T: GpuType>(&self, ctx: &Context) -> Option<Result<Vec<T>>> {
         if std::mem::size_of::<T::Repr>() != 4 {
             return None;

@@ -34,7 +34,7 @@ mod imp {
     use luma_core::{
         Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
         DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
-        RawKernel, TuningProfile,
+        RawKernel, TuningProfile, MemoryNow,
     };
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::ProtocolObject;
@@ -293,6 +293,9 @@ mod imp {
         pipelines: Mutex<HashMap<(String, bool), MtlPipeline>>,
     }
 
+    /// Alignment of the offset of a bound storage range. [verify: Metal's device buffers allow 4]
+    const STORAGE_OFFSET_ALIGN: u64 = 16;
+
     /// The process-wide device, opened on first use.
     static SHARED: Mutex<Option<Arc<MetalSharedDevice>>> = Mutex::new(None);
 
@@ -321,6 +324,7 @@ mod imp {
                     max_storage_buffers: if device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2 { 256 } else { 28 },
                     max_uniform_bytes: 65536,
                     uniform_align: 16,
+                    storage_offset_align: STORAGE_OFFSET_ALIGN,
                     max_dynamic_uniforms: u32::MAX,
                     max_workgroups_per_dim: 65535,
                     max_workgroup_size: [threads.width as u32, threads.height as u32, threads.depth as u32],
@@ -495,7 +499,7 @@ mod imp {
     /// One argument of a captured launch of a [`MslAbi::Direct`] kernel.
     #[derive(Debug)]
     enum GraphDirectArg {
-        Storage(ResolvedBuffer),
+        Storage(ResolvedBuffer, usize),
         /// A uniform `setBytes` takes, stored in `MetalExecGraph::bytes`.
         InlineUniform(ByteSlice),
         /// A uniform copied into a uniform chunk at every replay, stored in `MetalExecGraph::bytes`.
@@ -505,7 +509,7 @@ mod imp {
     /// One argument of a captured launch of a [`MslAbi::ArgBuffer`] kernel.
     #[derive(Debug)]
     enum GraphArgEntry {
-        Storage { buffer: ResolvedBuffer, writable: bool },
+        Storage { buffer: ResolvedBuffer, offset: u64, writable: bool },
         Uniform(ByteSlice),
     }
 
@@ -874,10 +878,10 @@ mod imp {
                     let mut slot = 1;
                     for (_, arg) in kernel.bound(args) {
                         match arg {
-                            RawArg::Storage { buffer, .. } => {
+                            RawArg::Storage { buffer, offset, .. } => {
                                 let buf = raw(buffer)?;
                                 self.mark_used(buf, next_seq);
-                                set_buffer(encoder, &mut batch.bound, buf, 0, slot);
+                                set_buffer(encoder, &mut batch.bound, buf, *offset as usize, slot);
                             }
                             RawArg::Uniform(bytes) if bytes.len() <= SET_BYTES_MAX => set_bytes(encoder, &mut batch.bound, bytes, slot),
                             RawArg::Uniform(bytes) => {
@@ -900,10 +904,10 @@ mod imp {
                     packed.clear();
                     for (_, arg) in kernel.bound(args) {
                         let address = match arg {
-                            RawArg::Storage { buffer, writable, .. } => {
+                            RawArg::Storage { buffer, offset, writable, .. } => {
                                 let buf = raw(buffer)?;
                                 self.mark_used(buf, next_seq);
-                                use_resource(encoder, &mut batch.resident, buf, *writable)
+                                use_resource(encoder, &mut batch.resident, buf, *writable) + offset
                             }
                             RawArg::Uniform(bytes) => {
                                 let (buf, offset) = self.uniform_slot(batch, bytes)?;
@@ -956,10 +960,10 @@ mod imp {
                     let mut slot = 1;
                     for arg in &graph.direct_args[*start as usize..*end as usize] {
                         match arg {
-                            GraphDirectArg::Storage(buffer) => {
+                            GraphDirectArg::Storage(buffer, offset) => {
                                 let buf = buffer.get();
                                 self.mark_used(buf, seq);
-                                set_buffer(encoder, &mut batch.bound, buf, 0, slot);
+                                set_buffer(encoder, &mut batch.bound, buf, *offset, slot);
                             }
                             GraphDirectArg::InlineUniform(range) => set_bytes(encoder, &mut batch.bound, graph.slice(*range), slot),
                             GraphDirectArg::LargeUniform(range) => {
@@ -975,7 +979,7 @@ mod imp {
                 }
                 GraphAbi::ArgBuffer { entries, lengths, packed } => {
                     for entry in entries {
-                        if let GraphArgEntry::Storage { buffer, writable } = entry {
+                        if let GraphArgEntry::Storage { buffer, writable, .. } = entry {
                             let buf = buffer.get();
                             self.mark_used(buf, seq);
                             use_resource(encoder, &mut batch.resident, buf, *writable);
@@ -988,7 +992,7 @@ mod imp {
                         packed.clear();
                         for entry in entries {
                             let address = match entry {
-                                GraphArgEntry::Storage { buffer, .. } => buffer.get().gpu_addr,
+                                GraphArgEntry::Storage { buffer, offset, .. } => buffer.get().gpu_addr + offset,
                                 GraphArgEntry::Uniform(range) => {
                                     let (buf, offset) = self.uniform_slot(batch, graph.slice(*range))?;
                                     use_resource(encoder, &mut batch.resident, &buf, false) + offset
@@ -1041,6 +1045,12 @@ mod imp {
     impl Backend for MetalBackend {
         fn info(&self) -> &DeviceInfo {
             &self.info
+        }
+
+        fn memory_now(&self) -> Option<MemoryNow> {
+            let total = self.info.memory_bytes?;
+            let allocated = self.device().currentAllocatedSize() as u64;
+            Some(MemoryNow { free: total.saturating_sub(allocated), total })
         }
 
         fn disk_cache(&self) -> &Arc<DiskCache> {
@@ -1141,6 +1151,7 @@ mod imp {
         fn record_launch(&self, kernel: &CompiledKernel, dispatch: Dispatch<'_>, size: [u32; 3], args: &[RawArg<'_>]) -> Result<u32, BackendError> {
             kernel.check_count(args.len())?;
             kernel.check_kinds(args)?;
+            kernel.check_offsets(args, STORAGE_OFFSET_ALIGN)?;
             let native = kernel
                 .raw
                 .downcast_ref::<MetalKernel>()
@@ -1426,6 +1437,7 @@ mod imp {
                 let kernel = launch.kernel;
                 kernel.check_count(launch.args.len()).ok()?;
                 kernel.check_kinds(launch.args).ok()?;
+                kernel.check_offsets(launch.args, STORAGE_OFFSET_ALIGN).ok()?;
                 let native = kernel.raw.downcast_ref::<MetalKernel>()?;
                 let len_start = u32::try_from(bytes.len()).ok()?;
                 push_lengths(native, launch.args, &mut bytes);
@@ -1435,7 +1447,7 @@ mod imp {
                         let arg_start = u32::try_from(direct_args.len()).ok()?;
                         for (_, arg) in kernel.bound(launch.args) {
                             let entry = match arg {
-                                RawArg::Storage { buffer, .. } => GraphDirectArg::Storage(ResolvedBuffer::new(buffer)?),
+                                RawArg::Storage { buffer, offset, .. } => GraphDirectArg::Storage(ResolvedBuffer::new(buffer)?, *offset as usize),
                                 RawArg::Uniform(data) if data.len() <= SET_BYTES_MAX => GraphDirectArg::InlineUniform(push_bytes(&mut bytes, data)?),
                                 RawArg::Uniform(data) => GraphDirectArg::LargeUniform(push_bytes(&mut bytes, data)?),
                             };
@@ -1448,8 +1460,8 @@ mod imp {
                         let mut entries = Vec::new();
                         for (_, arg) in kernel.bound(launch.args) {
                             entries.push(match arg {
-                                RawArg::Storage { buffer, writable, .. } => {
-                                    GraphArgEntry::Storage { buffer: ResolvedBuffer::new(buffer)?, writable: *writable }
+                                RawArg::Storage { buffer, offset, writable, .. } => {
+                                    GraphArgEntry::Storage { buffer: ResolvedBuffer::new(buffer)?, offset: *offset, writable: *writable }
                                 }
                                 RawArg::Uniform(data) => GraphArgEntry::Uniform(push_bytes(&mut bytes, data)?),
                             });
@@ -1458,8 +1470,8 @@ mod imp {
                         let packed = if entries.iter().all(|entry| matches!(entry, GraphArgEntry::Storage { .. })) {
                             let pack_start = u32::try_from(bytes.len()).ok()?;
                             for entry in &entries {
-                                if let GraphArgEntry::Storage { buffer, .. } = entry {
-                                    bytes.extend_from_slice(&buffer.get().gpu_addr.to_ne_bytes());
+                                if let GraphArgEntry::Storage { buffer, offset, .. } = entry {
+                                    bytes.extend_from_slice(&(buffer.get().gpu_addr + offset).to_ne_bytes());
                                 }
                             }
                             let (lo, ll) = len_slice;

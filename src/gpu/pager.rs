@@ -203,6 +203,8 @@ pub(crate) struct Pager {
     budget: Option<u64>,
     /// Bytes of array data moved to host memory so far.
     spilled_bytes: AtomicU64,
+    /// Windows given a buffer of their own, a copy of their range (see [`Segment::windowed`]).
+    window_copies: AtomicU64,
     /// Whether the spill warning has been printed.
     warned: AtomicBool,
     /// Held by the thread that is evicting, so one thread evicts at a time.
@@ -214,6 +216,12 @@ impl Pager {
     #[cfg(test)]
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Windows copied out of their pack so far.
+    #[cfg(test)]
+    pub(crate) fn window_copies(&self) -> u64 {
+        self.window_copies.load(Ordering::Relaxed)
     }
 
     /// Counts `bytes` of device buffers the context holds until it is dropped (nothing gives
@@ -235,6 +243,7 @@ impl Pager {
             clock: AtomicU64::new(0),
             budget,
             spilled_bytes: AtomicU64::new(0),
+            window_copies: AtomicU64::new(0),
             warned: AtomicBool::new(false),
             evicting: Mutex::new(()),
         }
@@ -376,6 +385,7 @@ impl Segment {
             if let Some((pack, offset)) = window {
                 // The copy runs after the launch that wrote the pack and before any later one.
                 let source = pack.pin(0)?;
+                pager.window_copies.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = self.ctx.copy(source.buffer(), offset, &buffer, 0, self.bytes) {
                     self.ctx.recycle(buffer);
                     return Err(e);
@@ -562,6 +572,7 @@ impl Context {
             pooled_bytes: self.pooled_bytes(),
             spilled_bytes: pager.spilled_bytes.load(Ordering::Relaxed),
             budget_bytes: pager.budget,
+            device_free_bytes: self.hal().memory_now().map(|now| now.free),
         }
     }
 }
@@ -590,6 +601,9 @@ pub struct MemoryStats {
     /// Bytes of array data the context keeps on the device (`None`: no budget; data only moves
     /// to host memory when the device reports that it is full).
     pub budget_bytes: Option<u64>,
+    /// Bytes of device memory free right now, as the device reports them (everything on it, not
+    /// only this context's); `None` where the backend cannot tell (wgpu, CPU).
+    pub device_free_bytes: Option<u64>,
 }
 
 #[cfg(test)]

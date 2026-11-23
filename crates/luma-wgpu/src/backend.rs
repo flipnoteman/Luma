@@ -432,14 +432,14 @@ struct CachedGroup {
     /// What is bound, in binding order. Uniforms are identified by their arena chunk (the slot
     /// is a dynamic offset). Holding the buffers keeps them alive as long as the group is cached,
     /// so a buffer's identity cannot be reused by another one.
-    entries: Box<[(Buffer, u64)]>,
+    entries: Box<[(Buffer, u64, u64)]>,
     group: wgpu::BindGroup,
 }
 
 impl CachedGroup {
-    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64)>) -> bool {
+    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64, u64)>) -> bool {
         self.kernel == kernel
-            && self.entries.iter().all(|(a, a_bytes)| entries.next().is_some_and(|(b, b_bytes)| a == b && *a_bytes == b_bytes))
+            && self.entries.iter().all(|(a, a_offset, a_bytes)| entries.next().is_some_and(|(b, b_offset, b_bytes)| a == b && *a_offset == b_offset && *a_bytes == b_bytes))
             && entries.next().is_none()
     }
 }
@@ -457,7 +457,7 @@ impl BindGroupCache {
     /// Invalidates indices into buckets: only call it while nothing is bound.
     fn forget(&mut self, buffers: &[Buffer]) {
         self.buckets.retain(|_, bucket| {
-            bucket.retain(|group| !group.entries.iter().any(|(b, _)| buffers.contains(b)));
+            bucket.retain(|group| !group.entries.iter().any(|(b, _, _)| buffers.contains(b)));
             !bucket.is_empty()
         });
         self.len = self.buckets.values().map(Vec::len).sum();
@@ -600,6 +600,7 @@ pub struct WgpuBackend {
     grid_layout: wgpu::BindGroupLayout,
     timestamps: bool,
     uniform_align: u64,
+    storage_offset_align: u64,
     max_dynamic_uniforms: u32,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
@@ -668,6 +669,7 @@ impl WgpuBackend {
                 max_storage_buffers: limits.max_storage_buffers_per_shader_stage,
                 max_uniform_bytes: limits.max_uniform_buffer_binding_size,
                 uniform_align: u64::from(limits.min_uniform_buffer_offset_alignment).max(4),
+                storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 max_workgroups_per_dim: limits.max_compute_workgroups_per_dimension,
                 max_workgroup_size: [limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z],
@@ -706,6 +708,7 @@ impl WgpuBackend {
             grid_layout,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             uniform_align: info.limits.uniform_align,
+            storage_offset_align: info.limits.storage_offset_align,
             max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
             max_buffer_bytes,
             info,
@@ -1357,6 +1360,7 @@ impl Backend for WgpuBackend {
         // error of its caller, not of the batch.
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
+        kernel.check_offsets(args, self.storage_offset_align)?;
         let native = kernel.raw.downcast_ref::<WgpuKernel>().ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))?;
         let indirect = match dispatch {
             Dispatch::Direct(_) => None,
@@ -1427,25 +1431,26 @@ impl Backend for WgpuBackend {
         // this launch's slots were allocated from.
         let bindings = || {
             kernel.bound(args).map(|(_, arg)| match *arg {
-                RawArg::Storage { buffer, bytes, .. } => (buffer, bytes),
-                RawArg::Uniform(data) => (uniforms, data.len() as u64),
+                RawArg::Storage { buffer, offset, bytes, .. } => (buffer, offset, bytes),
+                RawArg::Uniform(data) => (uniforms, 0, data.len() as u64),
             })
         };
         let mut hasher = FxHasher::default();
         kernel.id.hash(&mut hasher);
-        for (buffer, bytes) in bindings() {
+        for (buffer, offset, bytes) in bindings() {
             buffer.hash(&mut hasher);
+            offset.hash(&mut hasher);
             bytes.hash(&mut hasher);
         }
         let key = hasher.finish();
         let textured_group;
         let (args_group, cached) = if native.textured {
             let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-            for (((binding, _), (buffer, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
+            for (((binding, _), (buffer, offset, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
                 let resource = match info.kind {
                     BindingKind::Texture2d => BindingResource::TextureView(&texture(buffer)?.view),
                     BindingKind::Sampler => BindingResource::Sampler(&texture(buffer)?.sampler),
-                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset, size: std::num::NonZeroU64::new(bytes) }),
                 };
                 group_entries.push(BindGroupEntry { binding, resource });
             }
@@ -1457,14 +1462,14 @@ impl Backend for WgpuBackend {
                 Some(index) => index,
                 None => {
                     let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-                    for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
+                    for ((binding, _), (buffer, offset, bytes)) in kernel.bound(args).zip(bindings()) {
                         group_entries.push(BindGroupEntry {
                             binding,
-                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset, size: std::num::NonZeroU64::new(bytes) }),
                         });
                     }
                     let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
-                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
+                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, offset, bytes)| (buffer.clone(), offset, bytes)).collect(), group });
                     bind_groups.len += 1;
                     bucket.len().saturating_sub(1)
                 }
