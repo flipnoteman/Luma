@@ -136,8 +136,16 @@ impl Harness {
     }
 
     /// Like [`Harness::case`] for a case that only builds a lazy graph and drops it
-    /// (`*_build_step`): launching no kernel is expected.
+    /// (`*_build_step`, `converge/points_compile_only`): launching no kernel is expected.
     pub fn build_case(&mut self, case: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
+        self.run_case(case, size, work, f, true);
+    }
+
+    /// Like [`Harness::case`] for a case that does its work without a kernel launch on the harness
+    /// context: a pure transfer (`readback/to_vec_*`, `upload_*`), or work on a context of its own
+    /// (`compile/newctx_*`, `threads/private*`), which the profile of the harness context cannot see.
+    /// The case still evaluates and flushes inside `f`.
+    pub fn transfer_case(&mut self, case: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
         self.run_case(case, size, work, f, true);
     }
 
@@ -208,7 +216,7 @@ impl Harness {
         };
         let _ = self.ctx.sync();
         if !build_only && launches == Some(0) {
-            let why = "the profiled call launched no kernel: the case does not evaluate and flush its work (use build_case for a build-only case)";
+            let why = "the profiled call launched no kernel: the case does not evaluate and flush its work (build_case and transfer_case register cases that launch none by design)";
             println!("FAILED: {}: {why}", self.full(case));
             self.skipped.push((self.full(case), why.to_string()));
         }

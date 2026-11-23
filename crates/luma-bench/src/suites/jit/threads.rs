@@ -64,9 +64,14 @@ pub fn run(h: &mut Harness) {
             check("threads", &work(&ctxs[0], &uh, side, steps), &want, 1e-3, 1e-3);
             let t = ctxs.len();
             let case = if t == 1 { "threads/alone".to_string() } else { format!("threads/{name}{t}") };
-            h.case(&case, &format!("{t} thr {side}x{side} x{steps}"), per_sec(t * steps, "step/s"), &mut || {
-                round(ctxs, &uh, side, steps, &want);
-            });
+            let size = format!("{t} thr {side}x{side} x{steps}");
+            let mut f = || round(ctxs, &uh, side, steps, &want);
+            if name == "private" {
+                // The kernels run on contexts of their own, which the harness profile cannot see.
+                h.transfer_case(&case, &size, per_sec(t * steps, "step/s"), &mut f);
+            } else {
+                h.case(&case, &size, per_sec(t * steps, "step/s"), &mut f);
+            }
         }
     });
 }
