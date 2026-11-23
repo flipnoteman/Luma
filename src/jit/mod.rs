@@ -1927,20 +1927,17 @@ fn pending_depth(args: &[Src]) -> Option<u16> {
             memo.insert(node.id, node.depth());
             continue;
         };
-        let inner: Vec<Arc<Node>> = operands
-            .into_iter()
-            .take(node.op.kind.arity())
-            .filter_map(|operand| match operand {
-                Src::Node(inner) if inner.evaluated().is_none() => Some(inner),
-                _ => None,
-            })
-            .collect();
+        // The operands that are still pending (an iterator over the copy: no allocation per node).
+        let inner = operands.into_iter().take(node.op.kind.arity()).filter_map(|operand| match operand {
+            Src::Node(inner) if inner.evaluated().is_none() => Some(inner),
+            _ => None,
+        });
         if !expanded {
-            stack.push((Arc::clone(&node), true));
-            stack.extend(inner.into_iter().filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
+            stack.push((node, true));
+            stack.extend(inner.filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
             continue;
         }
-        let depth = inner.iter().filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
+        let depth = inner.filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
         memo.insert(node.id, depth);
     }
     roots.iter().filter_map(|node| memo.get(&node.id).copied()).max()
