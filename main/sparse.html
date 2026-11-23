@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -219,8 +219,13 @@ the row array of CSR is the row pointer, the column array of CSC is the column p
 no empty arrays, so they are <code>None</code> for a matrix without entries (<code>Sparse::empty</code>, or the sparse
 form of an all-zero matrix).</p>
 <h2 id="conversions-and-the-transpose"><a class="header" href="#conversions-and-the-transpose">Conversions and the transpose</a></h2>
-<p><code>to_format</code> converts between the three formats (a stable sort by the new major index, one <code>u32</code>
-sort and a gather); <code>to_dense</code> scatters the entries into zeros. <code>transpose</code> is free: the transpose
+<p><code>to_format</code> converts between the three formats: a stable sort of the entries by the new major index
+(CSR to CSC and back keep the entries of a row, or a column, in order), done as two radix sorts of
+the index that carry the other index and the value along (<code>ceil(log2 n)</code> bits for <code>n</code> rows or
+columns, so three 8-bit passes where 32 bits took four), with the offsets taken
+as a <code>searchsorted</code> of the sorted keys; <code>from_triplets</code> into a compressed format is the same sort.
+In the afcompare sparse rows CSR to CSC takes 1.34 ms on an RTX 3090, 1.96 times the speed of
+cuSPARSE’s <code>csr2csc</code> (2.62 ms before 0.5.2), and 2.98 ms on an RTX 3080 Laptop, 1.81 times. <code>to_dense</code> scatters the entries into zeros. <code>transpose</code> is free: the transpose
 of a CSR matrix is the CSC matrix with the same arrays, and COO swaps its two index arrays.</p>
 <h2 id="products"><a class="header" href="#products">Products</a></h2>
 <p><code>matmul</code> multiplies by a vector (shape <code>[cols]</code>) or a dense matrix (<code>[c, cols]</code>); <code>matmul_t</code> uses
@@ -238,8 +243,8 @@ assert_eq!(a.matmul_t(&amp;y).to_vec()?, vec![1.0, 0.0, 8.0]);
 <p>CSR <code>A x</code> and CSC <code>A^T x</code> (the product whose output runs along the compressed axis) run on kernels
 written for the format: for a vector, a thread (or a few lanes) per row when the rows are short, a
 kernel that takes tiles of 512 consecutive entries whatever the row lengths are (the balance of a
-merge-path product; a second small pass completes the rows that cross tiles) when some are long;
-for a dense matrix
+merge-path product: every invocation loads its run of four entries as one <code>vec4</code>; a second small
+pass completes the rows that cross tiles) when some are long; for a dense matrix
 one invocation per output element walks its row, reading <code>c</code> adjacent elements of <code>x</code> together,
 and the few very long rows of a power-law graph are cut in pieces summed by a workgroup each. No
 atomics are used, so the results are the same on every run. The first product of any other
@@ -250,9 +255,9 @@ reproducible. The first product of a matrix reads its row lengths back (one sync
 finds the first row of every tile. A pending expression as <code>x</code> is evaluated first.</p>
 <h2 id="elementwise-operations"><a class="header" href="#elementwise-operations">Elementwise operations</a></h2>
 <p><code>mul_dense</code> and <code>div_dense</code> keep the pattern of the sparse matrix and give a sparse result;
-<code>mul_scalar</code>, <code>div_scalar</code>, <code>neg</code> (and the operators <code>*</code>, <code>/</code>, <code>-</code> with <code>f32</code>) do too. Sums and
-differences with a dense matrix (<code>add_dense</code>, <code>sub_dense</code>, <code>rsub_dense</code>) and with a scalar
-(<code>add_scalar</code>) fill the zeros, so their results are dense arrays.</p>
+<code>mul_scalar</code>, <code>div_scalar</code>, <code>neg</code> (and the operators <code>*</code> and <code>/</code> with <code>f32</code>, and unary <code>-</code>) do
+too. Sums and differences with a dense matrix (<code>add_dense</code>, <code>sub_dense</code>, <code>rsub_dense</code>) and with a
+scalar (<code>add_scalar</code>, <code>sub_scalar</code>) fill the zeros, so their results are dense arrays.</p>
 
                     </main>
 

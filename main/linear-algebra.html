@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -232,17 +232,48 @@ assert!((back.to_vec()?[0] - 0.25).abs() &lt; 1e-5);
 <li>Small matrices and every matrix of a batch are factored by one workgroup each, in one launch:
 a batch of 4096 matrices of 16 x 16 costs one launch, where a library without batched LAPACK
 loops over calls.</li>
-<li>A big matrix is factored recursively; the leaves are small kernels and every other flop is a
-full-<code>f32</code> <code>matmul_f32</code> of the halves (never TF32: a factorisation’s accuracy depends on it).</li>
+<li>A big matrix (more than 64 rows) is blocked. LU and QR recurse on the columns: the leaves are
+panels of up to 32 columns and every other flop is a full-<code>f32</code> <code>matmul_f32</code> of the halves
+(never TF32: a factorisation’s accuracy depends on it).
+<ul>
+<li>LU factors a panel by a tournament (CALU) instead of one workgroup streaming the whole panel
+through one multiprocessor: workgroups pick pivot rows in chunks of up to 512 rows, one
+workgroup plays the winners off against each other, and a last kernel gives every row its
+multipliers. A panel of up to 512 rows is one chunk and pivots exactly as partial pivoting
+does. A panel of more rows has multipliers that can exceed 1 (mildly; the tests bound them by
+8 above 64 rows), so the pivoting is not the classical one there, though the result is the
+same on every backend. Triangular solves inside the recursion use register-resident
+substitution leaves of 64 rows.</li>
+<li>QR factors a panel by a two level tall-skinny QR (TSQR): blocks of rows are factored by one
+workgroup each, the stack of their <code>R</code>s is factored the same way, and the compact WY form is
+rebuilt from the explicit <code>Q</code>. A panel of up to 512 rows is one launch. Panels too tall for the
+tree (over 8192 rows with 32 columns), devices with workgroups of fewer than 64 invocations
+and, for the tree, less than 30 KB of workgroup memory keep the older kernel in which one
+workgroup streams the panel; <code>LUMA_QR_TSQR=0</code> selects it everywhere.</li>
+<li>Cholesky is left-looking in blocks of 128 columns (64 or fewer where workgroup memory is
+small), all writing into one output: one product of the finished columns per 512 columns plus a
+small correction per block, one workgroup that factors the diagonal block and one launch of
+warps that solve the rows below, about 100 launches at 4096 rows. <code>LUMA_CHOL_NB</code> and
+<code>LUMA_CHOL_WIDE</code> pick the block sizes.</li>
+<li>The update products of Cholesky and of the blocked triangular solves are exact <code>f32</code> too;
+<code>LUMA_LINALG_TF32=1</code> runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
+backward error of about 1e-3 of the entries of the updates instead of 1e-7. It is off by
+default and is independent of <code>ContextOptions::tf32_matmul</code>, which governs <code>matmul</code> only.</li>
+</ul>
+</li>
 <li>A triangular solve with up to 32 right-hand sides (<code>solve_triangular</code>, and the two solves inside
 <code>solve</code> and <code>solve_spd</code>) of a triangle of more than 64 rows is one launch on CUDA devices: one
 workgroup per block of 64 rows takes its turn from an atomic ticket, waits for the solved blocks
 before it (the words they publish are the complement of the bits, 0 meaning “not there yet”: no flags
-or fences), and solves its own block. The factorisations’ solves take the diagonal blocks as explicit
-inverses (computed while the workgroup waits; the blocks are well-conditioned triangles of a
-factorisation, a Cholesky factor or a unit <code>L</code> with bounded multipliers); <code>solve_triangular</code> of an
-arbitrary triangle substitutes. More right-hand sides, and every other backend, solve in blocks of rows
-with <code>matmul_f32</code> products.</li>
+or fences), and solves its own block. The solves inside <code>solve</code> and <code>solve_spd</code> take the diagonal
+blocks as explicit inverses from 768 rows (computed while the workgroup waits; the blocks are
+well-conditioned triangles of a factorisation, a Cholesky factor or a unit <code>L</code> with bounded
+multipliers); <code>solve_triangular</code> of an arbitrary triangle substitutes. More than 8 right-hand
+sides are split over workgroups of their own. More than 32 right-hand sides, and every backend
+that does not order memory across workgroups (wgpu, the CPU), solve in blocks of 128 rows, one
+product plus one launch each. <code>LUMA_TRSV=0</code> turns the one-launch solve off.</li>
+<li>The kernels of the factorisations are cached by the context that built them, not process-wide, so
+a dropped context releases them (and its device).</li>
 <li>Numerical failure never poisons or raises: a matrix that is not positive definite leaves <code>NaN</code>
 on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of <code>U</code> (the
 solve then gives <code>Inf</code>/<code>NaN</code>, the determinant 0). Shape errors poison the result as usual.</li>
@@ -270,7 +301,7 @@ assert!((l[0] - 1.0).abs() &lt; 1e-5 &amp;&amp; (l[1] - 3.0).abs() &lt; 1e-5);
 <tr><td><code>svd()</code></td><td><code>Svd { u, s, vt }</code>, thin: <code>u</code> <code>[k, m]</code>, <code>s</code> <code>[k, 1]</code>, <code>vt</code> <code>[n, k]</code>, <code>k = min(m, n)</code>, any shape</td></tr>
 <tr><td><code>singular_values()</code></td><td>the values alone (no <code>V</code>, no vectors written)</td></tr>
 <tr><td><code>pinv()</code>, <code>pinv_tol(tol)</code></td><td>Moore-Penrose pseudo-inverse <code>[m, n]</code>; values <code>&lt;= tol s_max</code> count as zero (default <code>max(m, n) eps</code>)</td></tr>
-<tr><td><code>rank()</code>, <code>rank_tol(tol)</code></td><td>numerical rank as a <code>u32</code> <code>[1, 1]</code></td></tr>
+<tr><td><code>rank()</code>, <code>rank_tol(tol)</code></td><td>numerical rank as a <code>u32</code> <code>[1, 1]</code>: the singular values above <code>tol s_max</code> (default <code>max(m, n) eps</code>)</td></tr>
 <tr><td><code>cond()</code></td><td><code>s_max / s_min</code></td></tr>
 <tr><td><code>eigh()</code>, <code>eigvalsh()</code></td><td><code>Eigh { values, vectors }</code> of a symmetric matrix (lower triangle read), ascending; the values alone</td></tr>
 </tbody>
@@ -281,15 +312,60 @@ round are disjoint, so a round is parallel) until they are orthogonal; the singu
 their norms. A matrix with its <code>V</code> that fits workgroup memory (up to 64 x 64 on devices with 32 KiB
 of it, 32 x 32 with 16 KiB) and every matrix of a batch is decomposed by one workgroup, in one
 launch, stopping inside the kernel when no rotation is left. A bigger matrix lives in global
-memory and one launch per round-robin round rotates <code>n / 2</code> pairs at once; the sweeps continue
-until one rotates nothing (the host looks every few sweeps, so a big <code>svd()</code> waits for the device,
-unlike the other operations). <code>eigh</code> is the SVD of <code>A + ||A||_F I</code> read from the lower triangle:
+memory. From 128 columns on it is decomposed by block Jacobi: the columns are cut in blocks of 16
+and a round pairs the blocks, in three launches (the Gram matrix of every block pair, a small
+two-sided Jacobi eigenproblem per pair whose rotation is made orthogonal with one Newton-Schulz
+step, and the two thin products that apply it to the columns and to <code>V</code>); below 128 columns one
+launch per round-robin round rotates <code>n / 2</code> pairs at once. From 1024 columns the decomposition
+goes through <code>A = Q R</code> and the iteration works on <code>Rᵀ</code>, which converges in fewer sweeps
+(<code>LUMA_SVD_PRECOND=off</code> turns it off, a number replaces the 1024). The sweeps continue until one
+rotates nothing (the host looks every few sweeps, so a big <code>svd()</code> waits for the device, unlike
+the other operations). <code>eigh</code> is the SVD of <code>A + ||A||_F I</code> read from the lower triangle:
 positive semi-definite, so <code>U = V</code> holds the eigenvectors and <code>lambda = sigma - ||A||_F</code>.</p>
 <p>Accuracy in <code>f32</code>: <code>||A - U diag(s) Vᵀ||_F / ||A||_F</code> and the singular values are within a few
 <code>eps</code> of <code>s_max</code> (absolute), the orthogonality of <code>U</code> and <code>V</code> degrades as about <code>n sqrt(n) eps</code>;
 the eigenvalues of <code>eigh</code> carry an absolute error of a few <code>eps ||A||_F</code>. A zero singular value
 gets a left vector completed to an orthonormal set. <code>NaN</code> input gives <code>NaN</code> values and never
-hangs (the sweeps are bounded).</p>
+hangs (the sweeps are bounded). For a 4096 x 4096 matrix the backward error is 8e-6 and the loss of
+orthogonality 1.8e-5 (RTX 3090).</p>
+<h2 id="rank-of-a-big-matrix"><a class="header" href="#rank-of-a-big-matrix">Rank of a big matrix</a></h2>
+<p><code>rank</code> of a matrix that fits workgroup memory is decided by its singular values, lazily, on the
+device. A bigger matrix makes <code>rank</code> wait for the device, and the answer is always the one of the
+singular values (the number above <code>tol s_max</code>), reached in one of two ways:</p>
+<ul>
+<li>When the cut is well above the rounding errors of a QR factorisation (a matrix of full rank that
+is not nearly singular, or a looser tolerance given with <code>rank_tol</code>), two unpivoted QR
+factorisations bound the number of singular values above the cut from both sides (the rows of
+<code>R</code> that can be cut from the bottom, and the smallest singular value of the rows kept, from the
+norm of the inverse of their triangle) and give the rank without any singular value. <code>rank_tol(4e-3)</code>
+of a 4096 x 4096 matrix of rank 2048 takes 185 ms on an RTX 3090 (a QR factorisation plus the certificate, the
+factorisation being most of it), which is 0.20 in ArrayFire to luma time ratio: ArrayFire’s <code>rank</code>
+is faster there.</li>
+<li>Otherwise the singular values decide: at the default tolerance <code>max(m, n) eps</code> the rounding
+errors of an unpivoted QR factorisation of a rank-deficient matrix are as big as the cut, and a
+matrix whose rank is set by singular values close to the cut cannot be certified either. Only
+columns above <code>tol s_max / (2 sqrt(n))</code> are rotated any more, so a low-rank matrix needs the
+sweeps of its rank. The values-only decomposition takes 1.43 s at 4096 columns and 68 ms at
+1024 (RTX 3090; ArrayFire’s QR based <code>rank</code> with an absolute tolerance takes 37 ms and 4.6 ms).</li>
+</ul>
+<h2 id="measured-against-arrayfire"><a class="header" href="#measured-against-arrayfire">Measured against ArrayFire</a></h2>
+<p>RTX 3090, ArrayFire 3.10.1 (cuSOLVER), interleaved, from the 0.5.2 changelog. A batch of small
+matrices (Cholesky, LU, solve, inverse, determinant, QR and SVD, 2048 matrices of 8 x 8 up to 1024
+of 32 x 32) is one launch against a loop of ArrayFire calls: 340 to 1900 times faster. A single big
+matrix is a closer race, in ms, luma (ArrayFire):</p>
+<ul>
+<li><code>cholesky</code>: 0.12 at 256 rows, 0.66 at 1024, 4.6 at 4096 (3.2).</li>
+<li><code>lu</code>: 17.4 at 4096 (66 before the tournament panels); the ArrayFire to luma time ratio is 0.85
+at 256, 0.80 at 1024 and 0.83 at 4096 (below 1: cuSOLVER is faster).</li>
+<li><code>qr</code>: 0.45 (0.71) at 256, 3.6 (3.9) at 1024, 31.3 (26.0) at 4096; <code>lstsq</code> of 2048 x 1024 takes
+6.3 (6.0).</li>
+<li><code>svd</code>: 54 (90) at 1024 x 1024, 1570 (1860) at 4096 x 4096; <code>singular_values</code> 42 at 1024 and
+1120 at 4096.</li>
+<li><code>solve_triangular</code>, 4096 rows and 16 right-hand sides: 0.630 (0.981); a single right-hand side
+with 4096 rows 0.137 (ArrayFire’s <code>trsm</code> about 0.2).</li>
+</ul>
+<p>What is left of the gap to cuSOLVER is in the Cholesky and LU diagonal and panel kernels, which are
+latency bound.</p>
 
                     </main>
 

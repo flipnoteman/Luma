@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -291,20 +291,24 @@ model still chooses between recomputing and materialising).</p>
 <h3 id="reading-a-source-through-a-texture"><a class="header" href="#reading-a-source-through-a-texture">Reading a source through a texture</a></h3>
 <p>The same model decides where a kernel reads a two-dimensional source (<code>jit::cost::read_path</code>): from
 the buffer (on NVIDIA GPUs through the read-only data cache, which a <code>read</code> binding gets on its own)
-or through the device’s texture units, as exact gathers. A texture is a view of the source:
-free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
-where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
-saving is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX
-3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
-28-36 %, none for <code>resize</code>, smooth positions and nearest: those kernels are bound by DRAM), and a
-texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
-per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
-kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
-or data-dependent coordinates (single <code>take</code>s, lookup tables, four-tap bilinear footprints written
-as array operations, clamped windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on
-both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
-indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
-and on CUDA the kernels above are measurably faster; <code>Profile</code> shows no extra launch.</p>
+or through the device’s texture units, as exact gathers. A texture is a view of the source: on CUDA the
+buffer itself as a pitched texture (no copy when its base is 512-byte aligned and its rows a multiple of
+32 bytes apart, kept with the array while its buffer stays where it is; otherwise one copy into a CUDA
+array), on wgpu a copy of the image (a read and a write of it and a launch, made per use). The saving
+is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX 3090 and an RTX
+3080 Laptop: bicubic warps and scattered bicubic positions about 25 %, bilinear warps 5-13 %, none for
+<code>resize</code>, smooth positions or scattered bilinear positions: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (nothing for a view of the
+buffer itself; for a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers).
+The decision is made for the NVIDIA tuning profile, where it was measured. The kernels the fusion planner
+builds never read through a texture: gathers from a 2-D array at computed or data-dependent coordinates
+(single <code>take</code>s, lookup tables, four-tap bilinear footprints written as array operations, clamped
+windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on both GPUs, because they are bound by
+DRAM or by index arithmetic, and the planner sees flat indices, not a footprint a gather could take. So
+on wgpu, Metal (which has no textures) and the CPU backend the sources are read from buffers, and on CUDA
+the kernels above are measurably faster; <code>Profile</code> shows no extra launch. The one case where luma reads a
+texture without the model is the opt-in <code>Interp::LinearHardware</code>, the texture unit’s own bilinear filter
+(<a href="signal.html#reading-a-source-through-the-texture-units">Interpolation</a>); luma never chooses it.</p>
 <p>The model also sizes loops: <a href="loops.html#launch-sizing"><code>iterate_all</code></a> cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular <code>shift</code> of an expression
 is recomputed, staged, or evaluated first.</p>
@@ -321,8 +325,9 @@ becomes the load of that kernel.</p>
 <tr><th>Primitive</th><th>Computed inside the kernel</th><th>When it runs</th></tr>
 </thead>
 <tbody>
-<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
-<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads of the shader kernels; the CUDA backend’s own <code>f32</code> kernels and the CPU backend’s native product evaluate a lazy operand first, once, and read transposes of stored arrays in place</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops; on wgpu an axis reduction of fewer than 524288 cells is recorded when called); otherwise eager: the result is evaluated when the call returns. <code>var_axis</code> and <code>std_axis</code> are one pass (sum and sum of squares of the line minus its first element)</td></tr>
+<tr><td><code>sum</code>, <code>min</code>, <code>max</code>, <code>prod</code>, <code>mean</code>, <code>sum_where</code>, … (whole-array reductions)</td><td>the operand, in the first pass</td><td><code>f32</code>, <code>u32</code> and <code>i32</code>: pending until its value is read or used, then recorded together with the other pending reductions of the same length that read what it reads (or are small), up to 16 accumulators per kernel (<code>LUMA_MULTI_REDUCE=off</code> or a number); each keeps its own combine order, so the value is the one it has alone. On CUDA a group is recorded reduction by reduction until its structure has been seen 4 times (<code>LUMA_MULTI_REDUCE_AFTER</code>), while the merged kernel compiles in the background</td></tr>
 <tr><td><code>solve_tridiagonal</code>, <code>solve_tridiagonal_parts</code>, <code>solve_block_tridiagonal_parts</code></td><td>each pending block/vector entry is computed where a cell’s system is loaded</td><td>eager: the solution is evaluated when the call returns</td></tr>
 <tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
 <tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>quantiles</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort (<code>sort_axis</code> of lines of up to 2048 elements evaluates its operand first)</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
@@ -379,10 +384,19 @@ and an expression with the same shape built again costs the host only the flatte
 operations on the same operands are one node (hash-consing).</li>
 <li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, the native CPU backend’s compiled machine code, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
 driver; the native Metal backend keeps none between processes. Repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
-<code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
+<code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored. The CPU blobs and the
+CUDA PTX are also keyed by a hash of the sources that generate them (the code generators, the CPU
+math-table ABI, the packet math routines, the planners), so a build whose code generation differs from the
+one that wrote a cached kernel never loads it; the first run after an upgrade compiles again. The cache
+files of the wgpu backend have format number 2, so files written by earlier versions are read as absent
+and rewritten once.</li>
 <li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
 earlier program, and after two such calls the GPU starts before the step is traced
 (<a href="loops.html#calling-it-again">Loops</a>).</li>
+<li><strong>Plans of eager evaluation</strong>: an <code>eval</code> whose pending graph has the structure of an earlier one runs
+that evaluation’s recorded launches over the new buffers and scalars (128 plans per context;
+<code>LUMA_PLAN_CACHE=off</code> disables it, results are bit-identical either way,
+<a href="loops.html#loops-with-eval">Loops</a>).</li>
 <li><strong>Buffers</strong>: freed arrays go to a pool of idle buffers (up to half of the memory budget), so a
 program that cycles through gigabytes of temporaries reuses them instead of allocating again.</li>
 </ul>
@@ -397,7 +411,7 @@ program that cycles through gigabytes of temporaries reuses them instead of allo
 <tr><td><code>iterate_all</code> of an elementwise <code>f32</code> or <code>u32</code> step</td><td>none</td><td>one kernel, state in registers, launches of about 40 ms</td></tr>
 <tr><td><code>iterate</code> of a 1-D or 2-D stencil</td><td>none</td><td>time-blocked: several steps per pass over memory</td></tr>
 <tr><td><code>iterate_until</code>, <code>iterate_until_all</code></td><td>none</td><td>the stop rule runs on the GPU; one wait per block of steps; a block is one graph replay on CUDA, Metal and the CPU backend</td></tr>
-<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps (a register loop, or a stencil of up to four arrays evaluated together); never waits</td></tr>
+<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps (a register loop, or a stencil of up to four arrays evaluated together); never waits; a step of the same structure as an earlier one skips planning (the plan cache, <code>LUMA_PLAN_CACHE</code>)</td></tr>
 <tr><td>readback every step (<code>max().item()?</code>)</td><td>a GPU round trip</td><td>speculation hides it when the step repeats</td></tr>
 </tbody>
 </table>
@@ -405,6 +419,39 @@ program that cycles through gigabytes of temporaries reuses them instead of allo
 <p>Prefer the primitives when the step fits them (<a href="loops.html">Loops</a>). Otherwise <code>eval</code> each step
 instead of reading, and <code>sync</code> once at the end. A readback in the loop (a convergence test) is the
 most expensive way: replace it with <code>iterate_until_all</code>, or test every k steps.</p>
+<h3 id="the-host-cost-of-an-eager-step"><a class="header" href="#the-host-cost-of-an-eager-step">The host cost of an eager step</a></h3>
+<p>A loop that records a step and evaluates it every iteration (<code>u = step(&amp;u); u.eval()?</code>) spends its host
+time in building the graph, one node per operation, and in planning it. Two things bound it. The plan
+cache (<a href="loops.html#loops-with-eval">Loops</a>) skips flattening, cutting and judging when the pending graph
+has the structure of an earlier evaluation; on an RTX 3090 (CUDA) the per-step cases of the <code>cfd</code>
+benchmarks went from 6.60 to 4.33 ms (<code>euler/3d_per_step</code>) and from 3.49 to 2.44 ms
+(<code>muscl/3d_per_step</code>), and the graph building that remains is 160-190 us of the 200-240 us of a 3-D step.
+<code>LUMA_PLAN_CACHE=off</code> turns the cache off. Building itself costs a few thousand instructions per node:
+operations are passed by reference, the table that makes equal operations one node and the list of live
+nodes are per thread, the id set every node keeps of the expression below it is merged with POPCNT / AVX2
+loops chosen at run time, and the buffer of that set is reused by the next node. An unrolled expression
+of about 10 000 operations (24 Keccak rounds written out) takes 3.4 ms of host time to record for 4096
+messages on an RTX 3090. A step of thousands of operations still pays for each of them every step, so the
+loop primitives, which trace the step once, are the cheaper form where they fit.</p>
+<h3 id="matrix-products"><a class="header" href="#matrix-products">Matrix products</a></h3>
+<p>On a CUDA device with tensor cores (compute capability 8.0 and up) <code>matmul</code> runs in TF32 by default: the
+operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so results differ from
+the exact <code>f32</code> product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::tf32_matmul(false)</code>
+or <code>LUMA_TF32_MATMUL=0</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
+<code>matmul_tf32</code> forces TF32 (<a href="data.html#tensor-cores-tf32">Tensor cores</a>). <code>matmul_batched</code> is always <code>f32</code>.
+Other backends compute <code>f32</code> products as before. A product whose output is small and whose <code>K</code> is long (a
+Gram matrix, a gradient <code>Xᵀr</code>) runs as a kernel family with no workgroup staging, and <code>matmul_nt</code>,
+<code>matmul_tn</code> and <code>matmul_tt</code> read a transposed operand in place instead of copying it.</p>
+<h3 id="the-cpu-backend"><a class="header" href="#the-cpu-backend">The CPU backend</a></h3>
+<p>The native <code>cpu</code> backend runs matrix products as multithreaded Rust (<code>matrixmultiply</code>, AVX-512, AVX2 + FMA
+or NEON microkernels chosen at run time) instead of compiled tile kernels: a 4096-cube product goes from
+64 to about 1100 GFLOP/s on a 32-thread Ryzen 9 7950X. <code>exp</code>, <code>ln</code>, <code>exp2</code>, <code>log2</code>, <code>sin</code>, <code>cos</code> and <code>tanh</code>
+of <code>f32</code> run as one call per 4-lane packet on x86-64 Unix (at most 2 ulp over the whole <code>f32</code> range;
+other targets keep the lanewise <code>libm</code> calls), and the line solves (<code>solve_tridiagonal*</code>,
+<code>solve_block_tridiagonal*</code>) are native Rust. A launch too small to pay for a hand-off runs on the calling
+thread, and idle workers poll for 200 microseconds before they sleep (<code>LUMA_CPU_SPIN_US</code>, <code>0</code> to sleep at
+once). Its kernels compile on a pool of threads (<code>LUMA_COMPILE_THREADS</code>, shared with the CUDA backend).</p>
 <h2 id="transfers"><a class="header" href="#transfers">Transfers</a></h2>
 <p>The GPU is fast, the way to it is not. Data crosses it at <code>Array::from_slice</code> (upload),
 <code>to_vec</code> / <code>read_into</code> / <code>item</code> (readback, which also waits), and <code>write</code>.</p>

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -182,6 +182,98 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="migration"><a class="header" href="#migration">Migration</a></h1>
+<h2 id="from-051-to-052"><a class="header" href="#from-051-to-052">From 0.5.1 to 0.5.2</a></h2>
+<p>0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
+algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
+reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
+behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.</p>
+<h3 id="matmul-is-tf32-by-default-on-cuda"><a class="header" href="#matmul-is-tf32-by-default-on-cuda"><code>matmul</code> is TF32 by default on CUDA</a></h3>
+<p>On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> rounds its operands to TF32
+(10 bits of mantissa) and accumulates in <code>f32</code>, so results differ from the exact <code>f32</code> product (each entry
+is within 1.5e-3 of the sum of the absolute values of its terms). Other backends and older devices compute
+<code>f32</code> products as before. Where the exact product matters, call <code>matmul_f32</code> for that product, or turn TF32
+off for a context:</p>
+<pre><code class="language-rust">use luma::*;
+
+let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
+assert!(!exact.tf32_matmul());
+let a = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
+let b = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
+assert_eq!(a.matmul_f32(&amp;b).to_vec()?, a.to_vec()?);   // the exact product of one call
+assert_eq!(a.matmul(&amp;b).to_vec()?, a.to_vec()?);       // the context's `matmul` is exact too
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always <code>f32</code>
+(<a href="data.html#tensor-cores-tf32">Tensor cores</a>).</p>
+<h3 id="api-changes-that-can-break-code-built-against-051"><a class="header" href="#api-changes-that-can-break-code-built-against-051">API changes that can break code built against 0.5.1</a></h3>
+<ul>
+<li>
+<p><strong><code>Reduction</code> has a new variant, <code>Product</code></strong> (the product of the elements, for <code>reduce</code> and
+<code>reduce_axis</code>). A <code>match</code> over <code>Reduction</code> without a wildcard needs an arm for it:</p>
+<pre><code class="language-rust">use luma::*;
+
+fn name(op: Reduction) -&gt; &amp;'static str {
+    match op {
+        Reduction::Sum =&gt; "sum",
+        Reduction::Min =&gt; "min",
+        Reduction::Max =&gt; "max",
+        Reduction::SumOfSquares =&gt; "sum of squares",
+        Reduction::Product =&gt; "product",              // new in 0.5.2
+    }
+}
+assert_eq!(name(Reduction::Product), "product");</code></pre>
+</li>
+<li>
+<p><strong>The re-exported <code>BindingKind</code> has two new variants, <code>Sampler</code> and <code>Texture2d</code></strong> (the bindings of a
+<code>sampler</code> and a <code>texture_2d&lt;f32&gt;</code> in a kernel). An exhaustive <code>match</code> over <code>luma::BindingKind</code> needs
+arms for them, or a wildcard.</p>
+</li>
+<li>
+<p><strong><code>Array&lt;f32&gt;::clamp</code> takes <code>impl Operand&lt;f32&gt;</code> bounds</strong> (an array, a reference to one, an <code>f32</code> or a
+<code>Scalar</code>) where it took two <code>f32</code>. Calls with <code>f32</code> values compile as before; a bound whose type used to
+be inferred from the <code>f32</code> parameter (<code>x.clamp(v.into(), 1.0)</code>) must now be spelled out
+(<code>x.clamp(f32::from(v), 1.0)</code>).</p>
+</li>
+</ul>
+<h3 id="for-backend-implementers"><a class="header" href="#for-backend-implementers">For backend implementers</a></h3>
+<p>These matter only to code that implements or drives the HAL crates directly (<code>luma-hal-core</code> and the
+backend crates); users of <code>Array</code> are not affected. The new <code>Backend</code> methods all have default
+implementations.</p>
+<ul>
+<li><code>Backend::compile_kernel</code> and <code>Backend::compile_naga</code> take <code>trust: luma_core::hal::KernelTrust</code>
+(<code>Checked</code>, <code>UncheckedBounds</code>, <code>Trusted</code>) where they took <code>trusted: bool</code>: pass <code>Trusted</code> for <code>true</code> and
+<code>Checked</code> for <code>false</code>. <code>UncheckedBounds</code> is the kernel of <code>unsafe KernelBuilder::unchecked_bounds</code>.</li>
+<li><code>DiskCache::load_pipelines</code> returns <code>Option&lt;PipelineBlob&gt;</code>, the cache file as read; <code>PipelineBlob::data()</code>
+is the driver’s cache data to hand to the driver, so the file is no longer copied to cut its header off.</li>
+<li><code>DeviceInfo</code> has a new field, <code>compute_units: Option&lt;u32&gt;</code>: a struct literal needs it.</li>
+<li>New variants: <code>Expr::Texture</code> in the kernel IR (<code>TextureOp::Load</code>, <code>Gather</code>, <code>Sample</code>), thirteen math
+functions in <code>IrUnOp</code> (see the enum) and <code>CudaArgAbi::Texture</code> / <code>Unbound</code>; an exhaustive <code>match</code> over
+any of them needs the new arms. A backend without textures leaves <code>Backend::texture_caps</code> at its default
+(<code>None</code>).</li>
+<li><code>luma_wgpu::emit_with</code> takes <code>hardware_f32_atomics: bool</code>; pass <code>false</code> for the compare-and-swap form
+of the <code>f32</code> atomic add, <code>true</code> where the device has <code>SHADER_FLOAT32_ATOMIC</code>.</li>
+<li><code>luma_cpu::WorkgroupPool::dispatch</code> takes a <code>&amp;CostHint</code> (the cost the pool has learned for the
+kernel, <code>CostHint::default()</code> for none), and <code>CompiledCpuKernel</code>, <code>WorkgroupCtx</code> and <code>CpuMathTable</code> have new
+public fields.</li>
+</ul>
+<h3 id="new-in-052-that-you-may-want"><a class="header" href="#new-in-052-that-you-may-want">New in 0.5.2 that you may want</a></h3>
+<ul>
+<li><a href="fft.html">Fourier transforms</a>, <a href="complex.html">complex numbers</a>, <a href="sparse.html">sparse matrices</a>,
+<a href="linear-algebra.html">dense linear algebra</a>, <a href="images.html">images and filters</a>, the
+<a href="vision.html">vision</a> chapters, <a href="signal.html">interpolation, image transforms and filters</a> (including the
+opt-in <code>Interp::LinearHardware</code>), <a href="accumulators.html">incremental accumulation</a> and
+<a href="compact.html">compact integers</a> (<code>Array&lt;u8&gt;</code>, <code>i8</code>, <code>u16</code>, <code>i16</code>).</li>
+<li><code>matmul_nt</code>, <code>matmul_tn</code>, <code>matmul_tt</code> and <code>dot</code>; <code>prod</code> / <code>product</code> and the <code>*_by_key</code> reductions;
+<code>sort_by_key</code>, <code>set_unique</code>, <code>set_union</code> and <code>set_intersect</code>; the elementwise functions of ArrayFire’s
+<code>arith.h</code>.</li>
+<li><code>ContextOptions::tf32_matmul</code>, <code>Context::tf32_matmul()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
+(<a href="performance.html#matrix-products">Performance guide</a>).</li>
+<li>The plan cache of eager evaluation (<code>LUMA_PLAN_CACHE</code>), compile worker threads (<code>LUMA_COMPILE_THREADS</code>)
+and the CPU backend’s native matrix products (<a href="performance.html">Performance guide</a>).</li>
+<li>A disk cache keyed by a hash of the sources that generate the code: the first run after the upgrade
+compiles every kernel again (<a href="faq.html#performance">FAQ</a>).</li>
+<li><code>KernelBuilder::unchecked_bounds</code> (<code>unsafe</code>) for custom kernels
+(<a href="custom-kernels.html#bounds-checks">Custom kernels</a>).</li>
+</ul>
 <h2 id="from-04-to-05"><a class="header" href="#from-04-to-05">From 0.4 to 0.5</a></h2>
 <p>0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal
 and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary

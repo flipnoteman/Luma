@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -252,8 +252,9 @@ assert_eq!((index.to_vec()?, dist.to_vec()?), (vec![2, 0], vec![2, 3]));
 <p>Features are <code>f32</code> (<code>f32</code> distances), <code>u32</code> (<code>u32</code> distances, also for <code>Sad</code> and <code>Ssd</code>; unsigned
 differences, sums wrap) or <code>i32</code> (<code>i32</code> distances). Differences from ArrayFire:</p>
 <ul>
-<li>ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code> and <code>f64</code> features; luma has no arrays of the first
-three, and <code>f64</code> is not supported here.</li>
+<li>ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code> and <code>f64</code> features. luma’s matchers take <code>f32</code>, <code>u32</code>
+and <code>i32</code> only: <code>Array&lt;u8&gt;</code>, <code>Array&lt;u16&gt;</code> and <code>Array&lt;i16&gt;</code> exist (<a href="compact.html">Compact integers</a>)
+but are not accepted here (convert with <code>to_f32()</code> or <code>to_u32()</code>), and <code>f64</code> is not supported.</li>
 <li><code>Shd</code> is only defined for <code>u32</code>, as in ArrayFire (which rejects <code>f32</code>/<code>i32</code> for it).</li>
 <li><code>n_dist</code> is at most 256 and at most the number of train features (as in ArrayFire).</li>
 <li>Ties are broken by the smaller train index. ArrayFire’s CUDA backend does the same; its CPU

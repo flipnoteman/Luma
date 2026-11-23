@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -190,7 +190,7 @@ arrays. The first dimension is the fastest, as everywhere in Luma. They run on e
 the grid points <code>0, 1, .., n - 1</code> and interpolates them at the positions <code>pos</code>. Positions below
 <code>0</code>, above <code>n - 1</code> and NaN give <code>off_grid</code>. <code>approx2</code> does the same along dimensions 0 and 1
 with two position arrays. <code>Interp</code> is <code>Nearest</code>, <code>Lower</code> (floor),
-<code>Linear</code>, <code>Cosine</code>, <code>Cubic</code> and <code>CubicSpline</code> (Catmull-Rom); in two dimensions <code>Linear</code> is
+<code>Linear</code>, <code>Cosine</code>, <code>Cubic</code> and <code>CubicSpline</code> (Catmull-Rom), and <code>LinearHardware</code> (below); in two dimensions <code>Linear</code> is
 bilinear and <code>Cubic</code> bicubic. Further dimensions are batches: positions with extent 1 along
 them are shared by the whole batch. <code>approx1_uniform</code> and <code>approx2_uniform</code> take the dimension
 and the <code>start</code> and <code>step</code> of the grid (the sample <code>i</code> sits at <code>start + step * i</code>).</p>
@@ -203,6 +203,14 @@ assert_eq!(x.approx1(&amp;pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
 them in registers. The input and the positions are evaluated first and must fit one buffer.</p>
+<p>The kernel of <code>approx1</code>, <code>approx2</code>, <code>resize</code>, <code>rotate</code> and <code>transform</code> is built for the method, the
+kind of source (positions, a scaled grid, an affine or projective warp) and the number of grid
+dimensions: they are constants of its source, so a launch runs none of the branches over them. On
+wgpu the generic kernel is used instead: the driver contracts the products of a kernel with folded
+constants differently for a texture read and a buffer read (up to 8e-7 on a bicubic gather), and
+the generic one gives the same bits for both. <code>resize</code> takes several output rows per invocation
+(one or two when it shrinks, eight or sixteen when it enlarges), and an <code>approx1</code> output is cut
+in tiles of one row of 256 invocations.</p>
 <h3 id="reading-a-source-through-the-texture-units"><a class="header" href="#reading-a-source-through-the-texture-units">Reading a source through the texture units</a></h3>
 <p>A kernel that reads a two-dimensional image at positions it computes (<code>approx2</code>, <code>resize</code>,
 <code>rotate</code>, <code>transform</code>) can fetch the four texels of a bilinear footprint, or the sixteen of a
@@ -215,14 +223,18 @@ texture, a view that costs nothing and is kept with the array) the gather takes 
 <code>rotate</code> / <code>transform</code> and <code>approx2</code> at scattered positions, 5-13 % off a bilinear one, and it is
 chosen for those; kernels bound by memory (<code>approx2</code> at smooth positions, <code>resize</code>) keep the loads.
 A backend that has to copy the source to
-make a texture (wgpu) reads the buffer, as does the CPU backend, which has no textures.
-Nothing in the API changes and the choice is not configurable.</p>
+make a texture (wgpu) reads the buffer, as do the CPU and Metal backends, which have no textures.
+Only a source that is one two-dimensional slice (extent 1 along dimensions 2 and 3, sampled
+along dimensions 0 and 1) can be read through a texture. Nothing in the API changes and the
+choice is not configurable.</p>
 <p><code>Interp::LinearHardware</code> is the explicit opt-in to the texture unit’s own bilinear <em>filter</em>: one
 fetch per output, but the hardware keeps 8 bits of the fraction of a position (the weights are
 multiples of 1/256), so along each axis a result is off from <code>Interp::Linear</code>’s by up to the
-difference of the two neighbouring samples over 256. Luma never chooses it. Where the source cannot
-be a texture (more than two dimensions, the CPU backend, a width the device cannot read in place on
-a copying backend) it is exactly <code>Interp::Linear</code>.</p>
+difference of the two neighbouring samples over 256. Luma never chooses it. It acts in two-dimensional
+sampling (<code>approx2</code>, <code>resize</code>, <code>rotate</code>, <code>transform</code>); <code>approx1</code> reads it as <code>Interp::Linear</code>. Where
+the source cannot be a texture (more than one two-dimensional slice, a width the device cannot
+bind as a texture, the CPU and Metal backends, which have no textures) it is exactly
+<code>Interp::Linear</code>. On wgpu the source is copied into a texture for every launch.</p>
 <h2 id="images"><a class="header" href="#images">Images</a></h2>
 <p>An image is an array whose dimensions 0 and 1 are the image axes; the dimensions after them
 (colour channels, a batch) all get the same transform. <code>resize(d0, d1, method)</code> (or

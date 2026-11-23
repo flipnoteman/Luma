@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -212,7 +212,8 @@ assert_eq!(corners.count(), 4);
 <li>The derivatives are the central differences <code>(in[i + 1] - in[i - 1]) / 2</code> along both axes.
 The structure tensor <code>M</code> sums their products with a separable window, and the response of a
 pixel is <code>det(M) - k_thr * trace(M)^2</code>. (Not normalised in any way: the scale is that of the
-pixel values to the fourth power, the default <code>min_response</code> of 1e5 suits pixels of 0 to 255.)</li>
+pixel values to the fourth power: ArrayFire’s default <code>min_response</code> of 1e5 suits
+pixels of 0 to 255.)</li>
 <li>The window has <code>floor(6 * sigma)</code> cells, one less if that is even, with Gaussian weights
 (<code>block_size == 0</code>, <code>sigma</code> in <code>[0.5, 5]</code>: 3 cells for <code>sigma</code> 0.5 to 0.8, 5 for 0.9 to 1.1, …).
 With <code>block_size &gt; 0</code> the window has that many cells (1 to 32): Gaussian weights of <code>sigma</code>

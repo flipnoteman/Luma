@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -185,8 +185,10 @@ Luma records it, fuses chains of elementwise operations into a single kernel, an
 on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through <a href="https://wgpu.rs">wgpu</a>). If
 no GPU opens it falls back to a native SIMD CPU backend.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
-products, group-bys, sorts and statistics of data-analysis tools. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, the matrix
+products, group-bys, sorts and statistics of data-analysis tools, and the signal, image and linear-algebra
+routines that ArrayFire users expect (FFTs, sparse and dense linear algebra, filters, feature detection,
+interpolation). You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 <a href="#custom-kernels">custom WGSL kernel</a> runs in the same batch as the built-in operations.</p>
 <p>This guide explains how to use the library and why it behaves as it does. The
@@ -238,6 +240,11 @@ location of the operation that failed.</li>
 <li><a href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
 <li><a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a>: <code>matmul</code>, axis statistics, scatter-add, histograms, sort, group-by, quantiles.</li>
 <li><a href="#sparse-matrices">Sparse matrices</a>: <code>Sparse</code> in CSR, CSC and COO, conversions, sparse-dense products, elementwise operations.</li>
+<li><a href="#fourier-transforms">Fourier transforms</a> and <a href="#complex-numbers">complex numbers</a>: <code>C32</code> arrays, FFTs of any length over any axes, FFT convolution.</li>
+<li><a href="#dense-linear-algebra">Dense linear algebra</a>: Cholesky, LU, QR, SVD, symmetric eigenproblem, solves and least squares, on matrices and batches.</li>
+<li><a href="#interpolation-image-transforms-and-filters">Interpolation, image transforms and filters</a>, <a href="#images-and-filters">Images and filters</a> and <a href="#features-matching-and-image-analysis">Features, matching and image analysis</a>: warps, convolution, rank filters, colour spaces, corner and blob detectors, descriptors, matching.</li>
+<li><a href="#incremental-accumulation">Incremental accumulation</a>: statistics of data that arrives in batches, kept as mergeable states on the device.</li>
+<li><a href="#loops">Loops</a>, <a href="#custom-kernels">Custom kernels</a> and the <a href="#performance-guide">Performance guide</a>: time stepping, your own WGSL, and how to see what Luma did.</li>
 <li><a href="#worked-examples">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
 <li><a href="#environment-variables">Environment variables</a> and the <a href="#faq-and-troubleshooting">FAQ</a> when something does not behave.</li>
 </ul>
@@ -563,6 +570,14 @@ ctx.sync()?;                 // wait once, at the end
 assert!((u.to_vec()?[0] - 1.0).abs() &lt; 1e-3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Errors the GPU raises while running a batch show up at the next call that waits.</p>
+<h3 id="the-host-cost-of-a-step"><a class="header" href="#the-host-cost-of-a-step">The host cost of a step</a></h3>
+<p>Building an expression costs host time per operation (one node each), and evaluating it flattens the
+graph, cuts it where the cost model says and launches. A loop that evaluates a step of the same
+structure every iteration (<code>u = step(&amp;u); u.eval()?</code>) does not plan it every time: the plan cache runs the
+launches the first evaluation recorded over the new buffers and scalar values, with bit-identical results
+(<code>LUMA_PLAN_CACHE=off</code> switches it off; <a href="#loops-with-eval">Loops</a>). Only the building of the
+expression stays, and the <a href="#loops">loop primitives</a> avoid that as well by tracing the step once.
+<a href="#the-host-cost-of-an-eager-step">Performance guide</a> has the numbers.</p>
 <h2 id="what-fuses"><a class="header" href="#what-fuses">What fuses</a></h2>
 <p>Fused into the kernel that reads them: all elementwise operations, comparisons, <code>select</code>, casts,
 generators (<code>range</code>, <code>linspace</code>, <code>uniform</code>), <a href="#views-and-writes">views</a> (<code>slice</code>, <code>pad</code>, <code>flip</code>,
@@ -577,7 +592,9 @@ and your own kernels. They read the arrays they are given, which are computed fi
 the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
 instead of storing it, and <code>matmul</code>, the line solves, the sorts and the axis reductions of types other than <code>f32</code> (and of <code>f32</code> while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
-(<a href="#primitives-that-read-an-expression">Performance guide</a>).</p>
+(<a href="#primitives-that-read-an-expression">Performance guide</a>). Whole-array reductions (<code>sum</code>,
+<code>max</code>, <code>sum_where</code>, …) of <code>f32</code>, <code>u32</code> and <code>i32</code> stay pending until their value is read or used, and
+those forced together are recorded in one kernel (up to 16 accumulators; <code>LUMA_MULTI_REDUCE</code>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
 cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
@@ -876,7 +893,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 </thead>
 <tbody>
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
-<tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
+<tr><td><code>mean()</code>, <code>norm()</code></td><td><code>mean</code> for <code>f32</code> and <code>f64</code>, <code>norm</code> for <code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
 <tr><td><code>prod()</code> / <code>product()</code></td><td>the product; NaN if any element is NaN, <code>u32</code> / <code>i32</code> products wrap around</td></tr>
 <tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code>, <code>Product</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
 <tr><td><code>norm_p(Norm)</code></td><td><code>One</code>, <code>Two</code>, <code>Inf</code>, <code>P(p)</code>, <code>Frobenius</code> and the matrix <code>MatrixOne</code> / <code>MatrixInf</code> norms, <code>f32</code> (<code>f64</code> except <code>P</code>)</td></tr>
@@ -911,6 +928,15 @@ if ctx.profiling_supported() {
 expression to a partial result, and a second that combines the partials (on CUDA the last workgroup of the first pass finishes the reduction in one launch). An array small enough
 for one workgroup takes one. Float sums combine in trees (see the <code>Array::sum</code> documentation), so the
 error stays far below that of a sequential sum.</p>
+<p>Reductions that are pending when one of them is needed are recorded together. When a reduction is
+recorded (its value is read, used on the GPU or evaluated with <code>eval_all</code>), the other live, unrecorded
+<code>f32</code>, <code>u32</code> and <code>i32</code> reductions of the same length that read what it reads (or are small) go into
+the same kernel, up to 16 accumulators per kernel (<code>LUMA_MULTI_REDUCE</code>, see
+<a href="#environment-variables">Environment variables</a>): one program computes their operands together, so what
+they share is computed and read once. Every reduction keeps its own combine order, so its value is
+the bits it has when recorded alone. The axis reductions of <code>f32</code> (<code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>,
+<code>reduce_axis</code> and what is built on them) stay pending the same way and are recorded in one kernel
+(up to 8 ops).</p>
 <h3 id="epilogues"><a class="header" href="#epilogues">Epilogues</a></h3>
 <p>For <code>f32</code> reductions, elementwise operations <em>with scalars</em> on the result extend the reduction
 instead of creating an expression: the last pass applies them. <code>norm()</code> is <code>SumOfSquares</code> followed by a
@@ -1087,6 +1113,21 @@ let cols = a.transpose().matmul(&amp;a);
 assert_eq!(cols.shape(), Shape::from([3, 3]));
 assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>matmul_nt</code>, <code>matmul_tn</code> and <code>matmul_tt</code> (and the functions of the same names) are the products
+with the right, the left or both operands transposed, written for the row-major matrices of NumPy:
+<code>a.matmul_nt(&amp;b)</code> is <code>A Bᵀ</code>, <code>a.matmul_tn(&amp;b)</code> is <code>Aᵀ B</code> and <code>a.matmul_tt(&amp;b)</code> is <code>Aᵀ Bᵀ</code>. The
+shapes are those of the stored matrices (<code>matmul_nt</code>: <code>a</code> is <code>[K, M]</code>, <code>b</code> is <code>[K, N]</code>), the result
+is <code>[N, M]</code>, and the backend’s own gemm kernels read a stored operand in place, with no transposed
+copy; an operand that is an expression is evaluated first. The precision is that of <code>matmul</code>.
+<code>a.dot(&amp;b)</code> is the dot product of two arrays of one shape as a lazy one-element array, <code>(a * b).sum()</code>
+in one fused reduction:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?; // [[1, 2, 3], [4, 5, 6]]
+assert_eq!(a.matmul_nt(&amp;a).to_vec()?, vec![14.0, 32.0, 32.0, 77.0]); // A Aᵀ
+assert_eq!(a.matmul_tn(&amp;a).to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]); // Aᵀ A
+assert_eq!(a.dot(&amp;a).item()?, 91.0);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>a.matmul_batched(&amp;b)</code> multiplies a batch of matrices in one launch (<code>matmul</code> in a loop is one launch
 per product). The batch is axis 2 of both operands: <code>a</code> is <code>[K, M, B]</code>, <code>b</code> is <code>[N, K, B]</code> and the
 result <code>[N, M, B]</code>. An operand without the batch (<code>[N, K]</code>) is shared by every product, as the
@@ -1116,7 +1157,7 @@ one call (a chain of fused multiply-adds in a fixed order per entry), and
 that product. <code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always
 <code>f32</code>. On CUDA the <code>f32</code> product has kernels of its own for the shapes above (an RTX 3090: 23
 TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
-are fused into the shader kernel as before. Products whose <code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and every other
+are evaluated once first and go through the same kernels. Products whose <code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and every other
 backend (wgpu, Metal, the CPU), compute the <code>f32</code> product, so the same program runs everywhere
 and differs only by the rounding where tensor cores are used. Transposed operands are read in
 place; other lazy operands are evaluated first, where the <code>f32</code> kernels fuse them.</p>
@@ -1155,7 +1196,7 @@ assert!(matches!(a.matmul(&amp;b).to_vec(), Err(LumaError::Op { .. })));
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="statistics-along-an-axis"><a class="header" href="#statistics-along-an-axis">Statistics along an axis</a></h2>
 <p><code>reduce_axis(axis, [ops])</code> computes one to four reductions (<code>Reduction::Sum</code>, <code>Min</code>, <code>Max</code>,
-<code>SumOfSquares</code>) along an axis in <strong>one pass</strong>: every element is read once for all of them. It
+<code>SumOfSquares</code>, <code>Product</code>) along an axis in <strong>one pass</strong>: every element is read once for all of them. It
 returns an array of results, one per op, each with extent 1 along <code>axis</code>. A pending operand is
 computed inside the pass and never stored.</p>
 <pre><code class="language-rust">use luma::*;
@@ -1173,8 +1214,10 @@ assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 count, <code>u32</code>), <code>min_axis</code> and <code>max_axis</code> only.</p>
 <p>For <code>f32</code>, <code>mean_axis</code>, <code>var_axis</code> and <code>std_axis</code> give the mean, the <strong>population</strong> variance
 (divisor <code>n</code>, NumPy’s <code>ddof = 0</code>) and its square root. They are lazy expressions on top of the
-reductions, so they broadcast back against the array. <code>var_axis</code> is two-pass (the mean, then the
-mean of squared deviations), which keeps it accurate for data far from zero:</p>
+reductions, so they broadcast back against the array. <code>var_axis</code> is one pass: the sum and the sum of
+squares of the elements minus the first element of each line (subtracted inside the reduction) come
+from one <code>reduce_axis</code>, and the variance is <code>(S2 - S1 * S1 / n) / n</code>, clamped at 0 (NaN is kept). The
+shift keeps it accurate for data far from zero:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0], [4, 2])?;
@@ -1182,7 +1225,7 @@ assert_eq!(x.mean_axis(0).to_vec()?, vec![2.5, 15.0]);
 assert_eq!(x.var_axis(0).to_vec()?, vec![1.25, 25.0]);
 assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 
-// Far from zero the two-pass variance is still right.
+// Far from zero the shifted one-pass variance is still right.
 let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
@@ -1317,6 +1360,27 @@ NaNs come last (first when descending) and <code>-0.0</code> sorts before <code>
 take the radix sort of the whole array followed by a regrouping by line (and, along an axis other
 than 0, a tiled transpose back to the layout). <code>sort_axis</code> returns the NaNs as the positive quiet NaN,
 like <code>sort</code>.</p>
+<p><code>sort_by_key(&amp;values)</code> sorts the keys (<code>u32</code>, <code>i32</code> or <code>f32</code>, ordered as above) and moves the
+elements of <code>values</code>, an array of the same shape and any element type, with them: it returns
+<code>(keys, values)</code>, stably, in flat order. <code>sort_by_key_descending(&amp;values)</code> is the exact reverse by
+key, and <code>sort_by_key_axis(axis, &amp;values)</code> and <code>sort_by_key_axis_descending(axis, &amp;values)</code> sort every
+line along an axis independently. Values of 4 bytes (<code>u32</code>, <code>i32</code>, <code>f32</code>) travel through the radix
+passes with their keys, one pass reading and writing both; other types are gathered by the
+permutation of an <code>argsort</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let keys = Array::from_slice(&amp;[3u32, 1, 3, 2], 4)?;
+let names = Array::from_slice(&amp;[10.0f32, 11.0, 12.0, 13.0], 4)?;
+let (k, v) = keys.sort_by_key(&amp;names);
+assert_eq!(k.to_vec()?, vec![1, 2, 3, 3]);
+assert_eq!(v.to_vec()?, vec![11.0, 13.0, 10.0, 12.0]); // the two keys 3 keep their order
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>On the CUDA backend <code>sort</code>, <code>argsort</code>, <code>sort_by_key</code> and what is built on them run as a single-sweep
+radix sort (as CUB’s onesweep): one kernel counts the digits of all four passes in one read of the
+keys, and each pass is one kernel that finds where its tile’s keys go by a decoupled look-back over
+the tiles before it, so a sort is 6 launches instead of 16. Where the device does not order memory
+across workgroups (wgpu, the CPU backend) the count, scan and scatter passes are unchanged. The
+results are the same on every backend.</p>
 <h2 id="groups"><a class="header" href="#groups">Groups</a></h2>
 <p><code>group_sum</code>, <code>group_min</code>, <code>group_max</code>, <code>group_mean</code> and <code>group_count</code> reduce the elements that
 share a code, a groupby over dense codes <code>0..groups</code>: result element <code>g</code> combines the elements
@@ -1361,6 +1425,25 @@ let y = (&amp;val * x.take(&amp;col)).sum_segments(&amp;ptr);
 assert_eq!(y.to_vec()?, vec![201.0, 0.0, 430.0]);
 assert_eq!(val.max_segments(&amp;ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="runs-of-equal-keys"><a class="header" href="#runs-of-equal-keys">Runs of equal keys</a></h3>
+<p><code>scan_by_key(&amp;keys, axis, op)</code> is the inclusive scan of an associative operator (as <code>scan</code>) that
+restarts at every run of equal consecutive keys along <code>axis</code>: the keys are <code>u32</code>, <code>i32</code> or <code>f32</code>, of
+the shape of the values, and equal keys that are apart are different runs (NaN keys are runs of one
+element). <code>scan_by_key_exclusive(&amp;keys, axis, identity, op)</code> is the exclusive form (the first element
+of every run is <code>identity</code>) and <code>cumsum_by_key(&amp;keys, axis)</code> the running sum. The results are the
+same on every run. <code>sum_by_key</code>, <code>min_by_key</code>, <code>max_by_key</code>, <code>product_by_key</code>, <code>count_by_key</code>,
+<code>any_true_by_key</code> and <code>all_true_by_key</code> reduce every run of equal consecutive keys and return the
+first key of each run with the result, both one-dimensional with one element per run (ArrayFire’s
+<code>*ByKey</code>); the number of runs depends on the data, so they read it back and synchronise once.</p>
+<pre><code class="language-rust">use luma::*;
+
+let keys = Array::from_slice(&amp;[1u32, 1, 2, 2, 2, 1], 6)?;
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], 6)?;
+assert_eq!(x.cumsum_by_key(&amp;keys, 0).to_vec()?, vec![1.0, 3.0, 3.0, 7.0, 12.0, 6.0]);
+let (first_keys, sums) = x.sum_by_key(&amp;keys)?;
+assert_eq!(first_keys.to_vec()?, vec![1, 2, 1]);
+assert_eq!(sums.to_vec()?, vec![3.0, 12.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="unique-values"><a class="header" href="#unique-values">Unique values</a></h2>
 <p><code>factorize()</code> returns the sorted distinct values of an array (flat, one dimension) and, shaped
 like the array, the index of each element’s value in them: <code>uniques.take(&amp;codes)</code> is the array
@@ -1385,6 +1468,34 @@ assert!(u[0] == 0.0 &amp;&amp; u[0].is_sign_negative());
 assert_eq!(u[1], 1.0);
 assert!(u[2].is_nan());
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="sets"><a class="header" href="#sets">Sets</a></h3>
+<p><code>x.set_unique(is_sorted)</code>, <code>a.set_union(&amp;b, is_unique)</code> and <code>a.set_intersect(&amp;b, is_unique)</code>
+(ArrayFire’s <code>setUnique</code>, <code>setUnion</code>, <code>setIntersect</code>) work on <code>u32</code>, <code>i32</code> and <code>f32</code> arrays taken in
+flat order and return sorted, distinct elements as one-dimensional arrays (as for <code>factorize</code>, all
+NaNs are one value, <code>-0.0</code> and <code>+0.0</code> one, written as <code>+0.0</code>). <code>is_sorted</code> and <code>is_unique</code> are
+ArrayFire’s hints: <code>is_sorted</code> says the array is already ascending, <code>is_unique</code> that both arrays are
+ascending and without duplicates, which skips the sorts (a wrong claim gives an unspecified
+result). <code>set_intersect</code> returns <code>None</code> when the arrays have nothing in common. The result size
+depends on the data, so each of them synchronises once.</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[5u32, 1, 3, 3, 9], 5)?;
+let b = Array::from_slice(&amp;[3u32, 4, 5, 5], 4)?;
+assert_eq!(a.set_unique(false)?.to_vec()?, vec![1, 3, 5, 9]);
+assert_eq!(a.set_union(&amp;b, false)?.to_vec()?, vec![1, 3, 4, 5, 9]);
+assert_eq!(a.set_intersect(&amp;b, false)?.unwrap().to_vec()?, vec![3, 5]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Union and intersection are a merge of the two sorted arrays: the unsorted forms sort both first, and
+with <code>is_unique</code> they are the merge alone. On CUDA the merge (<code>src/setmerge.rs</code>) is two launches and
+one 4-byte readback (a partition of the merged order into tiles, then one kernel that merges a tile,
+counts what it keeps, finds its first output slot by a decoupled look-back and writes coalesced).
+Measured for sorted distinct <code>u32</code> arrays of 3 181 963 elements each, against ArrayFire 3.10.1
+(interleaved): on an RTX 3090 <code>set_union</code> takes 0.086 ms (was 0.175; ArrayFire 0.098) and
+<code>set_intersect</code> 0.076 ms (was 0.149; ArrayFire 0.080), on an RTX 3080 Laptop 0.162 ms (was 0.312;
+ArrayFire 0.177) and 0.127 ms (was 0.268; ArrayFire 0.137); the unsorted forms take 0.58 / 1.16 ms
+(union) and 0.57 / 1.12 ms (intersection) on the two GPUs. <code>set_unique</code> is a sort, a mark of the
+first of every run and a compaction. Other backends, and <code>LUMA_LOOKBACK_SCAN=off</code>, run the merge as
+the three kernels (partition, count, write) and a scan, with the same results.</p>
 <h2 id="quantiles"><a class="header" href="#quantiles">Quantiles</a></h2>
 <p><code>quantile(q)</code> and <code>median()</code> of an <code>f32</code> array give a one-element array, interpolating linearly
 between the sorted neighbours as NumPy’s default does: with <code>h = q * (len - 1)</code> the value at
@@ -1658,6 +1769,14 @@ assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0,
 let v = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
 assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>lower</code> and <code>upper</code> of a stored matrix read only the half they keep: a <code>select</code> by a mask of the
+coordinates between an input and another value is lowered as a branch when not reading the input
+saves enough, and the zeroed half is only written (an RTX 3090: <code>lower</code> of a 4096 x 4096 matrix takes
+0.132 ms against ArrayFire’s 0.131, 0.185 ms before; an RTX 3080 Laptop 0.290 against 0.290, 0.383
+before). A kernel that reads through a wrapping view such as <code>tile</code> computes 4 elements per
+invocation on a long grid (a 4 x 4 tile of 1024 x 1024 takes 0.098 ms on an RTX 3090, 0.117 before,
+ArrayFire 0.108; 0.209 ms on an RTX 3080 Laptop, 0.249 before, ArrayFire 0.227). <code>iota</code> counts exactly for
+<code>u32</code>, <code>i32</code>, <code>f64</code> and <code>Df32</code>; an <code>f32</code> one rounds above <code>2^24</code>.</p>
 <p>A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
 with <code>InvalidShape</code> (as <code>diff1</code> does for an extent below 2).</p>
 <p><strong><code>replace(&amp;cond, b)</code></strong> is <code>af::replace</code> returning a new array (<code>a</code> where <code>cond</code>, else <code>b</code>, an
@@ -1809,8 +1928,13 @@ the row array of CSR is the row pointer, the column array of CSC is the column p
 no empty arrays, so they are <code>None</code> for a matrix without entries (<code>Sparse::empty</code>, or the sparse
 form of an all-zero matrix).</p>
 <h2 id="conversions-and-the-transpose"><a class="header" href="#conversions-and-the-transpose">Conversions and the transpose</a></h2>
-<p><code>to_format</code> converts between the three formats (a stable sort by the new major index, one <code>u32</code>
-sort and a gather); <code>to_dense</code> scatters the entries into zeros. <code>transpose</code> is free: the transpose
+<p><code>to_format</code> converts between the three formats: a stable sort of the entries by the new major index
+(CSR to CSC and back keep the entries of a row, or a column, in order), done as two radix sorts of
+the index that carry the other index and the value along (<code>ceil(log2 n)</code> bits for <code>n</code> rows or
+columns, so three 8-bit passes where 32 bits took four), with the offsets taken
+as a <code>searchsorted</code> of the sorted keys; <code>from_triplets</code> into a compressed format is the same sort.
+In the afcompare sparse rows CSR to CSC takes 1.34 ms on an RTX 3090, 1.96 times the speed of
+cuSPARSE’s <code>csr2csc</code> (2.62 ms before 0.5.2), and 2.98 ms on an RTX 3080 Laptop, 1.81 times. <code>to_dense</code> scatters the entries into zeros. <code>transpose</code> is free: the transpose
 of a CSR matrix is the CSC matrix with the same arrays, and COO swaps its two index arrays.</p>
 <h2 id="products"><a class="header" href="#products">Products</a></h2>
 <p><code>matmul</code> multiplies by a vector (shape <code>[cols]</code>) or a dense matrix (<code>[c, cols]</code>); <code>matmul_t</code> uses
@@ -1828,8 +1952,8 @@ assert_eq!(a.matmul_t(&amp;y).to_vec()?, vec![1.0, 0.0, 8.0]);
 <p>CSR <code>A x</code> and CSC <code>A^T x</code> (the product whose output runs along the compressed axis) run on kernels
 written for the format: for a vector, a thread (or a few lanes) per row when the rows are short, a
 kernel that takes tiles of 512 consecutive entries whatever the row lengths are (the balance of a
-merge-path product; a second small pass completes the rows that cross tiles) when some are long;
-for a dense matrix
+merge-path product: every invocation loads its run of four entries as one <code>vec4</code>; a second small
+pass completes the rows that cross tiles) when some are long; for a dense matrix
 one invocation per output element walks its row, reading <code>c</code> adjacent elements of <code>x</code> together,
 and the few very long rows of a power-law graph are cut in pieces summed by a workgroup each. No
 atomics are used, so the results are the same on every run. The first product of any other
@@ -1840,9 +1964,9 @@ reproducible. The first product of a matrix reads its row lengths back (one sync
 finds the first row of every tile. A pending expression as <code>x</code> is evaluated first.</p>
 <h2 id="elementwise-operations-1"><a class="header" href="#elementwise-operations-1">Elementwise operations</a></h2>
 <p><code>mul_dense</code> and <code>div_dense</code> keep the pattern of the sparse matrix and give a sparse result;
-<code>mul_scalar</code>, <code>div_scalar</code>, <code>neg</code> (and the operators <code>*</code>, <code>/</code>, <code>-</code> with <code>f32</code>) do too. Sums and
-differences with a dense matrix (<code>add_dense</code>, <code>sub_dense</code>, <code>rsub_dense</code>) and with a scalar
-(<code>add_scalar</code>) fill the zeros, so their results are dense arrays.</p>
+<code>mul_scalar</code>, <code>div_scalar</code>, <code>neg</code> (and the operators <code>*</code> and <code>/</code> with <code>f32</code>, and unary <code>-</code>) do
+too. Sums and differences with a dense matrix (<code>add_dense</code>, <code>sub_dense</code>, <code>rsub_dense</code>) and with a
+scalar (<code>add_scalar</code>, <code>sub_scalar</code>) fill the zeros, so their results are dense arrays.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="dense-linear-algebra"><a class="header" href="#dense-linear-algebra">Dense linear algebra</a></h1>
 <p>Factorisations and solvers for dense <code>f32</code> matrices, on every backend: Cholesky, triangular and
@@ -1895,17 +2019,48 @@ assert!((back.to_vec()?[0] - 0.25).abs() &lt; 1e-5);
 <li>Small matrices and every matrix of a batch are factored by one workgroup each, in one launch:
 a batch of 4096 matrices of 16 x 16 costs one launch, where a library without batched LAPACK
 loops over calls.</li>
-<li>A big matrix is factored recursively; the leaves are small kernels and every other flop is a
-full-<code>f32</code> <code>matmul_f32</code> of the halves (never TF32: a factorisation’s accuracy depends on it).</li>
+<li>A big matrix (more than 64 rows) is blocked. LU and QR recurse on the columns: the leaves are
+panels of up to 32 columns and every other flop is a full-<code>f32</code> <code>matmul_f32</code> of the halves
+(never TF32: a factorisation’s accuracy depends on it).
+<ul>
+<li>LU factors a panel by a tournament (CALU) instead of one workgroup streaming the whole panel
+through one multiprocessor: workgroups pick pivot rows in chunks of up to 512 rows, one
+workgroup plays the winners off against each other, and a last kernel gives every row its
+multipliers. A panel of up to 512 rows is one chunk and pivots exactly as partial pivoting
+does. A panel of more rows has multipliers that can exceed 1 (mildly; the tests bound them by
+8 above 64 rows), so the pivoting is not the classical one there, though the result is the
+same on every backend. Triangular solves inside the recursion use register-resident
+substitution leaves of 64 rows.</li>
+<li>QR factors a panel by a two level tall-skinny QR (TSQR): blocks of rows are factored by one
+workgroup each, the stack of their <code>R</code>s is factored the same way, and the compact WY form is
+rebuilt from the explicit <code>Q</code>. A panel of up to 512 rows is one launch. Panels too tall for the
+tree (over 8192 rows with 32 columns), devices with workgroups of fewer than 64 invocations
+and, for the tree, less than 30 KB of workgroup memory keep the older kernel in which one
+workgroup streams the panel; <code>LUMA_QR_TSQR=0</code> selects it everywhere.</li>
+<li>Cholesky is left-looking in blocks of 128 columns (64 or fewer where workgroup memory is
+small), all writing into one output: one product of the finished columns per 512 columns plus a
+small correction per block, one workgroup that factors the diagonal block and one launch of
+warps that solve the rows below, about 100 launches at 4096 rows. <code>LUMA_CHOL_NB</code> and
+<code>LUMA_CHOL_WIDE</code> pick the block sizes.</li>
+<li>The update products of Cholesky and of the blocked triangular solves are exact <code>f32</code> too;
+<code>LUMA_LINALG_TF32=1</code> runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
+backward error of about 1e-3 of the entries of the updates instead of 1e-7. It is off by
+default and is independent of <code>ContextOptions::tf32_matmul</code>, which governs <code>matmul</code> only.</li>
+</ul>
+</li>
 <li>A triangular solve with up to 32 right-hand sides (<code>solve_triangular</code>, and the two solves inside
 <code>solve</code> and <code>solve_spd</code>) of a triangle of more than 64 rows is one launch on CUDA devices: one
 workgroup per block of 64 rows takes its turn from an atomic ticket, waits for the solved blocks
 before it (the words they publish are the complement of the bits, 0 meaning “not there yet”: no flags
-or fences), and solves its own block. The factorisations’ solves take the diagonal blocks as explicit
-inverses (computed while the workgroup waits; the blocks are well-conditioned triangles of a
-factorisation, a Cholesky factor or a unit <code>L</code> with bounded multipliers); <code>solve_triangular</code> of an
-arbitrary triangle substitutes. More right-hand sides, and every other backend, solve in blocks of rows
-with <code>matmul_f32</code> products.</li>
+or fences), and solves its own block. The solves inside <code>solve</code> and <code>solve_spd</code> take the diagonal
+blocks as explicit inverses from 768 rows (computed while the workgroup waits; the blocks are
+well-conditioned triangles of a factorisation, a Cholesky factor or a unit <code>L</code> with bounded
+multipliers); <code>solve_triangular</code> of an arbitrary triangle substitutes. More than 8 right-hand
+sides are split over workgroups of their own. More than 32 right-hand sides, and every backend
+that does not order memory across workgroups (wgpu, the CPU), solve in blocks of 128 rows, one
+product plus one launch each. <code>LUMA_TRSV=0</code> turns the one-launch solve off.</li>
+<li>The kernels of the factorisations are cached by the context that built them, not process-wide, so
+a dropped context releases them (and its device).</li>
 <li>Numerical failure never poisons or raises: a matrix that is not positive definite leaves <code>NaN</code>
 on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of <code>U</code> (the
 solve then gives <code>Inf</code>/<code>NaN</code>, the determinant 0). Shape errors poison the result as usual.</li>
@@ -1933,7 +2088,7 @@ assert!((l[0] - 1.0).abs() &lt; 1e-5 &amp;&amp; (l[1] - 3.0).abs() &lt; 1e-5);
 <tr><td><code>svd()</code></td><td><code>Svd { u, s, vt }</code>, thin: <code>u</code> <code>[k, m]</code>, <code>s</code> <code>[k, 1]</code>, <code>vt</code> <code>[n, k]</code>, <code>k = min(m, n)</code>, any shape</td></tr>
 <tr><td><code>singular_values()</code></td><td>the values alone (no <code>V</code>, no vectors written)</td></tr>
 <tr><td><code>pinv()</code>, <code>pinv_tol(tol)</code></td><td>Moore-Penrose pseudo-inverse <code>[m, n]</code>; values <code>&lt;= tol s_max</code> count as zero (default <code>max(m, n) eps</code>)</td></tr>
-<tr><td><code>rank()</code>, <code>rank_tol(tol)</code></td><td>numerical rank as a <code>u32</code> <code>[1, 1]</code></td></tr>
+<tr><td><code>rank()</code>, <code>rank_tol(tol)</code></td><td>numerical rank as a <code>u32</code> <code>[1, 1]</code>: the singular values above <code>tol s_max</code> (default <code>max(m, n) eps</code>)</td></tr>
 <tr><td><code>cond()</code></td><td><code>s_max / s_min</code></td></tr>
 <tr><td><code>eigh()</code>, <code>eigvalsh()</code></td><td><code>Eigh { values, vectors }</code> of a symmetric matrix (lower triangle read), ascending; the values alone</td></tr>
 </tbody>
@@ -1944,15 +2099,60 @@ round are disjoint, so a round is parallel) until they are orthogonal; the singu
 their norms. A matrix with its <code>V</code> that fits workgroup memory (up to 64 x 64 on devices with 32 KiB
 of it, 32 x 32 with 16 KiB) and every matrix of a batch is decomposed by one workgroup, in one
 launch, stopping inside the kernel when no rotation is left. A bigger matrix lives in global
-memory and one launch per round-robin round rotates <code>n / 2</code> pairs at once; the sweeps continue
-until one rotates nothing (the host looks every few sweeps, so a big <code>svd()</code> waits for the device,
-unlike the other operations). <code>eigh</code> is the SVD of <code>A + ||A||_F I</code> read from the lower triangle:
+memory. From 128 columns on it is decomposed by block Jacobi: the columns are cut in blocks of 16
+and a round pairs the blocks, in three launches (the Gram matrix of every block pair, a small
+two-sided Jacobi eigenproblem per pair whose rotation is made orthogonal with one Newton-Schulz
+step, and the two thin products that apply it to the columns and to <code>V</code>); below 128 columns one
+launch per round-robin round rotates <code>n / 2</code> pairs at once. From 1024 columns the decomposition
+goes through <code>A = Q R</code> and the iteration works on <code>Rᵀ</code>, which converges in fewer sweeps
+(<code>LUMA_SVD_PRECOND=off</code> turns it off, a number replaces the 1024). The sweeps continue until one
+rotates nothing (the host looks every few sweeps, so a big <code>svd()</code> waits for the device, unlike
+the other operations). <code>eigh</code> is the SVD of <code>A + ||A||_F I</code> read from the lower triangle:
 positive semi-definite, so <code>U = V</code> holds the eigenvectors and <code>lambda = sigma - ||A||_F</code>.</p>
 <p>Accuracy in <code>f32</code>: <code>||A - U diag(s) Vᵀ||_F / ||A||_F</code> and the singular values are within a few
 <code>eps</code> of <code>s_max</code> (absolute), the orthogonality of <code>U</code> and <code>V</code> degrades as about <code>n sqrt(n) eps</code>;
 the eigenvalues of <code>eigh</code> carry an absolute error of a few <code>eps ||A||_F</code>. A zero singular value
 gets a left vector completed to an orthonormal set. <code>NaN</code> input gives <code>NaN</code> values and never
-hangs (the sweeps are bounded).</p>
+hangs (the sweeps are bounded). For a 4096 x 4096 matrix the backward error is 8e-6 and the loss of
+orthogonality 1.8e-5 (RTX 3090).</p>
+<h2 id="rank-of-a-big-matrix"><a class="header" href="#rank-of-a-big-matrix">Rank of a big matrix</a></h2>
+<p><code>rank</code> of a matrix that fits workgroup memory is decided by its singular values, lazily, on the
+device. A bigger matrix makes <code>rank</code> wait for the device, and the answer is always the one of the
+singular values (the number above <code>tol s_max</code>), reached in one of two ways:</p>
+<ul>
+<li>When the cut is well above the rounding errors of a QR factorisation (a matrix of full rank that
+is not nearly singular, or a looser tolerance given with <code>rank_tol</code>), two unpivoted QR
+factorisations bound the number of singular values above the cut from both sides (the rows of
+<code>R</code> that can be cut from the bottom, and the smallest singular value of the rows kept, from the
+norm of the inverse of their triangle) and give the rank without any singular value. <code>rank_tol(4e-3)</code>
+of a 4096 x 4096 matrix of rank 2048 takes 185 ms on an RTX 3090 (a QR factorisation plus the certificate, the
+factorisation being most of it), which is 0.20 in ArrayFire to luma time ratio: ArrayFire’s <code>rank</code>
+is faster there.</li>
+<li>Otherwise the singular values decide: at the default tolerance <code>max(m, n) eps</code> the rounding
+errors of an unpivoted QR factorisation of a rank-deficient matrix are as big as the cut, and a
+matrix whose rank is set by singular values close to the cut cannot be certified either. Only
+columns above <code>tol s_max / (2 sqrt(n))</code> are rotated any more, so a low-rank matrix needs the
+sweeps of its rank. The values-only decomposition takes 1.43 s at 4096 columns and 68 ms at
+1024 (RTX 3090; ArrayFire’s QR based <code>rank</code> with an absolute tolerance takes 37 ms and 4.6 ms).</li>
+</ul>
+<h2 id="measured-against-arrayfire"><a class="header" href="#measured-against-arrayfire">Measured against ArrayFire</a></h2>
+<p>RTX 3090, ArrayFire 3.10.1 (cuSOLVER), interleaved, from the 0.5.2 changelog. A batch of small
+matrices (Cholesky, LU, solve, inverse, determinant, QR and SVD, 2048 matrices of 8 x 8 up to 1024
+of 32 x 32) is one launch against a loop of ArrayFire calls: 340 to 1900 times faster. A single big
+matrix is a closer race, in ms, luma (ArrayFire):</p>
+<ul>
+<li><code>cholesky</code>: 0.12 at 256 rows, 0.66 at 1024, 4.6 at 4096 (3.2).</li>
+<li><code>lu</code>: 17.4 at 4096 (66 before the tournament panels); the ArrayFire to luma time ratio is 0.85
+at 256, 0.80 at 1024 and 0.83 at 4096 (below 1: cuSOLVER is faster).</li>
+<li><code>qr</code>: 0.45 (0.71) at 256, 3.6 (3.9) at 1024, 31.3 (26.0) at 4096; <code>lstsq</code> of 2048 x 1024 takes
+6.3 (6.0).</li>
+<li><code>svd</code>: 54 (90) at 1024 x 1024, 1570 (1860) at 4096 x 4096; <code>singular_values</code> 42 at 1024 and
+1120 at 4096.</li>
+<li><code>solve_triangular</code>, 4096 rows and 16 right-hand sides: 0.630 (0.981); a single right-hand side
+with 4096 rows 0.137 (ArrayFire’s <code>trsm</code> about 0.2).</li>
+</ul>
+<p>What is left of the gap to cuSOLVER is in the Cholesky and LU diagonal and panel kernels, which are
+latency bound.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="interpolation-image-transforms-and-filters"><a class="header" href="#interpolation-image-transforms-and-filters">Interpolation, image transforms and filters</a></h1>
 <p>These functions follow ArrayFire’s <code>approx1</code>, <code>approx2</code>, <code>resize</code>, <code>rotate</code>, <code>translate</code>, <code>scale</code>,
@@ -1963,7 +2163,7 @@ arrays. The first dimension is the fastest, as everywhere in Luma. They run on e
 the grid points <code>0, 1, .., n - 1</code> and interpolates them at the positions <code>pos</code>. Positions below
 <code>0</code>, above <code>n - 1</code> and NaN give <code>off_grid</code>. <code>approx2</code> does the same along dimensions 0 and 1
 with two position arrays. <code>Interp</code> is <code>Nearest</code>, <code>Lower</code> (floor),
-<code>Linear</code>, <code>Cosine</code>, <code>Cubic</code> and <code>CubicSpline</code> (Catmull-Rom); in two dimensions <code>Linear</code> is
+<code>Linear</code>, <code>Cosine</code>, <code>Cubic</code> and <code>CubicSpline</code> (Catmull-Rom), and <code>LinearHardware</code> (below); in two dimensions <code>Linear</code> is
 bilinear and <code>Cubic</code> bicubic. Further dimensions are batches: positions with extent 1 along
 them are shared by the whole batch. <code>approx1_uniform</code> and <code>approx2_uniform</code> take the dimension
 and the <code>start</code> and <code>step</code> of the grid (the sample <code>i</code> sits at <code>start + step * i</code>).</p>
@@ -1976,6 +2176,14 @@ assert_eq!(x.approx1(&amp;pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
 them in registers. The input and the positions are evaluated first and must fit one buffer.</p>
+<p>The kernel of <code>approx1</code>, <code>approx2</code>, <code>resize</code>, <code>rotate</code> and <code>transform</code> is built for the method, the
+kind of source (positions, a scaled grid, an affine or projective warp) and the number of grid
+dimensions: they are constants of its source, so a launch runs none of the branches over them. On
+wgpu the generic kernel is used instead: the driver contracts the products of a kernel with folded
+constants differently for a texture read and a buffer read (up to 8e-7 on a bicubic gather), and
+the generic one gives the same bits for both. <code>resize</code> takes several output rows per invocation
+(one or two when it shrinks, eight or sixteen when it enlarges), and an <code>approx1</code> output is cut
+in tiles of one row of 256 invocations.</p>
 <h3 id="reading-a-source-through-the-texture-units"><a class="header" href="#reading-a-source-through-the-texture-units">Reading a source through the texture units</a></h3>
 <p>A kernel that reads a two-dimensional image at positions it computes (<code>approx2</code>, <code>resize</code>,
 <code>rotate</code>, <code>transform</code>) can fetch the four texels of a bilinear footprint, or the sixteen of a
@@ -1988,14 +2196,18 @@ texture, a view that costs nothing and is kept with the array) the gather takes 
 <code>rotate</code> / <code>transform</code> and <code>approx2</code> at scattered positions, 5-13 % off a bilinear one, and it is
 chosen for those; kernels bound by memory (<code>approx2</code> at smooth positions, <code>resize</code>) keep the loads.
 A backend that has to copy the source to
-make a texture (wgpu) reads the buffer, as does the CPU backend, which has no textures.
-Nothing in the API changes and the choice is not configurable.</p>
+make a texture (wgpu) reads the buffer, as do the CPU and Metal backends, which have no textures.
+Only a source that is one two-dimensional slice (extent 1 along dimensions 2 and 3, sampled
+along dimensions 0 and 1) can be read through a texture. Nothing in the API changes and the
+choice is not configurable.</p>
 <p><code>Interp::LinearHardware</code> is the explicit opt-in to the texture unit’s own bilinear <em>filter</em>: one
 fetch per output, but the hardware keeps 8 bits of the fraction of a position (the weights are
 multiples of 1/256), so along each axis a result is off from <code>Interp::Linear</code>’s by up to the
-difference of the two neighbouring samples over 256. Luma never chooses it. Where the source cannot
-be a texture (more than two dimensions, the CPU backend, a width the device cannot read in place on
-a copying backend) it is exactly <code>Interp::Linear</code>.</p>
+difference of the two neighbouring samples over 256. Luma never chooses it. It acts in two-dimensional
+sampling (<code>approx2</code>, <code>resize</code>, <code>rotate</code>, <code>transform</code>); <code>approx1</code> reads it as <code>Interp::Linear</code>. Where
+the source cannot be a texture (more than one two-dimensional slice, a width the device cannot
+bind as a texture, the CPU and Metal backends, which have no textures) it is exactly
+<code>Interp::Linear</code>. On wgpu the source is copied into a texture for every launch.</p>
 <h2 id="images"><a class="header" href="#images">Images</a></h2>
 <p>An image is an array whose dimensions 0 and 1 are the image axes; the dimensions after them
 (colour channels, a batch) all get the same transform. <code>resize(d0, d1, method)</code> (or
@@ -2299,7 +2511,9 @@ for (g, w) in u.to_vec()?.iter().zip(&amp;want) {
 a few elements, scalars and other fixed arrays of the same shape), each launch loads a tile into
 workgroup memory and runs several steps on it, so the data passes through memory once per several
 steps rather than once per step. Any other step (shifts of a computed expression, <code>cache()</code>,
-<code>assign</code>, reductions) is traced and replayed step by step: each step is still the fused kernels
+<code>assign</code>, reductions) is traced and replayed step by step (a step of lazy expressions that does not fuse
+into a stencil may be traced as a body of several steps, see
+<a href="#elementwise-loops-iterate_all">Elementwise loops</a>): each step is still the fused kernels
 of the step, and the loop costs no host time per step.</p>
 <p>A step that is a stencil of 2-D data looks the same: <code>u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0</code>. Stencils exist for 1-D and 2-D arrays held in one
 buffer; a 3-D array, or one split over several buffers, runs step by step.</p>
@@ -2338,7 +2552,13 @@ assert_eq!(x.to_vec()?, want);
 <p>A step that is <em>not</em> elementwise (shifts, <code>cache()</code>, <code>assign</code>), or states of another element type
 (<code>i32</code>, <code>Df32</code>, <code>f64</code>), is traced once and its recorded kernels are replayed step by step (as one
 graph on CUDA, Metal and the CPU backend when the step is replayed often enough to pay for the
-capture). The results are the same; only the one-kernel register loop is lost.</p>
+capture). The results are the same; only the one-kernel register loop is lost. A step of lazy
+expressions only that is not a register loop (shifts, say) is also traced as the body of up to 16
+steps, so that the recorded launches are those the planner makes of the chain, as an eager
+<code>u = step(&amp;u); u.eval()</code> loop gets them; the loop replays that body <code>steps / k</code> times and the rest one step
+at a time. This is used only when the chain makes fewer launches than the steps one by one, the cost model
+gives it less time and tracing it costs less than half of what the loop takes step by step; loops on the
+CPU backend replay step by step. A state the step hands back unchanged takes no launch per step.</p>
 <h3 id="launch-sizing"><a class="header" href="#launch-sizing">Launch sizing</a></h3>
 <p>A long register loop is not one kernel launch for ever. The cost model
 (<a href="#the-cost-model">Performance</a>) sizes its launches to about 40 ms of GPU time (at least one step per launch), which keeps them far
@@ -2441,14 +2661,17 @@ passes the dispatch arguments from step to step on the device, so nothing in a b
 host. The first step of a loop reads the initial state, which no graph does, so it is launched on
 its own. A graph is captured only where it pays: the blocks of a compiled loop on first use, those of
 a one-shot loop the second time they run; until then the launches are replayed one by one, with the
-same results.</p>
+same results. A one-shot loop that has run 100 launches without stopping replays the rest as repeated
+graphs of a small unit of steps (at most 16, about 64 launches) where the backend captures graphs (CUDA).</p>
 <p>When there is one record and it is a reduction of one array expression (a norm, a sum, a maximum),
 Luma traces the record together with the step, so one launch stores the next state and reduces the
 record, and where a reduction finishes in its first launch (CUDA; the CPU backend with
 <code>LUMA_SINGLE_PASS_REDUCE=on</code>) the last workgroup of that launch also evaluates the stop rule: a step
 is one launch. <code>iterate_until</code> does the same with its residual <code>max |next - prev|</code>. Several records,
 or records that are not one reduction, run after the step in launches of their own; values, steps
-and reasons are the same.</p>
+and reasons are the same. On the wgpu backend, which has no single-pass reduction, the stop rule runs in the
+last pass that finishes the record’s reduction instead of a launch of its own, so a step is one launch less
+than it was.</p>
 <h3 id="chunked-solvers-compile_until_all"><a class="header" href="#chunked-solvers-compile_until_all">Chunked solvers: <code>compile_until_all</code></a></h3>
 <p>Running a loop in chunks with <code>iterate_until_all</code> (to look at the state between chunks) traces the
 step again for every chunk. <code>compile_until_all(&amp;init, until, step)</code> traces it once, for the shapes
@@ -2506,13 +2729,17 @@ step) but may use anything inside it, including readbacks. Use the primitive whe
 and the host time matters.</p>
 <p>When <code>eval</code> computes right away (the GPU is idle, as in a loop whose steps are shorter than the host’s
 work for them) and the graph it evaluates has the structure of an earlier one (the same operations,
-shapes, views and wiring, the same buffers read in the same places, equal scalars where they were
-equal), Luma runs the launches of that earlier evaluation again over the new buffers and
-scalars instead of planning the graph again: the host time per step of a step with hundreds of
-operations drops by a third to a half, the part that builds the expression stays. The results are
-bit-identical to what the planner makes, and only evaluations of plain elementwise, view and
-shift graphs with no other lazy array alive are replayed. <code>LUMA_PLAN_CACHE=off</code> switches this off
-(<a href="#environment-variables">Environment variables</a>).</p>
+lengths, views and wiring, the same buffers read in the same places, equal scalars where they were
+equal, the same planner flags and cost model) and is all the lazy work that is alive, Luma runs the store
+launches of that earlier evaluation again over the new buffers and scalar values instead of
+flattening, cutting and judging the graph again (the plan cache, 128 plans per context). The part that
+builds the expression stays: on an RTX 3090 (CUDA) the per-step cases of the <code>cfd</code> benchmark suite
+(<code>euler/3d_per_step</code> 6.60 to 4.33 ms, <code>muscl/3d_per_step</code> 3.49 to 2.44 ms, <code>euler/2d_per_step</code> 3.06 to
+2.42 ms) got 1.1 to 1.5 times faster. The results are bit-identical to what the planner makes.
+Structures whose planning looked at other state (an in-place buffer takeover, packing of arrays into one
+buffer, failures, loops, reductions) are remembered as uncacheable and plan as before, and the cache backs
+off after a run of misses. <code>LUMA_PLAN_CACHE=off</code> switches this off and <code>LUMA_PLAN_CACHE=trace</code> prints what
+it records (<a href="#environment-variables">Environment variables</a>).</p>
 <h3 id="readbacks-in-a-loop"><a class="header" href="#readbacks-in-a-loop">Readbacks in a loop</a></h3>
 <p><code>step</code> followed by <code>.max().item()?</code> every iteration waits once per step. When the same step has
 been seen repeating, Luma computes the next few steps and their residuals during a readback and
@@ -2656,9 +2883,13 @@ if ctx.features().contains(luma::Features::SHADER_F64) {
     assert!(matches!(err.root(), LumaError::Unsupported(_)));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>minimum</code>, <code>maximum</code>,
-comparisons, <code>select</code>, views and reductions. Anything else (<code>exp</code>, trigonometry, generators such
-as <code>range</code>) is refused when recorded. Use <code>Df32</code> when you need a wide type on every device, or
+<p><code>f64</code> arrays have <code>+ - * /</code> and <code>%</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>,
+<code>minimum</code>, <code>maximum</code>, <code>clamp</code>, comparisons, <code>select</code>, views, reductions (<code>sum</code>, <code>min</code>, <code>max</code>,
+<code>prod</code>, <code>mean</code>, <code>var</code>, <code>std</code>) and generators such as <code>range</code>. The transcendental functions (<code>exp</code>,
+<code>ln</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>log1p</code>, <code>expm1</code>, <code>asin</code> and the other inverse and hyperbolic
+functions, <code>log2</code>, <code>log10</code>, <code>cbrt</code>, <code>erf</code>, <code>erfc</code>, <code>lgamma</code>, <code>tgamma</code>, <code>powf</code>, <code>root</code>, <code>atan2</code>,
+<code>hypot</code>, <code>copysign</code>) run on the CUDA backend (libdevice) and the CPU backend (libm); on wgpu they
+fail with <code>Unsupported</code> when recorded. Use <code>Df32</code> when you need a wide type on every device, or
 cast down to <code>f32</code> for the function.</p>
 <h2 id="df32"><a class="header" href="#df32"><code>Df32</code></a></h2>
 <p>A <code>Df32</code> is the unevaluated sum <code>hi + lo</code> of two <code>f32</code>, with <code>|lo|</code> at most half an ulp of <code>hi</code>.
@@ -2693,7 +2924,7 @@ and loses bits, which limits every function there: <code>exp</code> of an argume
 error of about <code>1e-38</code> (a relative error of that over the result), and a result below <code>2^-126</code> is <code>0</code>. Out of range <code>exp</code> is
 infinity above <code>88.72</code> and <code>0</code> below <code>-87.33</code>, <code>tanh</code> is <code>+-1</code> from <code>|x| &gt; 20</code>, and <code>ln</code> and <code>powf</code>
 follow <code>f32</code> (<code>ln(0)</code> is <code>-inf</code>, <code>ln</code> and <code>powf</code> of a negative base are <code>NaN</code>, <code>x^0</code> is <code>1</code>, zero
-and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have none of these functions.</p>
+and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have functions of their own, see above.</p>
 <pre><code class="language-rust">use luma::*;
 
 let t = Array::from_slice(&amp;[Df32::from(300.0), Df32::from(2000.0)], 2)?;
@@ -2716,6 +2947,25 @@ model’s estimate, which weighs it against staging and materialising it
 device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
 operations for the error of the product). <code>LUMA_DF_FMA</code>
 and <code>ContextOptions::df_fma</code> force either way; the results are the same, only the speed differs.</p>
+<h2 id="matrix-products-tf32"><a class="header" href="#matrix-products-tf32">Matrix products: TF32</a></h2>
+<p><code>matmul</code> on a CUDA device with tensor cores (compute capability 8.0 and up) runs in TF32 by
+default: the operands are rounded to a 10-bit mantissa (the exponent keeps <code>f32</code>’s 8 bits) and the
+products are accumulated in <code>f32</code>, so each entry is within 1.5e-3 of the sum of the absolute
+values of its terms of the <code>f32</code> product (the precision of PyTorch’s <code>allow_tf32</code>). Everything else computes the <code>f32</code> product: other backends, products whose
+<code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and <code>matmul_batched</code>, which is always
+<code>f32</code>. Where the digits matter:</p>
+<ul>
+<li><code>a.matmul_f32(&amp;b)</code> is the exact <code>f32</code> product of one call (fused multiply-adds over <code>k</code> in a
+fixed order, so results are reproducible);</li>
+<li><code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context
+that product (<code>Context::tf32_matmul()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
+whatever the context says.</li>
+</ul>
+<p>The dense factorisations and solves (<a href="#dense-linear-algebra">Dense linear algebra</a>) do not follow the
+context setting: their update products are <code>matmul_f32</code>. Only the update products of Cholesky and
+the blocked triangular solves can take tensor cores, with the opt-in environment variable
+<code>LUMA_LINALG_TF32=1</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
+<code>f32</code>, never TF32 (<a href="#incremental-accumulation">Incremental accumulation</a>).</p>
 <h2 id="casts-1"><a class="header" href="#casts-1">Casts</a></h2>
 <pre><code class="language-rust">use luma::*;
 
@@ -2882,7 +3132,9 @@ make values; <code>C32</code> has <code>+ - * /</code>, <code>conj</code>, <code
 <p><code>Array&lt;u32&gt;</code> is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
 bit operations of a hash function; <code>u32</code> arithmetic wraps. <code>Array&lt;i32&gt;</code> is the signed one
-(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons.</p>
+(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons. The 8-bit and 16-bit integers (<code>u8</code>, <code>i8</code>, <code>u16</code>,
+<code>i16</code>) are stored in one or two bytes per element and have their own chapter,
+<a href="#compact-integers-u8-i8-u16-i16">Compact integers</a>.</p>
 <h2 id="arithmetic"><a class="header" href="#arithmetic">Arithmetic</a></h2>
 <p><code>+ - * / %</code> work on <code>u32</code> arrays and <code>u32</code> scalars, and wrap modulo <code>2^32</code> where a Rust
 <code>wrapping_*</code> would. Division and remainder by an element that is zero follow WGSL: <code>x / 0</code> is <code>x</code>
@@ -3201,9 +3453,16 @@ no two invocations ever write one word and no atomics are needed. Kernels that c
 <code>and</code> and <code>or</code> on its word, which is also race free but slower. The CUDA and CPU backends read the
 same words; the layout is byte-identical to a plain array of <code>u8</code> or <code>i16</code>, so nothing differs
 between backends.</p>
-<p>Where it pays: memory-bound work. On an RTX 3090 (CUDA), a chain of <code>u8</code> arithmetic over 64M
-elements takes 0.17 ms where the same chain on <code>u32</code> takes 0.65 ms, and the sum of 64M <code>i16</code> takes
-0.17 ms against 0.32 ms for <code>f32</code>.</p>
+<p>Where it pays: memory-bound work. On an RTX 3080 Laptop (CUDA, 64M elements, luma-bench <code>compact</code>)
+a chain of <code>u8</code> arithmetic takes 0.38 ms where the same chain on <code>u32</code> takes 1.54 ms, the sum of
+<code>i16</code> 0.39 ms against 0.74 ms for <code>f32</code>, per-column mean and variance over the traces of a
+1024 x 65536 <code>i16</code> matrix 0.53 ms (<code>f32</code>: 0.84 ms), a transposed copy of an <code>i16</code> matrix 0.79 ms
+(<code>f32</code>: 1.51 ms), a <code>u8</code> histogram 0.34 ms (a <code>u32</code> <code>bincount</code>: 0.77 ms) and a sort of 16M <code>i16</code>
+1.29 ms (two radix passes; <code>u32</code> keys take four: 1.77 ms).</p>
+<p>Against ArrayFire’s <code>s16</code>, <code>u16</code> and <code>u8</code> arrays (same laptop, 32M <code>s16</code>; afcompare rows 16-22;
+ratios of ArrayFire’s time to luma’s): upload 0.80x (bound by the host transfer), sum 1.0x,
+cast and sum 4.7x, per-column mean and variance 7.4x, <code>u8</code> histogram (38M elements) 2.3x, <code>u16</code>
+histogram of 16384 bins 1.0x.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="custom-kernels"><a class="header" href="#custom-kernels">Custom kernels</a></h1>
 <p>When an algorithm does not fit array operations (a scatter with atomics, a tuned stencil, an
@@ -3365,7 +3624,8 @@ assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
 <p><code>Kernel::new(src)</code> is <code>default_context()?.kernel(src).build()</code>. The builder also has
 <code>.workgroup([x, y, z])</code>, which asserts the size the shader declares with <code>@workgroup_size</code> (a
 different one is <code>KernelWorkgroup</code>); <code>kernel.workgroup()</code> returns it. Building the same source, entry point,
-workgroup size and label twice on a context reuses the pipeline, and a <code>Kernel</code> is cheap to clone. The shader is parsed and validated
+workgroup size, label and <a href="#bounds-checks">bounds mode</a> twice on a context reuses the pipeline, and a <code>Kernel</code> is cheap to clone. A custom kernel compiles, and a compile error
+surfaces, in <code>build</code> (the kernels Luma builds itself compile on worker threads and fail at their first launch). The shader is parsed and validated
 when you build it: a mistake comes out as <code>LumaError::ShaderCompile</code> with the WGSL error and
 line numbers that match your source (Luma appends its prelude, so it never shifts them).</p>
 <h2 id="mixing-with-built-in-operations"><a class="header" href="#mixing-with-built-in-operations">Mixing with built-in operations</a></h2>
@@ -3517,6 +3777,36 @@ cannot lay out), <code>KernelArgUniformSize</code>, <code>KernelArgAlias</code> 
 binding, as arrays that share a buffer through <code>reshape</code> are), <code>KernelEntryPoint</code>, <code>KernelBinding</code>
 (bindings outside <code>@group(1)</code> or not numbered from 0), <code>KernelWorkgroup</code>, <code>KernelGridTooLarge</code>,
 <code>Unsupported</code>. See <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError</code></a>.</p>
+<h2 id="bounds-checks"><a class="header" href="#bounds-checks">Bounds checks</a></h2>
+<p>By default every access of a custom kernel to a storage array, a workgroup array or a local array is
+checked against its bounds, on every backend, so that a bug in a kernel cannot read or write outside the
+memory it was given: a read out of range yields zero or another element, a write out of range is dropped.
+Workgroup memory starts zeroed. The checks cost a few percent of a tight kernel (the compiler leaves out
+those it can prove unnecessary). A kernel that is known to stay in range can skip the rest with the
+<code>unsafe</code> builder method <code>unchecked_bounds</code>; workgroup memory still starts zeroed, and integer division by
+zero and loops keep their guards:</p>
+<pre><code class="language-rust">use luma::*;
+
+const COPY: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; dst: array&lt;f32&gt;;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x) { return; }
+    dst[gid.x] = src[gid.x];
+}
+"#;
+
+let ctx = default_context()?;
+// SAFETY: every access is guarded by `gid.x &gt;= luma.size.x`, and both arrays have `luma.size.x` elements.
+let copy = unsafe { ctx.kernel(COPY).unchecked_bounds() }.build()?;
+let src = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let mut dst = Array::&lt;f32&gt;::zeros(3)?;
+copy.launch([3], args![&amp;src, &amp;mut dst])?;
+assert_eq!(dst.to_vec()?, vec![1.0, 2.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>An access outside the bounds of such a kernel is undefined behavior: it may read or overwrite other
+arrays, crash the process or hang the device. A kernel built with and without the call is two kernels.</p>
 <h2 id="limits"><a class="header" href="#limits">Limits</a></h2>
 <ul>
 <li>Kernel arguments must be arrays that fit one buffer; an array split over several buffers
@@ -3637,20 +3927,24 @@ model still chooses between recomputing and materialising).</p>
 <h3 id="reading-a-source-through-a-texture"><a class="header" href="#reading-a-source-through-a-texture">Reading a source through a texture</a></h3>
 <p>The same model decides where a kernel reads a two-dimensional source (<code>jit::cost::read_path</code>): from
 the buffer (on NVIDIA GPUs through the read-only data cache, which a <code>read</code> binding gets on its own)
-or through the device’s texture units, as exact gathers. A texture is a view of the source:
-free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
-where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
-saving is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX
-3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
-28-36 %, none for <code>resize</code>, smooth positions and nearest: those kernels are bound by DRAM), and a
-texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
-per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
-kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
-or data-dependent coordinates (single <code>take</code>s, lookup tables, four-tap bilinear footprints written
-as array operations, clamped windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on
-both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
-indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
-and on CUDA the kernels above are measurably faster; <code>Profile</code> shows no extra launch.</p>
+or through the device’s texture units, as exact gathers. A texture is a view of the source: on CUDA the
+buffer itself as a pitched texture (no copy when its base is 512-byte aligned and its rows a multiple of
+32 bytes apart, kept with the array while its buffer stays where it is; otherwise one copy into a CUDA
+array), on wgpu a copy of the image (a read and a write of it and a launch, made per use). The saving
+is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX 3090 and an RTX
+3080 Laptop: bicubic warps and scattered bicubic positions about 25 %, bilinear warps 5-13 %, none for
+<code>resize</code>, smooth positions or scattered bilinear positions: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (nothing for a view of the
+buffer itself; for a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers).
+The decision is made for the NVIDIA tuning profile, where it was measured. The kernels the fusion planner
+builds never read through a texture: gathers from a 2-D array at computed or data-dependent coordinates
+(single <code>take</code>s, lookup tables, four-tap bilinear footprints written as array operations, clamped
+windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on both GPUs, because they are bound by
+DRAM or by index arithmetic, and the planner sees flat indices, not a footprint a gather could take. So
+on wgpu, Metal (which has no textures) and the CPU backend the sources are read from buffers, and on CUDA
+the kernels above are measurably faster; <code>Profile</code> shows no extra launch. The one case where luma reads a
+texture without the model is the opt-in <code>Interp::LinearHardware</code>, the texture unit’s own bilinear filter
+(<a href="#reading-a-source-through-the-texture-units">Interpolation</a>); luma never chooses it.</p>
 <p>The model also sizes loops: <a href="#launch-sizing"><code>iterate_all</code></a> cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular <code>shift</code> of an expression
 is recomputed, staged, or evaluated first.</p>
@@ -3667,8 +3961,9 @@ becomes the load of that kernel.</p>
 <tr><th>Primitive</th><th>Computed inside the kernel</th><th>When it runs</th></tr>
 </thead>
 <tbody>
-<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
-<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads of the shader kernels; the CUDA backend’s own <code>f32</code> kernels and the CPU backend’s native product evaluate a lazy operand first, once, and read transposes of stored arrays in place</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops; on wgpu an axis reduction of fewer than 524288 cells is recorded when called); otherwise eager: the result is evaluated when the call returns. <code>var_axis</code> and <code>std_axis</code> are one pass (sum and sum of squares of the line minus its first element)</td></tr>
+<tr><td><code>sum</code>, <code>min</code>, <code>max</code>, <code>prod</code>, <code>mean</code>, <code>sum_where</code>, … (whole-array reductions)</td><td>the operand, in the first pass</td><td><code>f32</code>, <code>u32</code> and <code>i32</code>: pending until its value is read or used, then recorded together with the other pending reductions of the same length that read what it reads (or are small), up to 16 accumulators per kernel (<code>LUMA_MULTI_REDUCE=off</code> or a number); each keeps its own combine order, so the value is the one it has alone. On CUDA a group is recorded reduction by reduction until its structure has been seen 4 times (<code>LUMA_MULTI_REDUCE_AFTER</code>), while the merged kernel compiles in the background</td></tr>
 <tr><td><code>solve_tridiagonal</code>, <code>solve_tridiagonal_parts</code>, <code>solve_block_tridiagonal_parts</code></td><td>each pending block/vector entry is computed where a cell’s system is loaded</td><td>eager: the solution is evaluated when the call returns</td></tr>
 <tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
 <tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>quantiles</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort (<code>sort_axis</code> of lines of up to 2048 elements evaluates its operand first)</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
@@ -3725,10 +4020,19 @@ and an expression with the same shape built again costs the host only the flatte
 operations on the same operands are one node (hash-consing).</li>
 <li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, the native CPU backend’s compiled machine code, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
 driver; the native Metal backend keeps none between processes. Repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
-<code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
+<code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored. The CPU blobs and the
+CUDA PTX are also keyed by a hash of the sources that generate them (the code generators, the CPU
+math-table ABI, the packet math routines, the planners), so a build whose code generation differs from the
+one that wrote a cached kernel never loads it; the first run after an upgrade compiles again. The cache
+files of the wgpu backend have format number 2, so files written by earlier versions are read as absent
+and rewritten once.</li>
 <li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
 earlier program, and after two such calls the GPU starts before the step is traced
 (<a href="#calling-it-again">Loops</a>).</li>
+<li><strong>Plans of eager evaluation</strong>: an <code>eval</code> whose pending graph has the structure of an earlier one runs
+that evaluation’s recorded launches over the new buffers and scalars (128 plans per context;
+<code>LUMA_PLAN_CACHE=off</code> disables it, results are bit-identical either way,
+<a href="#loops-with-eval">Loops</a>).</li>
 <li><strong>Buffers</strong>: freed arrays go to a pool of idle buffers (up to half of the memory budget), so a
 program that cycles through gigabytes of temporaries reuses them instead of allocating again.</li>
 </ul>
@@ -3743,7 +4047,7 @@ program that cycles through gigabytes of temporaries reuses them instead of allo
 <tr><td><code>iterate_all</code> of an elementwise <code>f32</code> or <code>u32</code> step</td><td>none</td><td>one kernel, state in registers, launches of about 40 ms</td></tr>
 <tr><td><code>iterate</code> of a 1-D or 2-D stencil</td><td>none</td><td>time-blocked: several steps per pass over memory</td></tr>
 <tr><td><code>iterate_until</code>, <code>iterate_until_all</code></td><td>none</td><td>the stop rule runs on the GPU; one wait per block of steps; a block is one graph replay on CUDA, Metal and the CPU backend</td></tr>
-<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps (a register loop, or a stencil of up to four arrays evaluated together); never waits</td></tr>
+<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps (a register loop, or a stencil of up to four arrays evaluated together); never waits; a step of the same structure as an earlier one skips planning (the plan cache, <code>LUMA_PLAN_CACHE</code>)</td></tr>
 <tr><td>readback every step (<code>max().item()?</code>)</td><td>a GPU round trip</td><td>speculation hides it when the step repeats</td></tr>
 </tbody>
 </table>
@@ -3751,6 +4055,39 @@ program that cycles through gigabytes of temporaries reuses them instead of allo
 <p>Prefer the primitives when the step fits them (<a href="#loops">Loops</a>). Otherwise <code>eval</code> each step
 instead of reading, and <code>sync</code> once at the end. A readback in the loop (a convergence test) is the
 most expensive way: replace it with <code>iterate_until_all</code>, or test every k steps.</p>
+<h3 id="the-host-cost-of-an-eager-step"><a class="header" href="#the-host-cost-of-an-eager-step">The host cost of an eager step</a></h3>
+<p>A loop that records a step and evaluates it every iteration (<code>u = step(&amp;u); u.eval()?</code>) spends its host
+time in building the graph, one node per operation, and in planning it. Two things bound it. The plan
+cache (<a href="#loops-with-eval">Loops</a>) skips flattening, cutting and judging when the pending graph
+has the structure of an earlier evaluation; on an RTX 3090 (CUDA) the per-step cases of the <code>cfd</code>
+benchmarks went from 6.60 to 4.33 ms (<code>euler/3d_per_step</code>) and from 3.49 to 2.44 ms
+(<code>muscl/3d_per_step</code>), and the graph building that remains is 160-190 us of the 200-240 us of a 3-D step.
+<code>LUMA_PLAN_CACHE=off</code> turns the cache off. Building itself costs a few thousand instructions per node:
+operations are passed by reference, the table that makes equal operations one node and the list of live
+nodes are per thread, the id set every node keeps of the expression below it is merged with POPCNT / AVX2
+loops chosen at run time, and the buffer of that set is reused by the next node. An unrolled expression
+of about 10 000 operations (24 Keccak rounds written out) takes 3.4 ms of host time to record for 4096
+messages on an RTX 3090. A step of thousands of operations still pays for each of them every step, so the
+loop primitives, which trace the step once, are the cheaper form where they fit.</p>
+<h3 id="matrix-products-1"><a class="header" href="#matrix-products-1">Matrix products</a></h3>
+<p>On a CUDA device with tensor cores (compute capability 8.0 and up) <code>matmul</code> runs in TF32 by default: the
+operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so results differ from
+the exact <code>f32</code> product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::tf32_matmul(false)</code>
+or <code>LUMA_TF32_MATMUL=0</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
+<code>matmul_tf32</code> forces TF32 (<a href="#tensor-cores-tf32">Tensor cores</a>). <code>matmul_batched</code> is always <code>f32</code>.
+Other backends compute <code>f32</code> products as before. A product whose output is small and whose <code>K</code> is long (a
+Gram matrix, a gradient <code>Xᵀr</code>) runs as a kernel family with no workgroup staging, and <code>matmul_nt</code>,
+<code>matmul_tn</code> and <code>matmul_tt</code> read a transposed operand in place instead of copying it.</p>
+<h3 id="the-cpu-backend"><a class="header" href="#the-cpu-backend">The CPU backend</a></h3>
+<p>The native <code>cpu</code> backend runs matrix products as multithreaded Rust (<code>matrixmultiply</code>, AVX-512, AVX2 + FMA
+or NEON microkernels chosen at run time) instead of compiled tile kernels: a 4096-cube product goes from
+64 to about 1100 GFLOP/s on a 32-thread Ryzen 9 7950X. <code>exp</code>, <code>ln</code>, <code>exp2</code>, <code>log2</code>, <code>sin</code>, <code>cos</code> and <code>tanh</code>
+of <code>f32</code> run as one call per 4-lane packet on x86-64 Unix (at most 2 ulp over the whole <code>f32</code> range;
+other targets keep the lanewise <code>libm</code> calls), and the line solves (<code>solve_tridiagonal*</code>,
+<code>solve_block_tridiagonal*</code>) are native Rust. A launch too small to pay for a hand-off runs on the calling
+thread, and idle workers poll for 200 microseconds before they sleep (<code>LUMA_CPU_SPIN_US</code>, <code>0</code> to sleep at
+once). Its kernels compile on a pool of threads (<code>LUMA_COMPILE_THREADS</code>, shared with the CUDA backend).</p>
 <h2 id="transfers"><a class="header" href="#transfers">Transfers</a></h2>
 <p>The GPU is fast, the way to it is not. Data crosses it at <code>Array::from_slice</code> (upload),
 <code>to_vec</code> / <code>read_into</code> / <code>item</code> (readback, which also waits), and <code>write</code>.</p>
@@ -3914,9 +4251,9 @@ kernels that took.</li>
 </ul>
 <p>In the repository:</p>
 <ul>
-<li><a href="https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs"><code>tests/euler_residual.rs</code></a>:
+<li><a href="https://github.com/flipnoteman/Luma/blob/main/tests/all/euler_residual.rs"><code>tests/all/euler_residual.rs</code></a>:
 a 2-D first-order residual with a mirror-wall ghost assignment, compared with an <code>f64</code> host
-implementation. <code>cargo test --release --test euler_residual</code>.</li>
+implementation. <code>cargo test --release --test all euler_residual</code>.</li>
 <li><a href="https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs"><code>examples/bench_pde.rs</code></a>: the
 Euler (<code>euler/*</code>) and MUSCL (<code>muscl/*</code>) solvers in a handful of variants: a step per <code>eval</code>,
 <code>cache()</code> of the padded state, <code>iterate_all</code>, <code>iterate_until_all</code>, and a hand-written
@@ -3929,7 +4266,7 @@ were cut.</li>
 instances, written only with array operations: no custom kernel, no WGSL. It is the largest
 program in the repository and the best look at the integer side of Luma.</p>
 <pre><code class="language-sh">cargo run --release --example mlkem -- --set 768 --op keygen --n 4096
-cargo test --release --test mlkem          # known answers and NIST ACVP vectors
+cargo test --release --test all mlkem          # known answers and NIST ACVP vectors
 </code></pre>
 <p>What to look at (the header of the file explains each):</p>
 <ul>
@@ -3954,7 +4291,7 @@ a pair <code>(lo, hi)</code> of <code>u32</code> arrays with one element per ins
 of 24 rounds of <code>^ &amp; | ! &lt;&lt; &gt;&gt;</code> on those arrays (<a href="#64-bit-lanes-as-pairs-of-u32">the lane rotation</a>
 is the whole of the machinery).</p>
 <pre><code class="language-sh">cargo run --release --example keccak -- --quick
-cargo test --release --test keccak
+cargo test --release --test all keccak
 </code></pre>
 <p>What to look at:</p>
 <ul>
@@ -3966,7 +4303,7 @@ step is elementwise and fits (the <code>launches/perm</code> column and the prof
 how many kernels it took). The <code>host ms</code> column is only the tracing of the step: later calls
 run from the program of the first (the header of the file explains).</li>
 <li>The profile after the table: kernels per permutation and the reasons for the cuts.</li>
-<li>The known-answer tests in <code>tests/keccak.rs</code>, and the test that a chain of eight permutations
+<li>The known-answer tests in <code>tests/all/keccak.rs</code>, and the test that a chain of eight permutations
 (about 80 000 operations) is cut into at most 60 kernels (it needs timestamp queries, and allows
 up to 120 kernels in debug builds; a device with few bindings packs the 50 state words into a
 few buffers, <a href="#many-arrays-in-one-kernel">Performance</a>).</li>
@@ -4010,8 +4347,9 @@ let category = Array::from_slice(&amp;[0u32, 1, 0, 1, 0, 1, 2, 2], rows)?;
 // Standardise the columns. `z` is a lazy expression, computed where it is used.
 let z = (&amp;table - &amp;table.mean_axis(0)) / table.std_axis(0);
 
-// Correlation matrix: the Gram matrix of `z`, fused into the product's loads.
-let corr = (z.matmul(&amp;z.transpose()) / (rows as f32)).to_vec()?;
+// Correlation matrix: the Gram matrix of `z`, fused into the product's loads. `matmul_f32` is the
+// exact f32 product; `matmul` rounds its operands to TF32 on CUDA by default.
+let corr = (z.matmul_f32(&amp;z.transpose()) / (rows as f32)).to_vec()?;
 let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
 assert!(corr.iter().zip(expected).all(|(got, want)| (got - want).abs() &lt; 1e-4));
 
@@ -4071,8 +4409,13 @@ from it, so the image is read from memory about once whatever the kernel size.</
 <p><code>medfilt1(len, border)</code>, <code>medfilt2([k0, k1], border)</code>, <code>minfilt</code> / <code>maxfilt([k0, k1], border)</code>
 (<code>minfilt3</code> / <code>maxfilt3</code> for volumes) work on <code>f32</code>, <code>i32</code> and <code>u32</code>. <code>dilate(&amp;mask)</code> and
 <code>erode(&amp;mask)</code> (<code>dilate3</code>, <code>erode3</code>) take any structuring element: the window cells where the
-mask is not zero. With <code>Border::Ignore</code> (the default of the morphological filters) cells outside
-the image do not take part.</p>
+mask is not zero. <code>dilate</code> and <code>erode</code> (and the 3-D forms) use <code>Border::Ignore</code>: cells outside the
+image do not take part; <code>dilate_with(&amp;mask, border)</code> and <code>erode_with</code> take another border. <code>Ignore</code>
+is also accepted by <code>minfilt</code> and <code>maxfilt</code> (the minimum or maximum over the cells that exist, as
+ArrayFire’s), and poisons the result for the median. A rectangular <code>minfilt</code> / <code>maxfilt</code> window of
+25 cells or more runs as two separable passes. Windows of up to 49 cells are selected in registers
+(<code>medfilt2</code> of 3 x 3 is a 19-exchange network), larger ones bit by bit; the filters compute four
+outputs per invocation.</p>
 <pre><code class="language-rust">use luma::*;
 
 let img = Array::from_slice(&amp;[1u32, 5, 2, 9, 3, 7, 4, 8, 6], [3, 3])?;
@@ -4083,11 +4426,13 @@ assert_eq!(img.dilate(&amp;cross).to_vec()?[4], 9);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="derivatives-bilateral-filter"><a class="header" href="#derivatives-bilateral-filter">Derivatives, bilateral filter</a></h2>
 <p><code>sobel()</code> returns the Sobel derivatives <code>(d0, d1)</code> along axis 0 and axis 1 from one pass over the
-image, <code>sobel_magnitude()</code> their magnitude, <code>grad()</code> the central-difference gradient (one-sided
+image (the cells outside are the nearest ones; <code>sobel_with(border)</code> takes another border),
+<code>sobel_magnitude()</code> their magnitude (<code>sobel_magnitude_fast()</code> is <code>|d0| + |d1|</code>), <code>grad()</code> the central-difference gradient (one-sided
 at the borders). <code>bilateral(spatial_sigma, range_sigma)</code> and <code>bilateral_color(..)</code> (for
 <code>[H, W, 3]</code>) are the edge-preserving smoothing filter.</p>
 <h2 id="summed-area-tables-moments-histograms"><a class="header" href="#summed-area-tables-moments-histograms">Summed-area tables, moments, histograms</a></h2>
-<p><code>sat()</code> is the double prefix sum (four lookups give the sum of any rectangle), <code>moments()</code> the raw
+<p><code>sat()</code> is the double prefix sum (four lookups give the sum of any rectangle; three launches: axis 1
+in chunks of 64 cells, the carries, a workgroup scan per column along axis 0), <code>moments()</code> the raw
 moments <code>M00 M01 M10 M11</code> of every image, <code>hist_equal(&amp;hist)</code> equalises an image with the
 histogram <code>hist</code> of its (integer valued) pixels.</p>
 <h2 id="colour"><a class="header" href="#colour">Colour</a></h2>
@@ -4137,11 +4482,18 @@ assert_eq!(corners.count(), 1);
 assert_eq!(corners.x.to_vec()?, [8.0]);
 assert_eq!(corners.y.to_vec()?, [8.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>Two passes over tiles of 32 x 8 pixels do the work: the first counts the corners of every tile
-(nothing of the score image is stored), a one-workgroup scan turns the counts into offsets and the
-second recomputes the scores and writes every tile’s points at its offset. The points come in the
-order of the tiles (tiles along axis 0 first), within a tile axis 0 first; the limit
-<code>feature_ratio</code> keeps the first points of that order.</p>
+<p>Two launches over tiles of 32 x 8 pixels do the work. The first stages a tile with its halo in
+workgroup memory, scores it (a bit-mask arc test with an early reject on the four cardinal
+pixels), suppresses the non-maxima, writes the surviving scores to an image and adds the tile’s
+count to the counts of its block of tiles and to a total by atomics. The second launch gives every
+tile the offset at which it writes (the counts of the blocks before its block plus those of the
+tiles before it, summed by the workgroup itself, so there is no scan launch) and ranks the tile’s
+points by the bit masks of its rows; a tile without points exits after reading its count. The only
+readback is the total. The points come in the order of the tiles (tiles along axis 0 first),
+within a tile axis 0 first; the limit <code>feature_ratio</code> keeps the first points of that order.
+Scores and points equal ArrayFire’s <code>fast</code> on 99.4 % of its points; the rest differ in the last
+bits or lie in the border band. On an RTX 3080 Laptop (CUDA) <code>fast</code> of a 1080p image takes
+0.22 ms against ArrayFire’s 0.29 ms and of a 4K image 0.94 ms against 1.09 ms.</p>
 <p>Differences from ArrayFire: its <code>fast</code> limits the number of corner <em>candidates</em> before the
 non-maximal suppression and lists the points row by row; on its CPU backend the suppression
 leaves out the pixels within <code>edge + 2</code> of the border and mixes up the two axes on images that
@@ -4155,7 +4507,8 @@ points, RANSAC by the number of points that land within <code>inlier_thr</code> 
 median of squares (<code>HomographyMethod::Lmeds</code>) by the median of the squared errors. It returns the
 <code>[3, 3]</code> matrix (its nine values in memory order are the rows of <code>H</code>, <code>(x', y', 1) ~ H (x, y, 1)</code>,
 scaled so that <code>H[2][2] = 1</code>) and the inlier count as a one-element <code>u32</code> array: nothing is read
-back until you ask.</p>
+back until you ask. On an RTX 3080 Laptop (CUDA) RANSAC of 1000 points and 1000 iterations takes
+0.05 ms against ArrayFire’s 1.3 ms.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x: Vec&lt;f32&gt; = (0..8).map(|i| (i * 7 % 11) as f32).collect();
@@ -4166,7 +4519,8 @@ let (h, inliers) = homography(&amp;up(&amp;x)?, &amp;up(&amp;y)?, &amp;up(&amp;x
 assert_eq!(inliers.item()?, 8);
 assert!((h.to_vec()?[2] - 3.0).abs() &lt; 1e-3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>One workgroup scores one hypothesis; the samples come from a fixed hash of the hypothesis number,
+<p>One workgroup scores one hypothesis (an 8 x 8 direct linear transform on normalised coordinates);
+a second launch picks the best. The samples come from a fixed hash of the hypothesis number,
 so a call is deterministic (ArrayFire’s differ: compare the recovered transform, not the
 matrices). As in ArrayFire the matrix is the best sample’s, not refined over its inliers.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -4201,7 +4555,8 @@ assert_eq!(corners.count(), 4);
 <li>The derivatives are the central differences <code>(in[i + 1] - in[i - 1]) / 2</code> along both axes.
 The structure tensor <code>M</code> sums their products with a separable window, and the response of a
 pixel is <code>det(M) - k_thr * trace(M)^2</code>. (Not normalised in any way: the scale is that of the
-pixel values to the fourth power, the default <code>min_response</code> of 1e5 suits pixels of 0 to 255.)</li>
+pixel values to the fourth power: ArrayFire’s default <code>min_response</code> of 1e5 suits
+pixels of 0 to 255.)</li>
 <li>The window has <code>floor(6 * sigma)</code> cells, one less if that is even, with Gaussian weights
 (<code>block_size == 0</code>, <code>sigma</code> in <code>[0.5, 5]</code>: 3 cells for <code>sigma</code> 0.5 to 0.8, 5 for 0.9 to 1.1, …).
 With <code>block_size &gt; 0</code> the window has that many cells (1 to 32): Gaussian weights of <code>sigma</code>
@@ -4340,8 +4695,9 @@ assert_eq!((index.to_vec()?, dist.to_vec()?), (vec![2, 0], vec![2, 3]));
 <p>Features are <code>f32</code> (<code>f32</code> distances), <code>u32</code> (<code>u32</code> distances, also for <code>Sad</code> and <code>Ssd</code>; unsigned
 differences, sums wrap) or <code>i32</code> (<code>i32</code> distances). Differences from ArrayFire:</p>
 <ul>
-<li>ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code> and <code>f64</code> features; luma has no arrays of the first
-three, and <code>f64</code> is not supported here.</li>
+<li>ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code> and <code>f64</code> features. luma’s matchers take <code>f32</code>, <code>u32</code>
+and <code>i32</code> only: <code>Array&lt;u8&gt;</code>, <code>Array&lt;u16&gt;</code> and <code>Array&lt;i16&gt;</code> exist (<a href="#compact-integers-u8-i8-u16-i16">Compact integers</a>)
+but are not accepted here (convert with <code>to_f32()</code> or <code>to_u32()</code>), and <code>f64</code> is not supported.</li>
 <li><code>Shd</code> is only defined for <code>u32</code>, as in ArrayFire (which rejects <code>f32</code>/<code>i32</code> for it).</li>
 <li><code>n_dist</code> is at most 256 and at most the number of train features (as in ArrayFire).</li>
 <li>Ties are broken by the smaller train index. ArrayFire’s CUDA backend does the same; its CPU
@@ -4729,6 +5085,16 @@ and signal analysis all use the same few.</p>
 </tbody>
 </table>
 </div>
+<p>Batches of <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>f64</code> and <code>Df32</code> arrays and of the compact integer types <code>u8</code>, <code>i8</code>, <code>u16</code>
+and <code>i16</code> can be pushed (<code>AccumInput</code>; <code>Covariance</code> takes <code>f32</code> batches only and <code>TopK</code> <code>f32</code>, <code>u32</code>
+or <code>i32</code>). The compact types are processed as <code>i32</code>: the cast is exact and fuses into the
+reduction, so a <code>u8</code> batch is read at one byte per element and is never widened in memory.</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::new(Fold::all());
+acc.push(&amp;Array::from_slice(&amp;[10u8, 20, 30, 200], 4)?)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.mean()?)?, vec![65.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Every accumulator has the same surface: <code>push</code> folds a batch in (nothing is read back from the
 device; the work is recorded like any other luma operation, and a batch that is a lazy
 expression such as <code>(&amp;x - &amp;y).abs()</code> is computed <em>inside</em> the accumulation kernel, never stored),
@@ -4848,8 +5214,10 @@ assert_eq!(TopK::&lt;i32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 0.0,
 <p>[<code>CoMoments</code>] folds two streams <code>x</code> and <code>y</code> of one shape (per position, like <code>Accumulator</code>);
 [<code>Covariance</code>] folds the features of one stream against each other: a batch is a
 <code>[features, samples]</code> array and the state is the mean and the <code>features x features</code> matrix of
-sums of products. A push is one full-precision <code>f32</code> matrix product of the centered batch with
-itself (never TF32), and the state is merged in <code>Df32</code> or <code>f64</code>:</p>
+sums of products. The batch is an <code>f32</code> array. The centered batches of the pushes of an epoch
+(up to <code>flush_every</code> pushes, 16 by default, <code>Covariance::with_flush_every</code>; the first epoch is one
+push) are joined along the samples, and one full-precision <code>f32</code> matrix product of the joined
+batch with itself (never TF32, a long <code>K</code>) is merged into the state, which is <code>Df32</code> or <code>f64</code>:</p>
 <pre><code class="language-rust">use luma::*;
 
 let cov = Covariance::&lt;Df32&gt;::new();
@@ -4915,11 +5283,15 @@ builder methods override them:</p>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>calibrate</code> / <code>.calibrate(on)</code></td></tr>
 <tr><td><code>LUMA_FAST_MATH</code></td><td><code>fast_math</code> / <code>.fast_math(on)</code></td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>df_fma</code> / <code>.df_fma(fused)</code></td></tr>
+<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_MULTI_REDUCE*</code>, <code>LUMA_FUSION_*</code>,
+<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_NATIVE_*</code>, <code>LUMA_OWN_GEMM</code>, <code>LUMA_HOST_FAST</code>,
+<code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_WGPU_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>, the
+dense linear algebra variables <code>LUMA_LINALG_*</code>, <code>LUMA_CHOL_*</code>, <code>LUMA_TRSV*</code>, <code>LUMA_SVD_PRECOND</code>, <code>LUMA_QR_TSQR</code>, and <code>LUMA_SAMPLER_*</code>) are
+read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>luma-bench</code> crate (last section).</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -4955,11 +5327,32 @@ builder methods override them:</p>
 <tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
 <tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
 <tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
+<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
+<tr><td><code>LUMA_MULTI_REDUCE</code></td><td><code>off</code> (or <code>1</code>) keeps every pending reduction in a kernel of its own; a number sets the most accumulators one kernel computes when several reductions of the same length are forced together (clamped to what a kernel can hold; default 16)</td></tr>
+<tr><td><code>LUMA_MULTI_REDUCE_AFTER</code></td><td>How many times a group of pending reductions is recorded one by one before the kernel that computes the group together is compiled in the background (default 4 on CUDA, 0 elsewhere: the group’s kernel is compiled at once)</td></tr>
+<tr><td><code>LUMA_NATIVE_SOLVE</code></td><td><code>off</code> runs the line solves (<code>solve_tridiagonal</code> and relatives) of a backend that has native ones (the CPU backend) as compiled shaders, like the GPU backends</td></tr>
+<tr><td><code>LUMA_NATIVE_GEMM</code></td><td><code>off</code> runs the matrix products of a backend that has native ones (the CPU backend) as compiled tile kernels, like the GPU backends</td></tr>
+<tr><td><code>LUMA_OWN_GEMM</code></td><td><code>off</code> keeps the <code>f32</code> matrix products on the shader kernels even where the backend has its own (the PTX kernels of the CUDA backend)</td></tr>
+<tr><td><code>LUMA_HOST_FAST</code></td><td><code>off</code> never runs small operations on the host; <code>on</code> is only read by the crate’s own tests. Default: operations on small arrays may run on the host on devices with zero-copy memory (never on CPU devices, while recording a loop, with <code>LUMA_CHECK_FINITE</code> or while profiling)</td></tr>
+<tr><td><code>LUMA_WGPU_DUMP</code></td><td>a directory: the wgpu backend writes the WGSL of every kernel it builds from luma’s kernel IR there, as <code>&lt;label&gt;-&lt;hash&gt;.wgsl</code>. For inspecting generated code (the counterpart of <code>LUMA_CUDA_DUMP</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_TF32</code></td><td><code>1</code>: the trailing-update products of the factorisations (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, …) run in TF32 on CUDA with compute capability 8.0 and up; the factors then carry a backward error of about 1e-3 of the updates’ entries instead of 1e-7. Default: off (exact <code>f32</code> products); other backends ignore it</td></tr>
+<tr><td><code>LUMA_CHOL_NB</code></td><td><code>32</code>, <code>64</code>, <code>96</code> or <code>128</code>: rows of the diagonal blocks of the blocked Cholesky and triangular solves. Default: the largest of 128, 64 and 32 whose kernels fit in a workgroup’s memory</td></tr>
+<tr><td><code>LUMA_CHOL_WIDE</code></td><td>Columns of a blocked Cholesky that one outer step brings up to date with one product: a multiple of the block size (<code>LUMA_CHOL_NB</code>), at least the block size; default four blocks</td></tr>
+<tr><td><code>LUMA_TRSV</code></td><td><code>0</code> keeps triangular solves with up to 32 right-hand sides off the single-launch solve kernel (one matrix, on backends that run the look-back scan, see <code>LUMA_LOOKBACK_SCAN</code>); default on</td></tr>
+<tr><td><code>LUMA_TRSV_INV</code></td><td><code>1</code>: <code>solve_triangular</code> takes the diagonal blocks as explicit inverses (the solves of <code>solve</code> and <code>solve_spd</code> always do, from <code>LUMA_TRSV_INV_MIN</code> rows on)</td></tr>
+<tr><td><code>LUMA_TRSV_INV_MIN</code></td><td>Rows from which inverted diagonal blocks are used (default 768)</td></tr>
+<tr><td><code>LUMA_TRSV_KC</code></td><td><code>1</code>, <code>2</code>, <code>4</code>, <code>8</code>, <code>16</code> or <code>32</code>: right-hand-side columns one workgroup of the triangular-solve kernel takes (default 8); more are solved by workgroups of their own</td></tr>
+<tr><td><code>LUMA_SVD_PRECOND</code></td><td><code>off</code> turns off the decomposition of a big matrix through the QR factorisation of its tall form; a number changes the smaller side from which it applies (default 1024)</td></tr>
+<tr><td><code>LUMA_SAMPLER_COARSEN</code></td><td><code>1</code>, <code>2</code> or <code>4</code>: elements per invocation of the sampling kernels (<code>approx</code>, <code>approx2</code>, …; default 2)</td></tr>
+<tr><td><code>LUMA_SAMPLER_TILE</code></td><td><code>XxY</code> with <code>X * Y = 256</code> (for example <code>32x8</code>): the workgroup of the shaped sampling kernel, <code>X</code> along dimension 0 (default <code>32x8</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
+<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
+<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="testing-variables"><a class="header" href="#testing-variables">Testing variables</a></h2>
-<p>These only affect the crate’s own test suite: the first three the differential fuzzer (<code>cargo test fuzz::</code>), the last the cache directory:</p>
+<p>These only affect the crate’s own test suite: the first three the differential fuzzer (<code>cargo test fuzz::</code>), <code>LUMA_TEST_CACHE</code> the cache directory:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -4970,9 +5363,23 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
 <tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
 <tr><td><code>LUMA_TEST_CACHE</code></td><td><code>1</code>: the process uses a cache directory under the system temporary directory (<code>luma-test-cache</code>) instead of the user’s, unless <code>LUMA_CACHE</code> or <code>LUMA_CACHE_DIR</code> is set (unit tests always do)</td></tr>
-<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
-<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
-<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
+<tr><td><code>LUMA_EXIT_ORDER_CHILD</code></td><td>Internal: marks the child process of the wgpu backend’s exit-handler-order test</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="luma-bench-variables"><a class="header" href="#luma-bench-variables">luma-bench variables</a></h2>
+<p>The <code>luma-bench</code> crate (<code>crates/luma-bench</code>) reads these:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_BENCH_REPS</code></td><td>Timed repetitions per case (default: 3 for a case slower than a second, 5 with <code>--quick</code>, 21 for one under 10 ms, otherwise 9)</td></tr>
+<tr><td><code>LUMA_BENCH_KERNELS</code></td><td>Set to anything: list the kernels of one call under each case (the <code>sparse</code> suite lists them under each of its rows)</td></tr>
+<tr><td><code>LUMA_BENCH_REF</code></td><td>Text recorded as the <code>ref</code> of every JSON result line (<code>tools/benchref.sh</code> sets it to the commit)</td></tr>
+<tr><td><code>LUMA_BENCH_SHAPES</code></td><td>Set (not on the CPU): the <code>matmul</code> suite runs its per-shape cases; <code>small</code> runs a shorter list</td></tr>
+<tr><td><code>LUMA_BENCH_TF32</code></td><td>Set (not on the CPU): the <code>matmul</code> suite compares TF32 with <code>f32</code> products; <code>small</code> runs a shorter list</td></tr>
 </tbody>
 </table>
 </div>
@@ -5028,6 +5435,14 @@ this path; calling <code>std::process::exit</code> yourself does too.</p>
 submissions of <em>other</em> devices in the process until their in-flight GPU work finishes. This
 happens once per device creation. Create your contexts up front, before starting long GPU work,
 or use one context (the default one is shared by threads).</p>
+<p><strong>Opening a context fails with <code>RequestDevice("Parent device is lost")</code>, though no device was lost.</strong>
+(wgpu backend on NVIDIA.) A process opens at most 63 or 64 Vulkan devices, however many instances it has:
+past that limit <code>vkCreateDevice</code> fails with <code>VK_ERROR_INITIALIZATION_FAILED</code>, which wgpu words that way.
+A context frees its device with its last handle (the arrays, kernels and caches of a context do not keep
+it alive, 0.5.2), and a <code>Context::new</code> on the wgpu backend that meets the limit waits up to 60 s for another
+context to give its device back and takes it. A program or a test suite that holds more than 63 contexts
+alive at the same time still fails: drop contexts you no longer use, share one context between threads, or
+run the tests with fewer threads per process.</p>
 <h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
 axis reductions), <code>matmul</code>, sorts (and what builds on them), scatters into targets of up to 4096
@@ -5099,11 +5514,25 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 <p><strong>Which matrix shape is <code>matmul</code>’s?</strong> Axis 0 varies fastest, so the shapes are NumPy’s
 <code>a @ b</code> reversed: <code>lhs</code> <code>[K, M]</code>, <code>rhs</code> <code>[N, K]</code>, result <code>[N, M]</code>
 (<a href="#matrix-products">Matrix products</a>).</p>
+<p><strong><code>matmul</code> differs from the exact <code>f32</code> product in the last digits (or by 1e-3 relative to the size of
+its terms).</strong> On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> runs on tensor cores in
+TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so
+each entry is within 1.5e-3 of the sum of the absolute values of its terms of the <code>f32</code> product (the
+precision of PyTorch’s <code>allow_tf32</code>). <code>a.matmul_f32(&amp;b)</code> is the exact product of one call;
+<code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context exact, and
+<code>Context::tf32_matmul()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
+the CPU) compute <code>f32</code> products, so results also differ between a CUDA run and one on another backend
+(<a href="#tensor-cores-tf32">Tensor cores</a>). The dense linear algebra (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, <code>svd</code>, …)
+uses <code>f32</code> products only.</p>
 <h2 id="performance-2"><a class="header" href="#performance-2">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines (wgpu), the CUDA PTX, the CPU backend’s machine code and the measured cost
 model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set
-<code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it.</p>
+<code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it. The compiled CPU code and the CUDA PTX are
+keyed by a hash of the sources that generate them, so the first run after an upgrade (or after any change
+to the code generators) compiles everything again and then caches it; a stale kernel of an older build is
+never loaded. The wgpu pipeline cache files have a format number (2 since 0.5.2): files of an older format
+are read as absent and rewritten once.</p>
 <p><strong>Context creation takes about 150 ms.</strong> That is the device calibration (once per machine; the
 result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers for the GPU kind.</p>
 <p><strong>My loop is slow.</strong> See the <a href="#performance-guide">Performance guide</a> and <a href="#loops">Loops</a>: use
@@ -5111,6 +5540,98 @@ result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers
 <code>ctx.profile(..)</code> for kernel counts and split reasons.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="migration"><a class="header" href="#migration">Migration</a></h1>
+<h2 id="from-051-to-052"><a class="header" href="#from-051-to-052">From 0.5.1 to 0.5.2</a></h2>
+<p>0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
+algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
+reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
+behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.</p>
+<h3 id="matmul-is-tf32-by-default-on-cuda"><a class="header" href="#matmul-is-tf32-by-default-on-cuda"><code>matmul</code> is TF32 by default on CUDA</a></h3>
+<p>On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> rounds its operands to TF32
+(10 bits of mantissa) and accumulates in <code>f32</code>, so results differ from the exact <code>f32</code> product (each entry
+is within 1.5e-3 of the sum of the absolute values of its terms). Other backends and older devices compute
+<code>f32</code> products as before. Where the exact product matters, call <code>matmul_f32</code> for that product, or turn TF32
+off for a context:</p>
+<pre><code class="language-rust">use luma::*;
+
+let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
+assert!(!exact.tf32_matmul());
+let a = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
+let b = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
+assert_eq!(a.matmul_f32(&amp;b).to_vec()?, a.to_vec()?);   // the exact product of one call
+assert_eq!(a.matmul(&amp;b).to_vec()?, a.to_vec()?);       // the context's `matmul` is exact too
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always <code>f32</code>
+(<a href="#tensor-cores-tf32">Tensor cores</a>).</p>
+<h3 id="api-changes-that-can-break-code-built-against-051"><a class="header" href="#api-changes-that-can-break-code-built-against-051">API changes that can break code built against 0.5.1</a></h3>
+<ul>
+<li>
+<p><strong><code>Reduction</code> has a new variant, <code>Product</code></strong> (the product of the elements, for <code>reduce</code> and
+<code>reduce_axis</code>). A <code>match</code> over <code>Reduction</code> without a wildcard needs an arm for it:</p>
+<pre><code class="language-rust">use luma::*;
+
+fn name(op: Reduction) -&gt; &amp;'static str {
+    match op {
+        Reduction::Sum =&gt; "sum",
+        Reduction::Min =&gt; "min",
+        Reduction::Max =&gt; "max",
+        Reduction::SumOfSquares =&gt; "sum of squares",
+        Reduction::Product =&gt; "product",              // new in 0.5.2
+    }
+}
+assert_eq!(name(Reduction::Product), "product");</code></pre>
+</li>
+<li>
+<p><strong>The re-exported <code>BindingKind</code> has two new variants, <code>Sampler</code> and <code>Texture2d</code></strong> (the bindings of a
+<code>sampler</code> and a <code>texture_2d&lt;f32&gt;</code> in a kernel). An exhaustive <code>match</code> over <code>luma::BindingKind</code> needs
+arms for them, or a wildcard.</p>
+</li>
+<li>
+<p><strong><code>Array&lt;f32&gt;::clamp</code> takes <code>impl Operand&lt;f32&gt;</code> bounds</strong> (an array, a reference to one, an <code>f32</code> or a
+<code>Scalar</code>) where it took two <code>f32</code>. Calls with <code>f32</code> values compile as before; a bound whose type used to
+be inferred from the <code>f32</code> parameter (<code>x.clamp(v.into(), 1.0)</code>) must now be spelled out
+(<code>x.clamp(f32::from(v), 1.0)</code>).</p>
+</li>
+</ul>
+<h3 id="for-backend-implementers"><a class="header" href="#for-backend-implementers">For backend implementers</a></h3>
+<p>These matter only to code that implements or drives the HAL crates directly (<code>luma-hal-core</code> and the
+backend crates); users of <code>Array</code> are not affected. The new <code>Backend</code> methods all have default
+implementations.</p>
+<ul>
+<li><code>Backend::compile_kernel</code> and <code>Backend::compile_naga</code> take <code>trust: luma_core::hal::KernelTrust</code>
+(<code>Checked</code>, <code>UncheckedBounds</code>, <code>Trusted</code>) where they took <code>trusted: bool</code>: pass <code>Trusted</code> for <code>true</code> and
+<code>Checked</code> for <code>false</code>. <code>UncheckedBounds</code> is the kernel of <code>unsafe KernelBuilder::unchecked_bounds</code>.</li>
+<li><code>DiskCache::load_pipelines</code> returns <code>Option&lt;PipelineBlob&gt;</code>, the cache file as read; <code>PipelineBlob::data()</code>
+is the driver’s cache data to hand to the driver, so the file is no longer copied to cut its header off.</li>
+<li><code>DeviceInfo</code> has a new field, <code>compute_units: Option&lt;u32&gt;</code>: a struct literal needs it.</li>
+<li>New variants: <code>Expr::Texture</code> in the kernel IR (<code>TextureOp::Load</code>, <code>Gather</code>, <code>Sample</code>), thirteen math
+functions in <code>IrUnOp</code> (see the enum) and <code>CudaArgAbi::Texture</code> / <code>Unbound</code>; an exhaustive <code>match</code> over
+any of them needs the new arms. A backend without textures leaves <code>Backend::texture_caps</code> at its default
+(<code>None</code>).</li>
+<li><code>luma_wgpu::emit_with</code> takes <code>hardware_f32_atomics: bool</code>; pass <code>false</code> for the compare-and-swap form
+of the <code>f32</code> atomic add, <code>true</code> where the device has <code>SHADER_FLOAT32_ATOMIC</code>.</li>
+<li><code>luma_cpu::WorkgroupPool::dispatch</code> takes a <code>&amp;CostHint</code> (the cost the pool has learned for the
+kernel, <code>CostHint::default()</code> for none), and <code>CompiledCpuKernel</code>, <code>WorkgroupCtx</code> and <code>CpuMathTable</code> have new
+public fields.</li>
+</ul>
+<h3 id="new-in-052-that-you-may-want"><a class="header" href="#new-in-052-that-you-may-want">New in 0.5.2 that you may want</a></h3>
+<ul>
+<li><a href="#fourier-transforms">Fourier transforms</a>, <a href="#complex-numbers">complex numbers</a>, <a href="#sparse-matrices">sparse matrices</a>,
+<a href="#dense-linear-algebra">dense linear algebra</a>, <a href="#images-and-filters">images and filters</a>, the
+<a href="#features-matching-and-image-analysis">vision</a> chapters, <a href="#interpolation-image-transforms-and-filters">interpolation, image transforms and filters</a> (including the
+opt-in <code>Interp::LinearHardware</code>), <a href="#incremental-accumulation">incremental accumulation</a> and
+<a href="#compact-integers-u8-i8-u16-i16">compact integers</a> (<code>Array&lt;u8&gt;</code>, <code>i8</code>, <code>u16</code>, <code>i16</code>).</li>
+<li><code>matmul_nt</code>, <code>matmul_tn</code>, <code>matmul_tt</code> and <code>dot</code>; <code>prod</code> / <code>product</code> and the <code>*_by_key</code> reductions;
+<code>sort_by_key</code>, <code>set_unique</code>, <code>set_union</code> and <code>set_intersect</code>; the elementwise functions of ArrayFire’s
+<code>arith.h</code>.</li>
+<li><code>ContextOptions::tf32_matmul</code>, <code>Context::tf32_matmul()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
+(<a href="#matrix-products-1">Performance guide</a>).</li>
+<li>The plan cache of eager evaluation (<code>LUMA_PLAN_CACHE</code>), compile worker threads (<code>LUMA_COMPILE_THREADS</code>)
+and the CPU backend’s native matrix products (<a href="#performance-guide">Performance guide</a>).</li>
+<li>A disk cache keyed by a hash of the sources that generate the code: the first run after the upgrade
+compiles every kernel again (<a href="#performance-2">FAQ</a>).</li>
+<li><code>KernelBuilder::unchecked_bounds</code> (<code>unsafe</code>) for custom kernels
+(<a href="#bounds-checks">Custom kernels</a>).</li>
+</ul>
 <h2 id="from-04-to-05"><a class="header" href="#from-04-to-05">From 0.4 to 0.5</a></h2>
 <p>0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal
 and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary

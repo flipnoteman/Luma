@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -199,11 +199,15 @@ builder methods override them:</p>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>calibrate</code> / <code>.calibrate(on)</code></td></tr>
 <tr><td><code>LUMA_FAST_MATH</code></td><td><code>fast_math</code> / <code>.fast_math(on)</code></td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>df_fma</code> / <code>.df_fma(fused)</code></td></tr>
+<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_MULTI_REDUCE*</code>, <code>LUMA_FUSION_*</code>,
+<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_NATIVE_*</code>, <code>LUMA_OWN_GEMM</code>, <code>LUMA_HOST_FAST</code>,
+<code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_WGPU_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>, the
+dense linear algebra variables <code>LUMA_LINALG_*</code>, <code>LUMA_CHOL_*</code>, <code>LUMA_TRSV*</code>, <code>LUMA_SVD_PRECOND</code>, <code>LUMA_QR_TSQR</code>, and <code>LUMA_SAMPLER_*</code>) are
+read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>luma-bench</code> crate (last section).</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -239,11 +243,32 @@ builder methods override them:</p>
 <tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
 <tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
 <tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
+<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
+<tr><td><code>LUMA_MULTI_REDUCE</code></td><td><code>off</code> (or <code>1</code>) keeps every pending reduction in a kernel of its own; a number sets the most accumulators one kernel computes when several reductions of the same length are forced together (clamped to what a kernel can hold; default 16)</td></tr>
+<tr><td><code>LUMA_MULTI_REDUCE_AFTER</code></td><td>How many times a group of pending reductions is recorded one by one before the kernel that computes the group together is compiled in the background (default 4 on CUDA, 0 elsewhere: the group’s kernel is compiled at once)</td></tr>
+<tr><td><code>LUMA_NATIVE_SOLVE</code></td><td><code>off</code> runs the line solves (<code>solve_tridiagonal</code> and relatives) of a backend that has native ones (the CPU backend) as compiled shaders, like the GPU backends</td></tr>
+<tr><td><code>LUMA_NATIVE_GEMM</code></td><td><code>off</code> runs the matrix products of a backend that has native ones (the CPU backend) as compiled tile kernels, like the GPU backends</td></tr>
+<tr><td><code>LUMA_OWN_GEMM</code></td><td><code>off</code> keeps the <code>f32</code> matrix products on the shader kernels even where the backend has its own (the PTX kernels of the CUDA backend)</td></tr>
+<tr><td><code>LUMA_HOST_FAST</code></td><td><code>off</code> never runs small operations on the host; <code>on</code> is only read by the crate’s own tests. Default: operations on small arrays may run on the host on devices with zero-copy memory (never on CPU devices, while recording a loop, with <code>LUMA_CHECK_FINITE</code> or while profiling)</td></tr>
+<tr><td><code>LUMA_WGPU_DUMP</code></td><td>a directory: the wgpu backend writes the WGSL of every kernel it builds from luma’s kernel IR there, as <code>&lt;label&gt;-&lt;hash&gt;.wgsl</code>. For inspecting generated code (the counterpart of <code>LUMA_CUDA_DUMP</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_TF32</code></td><td><code>1</code>: the trailing-update products of the factorisations (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, …) run in TF32 on CUDA with compute capability 8.0 and up; the factors then carry a backward error of about 1e-3 of the updates’ entries instead of 1e-7. Default: off (exact <code>f32</code> products); other backends ignore it</td></tr>
+<tr><td><code>LUMA_CHOL_NB</code></td><td><code>32</code>, <code>64</code>, <code>96</code> or <code>128</code>: rows of the diagonal blocks of the blocked Cholesky and triangular solves. Default: the largest of 128, 64 and 32 whose kernels fit in a workgroup’s memory</td></tr>
+<tr><td><code>LUMA_CHOL_WIDE</code></td><td>Columns of a blocked Cholesky that one outer step brings up to date with one product: a multiple of the block size (<code>LUMA_CHOL_NB</code>), at least the block size; default four blocks</td></tr>
+<tr><td><code>LUMA_TRSV</code></td><td><code>0</code> keeps triangular solves with up to 32 right-hand sides off the single-launch solve kernel (one matrix, on backends that run the look-back scan, see <code>LUMA_LOOKBACK_SCAN</code>); default on</td></tr>
+<tr><td><code>LUMA_TRSV_INV</code></td><td><code>1</code>: <code>solve_triangular</code> takes the diagonal blocks as explicit inverses (the solves of <code>solve</code> and <code>solve_spd</code> always do, from <code>LUMA_TRSV_INV_MIN</code> rows on)</td></tr>
+<tr><td><code>LUMA_TRSV_INV_MIN</code></td><td>Rows from which inverted diagonal blocks are used (default 768)</td></tr>
+<tr><td><code>LUMA_TRSV_KC</code></td><td><code>1</code>, <code>2</code>, <code>4</code>, <code>8</code>, <code>16</code> or <code>32</code>: right-hand-side columns one workgroup of the triangular-solve kernel takes (default 8); more are solved by workgroups of their own</td></tr>
+<tr><td><code>LUMA_SVD_PRECOND</code></td><td><code>off</code> turns off the decomposition of a big matrix through the QR factorisation of its tall form; a number changes the smaller side from which it applies (default 1024)</td></tr>
+<tr><td><code>LUMA_SAMPLER_COARSEN</code></td><td><code>1</code>, <code>2</code> or <code>4</code>: elements per invocation of the sampling kernels (<code>approx</code>, <code>approx2</code>, …; default 2)</td></tr>
+<tr><td><code>LUMA_SAMPLER_TILE</code></td><td><code>XxY</code> with <code>X * Y = 256</code> (for example <code>32x8</code>): the workgroup of the shaped sampling kernel, <code>X</code> along dimension 0 (default <code>32x8</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
+<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
+<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="testing-variables"><a class="header" href="#testing-variables">Testing variables</a></h2>
-<p>These only affect the crate’s own test suite: the first three the differential fuzzer (<code>cargo test fuzz::</code>), the last the cache directory:</p>
+<p>These only affect the crate’s own test suite: the first three the differential fuzzer (<code>cargo test fuzz::</code>), <code>LUMA_TEST_CACHE</code> the cache directory:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -254,9 +279,23 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
 <tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
 <tr><td><code>LUMA_TEST_CACHE</code></td><td><code>1</code>: the process uses a cache directory under the system temporary directory (<code>luma-test-cache</code>) instead of the user’s, unless <code>LUMA_CACHE</code> or <code>LUMA_CACHE_DIR</code> is set (unit tests always do)</td></tr>
-<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
-<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
-<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
+<tr><td><code>LUMA_EXIT_ORDER_CHILD</code></td><td>Internal: marks the child process of the wgpu backend’s exit-handler-order test</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="luma-bench-variables"><a class="header" href="#luma-bench-variables">luma-bench variables</a></h2>
+<p>The <code>luma-bench</code> crate (<code>crates/luma-bench</code>) reads these:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_BENCH_REPS</code></td><td>Timed repetitions per case (default: 3 for a case slower than a second, 5 with <code>--quick</code>, 21 for one under 10 ms, otherwise 9)</td></tr>
+<tr><td><code>LUMA_BENCH_KERNELS</code></td><td>Set to anything: list the kernels of one call under each case (the <code>sparse</code> suite lists them under each of its rows)</td></tr>
+<tr><td><code>LUMA_BENCH_REF</code></td><td>Text recorded as the <code>ref</code> of every JSON result line (<code>tools/benchref.sh</code> sets it to the commit)</td></tr>
+<tr><td><code>LUMA_BENCH_SHAPES</code></td><td>Set (not on the CPU): the <code>matmul</code> suite runs its per-shape cases; <code>small</code> runs a shorter list</td></tr>
+<tr><td><code>LUMA_BENCH_TF32</code></td><td>Set (not on the CPU): the <code>matmul</code> suite compares TF32 with <code>f32</code> products; <code>small</code> runs a shorter list</td></tr>
 </tbody>
 </table>
 </div>

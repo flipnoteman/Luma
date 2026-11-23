@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -279,9 +279,16 @@ no two invocations ever write one word and no atomics are needed. Kernels that c
 <code>and</code> and <code>or</code> on its word, which is also race free but slower. The CUDA and CPU backends read the
 same words; the layout is byte-identical to a plain array of <code>u8</code> or <code>i16</code>, so nothing differs
 between backends.</p>
-<p>Where it pays: memory-bound work. On an RTX 3090 (CUDA), a chain of <code>u8</code> arithmetic over 64M
-elements takes 0.17 ms where the same chain on <code>u32</code> takes 0.65 ms, and the sum of 64M <code>i16</code> takes
-0.17 ms against 0.32 ms for <code>f32</code>.</p>
+<p>Where it pays: memory-bound work. On an RTX 3080 Laptop (CUDA, 64M elements, luma-bench <code>compact</code>)
+a chain of <code>u8</code> arithmetic takes 0.38 ms where the same chain on <code>u32</code> takes 1.54 ms, the sum of
+<code>i16</code> 0.39 ms against 0.74 ms for <code>f32</code>, per-column mean and variance over the traces of a
+1024 x 65536 <code>i16</code> matrix 0.53 ms (<code>f32</code>: 0.84 ms), a transposed copy of an <code>i16</code> matrix 0.79 ms
+(<code>f32</code>: 1.51 ms), a <code>u8</code> histogram 0.34 ms (a <code>u32</code> <code>bincount</code>: 0.77 ms) and a sort of 16M <code>i16</code>
+1.29 ms (two radix passes; <code>u32</code> keys take four: 1.77 ms).</p>
+<p>Against ArrayFire’s <code>s16</code>, <code>u16</code> and <code>u8</code> arrays (same laptop, 32M <code>s16</code>; afcompare rows 16-22;
+ratios of ArrayFire’s time to luma’s): upload 0.80x (bound by the host transfer), sum 1.0x,
+cast and sum 4.7x, per-column mean and variance 7.4x, <code>u8</code> histogram (38M elements) 2.3x, <code>u16</code>
+histogram of 16384 bins 1.0x.</p>
 
                     </main>
 

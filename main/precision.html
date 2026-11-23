@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -220,9 +220,13 @@ if ctx.features().contains(luma::Features::SHADER_F64) {
     assert!(matches!(err.root(), LumaError::Unsupported(_)));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>minimum</code>, <code>maximum</code>,
-comparisons, <code>select</code>, views and reductions. Anything else (<code>exp</code>, trigonometry, generators such
-as <code>range</code>) is refused when recorded. Use <code>Df32</code> when you need a wide type on every device, or
+<p><code>f64</code> arrays have <code>+ - * /</code> and <code>%</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>,
+<code>minimum</code>, <code>maximum</code>, <code>clamp</code>, comparisons, <code>select</code>, views, reductions (<code>sum</code>, <code>min</code>, <code>max</code>,
+<code>prod</code>, <code>mean</code>, <code>var</code>, <code>std</code>) and generators such as <code>range</code>. The transcendental functions (<code>exp</code>,
+<code>ln</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>log1p</code>, <code>expm1</code>, <code>asin</code> and the other inverse and hyperbolic
+functions, <code>log2</code>, <code>log10</code>, <code>cbrt</code>, <code>erf</code>, <code>erfc</code>, <code>lgamma</code>, <code>tgamma</code>, <code>powf</code>, <code>root</code>, <code>atan2</code>,
+<code>hypot</code>, <code>copysign</code>) run on the CUDA backend (libdevice) and the CPU backend (libm); on wgpu they
+fail with <code>Unsupported</code> when recorded. Use <code>Df32</code> when you need a wide type on every device, or
 cast down to <code>f32</code> for the function.</p>
 <h2 id="df32"><a class="header" href="#df32"><code>Df32</code></a></h2>
 <p>A <code>Df32</code> is the unevaluated sum <code>hi + lo</code> of two <code>f32</code>, with <code>|lo|</code> at most half an ulp of <code>hi</code>.
@@ -257,7 +261,7 @@ and loses bits, which limits every function there: <code>exp</code> of an argume
 error of about <code>1e-38</code> (a relative error of that over the result), and a result below <code>2^-126</code> is <code>0</code>. Out of range <code>exp</code> is
 infinity above <code>88.72</code> and <code>0</code> below <code>-87.33</code>, <code>tanh</code> is <code>+-1</code> from <code>|x| &gt; 20</code>, and <code>ln</code> and <code>powf</code>
 follow <code>f32</code> (<code>ln(0)</code> is <code>-inf</code>, <code>ln</code> and <code>powf</code> of a negative base are <code>NaN</code>, <code>x^0</code> is <code>1</code>, zero
-and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have none of these functions.</p>
+and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have functions of their own, see above.</p>
 <pre><code class="language-rust">use luma::*;
 
 let t = Array::from_slice(&amp;[Df32::from(300.0), Df32::from(2000.0)], 2)?;
@@ -280,6 +284,25 @@ model’s estimate, which weighs it against staging and materialising it
 device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
 operations for the error of the product). <code>LUMA_DF_FMA</code>
 and <code>ContextOptions::df_fma</code> force either way; the results are the same, only the speed differs.</p>
+<h2 id="matrix-products-tf32"><a class="header" href="#matrix-products-tf32">Matrix products: TF32</a></h2>
+<p><code>matmul</code> on a CUDA device with tensor cores (compute capability 8.0 and up) runs in TF32 by
+default: the operands are rounded to a 10-bit mantissa (the exponent keeps <code>f32</code>’s 8 bits) and the
+products are accumulated in <code>f32</code>, so each entry is within 1.5e-3 of the sum of the absolute
+values of its terms of the <code>f32</code> product (the precision of PyTorch’s <code>allow_tf32</code>). Everything else computes the <code>f32</code> product: other backends, products whose
+<code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and <code>matmul_batched</code>, which is always
+<code>f32</code>. Where the digits matter:</p>
+<ul>
+<li><code>a.matmul_f32(&amp;b)</code> is the exact <code>f32</code> product of one call (fused multiply-adds over <code>k</code> in a
+fixed order, so results are reproducible);</li>
+<li><code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context
+that product (<code>Context::tf32_matmul()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
+whatever the context says.</li>
+</ul>
+<p>The dense factorisations and solves (<a href="linear-algebra.html">Dense linear algebra</a>) do not follow the
+context setting: their update products are <code>matmul_f32</code>. Only the update products of Cholesky and
+the blocked triangular solves can take tensor cores, with the opt-in environment variable
+<code>LUMA_LINALG_TF32=1</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
+<code>f32</code>, never TF32 (<a href="accumulators.html">Incremental accumulation</a>).</p>
 <h2 id="casts"><a class="header" href="#casts">Casts</a></h2>
 <pre><code class="language-rust">use luma::*;
 

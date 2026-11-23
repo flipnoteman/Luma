@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -187,8 +187,10 @@ Luma records it, fuses chains of elementwise operations into a single kernel, an
 on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through <a href="https://wgpu.rs">wgpu</a>). If
 no GPU opens it falls back to a native SIMD CPU backend.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
-products, group-bys, sorts and statistics of data-analysis tools. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, the matrix
+products, group-bys, sorts and statistics of data-analysis tools, and the signal, image and linear-algebra
+routines that ArrayFire users expect (FFTs, sparse and dense linear algebra, filters, feature detection,
+interpolation). You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 <a href="custom-kernels.html">custom WGSL kernel</a> runs in the same batch as the built-in operations.</p>
 <p>This guide explains how to use the library and why it behaves as it does. The
@@ -240,6 +242,11 @@ location of the operation that failed.</li>
 <li><a href="lazy.html">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
 <li><a href="data.html">Matrices, statistics and grouping</a>: <code>matmul</code>, axis statistics, scatter-add, histograms, sort, group-by, quantiles.</li>
 <li><a href="sparse.html">Sparse matrices</a>: <code>Sparse</code> in CSR, CSC and COO, conversions, sparse-dense products, elementwise operations.</li>
+<li><a href="fft.html">Fourier transforms</a> and <a href="complex.html">complex numbers</a>: <code>C32</code> arrays, FFTs of any length over any axes, FFT convolution.</li>
+<li><a href="linear-algebra.html">Dense linear algebra</a>: Cholesky, LU, QR, SVD, symmetric eigenproblem, solves and least squares, on matrices and batches.</li>
+<li><a href="signal.html">Interpolation, image transforms and filters</a>, <a href="images.html">Images and filters</a> and <a href="vision.html">Features, matching and image analysis</a>: warps, convolution, rank filters, colour spaces, corner and blob detectors, descriptors, matching.</li>
+<li><a href="accumulators.html">Incremental accumulation</a>: statistics of data that arrives in batches, kept as mergeable states on the device.</li>
+<li><a href="loops.html">Loops</a>, <a href="custom-kernels.html">Custom kernels</a> and the <a href="performance.html">Performance guide</a>: time stepping, your own WGSL, and how to see what Luma did.</li>
 <li><a href="examples.html">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
 <li><a href="environment.html">Environment variables</a> and the <a href="faq.html">FAQ</a> when something does not behave.</li>
 </ul>

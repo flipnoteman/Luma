@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -217,8 +217,13 @@ from it, so the image is read from memory about once whatever the kernel size.</
 <p><code>medfilt1(len, border)</code>, <code>medfilt2([k0, k1], border)</code>, <code>minfilt</code> / <code>maxfilt([k0, k1], border)</code>
 (<code>minfilt3</code> / <code>maxfilt3</code> for volumes) work on <code>f32</code>, <code>i32</code> and <code>u32</code>. <code>dilate(&amp;mask)</code> and
 <code>erode(&amp;mask)</code> (<code>dilate3</code>, <code>erode3</code>) take any structuring element: the window cells where the
-mask is not zero. With <code>Border::Ignore</code> (the default of the morphological filters) cells outside
-the image do not take part.</p>
+mask is not zero. <code>dilate</code> and <code>erode</code> (and the 3-D forms) use <code>Border::Ignore</code>: cells outside the
+image do not take part; <code>dilate_with(&amp;mask, border)</code> and <code>erode_with</code> take another border. <code>Ignore</code>
+is also accepted by <code>minfilt</code> and <code>maxfilt</code> (the minimum or maximum over the cells that exist, as
+ArrayFire’s), and poisons the result for the median. A rectangular <code>minfilt</code> / <code>maxfilt</code> window of
+25 cells or more runs as two separable passes. Windows of up to 49 cells are selected in registers
+(<code>medfilt2</code> of 3 x 3 is a 19-exchange network), larger ones bit by bit; the filters compute four
+outputs per invocation.</p>
 <pre><code class="language-rust">use luma::*;
 
 let img = Array::from_slice(&amp;[1u32, 5, 2, 9, 3, 7, 4, 8, 6], [3, 3])?;
@@ -229,11 +234,13 @@ assert_eq!(img.dilate(&amp;cross).to_vec()?[4], 9);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="derivatives-bilateral-filter"><a class="header" href="#derivatives-bilateral-filter">Derivatives, bilateral filter</a></h2>
 <p><code>sobel()</code> returns the Sobel derivatives <code>(d0, d1)</code> along axis 0 and axis 1 from one pass over the
-image, <code>sobel_magnitude()</code> their magnitude, <code>grad()</code> the central-difference gradient (one-sided
+image (the cells outside are the nearest ones; <code>sobel_with(border)</code> takes another border),
+<code>sobel_magnitude()</code> their magnitude (<code>sobel_magnitude_fast()</code> is <code>|d0| + |d1|</code>), <code>grad()</code> the central-difference gradient (one-sided
 at the borders). <code>bilateral(spatial_sigma, range_sigma)</code> and <code>bilateral_color(..)</code> (for
 <code>[H, W, 3]</code>) are the edge-preserving smoothing filter.</p>
 <h2 id="summed-area-tables-moments-histograms"><a class="header" href="#summed-area-tables-moments-histograms">Summed-area tables, moments, histograms</a></h2>
-<p><code>sat()</code> is the double prefix sum (four lookups give the sum of any rectangle), <code>moments()</code> the raw
+<p><code>sat()</code> is the double prefix sum (four lookups give the sum of any rectangle; three launches: axis 1
+in chunks of 64 cells, the carries, a workgroup scan per column along axis 0), <code>moments()</code> the raw
 moments <code>M00 M01 M10 M11</code> of every image, <code>hist_equal(&amp;hist)</code> equalises an image with the
 histogram <code>hist</code> of its (integer valued) pixels.</p>
 <h2 id="colour"><a class="header" href="#colour">Colour</a></h2>

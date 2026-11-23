@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -232,6 +232,14 @@ this path; calling <code>std::process::exit</code> yourself does too.</p>
 submissions of <em>other</em> devices in the process until their in-flight GPU work finishes. This
 happens once per device creation. Create your contexts up front, before starting long GPU work,
 or use one context (the default one is shared by threads).</p>
+<p><strong>Opening a context fails with <code>RequestDevice("Parent device is lost")</code>, though no device was lost.</strong>
+(wgpu backend on NVIDIA.) A process opens at most 63 or 64 Vulkan devices, however many instances it has:
+past that limit <code>vkCreateDevice</code> fails with <code>VK_ERROR_INITIALIZATION_FAILED</code>, which wgpu words that way.
+A context frees its device with its last handle (the arrays, kernels and caches of a context do not keep
+it alive, 0.5.2), and a <code>Context::new</code> on the wgpu backend that meets the limit waits up to 60 s for another
+context to give its device back and takes it. A program or a test suite that holds more than 63 contexts
+alive at the same time still fails: drop contexts you no longer use, share one context between threads, or
+run the tests with fewer threads per process.</p>
 <h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
 axis reductions), <code>matmul</code>, sorts (and what builds on them), scatters into targets of up to 4096
@@ -303,11 +311,25 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 <p><strong>Which matrix shape is <code>matmul</code>’s?</strong> Axis 0 varies fastest, so the shapes are NumPy’s
 <code>a @ b</code> reversed: <code>lhs</code> <code>[K, M]</code>, <code>rhs</code> <code>[N, K]</code>, result <code>[N, M]</code>
 (<a href="data.html#matrix-products">Matrix products</a>).</p>
+<p><strong><code>matmul</code> differs from the exact <code>f32</code> product in the last digits (or by 1e-3 relative to the size of
+its terms).</strong> On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> runs on tensor cores in
+TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so
+each entry is within 1.5e-3 of the sum of the absolute values of its terms of the <code>f32</code> product (the
+precision of PyTorch’s <code>allow_tf32</code>). <code>a.matmul_f32(&amp;b)</code> is the exact product of one call;
+<code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context exact, and
+<code>Context::tf32_matmul()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
+the CPU) compute <code>f32</code> products, so results also differ between a CUDA run and one on another backend
+(<a href="data.html#tensor-cores-tf32">Tensor cores</a>). The dense linear algebra (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, <code>svd</code>, …)
+uses <code>f32</code> products only.</p>
 <h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines (wgpu), the CUDA PTX, the CPU backend’s machine code and the measured cost
 model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set
-<code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it.</p>
+<code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it. The compiled CPU code and the CUDA PTX are
+keyed by a hash of the sources that generate them, so the first run after an upgrade (or after any change
+to the code generators) compiles everything again and then caches it; a stale kernel of an older build is
+never loaded. The wgpu pipeline cache files have a format number (2 since 0.5.2): files of an older format
+are read as absent and rewritten once.</p>
 <p><strong>Context creation takes about 150 ms.</strong> That is the device calibration (once per machine; the
 result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers for the GPU kind.</p>
 <p><strong>My loop is slow.</strong> See the <a href="performance.html">Performance guide</a> and <a href="loops.html">Loops</a>: use

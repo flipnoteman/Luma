@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -261,6 +261,14 @@ ctx.sync()?;                 // wait once, at the end
 assert!((u.to_vec()?[0] - 1.0).abs() &lt; 1e-3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Errors the GPU raises while running a batch show up at the next call that waits.</p>
+<h3 id="the-host-cost-of-a-step"><a class="header" href="#the-host-cost-of-a-step">The host cost of a step</a></h3>
+<p>Building an expression costs host time per operation (one node each), and evaluating it flattens the
+graph, cuts it where the cost model says and launches. A loop that evaluates a step of the same
+structure every iteration (<code>u = step(&amp;u); u.eval()?</code>) does not plan it every time: the plan cache runs the
+launches the first evaluation recorded over the new buffers and scalar values, with bit-identical results
+(<code>LUMA_PLAN_CACHE=off</code> switches it off; <a href="loops.html#loops-with-eval">Loops</a>). Only the building of the
+expression stays, and the <a href="loops.html">loop primitives</a> avoid that as well by tracing the step once.
+<a href="performance.html#the-host-cost-of-an-eager-step">Performance guide</a> has the numbers.</p>
 <h2 id="what-fuses"><a class="header" href="#what-fuses">What fuses</a></h2>
 <p>Fused into the kernel that reads them: all elementwise operations, comparisons, <code>select</code>, casts,
 generators (<code>range</code>, <code>linspace</code>, <code>uniform</code>), <a href="views.html">views</a> (<code>slice</code>, <code>pad</code>, <code>flip</code>,
@@ -275,7 +283,9 @@ and your own kernels. They read the arrays they are given, which are computed fi
 the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
 instead of storing it, and <code>matmul</code>, the line solves, the sorts and the axis reductions of types other than <code>f32</code> (and of <code>f32</code> while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
-(<a href="performance.html#primitives-that-read-an-expression">Performance guide</a>).</p>
+(<a href="performance.html#primitives-that-read-an-expression">Performance guide</a>). Whole-array reductions (<code>sum</code>,
+<code>max</code>, <code>sum_where</code>, …) of <code>f32</code>, <code>u32</code> and <code>i32</code> stay pending until their value is read or used, and
+those forced together are recorded in one kernel (up to 16 accumulators; <code>LUMA_MULTI_REDUCE</code>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
 cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where

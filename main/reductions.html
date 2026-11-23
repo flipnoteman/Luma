@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -212,7 +212,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 </thead>
 <tbody>
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
-<tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
+<tr><td><code>mean()</code>, <code>norm()</code></td><td><code>mean</code> for <code>f32</code> and <code>f64</code>, <code>norm</code> for <code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
 <tr><td><code>prod()</code> / <code>product()</code></td><td>the product; NaN if any element is NaN, <code>u32</code> / <code>i32</code> products wrap around</td></tr>
 <tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code>, <code>Product</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
 <tr><td><code>norm_p(Norm)</code></td><td><code>One</code>, <code>Two</code>, <code>Inf</code>, <code>P(p)</code>, <code>Frobenius</code> and the matrix <code>MatrixOne</code> / <code>MatrixInf</code> norms, <code>f32</code> (<code>f64</code> except <code>P</code>)</td></tr>
@@ -247,6 +247,15 @@ if ctx.profiling_supported() {
 expression to a partial result, and a second that combines the partials (on CUDA the last workgroup of the first pass finishes the reduction in one launch). An array small enough
 for one workgroup takes one. Float sums combine in trees (see the <code>Array::sum</code> documentation), so the
 error stays far below that of a sequential sum.</p>
+<p>Reductions that are pending when one of them is needed are recorded together. When a reduction is
+recorded (its value is read, used on the GPU or evaluated with <code>eval_all</code>), the other live, unrecorded
+<code>f32</code>, <code>u32</code> and <code>i32</code> reductions of the same length that read what it reads (or are small) go into
+the same kernel, up to 16 accumulators per kernel (<code>LUMA_MULTI_REDUCE</code>, see
+<a href="environment.html">Environment variables</a>): one program computes their operands together, so what
+they share is computed and read once. Every reduction keeps its own combine order, so its value is
+the bits it has when recorded alone. The axis reductions of <code>f32</code> (<code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>,
+<code>reduce_axis</code> and what is built on them) stay pending the same way and are recorded in one kernel
+(up to 8 ops).</p>
 <h3 id="epilogues"><a class="header" href="#epilogues">Epilogues</a></h3>
 <p>For <code>f32</code> reductions, elementwise operations <em>with scalars</em> on the result extend the reduction
 instead of creating an expression: the last pass applies them. <code>norm()</code> is <code>SumOfSquares</code> followed by a

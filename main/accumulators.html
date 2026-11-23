@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -205,6 +205,16 @@ and signal analysis all use the same few.</p>
 </tbody>
 </table>
 </div>
+<p>Batches of <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>f64</code> and <code>Df32</code> arrays and of the compact integer types <code>u8</code>, <code>i8</code>, <code>u16</code>
+and <code>i16</code> can be pushed (<code>AccumInput</code>; <code>Covariance</code> takes <code>f32</code> batches only and <code>TopK</code> <code>f32</code>, <code>u32</code>
+or <code>i32</code>). The compact types are processed as <code>i32</code>: the cast is exact and fuses into the
+reduction, so a <code>u8</code> batch is read at one byte per element and is never widened in memory.</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::new(Fold::all());
+acc.push(&amp;Array::from_slice(&amp;[10u8, 20, 30, 200], 4)?)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.mean()?)?, vec![65.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Every accumulator has the same surface: <code>push</code> folds a batch in (nothing is read back from the
 device; the work is recorded like any other luma operation, and a batch that is a lazy
 expression such as <code>(&amp;x - &amp;y).abs()</code> is computed <em>inside</em> the accumulation kernel, never stored),
@@ -324,8 +334,10 @@ assert_eq!(TopK::&lt;i32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 0.0,
 <p>[<code>CoMoments</code>] folds two streams <code>x</code> and <code>y</code> of one shape (per position, like <code>Accumulator</code>);
 [<code>Covariance</code>] folds the features of one stream against each other: a batch is a
 <code>[features, samples]</code> array and the state is the mean and the <code>features x features</code> matrix of
-sums of products. A push is one full-precision <code>f32</code> matrix product of the centered batch with
-itself (never TF32), and the state is merged in <code>Df32</code> or <code>f64</code>:</p>
+sums of products. The batch is an <code>f32</code> array. The centered batches of the pushes of an epoch
+(up to <code>flush_every</code> pushes, 16 by default, <code>Covariance::with_flush_every</code>; the first epoch is one
+push) are joined along the samples, and one full-precision <code>f32</code> matrix product of the joined
+batch with itself (never TF32, a long <code>K</code>) is merged into the state, which is <code>Df32</code> or <code>f64</code>:</p>
 <pre><code class="language-rust">use luma::*;
 
 let cov = Covariance::&lt;Df32&gt;::new();

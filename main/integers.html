@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-732ff444.js"></script>
@@ -185,7 +185,9 @@
 <p><code>Array&lt;u32&gt;</code> is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
 bit operations of a hash function; <code>u32</code> arithmetic wraps. <code>Array&lt;i32&gt;</code> is the signed one
-(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons.</p>
+(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons. The 8-bit and 16-bit integers (<code>u8</code>, <code>i8</code>, <code>u16</code>,
+<code>i16</code>) are stored in one or two bytes per element and have their own chapter,
+<a href="compact.html">Compact integers</a>.</p>
 <h2 id="arithmetic"><a class="header" href="#arithmetic">Arithmetic</a></h2>
 <p><code>+ - * / %</code> work on <code>u32</code> arrays and <code>u32</code> scalars, and wrap modulo <code>2^32</code> where a Rust
 <code>wrapping_*</code> would. Division and remainder by an element that is zero follow WGSL: <code>x / 0</code> is <code>x</code>
