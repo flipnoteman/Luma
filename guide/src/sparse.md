@@ -45,8 +45,13 @@ form of an all-zero matrix).
 
 ## Conversions and the transpose
 
-`to_format` converts between the three formats (a stable sort by the new major index, one `u32`
-sort and a gather); `to_dense` scatters the entries into zeros. `transpose` is free: the transpose
+`to_format` converts between the three formats: a stable sort of the entries by the new major index
+(CSR to CSC and back keep the entries of a row, or a column, in order), done as two radix sorts of
+the index that carry the other index and the value along (`ceil(log2 n)` bits for `n` rows or
+columns, so three 8-bit passes where 32 bits took four), with the offsets taken
+as a `searchsorted` of the sorted keys; `from_triplets` into a compressed format is the same sort.
+In the afcompare sparse rows CSR to CSC takes 1.34 ms on an RTX 3090, 1.96 times the speed of
+cuSPARSE's `csr2csc` (2.62 ms before 0.5.2), and 2.98 ms on an RTX 3080 Laptop, 1.81 times. `to_dense` scatters the entries into zeros. `transpose` is free: the transpose
 of a CSR matrix is the CSC matrix with the same arrays, and COO swaps its two index arrays.
 
 ## Products
@@ -70,8 +75,8 @@ assert_eq!(a.matmul_t(&y).to_vec()?, vec![1.0, 0.0, 8.0]);
 CSR `A x` and CSC `A^T x` (the product whose output runs along the compressed axis) run on kernels
 written for the format: for a vector, a thread (or a few lanes) per row when the rows are short, a
 kernel that takes tiles of 512 consecutive entries whatever the row lengths are (the balance of a
-merge-path product; a second small pass completes the rows that cross tiles) when some are long;
-for a dense matrix
+merge-path product: every invocation loads its run of four entries as one `vec4`; a second small
+pass completes the rows that cross tiles) when some are long; for a dense matrix
 one invocation per output element walks its row, reading `c` adjacent elements of `x` together,
 and the few very long rows of a power-law graph are cut in pieces summed by a workgroup each. No
 atomics are used, so the results are the same on every run. The first product of any other
@@ -84,6 +89,6 @@ finds the first row of every tile. A pending expression as `x` is evaluated firs
 ## Elementwise operations
 
 `mul_dense` and `div_dense` keep the pattern of the sparse matrix and give a sparse result;
-`mul_scalar`, `div_scalar`, `neg` (and the operators `*`, `/`, `-` with `f32`) do too. Sums and
-differences with a dense matrix (`add_dense`, `sub_dense`, `rsub_dense`) and with a scalar
-(`add_scalar`) fill the zeros, so their results are dense arrays.
+`mul_scalar`, `div_scalar`, `neg` (and the operators `*` and `/` with `f32`, and unary `-`) do
+too. Sums and differences with a dense matrix (`add_dense`, `sub_dense`, `rsub_dense`) and with a
+scalar (`add_scalar`, `sub_scalar`) fill the zeros, so their results are dense arrays.

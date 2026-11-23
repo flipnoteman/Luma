@@ -18,6 +18,9 @@
 //! * **Default device**: arrays and kernels are created on a lazily opened global
 //!   [`default_context`]; every constructor has an `_on(&ctx, ..)` form for an explicit
 //!   [`Context`].
+//! * **Backends**: with [`BackendKind::Auto`] a context opens CUDA, then Metal, then wgpu (Vulkan,
+//!   Metal, DX12); [`ContextOptions::backend`], the `Context::cuda` / `metal` / `wgpu` / `cpu`
+//!   constructors and `LUMA_BACKEND` choose one, and [`Context::backend`] says which opened.
 //! * **CPU fallback**: without a GPU the context opens the native `cpu` backend (SIMD code on
 //!   the host's threads); `LUMA_DEVICE=cpu` or [`Context::cpu`] force it. Software Vulkan
 //!   adapters such as llvmpipe are never used. [`Context::device`] says which device runs. See [`DeviceKind`].
@@ -37,6 +40,19 @@
 //! * **Incremental accumulation**: [`Accumulator`], [`CoMoments`], [`Covariance`], [`Histogram`],
 //!   [`Histogram2d`] and [`TopK`] fold batches that arrive over time into mergeable states on the
 //!   GPU; see the guide chapter "Incremental accumulation".
+//! * **Linear algebra and signals**: [`C32`] arrays with FFTs of any length over any axes,
+//!   [`Sparse`] matrices (CSR, CSC, COO) with sparse-dense products, dense `f32` factorizations and
+//!   solves ([`Lu`], [`Qr`], [`Svd`], [`Eigh`], Cholesky, least squares), interpolation and warps
+//!   ([`Interp`]), and FIR / IIR filters.
+//! * **Images and vision**: convolutions and rank filters ([`ConvSpec`], [`Border`]), colour spaces
+//!   ([`ColorSpace`]), and feature detection and matching (`fast`, `harris`, `orb`, `sift`, `canny`,
+//!   `match_template`, connected components; points come back as [`Keypoints`]).
+//! * **Element types**: `f32`, `u32`, `i32`, `bool`, compact integers (`u8`, `i8`, `u16`, `i16`),
+//!   [`Df32`] (double-float) and `f64` where the device has it.
+//! * **Matrix products**: [`Array::matmul`] runs on tensor cores in TF32 on CUDA devices of compute
+//!   capability 8.0 and up (results differ from the exact product by TF32 rounding);
+//!   [`ContextOptions::tf32_matmul`] or `LUMA_TF32_MATMUL=0` turns that off for a context and
+//!   [`Array::matmul_f32`] is the exact product of one call.
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
 // exceeds the default limit on recent nightlies (future-compat lint
@@ -58,6 +74,8 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/fft.md")]
+    pub mod fft {}
     #[doc = include_str!("../guide/src/sparse.md")]
     pub mod sparse {}
     #[doc = include_str!("../guide/src/linear-algebra.md")]

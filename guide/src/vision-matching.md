@@ -76,8 +76,9 @@ assert_eq!((index.to_vec()?, dist.to_vec()?), (vec![2, 0], vec![2, 3]));
 Features are `f32` (`f32` distances), `u32` (`u32` distances, also for `Sad` and `Ssd`; unsigned
 differences, sums wrap) or `i32` (`i32` distances). Differences from ArrayFire:
 
-* ArrayFire also takes `u8`, `u16`, `i16` and `f64` features; luma has no arrays of the first
-  three, and `f64` is not supported here.
+* ArrayFire also takes `u8`, `u16`, `i16` and `f64` features. luma's matchers take `f32`, `u32`
+  and `i32` only: `Array<u8>`, `Array<u16>` and `Array<i16>` exist ([Compact integers](compact.md))
+  but are not accepted here (convert with `to_f32()` or `to_u32()`), and `f64` is not supported.
 * `Shd` is only defined for `u32`, as in ArrayFire (which rejects `f32`/`i32` for it).
 * `n_dist` is at most 256 and at most the number of train features (as in ArrayFire).
 * Ties are broken by the smaller train index. ArrayFire's CUDA backend does the same; its CPU

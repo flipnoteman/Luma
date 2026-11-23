@@ -134,9 +134,9 @@ What to look at:
 
 In the repository:
 
-- [`tests/euler_residual.rs`](https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs):
+- [`tests/all/euler_residual.rs`](https://github.com/flipnoteman/Luma/blob/main/tests/all/euler_residual.rs):
   a 2-D first-order residual with a mirror-wall ghost assignment, compared with an `f64` host
-  implementation. `cargo test --release --test euler_residual`.
+  implementation. `cargo test --release --test all euler_residual`.
 - [`examples/bench_pde.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs): the
   Euler (`euler/*`) and MUSCL (`muscl/*`) solvers in a handful of variants: a step per `eval`,
   `cache()` of the padded state, `iterate_all`, `iterate_until_all`, and a hand-written
@@ -153,7 +153,7 @@ program in the repository and the best look at the integer side of Luma.
 
 ```sh
 cargo run --release --example mlkem -- --set 768 --op keygen --n 4096
-cargo test --release --test mlkem          # known answers and NIST ACVP vectors
+cargo test --release --test all mlkem          # known answers and NIST ACVP vectors
 ```
 
 What to look at (the header of the file explains each):
@@ -182,7 +182,7 @@ is the whole of the machinery).
 
 ```sh
 cargo run --release --example keccak -- --quick
-cargo test --release --test keccak
+cargo test --release --test all keccak
 ```
 
 What to look at:
@@ -195,7 +195,7 @@ What to look at:
   how many kernels it took). The `host ms` column is only the tracing of the step: later calls
   run from the program of the first (the header of the file explains).
 - The profile after the table: kernels per permutation and the reasons for the cuts.
-- The known-answer tests in `tests/keccak.rs`, and the test that a chain of eight permutations
+- The known-answer tests in `tests/all/keccak.rs`, and the test that a chain of eight permutations
   (about 80 000 operations) is cut into at most 60 kernels (it needs timestamp queries, and allows
   up to 120 kernels in debug builds; a device with few bindings packs the 50 state words into a
   few buffers, [Performance](performance.md#many-arrays-in-one-kernel)).
@@ -245,8 +245,9 @@ let category = Array::from_slice(&[0u32, 1, 0, 1, 0, 1, 2, 2], rows)?;
 // Standardise the columns. `z` is a lazy expression, computed where it is used.
 let z = (&table - &table.mean_axis(0)) / table.std_axis(0);
 
-// Correlation matrix: the Gram matrix of `z`, fused into the product's loads.
-let corr = (z.matmul(&z.transpose()) / (rows as f32)).to_vec()?;
+// Correlation matrix: the Gram matrix of `z`, fused into the product's loads. `matmul_f32` is the
+// exact f32 product; `matmul` rounds its operands to TF32 on CUDA by default.
+let corr = (z.matmul_f32(&z.transpose()) / (rows as f32)).to_vec()?;
 let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
 assert!(corr.iter().zip(expected).all(|(got, want)| (got - want).abs() < 1e-4));
 

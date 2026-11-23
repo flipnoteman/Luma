@@ -10,7 +10,7 @@ arrays. The first dimension is the fastest, as everywhere in Luma. They run on e
 the grid points `0, 1, .., n - 1` and interpolates them at the positions `pos`. Positions below
 `0`, above `n - 1` and NaN give `off_grid`. `approx2` does the same along dimensions 0 and 1
 with two position arrays. `Interp` is `Nearest`, `Lower` (floor),
-`Linear`, `Cosine`, `Cubic` and `CubicSpline` (Catmull-Rom); in two dimensions `Linear` is
+`Linear`, `Cosine`, `Cubic` and `CubicSpline` (Catmull-Rom), and `LinearHardware` (below); in two dimensions `Linear` is
 bilinear and `Cubic` bicubic. Further dimensions are batches: positions with extent 1 along
 them are shared by the whole batch. `approx1_uniform` and `approx2_uniform` take the dimension
 and the `start` and `step` of the grid (the sample `i` sits at `start + step * i`).
@@ -28,6 +28,15 @@ assert_eq!(x.approx1(&pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 2.0,
 Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
 them in registers. The input and the positions are evaluated first and must fit one buffer.
 
+The kernel of `approx1`, `approx2`, `resize`, `rotate` and `transform` is built for the method, the
+kind of source (positions, a scaled grid, an affine or projective warp) and the number of grid
+dimensions: they are constants of its source, so a launch runs none of the branches over them. On
+wgpu the generic kernel is used instead: the driver contracts the products of a kernel with folded
+constants differently for a texture read and a buffer read (up to 8e-7 on a bicubic gather), and
+the generic one gives the same bits for both. `resize` takes several output rows per invocation
+(one or two when it shrinks, eight or sixteen when it enlarges), and an `approx1` output is cut
+in tiles of one row of 256 invocations.
+
 ### Reading a source through the texture units
 
 A kernel that reads a two-dimensional image at positions it computes (`approx2`, `resize`,
@@ -41,15 +50,19 @@ texture, a view that costs nothing and is kept with the array) the gather takes 
 `rotate` / `transform` and `approx2` at scattered positions, 5-13 % off a bilinear one, and it is
 chosen for those; kernels bound by memory (`approx2` at smooth positions, `resize`) keep the loads.
 A backend that has to copy the source to
-make a texture (wgpu) reads the buffer, as does the CPU backend, which has no textures.
-Nothing in the API changes and the choice is not configurable.
+make a texture (wgpu) reads the buffer, as do the CPU and Metal backends, which have no textures.
+Only a source that is one two-dimensional slice (extent 1 along dimensions 2 and 3, sampled
+along dimensions 0 and 1) can be read through a texture. Nothing in the API changes and the
+choice is not configurable.
 
 `Interp::LinearHardware` is the explicit opt-in to the texture unit's own bilinear *filter*: one
 fetch per output, but the hardware keeps 8 bits of the fraction of a position (the weights are
 multiples of 1/256), so along each axis a result is off from `Interp::Linear`'s by up to the
-difference of the two neighbouring samples over 256. Luma never chooses it. Where the source cannot
-be a texture (more than two dimensions, the CPU backend, a width the device cannot read in place on
-a copying backend) it is exactly `Interp::Linear`.
+difference of the two neighbouring samples over 256. Luma never chooses it. It acts in two-dimensional
+sampling (`approx2`, `resize`, `rotate`, `transform`); `approx1` reads it as `Interp::Linear`. Where
+the source cannot be a texture (more than one two-dimensional slice, a width the device cannot
+bind as a texture, the CPU and Metal backends, which have no textures) it is exactly
+`Interp::Linear`. On wgpu the source is copied into a texture for every launch.
 
 ## Images
 

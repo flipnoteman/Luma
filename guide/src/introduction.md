@@ -6,8 +6,10 @@ on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through [wgpu](ht
 no GPU opens it falls back to a native SIMD CPU backend.
 
 It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
-products, group-bys, sorts and statistics of data-analysis tools. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, the matrix
+products, group-bys, sorts and statistics of data-analysis tools, and the signal, image and linear-algebra
+routines that ArrayFire users expect (FFTs, sparse and dense linear algebra, filters, feature detection,
+interpolation). You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 [custom WGSL kernel](custom-kernels.md) runs in the same batch as the built-in operations.
 
@@ -70,6 +72,11 @@ Three things to notice:
 - [Lazy evaluation and fusion](lazy.md): when kernels run, `eval`, `flush`, `sync`, `cache`.
 - [Matrices, statistics and grouping](data.md): `matmul`, axis statistics, scatter-add, histograms, sort, group-by, quantiles.
 - [Sparse matrices](sparse.md): `Sparse` in CSR, CSC and COO, conversions, sparse-dense products, elementwise operations.
+- [Fourier transforms](fft.md) and [complex numbers](complex.md): `C32` arrays, FFTs of any length over any axes, FFT convolution.
+- [Dense linear algebra](linear-algebra.md): Cholesky, LU, QR, SVD, symmetric eigenproblem, solves and least squares, on matrices and batches.
+- [Interpolation, image transforms and filters](signal.md), [Images and filters](images.md) and [Features, matching and image analysis](vision.md): warps, convolution, rank filters, colour spaces, corner and blob detectors, descriptors, matching.
+- [Incremental accumulation](accumulators.md): statistics of data that arrives in batches, kept as mergeable states on the device.
+- [Loops](loops.md), [Custom kernels](custom-kernels.md) and the [Performance guide](performance.md): time stepping, your own WGSL, and how to see what Luma did.
 - [Worked examples](examples.md): heat equation, Euler solver, ML-KEM, CPA.
 - [Environment variables](environment.md) and the [FAQ](faq.md) when something does not behave.
 

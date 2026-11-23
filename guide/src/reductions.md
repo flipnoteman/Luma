@@ -31,7 +31,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | Method | Result |
 | --- | --- |
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
-| `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
+| `mean()`, `norm()` | `mean` for `f32` and `f64`, `norm` for `f32`; the norm is the Euclidean (L2) norm |
 | `prod()` / `product()` | the product; NaN if any element is NaN, `u32` / `i32` products wrap around |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares`, `Product` (one to four) in one pass, as an `N`-element array |
 | `norm_p(Norm)` | `One`, `Two`, `Inf`, `P(p)`, `Frobenius` and the matrix `MatrixOne` / `MatrixInf` norms, `f32` (`f64` except `P`) |
@@ -70,6 +70,16 @@ A large array takes at most two launches: a first pass in which every workgroup 
 expression to a partial result, and a second that combines the partials (on CUDA the last workgroup of the first pass finishes the reduction in one launch). An array small enough
 for one workgroup takes one. Float sums combine in trees (see the `Array::sum` documentation), so the
 error stays far below that of a sequential sum.
+
+Reductions that are pending when one of them is needed are recorded together. When a reduction is
+recorded (its value is read, used on the GPU or evaluated with `eval_all`), the other live, unrecorded
+`f32`, `u32` and `i32` reductions of the same length that read what it reads (or are small) go into
+the same kernel, up to 16 accumulators per kernel (`LUMA_MULTI_REDUCE`, see
+[Environment variables](environment.md)): one program computes their operands together, so what
+they share is computed and read once. Every reduction keeps its own combine order, so its value is
+the bits it has when recorded alone. The axis reductions of `f32` (`sum_axis`, `min_axis`, `max_axis`,
+`reduce_axis` and what is built on them) stay pending the same way and are recorded in one kernel
+(up to 8 ops).
 
 ### Epilogues
 

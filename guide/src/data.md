@@ -53,6 +53,25 @@ assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 
 # Ok::<(), luma::LumaError>(())
 ```
 
+`matmul_nt`, `matmul_tn` and `matmul_tt` (and the functions of the same names) are the products
+with the right, the left or both operands transposed, written for the row-major matrices of NumPy:
+`a.matmul_nt(&b)` is `A Bᵀ`, `a.matmul_tn(&b)` is `Aᵀ B` and `a.matmul_tt(&b)` is `Aᵀ Bᵀ`. The
+shapes are those of the stored matrices (`matmul_nt`: `a` is `[K, M]`, `b` is `[K, N]`), the result
+is `[N, M]`, and the backend's own gemm kernels read a stored operand in place, with no transposed
+copy; an operand that is an expression is evaluated first. The precision is that of `matmul`.
+`a.dot(&b)` is the dot product of two arrays of one shape as a lazy one-element array, `(a * b).sum()`
+in one fused reduction:
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?; // [[1, 2, 3], [4, 5, 6]]
+assert_eq!(a.matmul_nt(&a).to_vec()?, vec![14.0, 32.0, 32.0, 77.0]); // A Aᵀ
+assert_eq!(a.matmul_tn(&a).to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]); // Aᵀ A
+assert_eq!(a.dot(&a).item()?, 91.0);
+# Ok::<(), luma::LumaError>(())
+```
+
 `a.matmul_batched(&b)` multiplies a batch of matrices in one launch (`matmul` in a loop is one launch
 per product). The batch is axis 2 of both operands: `a` is `[K, M, B]`, `b` is `[N, K, B]` and the
 result `[N, M, B]`. An operand without the batch (`[N, K]`) is shared by every product, as the
@@ -88,7 +107,7 @@ one call (a chain of fused multiply-adds in a fixed order per entry), and
 that product. `matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always
 `f32`. On CUDA the `f32` product has kernels of its own for the shapes above (an RTX 3090: 23
 TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
-are fused into the shader kernel as before. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
+are evaluated once first and go through the same kernels. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
 backend (wgpu, Metal, the CPU), compute the `f32` product, so the same program runs everywhere
 and differs only by the rounding where tensor cores are used. Transposed operands are read in
 place; other lazy operands are evaluated first, where the `f32` kernels fuse them.
@@ -139,7 +158,7 @@ assert!(matches!(a.matmul(&b).to_vec(), Err(LumaError::Op { .. })));
 ## Statistics along an axis
 
 `reduce_axis(axis, [ops])` computes one to four reductions (`Reduction::Sum`, `Min`, `Max`,
-`SumOfSquares`) along an axis in **one pass**: every element is read once for all of them. It
+`SumOfSquares`, `Product`) along an axis in **one pass**: every element is read once for all of them. It
 returns an array of results, one per op, each with extent 1 along `axis`. A pending operand is
 computed inside the pass and never stored.
 
@@ -162,8 +181,10 @@ count, `u32`), `min_axis` and `max_axis` only.
 
 For `f32`, `mean_axis`, `var_axis` and `std_axis` give the mean, the **population** variance
 (divisor `n`, NumPy's `ddof = 0`) and its square root. They are lazy expressions on top of the
-reductions, so they broadcast back against the array. `var_axis` is two-pass (the mean, then the
-mean of squared deviations), which keeps it accurate for data far from zero:
+reductions, so they broadcast back against the array. `var_axis` is one pass: the sum and the sum of
+squares of the elements minus the first element of each line (subtracted inside the reduction) come
+from one `reduce_axis`, and the variance is `(S2 - S1 * S1 / n) / n`, clamped at 0 (NaN is kept). The
+shift keeps it accurate for data far from zero:
 
 ```rust
 use luma::*;
@@ -173,7 +194,7 @@ assert_eq!(x.mean_axis(0).to_vec()?, vec![2.5, 15.0]);
 assert_eq!(x.var_axis(0).to_vec()?, vec![1.25, 25.0]);
 assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 
-// Far from zero the two-pass variance is still right.
+// Far from zero the shifted one-pass variance is still right.
 let y = Array::from_slice(&[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() < 1e-3);
 # Ok::<(), luma::LumaError>(())
@@ -338,6 +359,32 @@ take the radix sort of the whole array followed by a regrouping by line (and, al
 than 0, a tiled transpose back to the layout). `sort_axis` returns the NaNs as the positive quiet NaN,
 like `sort`.
 
+`sort_by_key(&values)` sorts the keys (`u32`, `i32` or `f32`, ordered as above) and moves the
+elements of `values`, an array of the same shape and any element type, with them: it returns
+`(keys, values)`, stably, in flat order. `sort_by_key_descending(&values)` is the exact reverse by
+key, and `sort_by_key_axis(axis, &values)` and `sort_by_key_axis_descending(axis, &values)` sort every
+line along an axis independently. Values of 4 bytes (`u32`, `i32`, `f32`) travel through the radix
+passes with their keys, one pass reading and writing both; other types are gathered by the
+permutation of an `argsort`.
+
+```rust
+use luma::*;
+
+let keys = Array::from_slice(&[3u32, 1, 3, 2], 4)?;
+let names = Array::from_slice(&[10.0f32, 11.0, 12.0, 13.0], 4)?;
+let (k, v) = keys.sort_by_key(&names);
+assert_eq!(k.to_vec()?, vec![1, 2, 3, 3]);
+assert_eq!(v.to_vec()?, vec![11.0, 13.0, 10.0, 12.0]); // the two keys 3 keep their order
+# Ok::<(), luma::LumaError>(())
+```
+
+On the CUDA backend `sort`, `argsort`, `sort_by_key` and what is built on them run as a single-sweep
+radix sort (as CUB's onesweep): one kernel counts the digits of all four passes in one read of the
+keys, and each pass is one kernel that finds where its tile's keys go by a decoupled look-back over
+the tiles before it, so a sort is 6 launches instead of 16. Where the device does not order memory
+across workgroups (wgpu, the CPU backend) the count, scan and scatter passes are unchanged. The
+results are the same on every backend.
+
 ## Groups
 
 `group_sum`, `group_min`, `group_max`, `group_mean` and `group_count` reduce the elements that
@@ -394,6 +441,30 @@ assert_eq!(val.max_segments(&ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
+### Runs of equal keys
+
+`scan_by_key(&keys, axis, op)` is the inclusive scan of an associative operator (as `scan`) that
+restarts at every run of equal consecutive keys along `axis`: the keys are `u32`, `i32` or `f32`, of
+the shape of the values, and equal keys that are apart are different runs (NaN keys are runs of one
+element). `scan_by_key_exclusive(&keys, axis, identity, op)` is the exclusive form (the first element
+of every run is `identity`) and `cumsum_by_key(&keys, axis)` the running sum. The results are the
+same on every run. `sum_by_key`, `min_by_key`, `max_by_key`, `product_by_key`, `count_by_key`,
+`any_true_by_key` and `all_true_by_key` reduce every run of equal consecutive keys and return the
+first key of each run with the result, both one-dimensional with one element per run (ArrayFire's
+`*ByKey`); the number of runs depends on the data, so they read it back and synchronise once.
+
+```rust
+use luma::*;
+
+let keys = Array::from_slice(&[1u32, 1, 2, 2, 2, 1], 6)?;
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], 6)?;
+assert_eq!(x.cumsum_by_key(&keys, 0).to_vec()?, vec![1.0, 3.0, 3.0, 7.0, 12.0, 6.0]);
+let (first_keys, sums) = x.sum_by_key(&keys)?;
+assert_eq!(first_keys.to_vec()?, vec![1, 2, 1]);
+assert_eq!(sums.to_vec()?, vec![3.0, 12.0, 6.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
 ## Unique values
 
 `factorize()` returns the sorted distinct values of an array (flat, one dimension) and, shaped
@@ -422,6 +493,40 @@ assert_eq!(u[1], 1.0);
 assert!(u[2].is_nan());
 # Ok::<(), luma::LumaError>(())
 ```
+
+### Sets
+
+`x.set_unique(is_sorted)`, `a.set_union(&b, is_unique)` and `a.set_intersect(&b, is_unique)`
+(ArrayFire's `setUnique`, `setUnion`, `setIntersect`) work on `u32`, `i32` and `f32` arrays taken in
+flat order and return sorted, distinct elements as one-dimensional arrays (as for `factorize`, all
+NaNs are one value, `-0.0` and `+0.0` one, written as `+0.0`). `is_sorted` and `is_unique` are
+ArrayFire's hints: `is_sorted` says the array is already ascending, `is_unique` that both arrays are
+ascending and without duplicates, which skips the sorts (a wrong claim gives an unspecified
+result). `set_intersect` returns `None` when the arrays have nothing in common. The result size
+depends on the data, so each of them synchronises once.
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[5u32, 1, 3, 3, 9], 5)?;
+let b = Array::from_slice(&[3u32, 4, 5, 5], 4)?;
+assert_eq!(a.set_unique(false)?.to_vec()?, vec![1, 3, 5, 9]);
+assert_eq!(a.set_union(&b, false)?.to_vec()?, vec![1, 3, 4, 5, 9]);
+assert_eq!(a.set_intersect(&b, false)?.unwrap().to_vec()?, vec![3, 5]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Union and intersection are a merge of the two sorted arrays: the unsorted forms sort both first, and
+with `is_unique` they are the merge alone. On CUDA the merge (`src/setmerge.rs`) is two launches and
+one 4-byte readback (a partition of the merged order into tiles, then one kernel that merges a tile,
+counts what it keeps, finds its first output slot by a decoupled look-back and writes coalesced).
+Measured for sorted distinct `u32` arrays of 3 181 963 elements each, against ArrayFire 3.10.1
+(interleaved): on an RTX 3090 `set_union` takes 0.086 ms (was 0.175; ArrayFire 0.098) and
+`set_intersect` 0.076 ms (was 0.149; ArrayFire 0.080), on an RTX 3080 Laptop 0.162 ms (was 0.312;
+ArrayFire 0.177) and 0.127 ms (was 0.268; ArrayFire 0.137); the unsorted forms take 0.58 / 1.16 ms
+(union) and 0.57 / 1.12 ms (intersection) on the two GPUs. `set_unique` is a sort, a mark of the
+first of every run and a compaction. Other backends, and `LUMA_LOOKBACK_SCAN=off`, run the merge as
+the three kernels (partition, count, write) and a scan, with the same results.
 
 ## Quantiles
 
@@ -774,6 +879,15 @@ let v = Array::from_slice(&[1.0f32, 2.0], 2)?;
 assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
 # Ok::<(), luma::LumaError>(())
 ```
+
+`lower` and `upper` of a stored matrix read only the half they keep: a `select` by a mask of the
+coordinates between an input and another value is lowered as a branch when not reading the input
+saves enough, and the zeroed half is only written (an RTX 3090: `lower` of a 4096 x 4096 matrix takes
+0.132 ms against ArrayFire's 0.131, 0.185 ms before; an RTX 3080 Laptop 0.290 against 0.290, 0.383
+before). A kernel that reads through a wrapping view such as `tile` computes 4 elements per
+invocation on a long grid (a 4 x 4 tile of 1024 x 1024 takes 0.098 ms on an RTX 3090, 0.117 before,
+ArrayFire 0.108; 0.209 ms on an RTX 3080 Laptop, 0.249 before, ArrayFire 0.227). `iota` counts exactly for
+`u32`, `i32`, `f64` and `Df32`; an `f32` one rounds above `2^24`.
 
 A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
 with `InvalidShape` (as `diff1` does for an extent below 2).

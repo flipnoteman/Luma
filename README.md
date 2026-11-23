@@ -32,7 +32,7 @@ use luma::*;
 fn main() -> Result<()> {
     let x = Array::from_slice(&[1.0f32, 2.0, 0.0, 2.0, 1.0, 1.0, 0.0, 0.0, 3.0, 4.0, 2.0, 1.0], [3, 4])?;
     let gram = x.transpose().matmul(&x);              // XᵀX, [3, 3]; the transpose is read inside the kernel
-    let variance = x.var_axis(0);                      // per row, in two passes
+    let variance = x.var_axis(0);                      // per row, in one pass
 
     let codes = Array::from_slice(&[0u32, 1, 0, 1], 4)?;
     let price = Array::from_slice(&[10.0f32, 20.0, 30.0, 50.0], 4)?;
@@ -57,15 +57,20 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice`, `pad`, `flip`, `transpose`, `swap_axes`, `permute_axes` (`ViewMut` `_mut` forms for writes), `take`, `put`, `concat`, `stack`, `broadcast_to`
-- Reductions: sum, min, max, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`); `scan` / `cumsum`; `solve_tridiagonal`
+- Reductions: sum, min, max, product, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`; pending reductions that are forced together run in one kernel); `scan` / `cumsum`, `scan_by_key` and the `*_by_key` reductions; `solve_tridiagonal`
 - Data-science primitives: `matmul` (TF32 tensor cores on CUDA by default, `matmul_f32` for full precision), `matmul_batched`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile`, `quantiles` and `median`; `searchsorted` / `digitize` / `isin`; NaN-aware reductions (`nansum`, `nanmean`, `nanmin`, `nanmax`); `round`, `trunc`, `log1p`, `expm1`. Pending operands are computed inside their kernels instead of being stored first
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
+- Complex arrays (`C32`) and FFTs on every backend: `fft` / `ifft`, 2-D and 3-D, over any axes, real-input `rfft` / `irfft`, any length, `fft_convolve1` / `2` / `3`
+- Sparse matrices (`Sparse<f32>` in CSR, CSC and COO, conversions, sparse-dense `matmul`) and dense linear algebra for `f32` matrices and batches: `cholesky`, `lu`, `qr`, `solve`, `lstsq`, `inverse`, `det`, `svd`, `pinv`, `rank`, `eigh`
+- Images and filters: `conv2` / `conv3`, separable, median, rank and morphological filters, `sobel`, `bilateral`, `sat`, colour-space conversions, `unwrap` / `wrap` (im2col / col2im), `fir` / `iir`; interpolation and warps (`approx1`, `approx2`, `resize`, `rotate`, `transform`; the sampling kernels read through the texture units of NVIDIA GPUs where the cost model says it pays, and `Interp::LinearHardware` is the opt-in for the texture filter)
+- Vision: `fast`, `harris`, `susan`, `dog`, `orb`, `sift`, `gloh`, `canny`, `anisotropic_diffusion`, `mean_shift`, `match_template`, nearest-neighbour and Hamming matchers, connected components, `homography`
+- Incremental accumulation (`Accumulator`, `CoMoments`, `Covariance`, `Histogram`, `TopK`): statistics of data that arrives in batches, folded on the device into mergeable, serializable states
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
 - Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
 - Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers; `iterate_until` / `iterate_until_all` stop on a device-side condition (`compile_until_all` traces that loop once for solvers that run it in chunks)
-- Ability to use custom WGSL kernels
+- Ability to use custom WGSL kernels (`Context::kernel`; bounds-checked unless built with the `unsafe` `unchecked_bounds`)
 - Subgroups and `f16` on GPUs that support them; cooperative matrices (tensor cores) on the wgpu backend
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
 - Useful error handling
@@ -137,7 +142,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 ### Environment variables
 
-Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
+Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, `LUMA_TF32_MATMUL=0` (exact `f32` `matmul` on CUDA; TF32 tensor cores are the default), and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
 
 ### Examples
 

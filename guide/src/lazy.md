@@ -95,6 +95,16 @@ assert!((u.to_vec()?[0] - 1.0).abs() < 1e-3);
 
 Errors the GPU raises while running a batch show up at the next call that waits.
 
+### The host cost of a step
+
+Building an expression costs host time per operation (one node each), and evaluating it flattens the
+graph, cuts it where the cost model says and launches. A loop that evaluates a step of the same
+structure every iteration (`u = step(&u); u.eval()?`) does not plan it every time: the plan cache runs the
+launches the first evaluation recorded over the new buffers and scalar values, with bit-identical results
+(`LUMA_PLAN_CACHE=off` switches it off; [Loops](loops.md#loops-with-eval)). Only the building of the
+expression stays, and the [loop primitives](loops.md) avoid that as well by tracing the step once.
+[Performance guide](performance.md#the-host-cost-of-an-eager-step) has the numbers.
+
 ## What fuses
 
 Fused into the kernel that reads them: all elementwise operations, comparisons, `select`, casts,
@@ -111,7 +121,9 @@ and your own kernels. They read the arrays they are given, which are computed fi
 the sorts are kernels of their own too, but they compute a pending operand *inside* their loads
 instead of storing it, and `matmul`, the line solves, the sorts and the axis reductions of types other than `f32` (and of `f32` while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
-([Performance guide](performance.md#primitives-that-read-an-expression)).
+([Performance guide](performance.md#primitives-that-read-an-expression)). Whole-array reductions (`sum`,
+`max`, `sum_where`, ...) of `f32`, `u32` and `i32` stay pending until their value is read or used, and
+those forced together are recorded in one kernel (up to 16 accumulators; `LUMA_MULTI_REDUCE`).
 
 An expression is cut into several kernels when it would grow past a limit (`LUMA_FUSION_MAX_NODES`,
 `LUMA_FUSION_MAX_LIVE`, `LUMA_FUSION_MAX_INLINED`) or when evaluating a shared piece first is

@@ -1,5 +1,104 @@
 # Migration
 
+## From 0.5.1 to 0.5.2
+
+0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
+algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
+reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
+behaviour changes without a compile error: `matmul` runs in TF32 on CUDA devices with tensor cores.
+
+### `matmul` is TF32 by default on CUDA
+
+On a CUDA device of compute capability 8.0 or higher (Ampere and later) `matmul` rounds its operands to TF32
+(10 bits of mantissa) and accumulates in `f32`, so results differ from the exact `f32` product (each entry
+is within 1.5e-3 of the sum of the absolute values of its terms). Other backends and older devices compute
+`f32` products as before. Where the exact product matters, call `matmul_f32` for that product, or turn TF32
+off for a context:
+
+```rust
+use luma::*;
+
+let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
+assert!(!exact.tf32_matmul());
+let a = Array::from_slice_on(&exact, &[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
+let b = Array::from_slice_on(&exact, &[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
+assert_eq!(a.matmul_f32(&b).to_vec()?, a.to_vec()?);   // the exact product of one call
+assert_eq!(a.matmul(&b).to_vec()?, a.to_vec()?);       // the context's `matmul` is exact too
+# Ok::<(), luma::LumaError>(())
+```
+
+`matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always `f32`
+([Tensor cores](data.md#tensor-cores-tf32)).
+
+### API changes that can break code built against 0.5.1
+
+- **`Reduction` has a new variant, `Product`** (the product of the elements, for `reduce` and
+  `reduce_axis`). A `match` over `Reduction` without a wildcard needs an arm for it:
+
+  ```rust
+  use luma::*;
+
+  fn name(op: Reduction) -> &'static str {
+      match op {
+          Reduction::Sum => "sum",
+          Reduction::Min => "min",
+          Reduction::Max => "max",
+          Reduction::SumOfSquares => "sum of squares",
+          Reduction::Product => "product",              // new in 0.5.2
+      }
+  }
+  assert_eq!(name(Reduction::Product), "product");
+  ```
+
+- **The re-exported `BindingKind` has two new variants, `Sampler` and `Texture2d`** (the bindings of a
+  `sampler` and a `texture_2d<f32>` in a kernel). An exhaustive `match` over `luma::BindingKind` needs
+  arms for them, or a wildcard.
+- **`Array<f32>::clamp` takes `impl Operand<f32>` bounds** (an array, a reference to one, an `f32` or a
+  `Scalar`) where it took two `f32`. Calls with `f32` values compile as before; a bound whose type used to
+  be inferred from the `f32` parameter (`x.clamp(v.into(), 1.0)`) must now be spelled out
+  (`x.clamp(f32::from(v), 1.0)`).
+
+### For backend implementers
+
+These matter only to code that implements or drives the HAL crates directly (`luma-hal-core` and the
+backend crates); users of `Array` are not affected. The new `Backend` methods all have default
+implementations.
+
+- `Backend::compile_kernel` and `Backend::compile_naga` take `trust: luma_core::hal::KernelTrust`
+  (`Checked`, `UncheckedBounds`, `Trusted`) where they took `trusted: bool`: pass `Trusted` for `true` and
+  `Checked` for `false`. `UncheckedBounds` is the kernel of `unsafe KernelBuilder::unchecked_bounds`.
+- `DiskCache::load_pipelines` returns `Option<PipelineBlob>`, the cache file as read; `PipelineBlob::data()`
+  is the driver's cache data to hand to the driver, so the file is no longer copied to cut its header off.
+- `DeviceInfo` has a new field, `compute_units: Option<u32>`: a struct literal needs it.
+- New variants: `Expr::Texture` in the kernel IR (`TextureOp::Load`, `Gather`, `Sample`), thirteen math
+  functions in `IrUnOp` (see the enum) and `CudaArgAbi::Texture` / `Unbound`; an exhaustive `match` over
+  any of them needs the new arms. A backend without textures leaves `Backend::texture_caps` at its default
+  (`None`).
+- `luma_wgpu::emit_with` takes `hardware_f32_atomics: bool`; pass `false` for the compare-and-swap form
+  of the `f32` atomic add, `true` where the device has `SHADER_FLOAT32_ATOMIC`.
+- `luma_cpu::WorkgroupPool::dispatch` takes a `&CostHint` (the cost the pool has learned for the
+  kernel, `CostHint::default()` for none), and `CompiledCpuKernel`, `WorkgroupCtx` and `CpuMathTable` have new
+  public fields.
+
+### New in 0.5.2 that you may want
+
+- [Fourier transforms](fft.md), [complex numbers](complex.md), [sparse matrices](sparse.md),
+  [dense linear algebra](linear-algebra.md), [images and filters](images.md), the
+  [vision](vision.md) chapters, [interpolation, image transforms and filters](signal.md) (including the
+  opt-in `Interp::LinearHardware`), [incremental accumulation](accumulators.md) and
+  [compact integers](compact.md) (`Array<u8>`, `i8`, `u16`, `i16`).
+- `matmul_nt`, `matmul_tn`, `matmul_tt` and `dot`; `prod` / `product` and the `*_by_key` reductions;
+  `sort_by_key`, `set_unique`, `set_union` and `set_intersect`; the elementwise functions of ArrayFire's
+  `arith.h`.
+- `ContextOptions::tf32_matmul`, `Context::tf32_matmul()`, `matmul_f32`, `matmul_tf32`
+  ([Performance guide](performance.md#matrix-products)).
+- The plan cache of eager evaluation (`LUMA_PLAN_CACHE`), compile worker threads (`LUMA_COMPILE_THREADS`)
+  and the CPU backend's native matrix products ([Performance guide](performance.md)).
+- A disk cache keyed by a hash of the sources that generate the code: the first run after the upgrade
+  compiles every kernel again ([FAQ](faq.md#performance)).
+- `KernelBuilder::unchecked_bounds` (`unsafe`) for custom kernels
+  ([Custom kernels](custom-kernels.md#bounds-checks)).
+
 ## From 0.4 to 0.5
 
 0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal

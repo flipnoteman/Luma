@@ -39,9 +39,13 @@ if ctx.features().contains(luma::Features::SHADER_F64) {
 # Ok::<(), luma::LumaError>(())
 ```
 
-`f64` arrays have `+ - * /`, `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `minimum`, `maximum`,
-comparisons, `select`, views and reductions. Anything else (`exp`, trigonometry, generators such
-as `range`) is refused when recorded. Use `Df32` when you need a wide type on every device, or
+`f64` arrays have `+ - * /` and `%`, `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`,
+`minimum`, `maximum`, `clamp`, comparisons, `select`, views, reductions (`sum`, `min`, `max`,
+`prod`, `mean`, `var`, `std`) and generators such as `range`. The transcendental functions (`exp`,
+`ln`, `sin`, `cos`, `tan`, `tanh`, `log1p`, `expm1`, `asin` and the other inverse and hyperbolic
+functions, `log2`, `log10`, `cbrt`, `erf`, `erfc`, `lgamma`, `tgamma`, `powf`, `root`, `atan2`,
+`hypot`, `copysign`) run on the CUDA backend (libdevice) and the CPU backend (libm); on wgpu they
+fail with `Unsupported` when recorded. Use `Df32` when you need a wide type on every device, or
 cast down to `f32` for the function.
 
 ## `Df32`
@@ -83,7 +87,7 @@ and loses bits, which limits every function there: `exp` of an argument under `-
 error of about `1e-38` (a relative error of that over the result), and a result below `2^-126` is `0`. Out of range `exp` is
 infinity above `88.72` and `0` below `-87.33`, `tanh` is `+-1` from `|x| > 20`, and `ln` and `powf`
 follow `f32` (`ln(0)` is `-inf`, `ln` and `powf` of a negative base are `NaN`, `x^0` is `1`, zero
-and infinite bases give the `pow` results). `f64` arrays have none of these functions.
+and infinite bases give the `pow` results). `f64` arrays have functions of their own, see above.
 
 ```rust
 use luma::*;
@@ -111,6 +115,27 @@ model's estimate, which weighs it against staging and materialising it
 device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
 operations for the error of the product). `LUMA_DF_FMA`
 and `ContextOptions::df_fma` force either way; the results are the same, only the speed differs.
+
+## Matrix products: TF32
+
+`matmul` on a CUDA device with tensor cores (compute capability 8.0 and up) runs in TF32 by
+default: the operands are rounded to a 10-bit mantissa (the exponent keeps `f32`'s 8 bits) and the
+products are accumulated in `f32`, so each entry is within 1.5e-3 of the sum of the absolute
+values of its terms of the `f32` product (the precision of PyTorch's `allow_tf32`). Everything else computes the `f32` product: other backends, products whose
+`M`, `N` and `K` are not all multiples of 4 and at least 32, and `matmul_batched`, which is always
+`f32`. Where the digits matter:
+
+* `a.matmul_f32(&b)` is the exact `f32` product of one call (fused multiply-adds over `k` in a
+  fixed order, so results are reproducible);
+* `ContextOptions::tf32_matmul(false)` or `LUMA_TF32_MATMUL=0` makes every `matmul` of a context
+  that product (`Context::tf32_matmul()` reports the setting), and `a.matmul_tf32(&b)` forces TF32
+  whatever the context says.
+
+The dense factorisations and solves ([Dense linear algebra](linear-algebra.md)) do not follow the
+context setting: their update products are `matmul_f32`. Only the update products of Cholesky and
+the blocked triangular solves can take tensor cores, with the opt-in environment variable
+`LUMA_LINALG_TF32=1` (off by default). Accumulators' `Covariance` also forms its products in
+`f32`, never TF32 ([Incremental accumulation](accumulators.md)).
 
 ## Casts
 

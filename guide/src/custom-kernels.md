@@ -160,7 +160,8 @@ assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
 `Kernel::new(src)` is `default_context()?.kernel(src).build()`. The builder also has
 `.workgroup([x, y, z])`, which asserts the size the shader declares with `@workgroup_size` (a
 different one is `KernelWorkgroup`); `kernel.workgroup()` returns it. Building the same source, entry point,
-workgroup size and label twice on a context reuses the pipeline, and a `Kernel` is cheap to clone. The shader is parsed and validated
+workgroup size, label and [bounds mode](#bounds-checks) twice on a context reuses the pipeline, and a `Kernel` is cheap to clone. A custom kernel compiles, and a compile error
+surfaces, in `build` (the kernels Luma builds itself compile on worker threads and fail at their first launch). The shader is parsed and validated
 when you build it: a mistake comes out as `LumaError::ShaderCompile` with the WGSL error and
 line numbers that match your source (Luma appends its prelude, so it never shifts them).
 
@@ -334,6 +335,42 @@ cannot lay out), `KernelArgUniformSize`, `KernelArgAlias` (one buffer bound twic
 binding, as arrays that share a buffer through `reshape` are), `KernelEntryPoint`, `KernelBinding`
 (bindings outside `@group(1)` or not numbered from 0), `KernelWorkgroup`, `KernelGridTooLarge`,
 `Unsupported`. See [`LumaError`](https://docs.rs/luma/latest/luma/enum.LumaError.html).
+
+## Bounds checks
+
+By default every access of a custom kernel to a storage array, a workgroup array or a local array is
+checked against its bounds, on every backend, so that a bug in a kernel cannot read or write outside the
+memory it was given: a read out of range yields zero or another element, a write out of range is dropped.
+Workgroup memory starts zeroed. The checks cost a few percent of a tight kernel (the compiler leaves out
+those it can prove unnecessary). A kernel that is known to stay in range can skip the rest with the
+`unsafe` builder method `unchecked_bounds`; workgroup memory still starts zeroed, and integer division by
+zero and loops keep their guards:
+
+```rust
+use luma::*;
+
+const COPY: &str = r#"
+@group(1) @binding(0) var<storage, read> src: array<f32>;
+@group(1) @binding(1) var<storage, read_write> dst: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x) { return; }
+    dst[gid.x] = src[gid.x];
+}
+"#;
+
+let ctx = default_context()?;
+// SAFETY: every access is guarded by `gid.x >= luma.size.x`, and both arrays have `luma.size.x` elements.
+let copy = unsafe { ctx.kernel(COPY).unchecked_bounds() }.build()?;
+let src = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+let mut dst = Array::<f32>::zeros(3)?;
+copy.launch([3], args![&src, &mut dst])?;
+assert_eq!(dst.to_vec()?, vec![1.0, 2.0, 3.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+An access outside the bounds of such a kernel is undefined behavior: it may read or overwrite other
+arrays, crash the process or hang the device. A kernel built with and without the call is two kernels.
 
 ## Limits
 
