@@ -3,7 +3,9 @@
 `Array<u32>` is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A `u32` array fuses, views, reduces, scans and loops like an `f32` one, and has the
 bit operations of a hash function; `u32` arithmetic wraps. `Array<i32>` is the signed one
-([below](#signed-integers-and-casts)), and `Array<bool>` the result of comparisons.
+([below](#signed-integers-and-casts)), and `Array<bool>` the result of comparisons. The 8-bit and 16-bit integers (`u8`, `i8`, `u16`,
+`i16`) are stored in one or two bytes per element and have their own chapter,
+[Compact integers](compact.md).
 
 ## Arithmetic
 

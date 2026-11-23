@@ -19,6 +19,20 @@ and signal analysis all use the same few.
 | [`Histogram`], [`Histogram2d`] | counts in fixed bins of one stream or of two jointly | counts, marginals, entropy, mutual information |
 | [`TopK`] | the `k` largest or smallest values and where they came from | values and global indices |
 
+Batches of `f32`, `u32`, `i32`, `f64` and `Df32` arrays and of the compact integer types `u8`, `i8`, `u16`
+and `i16` can be pushed (`AccumInput`; `Covariance` takes `f32` batches only and `TopK` `f32`, `u32`
+or `i32`). The compact types are processed as `i32`: the cast is exact and fuses into the
+reduction, so a `u8` batch is read at one byte per element and is never widened in memory.
+
+```rust
+use luma::*;
+
+let acc = Accumulator::<Df32>::new(Fold::all());
+acc.push(&Array::from_slice(&[10u8, 20, 30, 200], 4)?)?;
+assert_eq!(Accumulator::<Df32>::to_f64(&acc.mean()?)?, vec![65.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
 Every accumulator has the same surface: `push` folds a batch in (nothing is read back from the
 device; the work is recorded like any other luma operation, and a batch that is a lazy
 expression such as `(&x - &y).abs()` is computed *inside* the accumulation kernel, never stored),
@@ -174,8 +188,10 @@ assert_eq!(TopK::<i32, Df32>::to_f64(&top.indices()?)?, vec![1.0, 0.0, 3.0, 2.0]
 [`CoMoments`] folds two streams `x` and `y` of one shape (per position, like `Accumulator`);
 [`Covariance`] folds the features of one stream against each other: a batch is a
 `[features, samples]` array and the state is the mean and the `features x features` matrix of
-sums of products. A push is one full-precision `f32` matrix product of the centered batch with
-itself (never TF32), and the state is merged in `Df32` or `f64`:
+sums of products. The batch is an `f32` array. The centered batches of the pushes of an epoch
+(up to `flush_every` pushes, 16 by default, `Covariance::with_flush_every`; the first epoch is one
+push) are joined along the samples, and one full-precision `f32` matrix product of the joined
+batch with itself (never TF32, a long `K`) is merged into the state, which is `Df32` or `f64`:
 
 ```rust
 use luma::*;

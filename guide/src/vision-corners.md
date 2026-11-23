@@ -36,7 +36,8 @@ assert_eq!(corners.count(), 4);
 * The derivatives are the central differences `(in[i + 1] - in[i - 1]) / 2` along both axes.
   The structure tensor `M` sums their products with a separable window, and the response of a
   pixel is `det(M) - k_thr * trace(M)^2`. (Not normalised in any way: the scale is that of the
-  pixel values to the fourth power, the default `min_response` of 1e5 suits pixels of 0 to 255.)
+  pixel values to the fourth power: ArrayFire's default `min_response` of 1e5 suits
+  pixels of 0 to 255.)
 * The window has `floor(6 * sigma)` cells, one less if that is even, with Gaussian weights
   (`block_size == 0`, `sigma` in `[0.5, 5]`: 3 cells for `sigma` 0.5 to 0.8, 5 for 0.9 to 1.1, ...).
   With `block_size > 0` the window has that many cells (1 to 32): Gaussian weights of `sigma`

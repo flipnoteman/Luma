@@ -55,6 +55,15 @@ submissions of *other* devices in the process until their in-flight GPU work fin
 happens once per device creation. Create your contexts up front, before starting long GPU work,
 or use one context (the default one is shared by threads).
 
+**Opening a context fails with `RequestDevice("Parent device is lost")`, though no device was lost.**
+(wgpu backend on NVIDIA.) A process opens at most 63 or 64 Vulkan devices, however many instances it has:
+past that limit `vkCreateDevice` fails with `VK_ERROR_INITIALIZATION_FAILED`, which wgpu words that way.
+A context frees its device with its last handle (the arrays, kernels and caches of a context do not keep
+it alive, 0.5.2), and a `Context::new` on the wgpu backend that meets the limit waits up to 60 s for another
+context to give its device back and takes it. A program or a test suite that holds more than 63 contexts
+alive at the same time still fails: drop contexts you no longer use, share one context between threads, or
+run the tests with fewer threads per process.
+
 ## RADV integrated GPUs give wrong results
 
 Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (`scan`, `cumsum`,
@@ -136,12 +145,27 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 `a @ b` reversed: `lhs` `[K, M]`, `rhs` `[N, K]`, result `[N, M]`
 ([Matrix products](data.md#matrix-products)).
 
+**`matmul` differs from the exact `f32` product in the last digits (or by 1e-3 relative to the size of
+its terms).** On a CUDA device of compute capability 8.0 or higher (Ampere and later) `matmul` runs on tensor cores in
+TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in `f32`, so
+each entry is within 1.5e-3 of the sum of the absolute values of its terms of the `f32` product (the
+precision of PyTorch's `allow_tf32`). `a.matmul_f32(&b)` is the exact product of one call;
+`ContextOptions::tf32_matmul(false)` or `LUMA_TF32_MATMUL=0` makes every `matmul` of a context exact, and
+`Context::tf32_matmul()` says which a context does. `matmul_batched` and the other backends (wgpu, Metal,
+the CPU) compute `f32` products, so results also differ between a CUDA run and one on another backend
+([Tensor cores](data.md#tensor-cores-tf32)). The dense linear algebra (`lu`, `qr`, `cholesky`, `svd`, ...)
+uses `f32` products only.
+
 ## Performance
 
 **The first run is slow, later ones are fast.** Large kernels (especially `Df32`) take seconds
 to compile on some drivers. Luma keeps the driver's compiled pipelines (wgpu), the CUDA PTX, the CPU backend's machine code and the measured cost
 model in `$XDG_CACHE_HOME/luma` (`~/.cache/luma`), so the second process skips that. Set
-`LUMA_CACHE=off` to turn it off or `LUMA_CACHE_DIR` to move it.
+`LUMA_CACHE=off` to turn it off or `LUMA_CACHE_DIR` to move it. The compiled CPU code and the CUDA PTX are
+keyed by a hash of the sources that generate them, so the first run after an upgrade (or after any change
+to the code generators) compiles everything again and then caches it; a stale kernel of an older build is
+never loaded. The wgpu pipeline cache files have a format number (2 since 0.5.2): files of an older format
+are read as absent and rewritten once.
 
 **Context creation takes about 150 ms.** That is the device calibration (once per machine; the
 result is cached). `LUMA_CALIBRATE=0` skips it and uses fixed numbers for the GPU kind.

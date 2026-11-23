@@ -949,8 +949,8 @@ impl Sparse<f32> {
     /// The same matrix in `format`. The same format is a clone (no work, buffers shared); other
     /// conversions are a stable sort of the entries by their new major index (CSR to CSC and back
     /// keep the entries of a row, a column, in order; COO to a compressed format as in
-    /// [`Sparse::from_triplets`]) and take the time of one sort of `u32` keys with a gather of
-    /// the indices and values. Conversions to COO move no data beyond expanding the pointer. A
+    /// [`Sparse::from_triplets`]): two radix sorts of the new major index, of as many bits as it
+    /// needs, that carry the other index and the values along. Conversions to COO move no data beyond expanding the pointer. A
     /// poisoned matrix converts to a poisoned matrix.
     pub fn to_format(&self, format: SparseFormat) -> Sparse {
         if self.error.is_some() || format == self.format {

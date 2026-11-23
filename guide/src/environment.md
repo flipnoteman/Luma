@@ -14,9 +14,13 @@ builder methods override them:
 | `LUMA_CALIBRATE` | `calibrate` / `.calibrate(on)` |
 | `LUMA_FAST_MATH` | `fast_math` / `.fast_math(on)` |
 | `LUMA_DF_FMA` | `df_fma` / `.df_fma(fused)` |
+| `LUMA_TF32_MATMUL` | `tf32_matmul` / `.tf32_matmul(on)` |
 
-The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_FUSION_*`,
-`LUMA_STAGING`, `LUMA_COARSEN`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_PLAN_CACHE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
+The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_MULTI_REDUCE*`, `LUMA_FUSION_*`,
+`LUMA_STAGING`, `LUMA_COARSEN`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_PLAN_CACHE`, `LUMA_NATIVE_*`, `LUMA_OWN_GEMM`, `LUMA_HOST_FAST`,
+`LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_WGPU_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`, the
+dense linear algebra variables `LUMA_LINALG_*`, `LUMA_CHOL_*`, `LUMA_TRSV*`, `LUMA_SVD_PRECOND`, `LUMA_QR_TSQR`, and `LUMA_SAMPLER_*`) are
+read from the environment only. `LUMA_BENCH_*` belong to the `luma-bench` crate (last section).
 
 ## All variables
 
@@ -50,10 +54,31 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LO
 | `LUMA_COMPILE_THREADS` | Worker threads that compile luma's own kernels in the background on the `cuda` and `cpu` backends (default: the machine's available parallelism; `0` compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress |
 | `LUMA_CPU_SPIN_US` | Microseconds an idle worker of the native `cpu` backend polls for the next launch before it sleeps (default 200; `0` sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches |
 | `LUMA_EXIT_WAIT` | `0` skips waiting at exit for the driver's threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA's Vulkan driver) and then ends the process with `_exit` |
+| `LUMA_TF32_MATMUL` | `tf32_matmul` / `.tf32_matmul(on)` |
+| `LUMA_MULTI_REDUCE` | `off` (or `1`) keeps every pending reduction in a kernel of its own; a number sets the most accumulators one kernel computes when several reductions of the same length are forced together (clamped to what a kernel can hold; default 16) |
+| `LUMA_MULTI_REDUCE_AFTER` | How many times a group of pending reductions is recorded one by one before the kernel that computes the group together is compiled in the background (default 4 on CUDA, 0 elsewhere: the group's kernel is compiled at once) |
+| `LUMA_NATIVE_SOLVE` | `off` runs the line solves (`solve_tridiagonal` and relatives) of a backend that has native ones (the CPU backend) as compiled shaders, like the GPU backends |
+| `LUMA_NATIVE_GEMM` | `off` runs the matrix products of a backend that has native ones (the CPU backend) as compiled tile kernels, like the GPU backends |
+| `LUMA_OWN_GEMM` | `off` keeps the `f32` matrix products on the shader kernels even where the backend has its own (the PTX kernels of the CUDA backend) |
+| `LUMA_HOST_FAST` | `off` never runs small operations on the host; `on` is only read by the crate's own tests. Default: operations on small arrays may run on the host on devices with zero-copy memory (never on CPU devices, while recording a loop, with `LUMA_CHECK_FINITE` or while profiling) |
+| `LUMA_WGPU_DUMP` | a directory: the wgpu backend writes the WGSL of every kernel it builds from luma's kernel IR there, as `<label>-<hash>.wgsl`. For inspecting generated code (the counterpart of `LUMA_CUDA_DUMP`) |
+| `LUMA_LINALG_TF32` | `1`: the trailing-update products of the factorisations (`lu`, `qr`, `cholesky`, ...) run in TF32 on CUDA with compute capability 8.0 and up; the factors then carry a backward error of about 1e-3 of the updates' entries instead of 1e-7. Default: off (exact `f32` products); other backends ignore it |
+| `LUMA_CHOL_NB` | `32`, `64`, `96` or `128`: rows of the diagonal blocks of the blocked Cholesky and triangular solves. Default: the largest of 128, 64 and 32 whose kernels fit in a workgroup's memory |
+| `LUMA_CHOL_WIDE` | Columns of a blocked Cholesky that one outer step brings up to date with one product: a multiple of the block size (`LUMA_CHOL_NB`), at least the block size; default four blocks |
+| `LUMA_TRSV` | `0` keeps triangular solves with up to 32 right-hand sides off the single-launch solve kernel (one matrix, on backends that run the look-back scan, see `LUMA_LOOKBACK_SCAN`); default on |
+| `LUMA_TRSV_INV` | `1`: `solve_triangular` takes the diagonal blocks as explicit inverses (the solves of `solve` and `solve_spd` always do, from `LUMA_TRSV_INV_MIN` rows on) |
+| `LUMA_TRSV_INV_MIN` | Rows from which inverted diagonal blocks are used (default 768) |
+| `LUMA_TRSV_KC` | `1`, `2`, `4`, `8`, `16` or `32`: right-hand-side columns one workgroup of the triangular-solve kernel takes (default 8); more are solved by workgroups of their own |
+| `LUMA_SVD_PRECOND` | `off` turns off the decomposition of a big matrix through the QR factorisation of its tall form; a number changes the smaller side from which it applies (default 1024) |
+| `LUMA_SAMPLER_COARSEN` | `1`, `2` or `4`: elements per invocation of the sampling kernels (`approx`, `approx2`, ...; default 2) |
+| `LUMA_SAMPLER_TILE` | `XxY` with `X * Y = 256` (for example `32x8`): the workgroup of the shaped sampling kernel, `X` along dimension 0 (default `32x8`) |
+| `LUMA_LINALG_FENCE` | `1` / `0`: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; `0` is the opt-out) |
+| `LUMA_LINALG_PANEL` | `8`, `16` or `32` (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop |
+| `LUMA_QR_TSQR` | `0`: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it) |
 
 ## Testing variables
 
-These only affect the crate's own test suite: the first three the differential fuzzer (`cargo test fuzz::`), the last the cache directory:
+These only affect the crate's own test suite: the first three the differential fuzzer (`cargo test fuzz::`), `LUMA_TEST_CACHE` the cache directory:
 
 | Variable | Effect |
 | --- | --- |
@@ -61,6 +86,16 @@ These only affect the crate's own test suite: the first three the differential f
 | `LUMA_FUZZ_SEED` | Fixed seed (default: random; failing cases are also kept in `tests/proptest-regressions/`) |
 | `LUMA_FUZZ_VERBOSE` | Set to anything: print a line for each program that ends early on a documented limit |
 | `LUMA_TEST_CACHE` | `1`: the process uses a cache directory under the system temporary directory (`luma-test-cache`) instead of the user's, unless `LUMA_CACHE` or `LUMA_CACHE_DIR` is set (unit tests always do) |
-| `LUMA_LINALG_FENCE` | `1` / `0`: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; `0` is the opt-out) |
-| `LUMA_LINALG_PANEL` | `8`, `16` or `32` (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop |
-| `LUMA_QR_TSQR` | `0`: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it) |
+| `LUMA_EXIT_ORDER_CHILD` | Internal: marks the child process of the wgpu backend's exit-handler-order test |
+
+## luma-bench variables
+
+The `luma-bench` crate (`crates/luma-bench`) reads these:
+
+| Variable | Effect |
+| --- | --- |
+| `LUMA_BENCH_REPS` | Timed repetitions per case (default: 3 for a case slower than a second, 5 with `--quick`, 21 for one under 10 ms, otherwise 9) |
+| `LUMA_BENCH_KERNELS` | Set to anything: list the kernels of one call under each case (the `sparse` suite lists them under each of its rows) |
+| `LUMA_BENCH_REF` | Text recorded as the `ref` of every JSON result line (`tools/benchref.sh` sets it to the commit) |
+| `LUMA_BENCH_SHAPES` | Set (not on the CPU): the `matmul` suite runs its per-shape cases; `small` runs a shorter list |
+| `LUMA_BENCH_TF32` | Set (not on the CPU): the `matmul` suite compares TF32 with `f32` products; `small` runs a shorter list |

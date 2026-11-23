@@ -50,7 +50,9 @@ When the step is a stencil (one elementwise expression of the argument, circular
 a few elements, scalars and other fixed arrays of the same shape), each launch loads a tile into
 workgroup memory and runs several steps on it, so the data passes through memory once per several
 steps rather than once per step. Any other step (shifts of a computed expression, `cache()`,
-`assign`, reductions) is traced and replayed step by step: each step is still the fused kernels
+`assign`, reductions) is traced and replayed step by step (a step of lazy expressions that does not fuse
+into a stencil may be traced as a body of several steps, see
+[Elementwise loops](#elementwise-loops-iterate_all)): each step is still the fused kernels
 of the step, and the loop costs no host time per step.
 
 A step that is a stencil of 2-D data looks the same: `u.shift([1, 0]) + u.shift([-1, 0]) +
@@ -101,7 +103,13 @@ assert_eq!(x.to_vec()?, want);
 A step that is *not* elementwise (shifts, `cache()`, `assign`), or states of another element type
 (`i32`, `Df32`, `f64`), is traced once and its recorded kernels are replayed step by step (as one
 graph on CUDA, Metal and the CPU backend when the step is replayed often enough to pay for the
-capture). The results are the same; only the one-kernel register loop is lost.
+capture). The results are the same; only the one-kernel register loop is lost. A step of lazy
+expressions only that is not a register loop (shifts, say) is also traced as the body of up to 16
+steps, so that the recorded launches are those the planner makes of the chain, as an eager
+`u = step(&u); u.eval()` loop gets them; the loop replays that body `steps / k` times and the rest one step
+at a time. This is used only when the chain makes fewer launches than the steps one by one, the cost model
+gives it less time and tracing it costs less than half of what the loop takes step by step; loops on the
+CPU backend replay step by step. A state the step hands back unchanged takes no launch per step.
 
 ### Launch sizing
 
@@ -222,7 +230,8 @@ passes the dispatch arguments from step to step on the device, so nothing in a b
 host. The first step of a loop reads the initial state, which no graph does, so it is launched on
 its own. A graph is captured only where it pays: the blocks of a compiled loop on first use, those of
 a one-shot loop the second time they run; until then the launches are replayed one by one, with the
-same results.
+same results. A one-shot loop that has run 100 launches without stopping replays the rest as repeated
+graphs of a small unit of steps (at most 16, about 64 launches) where the backend captures graphs (CUDA).
 
 When there is one record and it is a reduction of one array expression (a norm, a sum, a maximum),
 Luma traces the record together with the step, so one launch stores the next state and reduces the
@@ -230,7 +239,9 @@ record, and where a reduction finishes in its first launch (CUDA; the CPU backen
 `LUMA_SINGLE_PASS_REDUCE=on`) the last workgroup of that launch also evaluates the stop rule: a step
 is one launch. `iterate_until` does the same with its residual `max |next - prev|`. Several records,
 or records that are not one reduction, run after the step in launches of their own; values, steps
-and reasons are the same.
+and reasons are the same. On the wgpu backend, which has no single-pass reduction, the stop rule runs in the
+last pass that finishes the record's reduction instead of a launch of its own, so a step is one launch less
+than it was.
 
 ### Chunked solvers: `compile_until_all`
 
@@ -306,13 +317,17 @@ and the host time matters.
 
 When `eval` computes right away (the GPU is idle, as in a loop whose steps are shorter than the host's
 work for them) and the graph it evaluates has the structure of an earlier one (the same operations,
-shapes, views and wiring, the same buffers read in the same places, equal scalars where they were
-equal), Luma runs the launches of that earlier evaluation again over the new buffers and
-scalars instead of planning the graph again: the host time per step of a step with hundreds of
-operations drops by a third to a half, the part that builds the expression stays. The results are
-bit-identical to what the planner makes, and only evaluations of plain elementwise, view and
-shift graphs with no other lazy array alive are replayed. `LUMA_PLAN_CACHE=off` switches this off
-([Environment variables](environment.md)).
+lengths, views and wiring, the same buffers read in the same places, equal scalars where they were
+equal, the same planner flags and cost model) and is all the lazy work that is alive, Luma runs the store
+launches of that earlier evaluation again over the new buffers and scalar values instead of
+flattening, cutting and judging the graph again (the plan cache, 128 plans per context). The part that
+builds the expression stays: on an RTX 3090 (CUDA) the per-step cases of the `cfd` benchmark suite
+(`euler/3d_per_step` 6.60 to 4.33 ms, `muscl/3d_per_step` 3.49 to 2.44 ms, `euler/2d_per_step` 3.06 to
+2.42 ms) got 1.1 to 1.5 times faster. The results are bit-identical to what the planner makes.
+Structures whose planning looked at other state (an in-place buffer takeover, packing of arrays into one
+buffer, failures, loops, reductions) are remembered as uncacheable and plan as before, and the cache backs
+off after a run of misses. `LUMA_PLAN_CACHE=off` switches this off and `LUMA_PLAN_CACHE=trace` prints what
+it records ([Environment variables](environment.md)).
 
 ### Readbacks in a loop
 

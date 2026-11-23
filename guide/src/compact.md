@@ -105,6 +105,14 @@ no two invocations ever write one word and no atomics are needed. Kernels that c
 same words; the layout is byte-identical to a plain array of `u8` or `i16`, so nothing differs
 between backends.
 
-Where it pays: memory-bound work. On an RTX 3090 (CUDA), a chain of `u8` arithmetic over 64M
-elements takes 0.17 ms where the same chain on `u32` takes 0.65 ms, and the sum of 64M `i16` takes
-0.17 ms against 0.32 ms for `f32`.
+Where it pays: memory-bound work. On an RTX 3080 Laptop (CUDA, 64M elements, luma-bench `compact`)
+a chain of `u8` arithmetic takes 0.38 ms where the same chain on `u32` takes 1.54 ms, the sum of
+`i16` 0.39 ms against 0.74 ms for `f32`, per-column mean and variance over the traces of a
+1024 x 65536 `i16` matrix 0.53 ms (`f32`: 0.84 ms), a transposed copy of an `i16` matrix 0.79 ms
+(`f32`: 1.51 ms), a `u8` histogram 0.34 ms (a `u32` `bincount`: 0.77 ms) and a sort of 16M `i16`
+1.29 ms (two radix passes; `u32` keys take four: 1.77 ms).
+
+Against ArrayFire's `s16`, `u16` and `u8` arrays (same laptop, 32M `s16`; afcompare rows 16-22;
+ratios of ArrayFire's time to luma's): upload 0.80x (bound by the host transfer), sum 1.0x,
+cast and sum 4.7x, per-column mean and variance 7.4x, `u8` histogram (38M elements) 2.3x, `u16`
+histogram of 16384 bins 1.0x.

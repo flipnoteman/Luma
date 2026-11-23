@@ -46,8 +46,13 @@ from it, so the image is read from memory about once whatever the kernel size.
 `medfilt1(len, border)`, `medfilt2([k0, k1], border)`, `minfilt` / `maxfilt([k0, k1], border)`
 (`minfilt3` / `maxfilt3` for volumes) work on `f32`, `i32` and `u32`. `dilate(&mask)` and
 `erode(&mask)` (`dilate3`, `erode3`) take any structuring element: the window cells where the
-mask is not zero. With `Border::Ignore` (the default of the morphological filters) cells outside
-the image do not take part.
+mask is not zero. `dilate` and `erode` (and the 3-D forms) use `Border::Ignore`: cells outside the
+image do not take part; `dilate_with(&mask, border)` and `erode_with` take another border. `Ignore`
+is also accepted by `minfilt` and `maxfilt` (the minimum or maximum over the cells that exist, as
+ArrayFire's), and poisons the result for the median. A rectangular `minfilt` / `maxfilt` window of
+25 cells or more runs as two separable passes. Windows of up to 49 cells are selected in registers
+(`medfilt2` of 3 x 3 is a 19-exchange network), larger ones bit by bit; the filters compute four
+outputs per invocation.
 
 ```rust
 use luma::*;
@@ -63,13 +68,15 @@ assert_eq!(img.dilate(&cross).to_vec()?[4], 9);
 ## Derivatives, bilateral filter
 
 `sobel()` returns the Sobel derivatives `(d0, d1)` along axis 0 and axis 1 from one pass over the
-image, `sobel_magnitude()` their magnitude, `grad()` the central-difference gradient (one-sided
+image (the cells outside are the nearest ones; `sobel_with(border)` takes another border),
+`sobel_magnitude()` their magnitude (`sobel_magnitude_fast()` is `|d0| + |d1|`), `grad()` the central-difference gradient (one-sided
 at the borders). `bilateral(spatial_sigma, range_sigma)` and `bilateral_color(..)` (for
 `[H, W, 3]`) are the edge-preserving smoothing filter.
 
 ## Summed-area tables, moments, histograms
 
-`sat()` is the double prefix sum (four lookups give the sum of any rectangle), `moments()` the raw
+`sat()` is the double prefix sum (four lookups give the sum of any rectangle; three launches: axis 1
+in chunks of 64 cells, the carries, a workgroup scan per column along axis 0), `moments()` the raw
 moments `M00 M01 M10 M11` of every image, `hist_equal(&hist)` equalises an image with the
 histogram `hist` of its (integer valued) pixels.
 
