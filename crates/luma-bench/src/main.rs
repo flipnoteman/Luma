@@ -1,8 +1,11 @@
 //! `luma-bench`: workload benchmark suites for Luma.
 //!
 //! ```text
-//! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>] [--json out.jsonl]
+//! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>] [--json out.jsonl] [--iters N]
 //! ```
+//!
+//! `--iters N` times every selected case with exactly N calls (no calibration, no profile run); it is for
+//! `tools/hosttime`, which counts instructions under callgrind.
 //!
 //! The backend comes from the environment (`LUMA_BACKEND=cuda|wgpu|metal|cpu`, `LUMA_DEVICE`).
 //! Every case is verified against a host reference before it is timed. `tools/benchcmp.py A B`
@@ -19,6 +22,7 @@ fn main() {
     let mut only = None;
     let mut json = None;
     let mut suites: Option<Vec<String>> = None;
+    let mut iters: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -26,6 +30,7 @@ fn main() {
             "--only" => only = args.next(),
             "--json" => json = args.next(),
             "--suite" => suites = args.next().map(|s| s.split(',').map(str::to_string).collect()),
+            "--iters" => iters = Some(args.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).expect("--iters takes a positive integer")),
             "--list" => {
                 for (name, _) in suites::ALL {
                     println!("{name}");
@@ -41,6 +46,7 @@ fn main() {
     let ctx = Context::with_options(ContextOptions::from_env()).expect("no device");
     println!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());
     let mut h = harness::Harness::new(ctx, quick, only, json.as_deref());
+    h.iters = iters;
     for (name, run) in suites::ALL {
         if suites.as_ref().is_some_and(|s| !s.iter().any(|x| x == name)) {
             continue;

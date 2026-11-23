@@ -60,6 +60,8 @@ pub struct Harness {
     pub suite: String,
     pub records: Vec<Record>,
     pub skipped: Vec<(String, String)>,
+    /// `--iters N`: every case runs exactly N timed calls, no calibration or profile run.
+    pub iters: Option<usize>,
     json: Option<std::io::BufWriter<std::fs::File>>,
     header_printed: bool,
 }
@@ -72,7 +74,7 @@ impl Harness {
             let loc = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
             *PANIC.lock().unwrap() = format!("{msg}{loc}");
         }));
-        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), json, header_printed: false }
+        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), iters: None, json, header_printed: false }
     }
 
     fn full(&self, case: &str) -> String {
@@ -125,7 +127,21 @@ impl Harness {
 
     /// Times `f` as case `case` of size `size` if selected. `f` must leave its results on the
     /// device or read them back itself; the harness syncs after every call.
+    ///
+    /// The profiled call must launch at least one kernel: a case whose work is never evaluated
+    /// (an `Array::eval` postpones work, and an array dropped before it is evaluated never runs)
+    /// times nothing, so it fails the run. Cases that only build lazy graphs use [`Harness::build_case`].
     pub fn case(&mut self, case: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
+        self.run_case(case, size, work, f, false);
+    }
+
+    /// Like [`Harness::case`] for a case that only builds a lazy graph and drops it
+    /// (`*_build_step`): launching no kernel is expected.
+    pub fn build_case(&mut self, case: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
+        self.run_case(case, size, work, f, true);
+    }
+
+    fn run_case(&mut self, case: &str, size: &str, work: Work, f: &mut dyn FnMut(), build_only: bool) {
         if !self.want(case) {
             return;
         }
@@ -139,6 +155,15 @@ impl Harness {
         };
         let started = Instant::now();
         let first = run(f);
+        if let Some(n) = self.iters {
+            // Fixed iteration count for `tools/hosttime` (callgrind): no calibration, no profile run.
+            let t = Instant::now();
+            for _ in 0..n {
+                run(f);
+            }
+            println!("{:<40} {:>14} {n} iterations, {:.3} ms each", self.full(case), size, t.elapsed().as_secs_f64() * 1e3 / n as f64);
+            return;
+        }
         let warm = run(f).max(run(f));
         // A GPU that idled between cases runs at low clocks (NVIDIA drops to 210 MHz within
         // ~50 ms, which made a 12 us kernel take 150 us in a case, and a laptop GPU can start a
@@ -182,6 +207,11 @@ impl Harness {
             Err(_) => (None, None),
         };
         let _ = self.ctx.sync();
+        if !build_only && launches == Some(0) {
+            let why = "the profiled call launched no kernel: the case does not evaluate and flush its work (use build_case for a build-only case)";
+            println!("FAILED: {}: {why}", self.full(case));
+            self.skipped.push((self.full(case), why.to_string()));
+        }
         let stats = self.ctx.memory_stats();
         let mem_mib = (stats.resident_bytes + stats.pooled_bytes) as f64 / (1 << 20) as f64;
         let rec = Record {
