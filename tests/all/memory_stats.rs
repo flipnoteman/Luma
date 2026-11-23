@@ -53,3 +53,28 @@ fn a_compiled_loop_counts_the_buffers_it_keeps() {
     drop(compiled);
     assert!(ctx.memory_stats().resident_bytes <= before, "the loop's buffers leave the count with it");
 }
+
+/// Buffers round to eighth-octave size classes, so arrays of odd sizes take at most 12.5% more
+/// device memory than their data (power-of-two classes took 1.4 to 1.9 times).
+#[test]
+fn odd_sized_arrays_waste_at_most_an_eighth() {
+    let ctx = Context::new().unwrap();
+    let before = ctx.memory_stats().resident_bytes;
+    let mut logical = 0u64;
+    let mut arrays = Vec::new();
+    for i in 0..20u64 {
+        // Between 3 and 70 MiB, never a round number.
+        let len = (((3 + i * 7919 % 68) << 18) + 12_345 + i * 977) as usize;
+        let data = vec![i as f32; len];
+        let array = Array::from_slice_on(&ctx, &data, len).unwrap();
+        array.eval().unwrap();
+        logical += 4 * len as u64;
+        arrays.push(array);
+    }
+    ctx.sync().unwrap();
+    let resident = ctx.memory_stats().resident_bytes - before;
+    let ratio = resident as f64 / logical as f64;
+    eprintln!("resident {resident} bytes for {logical} bytes of data: {ratio:.4}x");
+    assert!(resident as f64 <= 1.13 * logical as f64, "{resident} bytes resident for {logical} bytes of data");
+    assert_eq!(arrays[3].to_vec().unwrap()[0], 3.0);
+}

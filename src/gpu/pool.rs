@@ -1,24 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use luma_core::{Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT};
-
-/// Smallest buffer the pool hands out.
-const MIN_BUFFER_SIZE: u64 = 16;
-
-/// Size class for a buffer holding `bytes` bytes: the next power of two (at least
-/// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
-///
-/// Buffers of a class may be larger than the data they hold, so users must track the logical
-/// size themselves and never rely on `Buffer::size()` / WGSL `arrayLength`.
-pub(crate) fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
-    // Keep copy sizes aligned even when the limit is not.
-    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
-    if bytes > max_size {
-        return None;
-    }
-    let class = bytes.max(MIN_BUFFER_SIZE).checked_next_power_of_two().unwrap_or(max_size);
-    Some(class.min(max_size))
-}
+use luma_core::{Buffer, BufferUsage};
 
 /// Free lists of idle buffers keyed by (size class, usage flags), each oldest first.
 #[derive(Debug)]
@@ -90,26 +72,63 @@ impl BufferPool {
 
 #[cfg(test)]
 mod tests {
-    use super::size_class;
+    use luma_core::hal::size_class;
 
     const MAX: u64 = 1 << 32;
 
     #[test]
-    fn rounds_up_to_power_of_two_with_minimum() {
+    fn small_sizes_round_up_to_power_of_two_with_minimum() {
         assert_eq!(size_class(1, MAX), Some(16));
         assert_eq!(size_class(16, MAX), Some(16));
         assert_eq!(size_class(17, MAX), Some(32));
-        assert_eq!(size_class(12_000_012, MAX), Some(16_777_216));
+        assert_eq!(size_class(2400, MAX), Some(4096));
+        assert_eq!(size_class(4096, MAX), Some(4096));
+    }
+
+    #[test]
+    fn large_sizes_round_to_eighth_octaves() {
+        assert_eq!(size_class(4097, MAX), Some(4608));
+        assert_eq!(size_class(5000, MAX), Some(5120));
+        assert_eq!(size_class(5100, MAX), Some(5120));
+        assert_eq!(size_class(6200, MAX), Some(6656));
+        assert_eq!(size_class(8192, MAX), Some(8192));
+        assert_eq!(size_class(12_000_012, MAX), Some(12_582_912));
         assert_eq!(size_class(1 << 20, MAX), Some(1 << 20));
+    }
+
+    #[test]
+    fn classes_bound_the_waste_and_are_monotone() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut sizes: Vec<u64> = (0..20_000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // Log-uniform between 4 KiB and 1 GiB.
+                let octave = (state >> 59) % 18; // 0..17
+                let base = 4096u64 << octave;
+                base + (state >> 8) % base
+            })
+            .collect();
+        sizes.extend([4097, 4608, 4609, 1 << 30]);
+        sizes.sort_unstable();
+        let mut previous = 0;
+        for bytes in sizes {
+            let class = size_class(bytes, u64::MAX).unwrap();
+            assert!(class >= bytes, "{bytes} -> {class}");
+            assert!(class as f64 <= 1.125 * bytes as f64, "{bytes} -> {class}");
+            assert_eq!(class % 512, 0, "{bytes} -> {class}");
+            assert!(class >= previous, "{bytes} -> {class} after {previous}");
+            previous = class;
+        }
     }
 
     #[test]
     fn clamps_to_device_limit() {
         let max = (3 << 30) + 2; // not a power of two, not 4-aligned
         assert_eq!(size_class(1 << 30, max), Some(1 << 30));
-        assert_eq!(size_class((1 << 30) + 4, max), Some(2 << 30));
-        assert_eq!(size_class((2 << 30) + 4, max), Some(3 << 30));
+        assert_eq!(size_class((1 << 30) + 4, max), Some((1 << 30) + (1 << 27)));
+        assert_eq!(size_class((2 << 30) + 4, max), Some((2 << 30) + (1 << 28)));
         assert_eq!(size_class(3 << 30, max), Some(3 << 30));
         assert_eq!(size_class((3 << 30) + 4, max), None);
+        assert_eq!(size_class((3 << 30) - 4, max), Some(3 << 30));
     }
 }

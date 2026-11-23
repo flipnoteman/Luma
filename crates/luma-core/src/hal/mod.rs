@@ -601,6 +601,40 @@ impl BufferUsage {
 /// Copies between buffers and writes into them are multiples of this many bytes.
 pub const COPY_BUFFER_ALIGNMENT: u64 = 4;
 
+/// Smallest buffer size class.
+const MIN_BUFFER_SIZE: u64 = 16;
+
+/// Buffers up to this many bytes round to a power of two; larger ones to an eighth-octave class.
+const FINE_CLASS_START: u64 = 4096;
+
+/// Size class for a buffer holding `bytes` bytes, the one rule every backend and the pool share.
+///
+/// Up to 4 KiB: the next power of two (at least 16 bytes). Above: the next multiple of
+/// `next_power_of_two(bytes) / 16`, which cuts each octave into 8 steps (at most 12.5% waste,
+/// every class a multiple of 512 bytes). Clamped to `max_size & !3`; `None` if `bytes` itself
+/// exceeds that.
+///
+/// Buffers of a class may be larger than the data they hold, so users must track the logical
+/// size themselves and never rely on `Buffer::size()` / WGSL `arrayLength`.
+pub fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
+    // Keep copy sizes aligned even when the limit is not.
+    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
+    if bytes > max_size {
+        return None;
+    }
+    let bytes = bytes.max(MIN_BUFFER_SIZE);
+    let Some(pow2) = bytes.checked_next_power_of_two() else {
+        return Some(max_size);
+    };
+    let class = if bytes <= FINE_CLASS_START {
+        pow2
+    } else {
+        let step = pow2 / 16;
+        bytes.next_multiple_of(step)
+    };
+    Some(class.min(max_size))
+}
+
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 

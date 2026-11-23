@@ -7,6 +7,7 @@ use crate::array::Array;
 use crate::context::{Context, ContextOptions};
 use crate::jit::cost::CostModel;
 use crate::ops::select;
+use luma_core::hal::size_class;
 
 /// A context with the calibration off and the cost model pinned, so that kernel counts do not
 /// depend on the machine.
@@ -5014,7 +5015,7 @@ fn staged_reference(x: &Array<f32>, stages: usize, late: bool, steps: usize) -> 
 fn recording_a_chain_of_intermediates_creates_few_buffers() {
     let ctx = ctx();
     let x = f32s(&ctx, &values(1000, 34, 0.0, 1.0));
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let stages = 16;
     let before = ctx.created_bytes();
     let (stepper, held) = trace_staged(&x, stages, false);
@@ -5034,7 +5035,7 @@ fn recording_a_chain_of_intermediates_creates_few_buffers() {
 fn a_stepper_does_not_keep_its_probes() {
     let ctx = ctx();
     let x = f32s(&ctx, &values(1000, 36, 0.0, 1.0));
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = ctx.pager().resident_bytes();
     let (stepper, _) = trace_staged(&x, 8, false);
     let held = ctx.pager().resident_bytes() - before;
@@ -5090,7 +5091,7 @@ fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
     let x = f32s(&ctx, &values(1000, 33, 0.0, 1.0));
     let resident = || ctx.pager().resident_bytes();
     // Every buffer here is of the one size class of 1000 floats.
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = resident();
     let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
     let probe = probes.pop().unwrap();
@@ -5123,7 +5124,7 @@ fn the_buffers_a_step_released_stay_counted_while_the_plan_holds_them() {
     spare.eval().unwrap();
     ctx.sync().unwrap();
     let resident = || ctx.pager().resident_bytes();
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = resident();
     let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
     let probe = probes.pop().unwrap();

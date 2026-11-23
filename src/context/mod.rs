@@ -10,7 +10,8 @@ use crate::gpu::pager::{Accounted, Pager};
 use crate::gpu::built::BuildCache;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
-use crate::gpu::pool::{self, BufferPool};
+use crate::gpu::pool::BufferPool;
+use luma_core::hal::size_class;
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
 use crate::tuning::{Tuning, TuningProfile};
 
@@ -896,7 +897,7 @@ impl Context {
             return Ok(buffer);
         }
         let max = self.inner.max_buffer_bytes;
-        let class = pool::size_class(bytes, max)
+        let class = size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
 
         let pooled = lock(&self.inner.pool).take(class, usage);
@@ -911,7 +912,7 @@ impl Context {
     /// A buffer for `bytes` bytes with `usage` that this thread's recording is done with (see
     /// `Recording::reuse`), if it is recording and has one: no new memory is needed for it.
     pub(crate) fn take_recorded(&self, bytes: u64, usage: BufferUsage) -> Option<Buffer> {
-        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
+        let class = size_class(bytes, self.inner.max_buffer_bytes)?;
         self.reuse_recorded(class, usage)
     }
 

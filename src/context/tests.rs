@@ -59,6 +59,16 @@ fn recycled_buffers_are_reused_per_size_class_and_usage() {
     assert_ne!(ctx.alloc_buffer(4100, STORAGE_USAGE).unwrap(), a);
     // ... while the recycled one is still waiting in the pool.
     assert_eq!(ctx.alloc_buffer(4000, STORAGE_USAGE).unwrap(), a);
+
+    // Above 4 KiB classes are eighths of an octave: 5000 and 5100 share 5120, 6200 is in 6656.
+    let c = ctx.alloc_buffer(5000, STORAGE_USAGE).unwrap();
+    assert_eq!(c.size(), 5120);
+    ctx.recycle(c.clone());
+    assert_eq!(ctx.alloc_buffer(5100, STORAGE_USAGE).unwrap(), c);
+    ctx.recycle(c.clone());
+    let d = ctx.alloc_buffer(6200, STORAGE_USAGE).unwrap();
+    assert_ne!(d, c);
+    assert_eq!(d.size(), 6656);
 }
 
 #[test]

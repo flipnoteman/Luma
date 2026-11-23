@@ -22,7 +22,7 @@ use luma_core::{
     DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
-use luma_core::hal::{check_transfer, copy_parallel};
+use luma_core::hal::{check_transfer, copy_parallel, size_class};
 use luma_core::{Stage, StageDir, Ticket};
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
@@ -184,21 +184,6 @@ impl Hasher for FxHasher {
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 // -- Sizes --
-
-/// Smallest buffer the pools hand out.
-const MIN_BUFFER_SIZE: u64 = 16;
-
-/// Size class for a buffer holding `bytes` bytes: the next power of two (at least
-/// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
-fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
-    // Keep copy sizes aligned even when the limit is not.
-    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
-    if bytes > max_size {
-        return None;
-    }
-    let class = bytes.max(MIN_BUFFER_SIZE).checked_next_power_of_two().unwrap_or(max_size);
-    Some(class.min(max_size))
-}
 
 /// How an idle staging buffer is matched to a request.
 #[derive(Clone, Copy)]
@@ -1816,14 +1801,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_classes_round_up_to_powers_of_two_and_clamp() {
+    fn size_classes_use_eighth_octaves_and_clamp() {
         const MAX: u64 = 1 << 32;
         assert_eq!(size_class(1, MAX), Some(16));
         assert_eq!(size_class(17, MAX), Some(32));
-        assert_eq!(size_class(12_000_012, MAX), Some(16_777_216));
+        assert_eq!(size_class(5000, MAX), Some(5120));
+        assert_eq!(size_class(12_000_012, MAX), Some(12_582_912));
         let max = (3 << 30) + 2;
-        assert_eq!(size_class((1 << 30) + 4, max), Some(2 << 30));
-        assert_eq!(size_class((2 << 30) + 4, max), Some(3 << 30));
+        assert_eq!(size_class((1 << 30) + 4, max), Some((1 << 30) + (1 << 27)));
+        assert_eq!(size_class((2 << 30) + 4, max), Some((2 << 30) + (1 << 28)));
         assert_eq!(size_class((3 << 30) + 4, max), None);
     }
 

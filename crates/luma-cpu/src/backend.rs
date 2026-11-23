@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use luma_core::hal::{cache, copy_parallel_host};
+use luma_core::hal::{cache, copy_parallel_host, size_class};
 use luma_core::kir::KernelModule;
 use luma_core::{
-    Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel,
+    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel,
     CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads,
     FusionSplit, GraphLaunch, LineSolveSpec, MatmulSpec, Profile, RawArg, RawKernel, TuningProfile,
 };
@@ -26,7 +26,6 @@ use crate::solve::NativeLineSolve;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
 const MAPPABLE_CAP: u64 = 256 << 20;
-const MIN_BUFFER_SIZE: u64 = 16;
 const MAPPABLE_STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
     .union(BufferUsage::COPY_SRC)
     .union(BufferUsage::COPY_DST)
@@ -41,20 +40,6 @@ fn raw(buffer: &Buffer) -> Result<&AlignedBuf, BackendError> {
     buffer
         .downcast_ref::<AlignedBuf>()
         .ok_or_else(|| BackendError::Unsupported("the buffer belongs to another backend".into()))
-}
-
-/// Size class for a buffer holding `bytes` bytes: the next power of two (at least
-/// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
-fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
-    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
-    if bytes > max_size {
-        return None;
-    }
-    let class = bytes
-        .max(MIN_BUFFER_SIZE)
-        .checked_next_power_of_two()
-        .unwrap_or(max_size);
-    Some(class.min(max_size))
 }
 
 struct CpuShared {
@@ -871,9 +856,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_classes_round_up_to_powers_of_two_and_clamp() {
-        assert_eq!(size_class(1, 1 << 20), Some(MIN_BUFFER_SIZE));
+    fn size_classes_use_eighth_octaves_and_clamp() {
+        assert_eq!(size_class(1, 1 << 20), Some(16));
         assert_eq!(size_class(17, 1 << 20), Some(32));
+        assert_eq!(size_class(5000, 1 << 20), Some(5120));
         assert_eq!(size_class((1 << 20) + 1, 1 << 20), None);
         assert_eq!(size_class(600, 1000), Some(1000 & !3));
     }

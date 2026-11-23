@@ -29,10 +29,10 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use block2::RcBlock;
-    use luma_core::hal::{cache, copy_parallel};
+    use luma_core::hal::{cache, copy_parallel, size_class};
     use luma_core::kir::KernelModule;
     use luma_core::{
-        Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
+        Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
         DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
         RawKernel, TuningProfile, MemoryNow,
     };
@@ -84,17 +84,6 @@ mod imp {
     /// consistent if a holder panicked.
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Size class for a buffer holding `bytes` bytes: the next power of two (at least
-    /// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
-    fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
-        let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
-        if bytes > max_size {
-            return None;
-        }
-        let class = bytes.max(MIN_BUFFER_SIZE).checked_next_power_of_two().unwrap_or(max_size);
-        Some(class.min(max_size))
     }
 
     // -- Native handles --
@@ -1511,9 +1500,10 @@ mod imp {
         use super::*;
 
         #[test]
-        fn size_classes_round_up_to_powers_of_two_and_clamp() {
+        fn size_classes_use_eighth_octaves_and_clamp() {
             assert_eq!(size_class(1, 1 << 20), Some(MIN_BUFFER_SIZE));
             assert_eq!(size_class(17, 1 << 20), Some(32));
+            assert_eq!(size_class(5000, 1 << 20), Some(5120));
             assert_eq!(size_class(1 << 20, 1 << 20), Some(1 << 20));
             assert_eq!(size_class((1 << 20) + 1, 1 << 20), None);
             assert_eq!(size_class(600, 1000), Some(1000 & !3));

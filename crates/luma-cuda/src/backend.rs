@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, DriverError, result, sys};
 use cudarc::nvrtc::Ptx;
 use luma_core::hal::cache::{self, PTX_MAGIC};
-use luma_core::hal::copy_parallel;
+use luma_core::hal::{copy_parallel, size_class};
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
@@ -1139,7 +1139,7 @@ impl CudaBackend {
     /// (`cuMemHostAlloc` pins every page: 0.4 ms per MiB, and freeing costs a third of that),
     /// after waiting for earlier work when too much staging memory is in flight.
     fn take_pinned(&self, st: &mut State, bytes: usize) -> Result<Pinned, BackendError> {
-        let class = bytes.max(PINNED_MIN).next_power_of_two();
+        let class = size_class(bytes.max(PINNED_MIN) as u64, u64::MAX).map_or(bytes, |class| class as usize);
         // The smallest idle block that is large enough, and not much larger.
         let find = |st: &mut State| {
             let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class && p.cap / class <= PINNED_FIT).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;

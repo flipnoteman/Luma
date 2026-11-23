@@ -19,7 +19,7 @@ use crate::array::Storage;
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::Result;
 use crate::gpu::hash::{FxMap, FxSet};
-use crate::gpu::pool;
+use luma_core::hal::size_class;
 use crate::gpu::lock;
 
 /// Smallest list length worth pruning.
@@ -495,7 +495,7 @@ impl Context {
     pub(crate) fn make_room(&self, bytes: u64) -> Result<()> {
         let pager = self.pager();
         let Some(budget) = pager.budget else { return Ok(()) };
-        let class = pool::size_class(bytes, self.max_buffer_bytes()).unwrap_or(bytes);
+        let class = size_class(bytes, self.max_buffer_bytes()).unwrap_or(bytes);
         while pager.resident_bytes.load(Ordering::Relaxed) + class > budget && self.evict_one()? { std::hint::spin_loop() }
         Ok(())
     }
