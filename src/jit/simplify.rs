@@ -108,10 +108,12 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
         // Not one identity of a real number holds bit for bit for a complex one: `z * 1` has
         // `inf * 0` in it, and `z + (-0)` turns a `-0` imaginary part into `+0`.
         OpKind::Binary(_) if ty == ElemTy::C32 => None,
+        // arm: complex-part-of-make
         OpKind::Part(Part::Real | Part::Imag) => {
             let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Make)?;
             identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))])
         }
+        // arm: complex-make-of-parts
         OpKind::Make => {
             let (_, real) = inner(a, |inside| inside.kind == OpKind::Part(Part::Real))?;
             let (_, imag) = inner(b, |inside| inside.kind == OpKind::Part(Part::Imag))?;
@@ -124,6 +126,7 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
             // All bits set: `-1` for `i32` (a larger constant saturates to `i32::MAX`).
             let all_ones = if ty == ElemTy::I32 { -1.0 } else { f64::from(u32::MAX) };
             match bin {
+                // arm: mul-one, mul-minus-one, mul-zero-int
                 BinOp::Mul => {
                     if is_value(sb, ty, 1.0) {
                         identity(op, a)
@@ -139,9 +142,13 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                         None
                     }
                 }
+                // arm: div-one
                 BinOp::Div if is_value(sb, ty, 1.0) => identity(op, a),
+                // arm: sub-zero
                 BinOp::Sub if is_value(sb, ty, 0.0) => identity(op, a),
+                // arm: sub-same-int
                 BinOp::Sub if u32s && same(a, b) => constant(op, 0.0),
+                // arm: add-neutral
                 BinOp::Add => {
                     if float && is_value(sb, ty, -0.0) || u32s && is_value(sb, ty, 0.0) {
                         identity(op, a)
@@ -151,21 +158,31 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                         None
                     }
                 }
+                // arm: min-max-same
                 BinOp::Min | BinOp::Max if same(a, b) => identity(op, a),
+                // arm: rem-one-int
                 BinOp::Rem if u32s && is_value(sb, ty, 1.0) => constant(op, 0.0),
+                // arm: xor-or-zero
                 BinOp::BitXor | BinOp::BitOr if is_value(sb, ty, 0.0) => identity(op, a),
                 BinOp::BitXor | BinOp::BitOr if is_value(sa, ty, 0.0) => identity(op, b),
+                // arm: xor-same
                 BinOp::BitXor if same(a, b) => constant(op, 0.0),
+                // arm: or-and-same
                 BinOp::BitOr | BinOp::BitAnd if same(a, b) => identity(op, a),
+                // arm: and-zero
                 BinOp::BitAnd if is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0) => constant(op, 0.0),
+                // arm: and-all-ones
                 BinOp::BitAnd if is_value(sb, ty, all_ones) => identity(op, a),
                 BinOp::BitAnd if is_value(sa, ty, all_ones) => identity(op, b),
+                // arm: binary-shift-multiple-of-32
                 // The amount is taken modulo 32: a multiple of 32 moves nothing.
                 BinOp::Shl | BinOp::Shr | BinOp::Rotl if sb.is_some_and(|s| s.ty == ty && s.bits & 31 == 0) => identity(op, a),
                 _ => None,
             }
         }
+        // arm: unary-shift-zero
         OpKind::Unary(UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0)) => identity(op, a),
+        // arm: involution, abs-chain, rounding-chain, shift-chain, sign-chain
         OpKind::Unary(un) => {
             if !matches!(
                 un,
@@ -188,6 +205,7 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                 _ => None,
             }
         }
+        // arm: select-scalar, select-not, select-same
         OpKind::Select => {
             if let Some(m) = scalar(a) {
                 identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c })
@@ -199,12 +217,14 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                 None
             }
         }
+        // arm: compare-same
         OpKind::Compare(cmp) if same(a, b) && cmp.exists_for(ty) => match cmp {
             CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
             CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
             CmpOp::Ne if !is_float(ty) => constant(op, 0.0),
             _ => None,
         },
+        // arm: cast-f64-round-trip
         OpKind::Cast(ElemTy::F32) if ty == ElemTy::F64 => {
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Cast(_)))?;
             match iop.kind {
@@ -247,10 +267,14 @@ fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             match bin {
+                // arm: fast-add-zero
                 BinOp::Add if float && is_value(sb, ty, 0.0) => identity(op, a),
                 BinOp::Add if float && is_value(sa, ty, 0.0) => identity(op, b),
+                // arm: fast-mul-zero
                 BinOp::Mul if float && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) => constant(op, 0.0),
+                // arm: fast-sub-same
                 BinOp::Sub if float && same(a, b) => constant(op, 0.0),
+                // arm: fast-add-neg, fast-sub-neg
                 BinOp::Add if float && inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
                     let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
                     binary(BinOp::Sub, ty, a, iargs[0].clone())
@@ -263,7 +287,9 @@ fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
                     let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
                     binary(BinOp::Add, ty, a, iargs[0].clone())
                 }
+                // arm: fast-div-same
                 BinOp::Div if float && same(a, b) => constant(op, 1.0),
+                // arm: fast-div-const
                 BinOp::Div if matches!(ty, ElemTy::F32 | ElemTy::F64) => {
                     let divisor = sb.and_then(value_of).filter(|v| *v != 0.0)?;
                     let recip = 1.0 / divisor;
@@ -272,14 +298,17 @@ fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
                     }
                     binary(BinOp::Mul, ty, a, scalar_of(ty, recip))
                 }
+                // arm: fast-reassociate
                 _ => reassociate(op, args),
             }
         }
+        // arm: fast-compare-same
         OpKind::Compare(cmp) if same(a, b) => match cmp {
             CmpOp::Le | CmpOp::Ge | CmpOp::Eq => constant(op, 1.0),
             CmpOp::Ne => constant(op, 0.0),
             CmpOp::Lt | CmpOp::Gt => None,
         },
+        // arm: fast-powf
         OpKind::Powf => match scalar(b).and_then(value_of)? {
             0.0 => constant(op, 1.0),
             -1.0 => Some((Op::new(OpKind::Binary(BinOp::Div), ty), args_of(scalar_of(ty, 1.0), a.clone(), Src::unused()))),
@@ -347,7 +376,6 @@ mod tests {
     use crate::array::Array;
     use crate::context::{Context, ContextOptions};
     use crate::gpu_type::Df32;
-    use crate::ops::select;
 
     fn context(fast: bool) -> Context {
         Context::with_options(ContextOptions::from_env().fast_math(fast)).unwrap()
@@ -363,23 +391,13 @@ mod tests {
     /// Finite and non-zero: the fast rules are only exact on such values.
     const W: [f32; 6] = [0.5, -1.5, 3.0, 0.25, -2.0, 7.0];
 
-    type FloatCase = fn(&Array<f32>, &Array<f32>) -> Vec<u32>;
-
     fn host(array: &Array<f32>) -> Vec<u32> {
         bits(&array.to_vec().unwrap())
     }
 
-    fn mask(array: &Array<u32>) -> Vec<u32> {
-        array.to_vec().unwrap()
-    }
-
-    fn compared(array: &Array<bool>) -> Vec<u32> {
-        array.to_u32().to_vec().unwrap()
-    }
-
     /// Evaluates `case` on `x` and `y` (pending `* 2` of the data, which keeps `-0.0`); returns
     /// the result bits and the length of the program of the last kernel.
-    fn run(ctx: &Context, simplify: bool, data: (&[f32], &[f32]), case: FloatCase) -> (Vec<u32>, usize) {
+    fn run(ctx: &Context, simplify: bool, data: (&[f32], &[f32]), case: fn(&Array<f32>, &Array<f32>) -> Vec<u32>) -> (Vec<u32>, usize) {
         ctx.jit().set_simplify(simplify);
         let x = Array::from_slice_on(ctx, data.0, data.0.len()).unwrap();
         let y = Array::from_slice_on(ctx, data.1, data.1.len()).unwrap();
@@ -387,50 +405,6 @@ mod tests {
         let len = ctx.jit().last_program_len();
         ctx.jit().set_simplify(true);
         (out, len)
-    }
-
-    /// Exact rules: same bits as without simplification, and (when `shorter`) fewer instructions.
-    fn exact_cases() -> Vec<(&'static str, bool, FloatCase)> {
-        vec![
-            ("mul by one", false, |b, _| host(&(b * 1.0))),
-            ("div by one", false, |b, _| host(&(b / 1.0))),
-            ("mul by minus one", false, |b, _| host(&(b * -1.0))),
-            ("sub plus zero", false, |b, _| host(&(b - 0.0))),
-            ("add minus zero", false, |b, _| host(&(b + -0.0))),
-            ("neg neg", true, |b, _| host(&-(-b))),
-            ("abs abs", true, |b, _| host(&b.abs().abs())),
-            ("abs neg", true, |b, _| host(&(-b).abs())),
-            ("floor floor", true, |b, _| host(&b.floor().floor())),
-            ("floor ceil", true, |b, _| host(&b.ceil().floor())),
-            ("ceil ceil", true, |b, _| host(&b.ceil().ceil())),
-            ("ceil floor", true, |b, _| host(&b.floor().ceil())),
-            ("sign sign", true, |b, _| host(&b.sign().sign())),
-            ("min same", false, |b, _| host(&b.minimum(b))),
-            ("max same", false, |b, _| host(&b.maximum(b))),
-            ("select same", false, |b, c| {
-                let m = c.lt(0.5);
-                host(&select(&m, b, b))
-            }),
-            ("lt same", true, |b, _| compared(&b.lt(b))),
-            ("gt same", true, |b, _| compared(&b.gt(b))),
-        ]
-    }
-
-    #[test]
-    fn simplify_exact_float_rules_keep_every_bit() {
-        let ctx = context(false);
-        for (name, shorter, case) in exact_cases() {
-            for data in [(&X[..], &Y[..]), (&Y[..], &X[..])] {
-                let (plain, plain_len) = run(&ctx, false, data, case);
-                let (got, len) = run(&ctx, true, data, case);
-                assert_eq!(got, plain, "{name}: bits differ");
-                if shorter {
-                    assert!(len < plain_len, "{name}: program of {len} instructions, {plain_len} unsimplified");
-                } else {
-                    assert!(len <= plain_len, "{name}: program of {len} instructions, {plain_len} unsimplified");
-                }
-            }
-        }
     }
 
     #[test]
@@ -456,54 +430,6 @@ mod tests {
         let want = bits(&X.map(|v| v + 1.0));
         assert_eq!(bits(&y.to_vec().unwrap()), want);
         assert_eq!(ctx.jit().last_program_len(), 2);
-    }
-
-    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::modulo_one, clippy::eq_op)]
-    #[test]
-    fn simplify_exact_u32_rules() {
-        let ctx = context(false);
-        let data = [0u32, 1, 2, 7, 4_000_000_000, 3];
-        let cases: Vec<(&str, bool, fn(&Array<u32>) -> Vec<u32>)> = vec![
-            ("add zero", false, |u| mask(&(u + 0u32))),
-            ("sub zero", false, |u| mask(&(u - 0u32))),
-            ("mul one", false, |u| mask(&(u * 1u32))),
-            ("div one", false, |u| mask(&(u / 1u32))),
-            ("mul zero", true, |u| mask(&(u * 0u32))),
-            ("rem one", false, |u| mask(&(u % 1u32))),
-            ("xor zero", false, |u| mask(&(u ^ 0u32))),
-            ("zero xor", false, |u| mask(&(0u32 ^ u))),
-            ("or zero", false, |u| mask(&(u | 0u32))),
-            ("and all ones", false, |u| mask(&(u & u32::MAX))),
-            ("all ones and", false, |u| mask(&(u32::MAX & u))),
-            ("and zero", true, |u| mask(&(u & 0u32))),
-            ("shl zero", false, |u| mask(&(u << 0u32))),
-            ("shr 32", false, |u| mask(&(u >> 32u32))),
-            ("rotl 0", false, |u| mask(&u.rotate_left(0u32))),
-            ("rotl 64", false, |u| mask(&u.rotate_left(64u32))),
-            ("rotr 0", false, |u| mask(&u.rotate_right(0u32))),
-            ("xor self", true, |u| mask(&(u ^ u))),
-            ("and self", false, |u| mask(&(u & u))),
-            ("or self", false, |u| mask(&(u | u))),
-            ("not not", true, |u| mask(&!!u)),
-            // Not rules: the amounts and masks that change the value stay operations.
-            ("shl one", false, |u| mask(&(u << 1u32))),
-            ("rotl 33", false, |u| mask(&u.rotate_left(33u32))),
-            ("and mask", false, |u| mask(&(u & 0xFF00u32))),
-        ];
-        for (name, shorter, case) in cases {
-            let mut results = Vec::new();
-            for simplify in [false, true] {
-                ctx.jit().set_simplify(simplify);
-                let u = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
-                let out = case(&(&u + 5u32));
-                results.push((out, ctx.jit().last_program_len()));
-            }
-            ctx.jit().set_simplify(true);
-            assert_eq!(results[0].0, results[1].0, "{name}");
-            if shorter {
-                assert!(results[1].1 < results[0].1, "{name}: {} vs {}", results[1].1, results[0].1);
-            }
-        }
     }
 
     #[allow(clippy::erasing_op)]
@@ -539,109 +465,6 @@ mod tests {
         assert!(same(&operands[0], &args(1, &f, &g)[1]));
         let (_, operands) = rewrite(&op, &args(0, &f, &g), false).unwrap();
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
-    }
-
-    /// The parts of a complex number put together are that number, the real part of a made number
-    /// is its first part, `conj conj` is the identity; a real number in a complex product is not
-    /// a rule (`z * (1 + 0i)` is not `z`: `inf * 0`).
-    #[test]
-    fn simplify_complex_rules() {
-        use crate::complex::C32;
-        let ctx = context(false);
-        let data = [C32::new(f32::INFINITY, 1.0), C32::new(-0.0, 2.0), C32::new(f32::NAN, -3.0), C32::new(1.5, f32::NEG_INFINITY)];
-        type ComplexCase = (&'static str, bool, fn(&Array<C32>) -> Vec<C32>);
-        let cases: [ComplexCase; 4] = [
-            ("make of the parts", true, |w| {
-                let w = w.conj();
-                Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap()
-            }),
-            ("real of make", true, |w| {
-                let w = w.conj();
-                Array::from_parts(&w.real(), &w.imag()).conj().to_vec().unwrap()
-            }),
-            ("conj conj", true, |w| w.conj().conj().to_vec().unwrap()),
-            ("times one", false, |w| (&w.conj() * C32::ONE).to_vec().unwrap()),
-        ];
-        for (name, shorter, case) in cases {
-            let mut results = Vec::new();
-            for simplify in [false, true] {
-                ctx.jit().set_simplify(simplify);
-                let z = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
-                let got = case(&z);
-                let bits: Vec<(u32, u32)> = got.iter().map(|c| (if c.re.is_nan() { 0 } else { c.re.to_bits() }, if c.im.is_nan() { 0 } else { c.im.to_bits() })).collect();
-                results.push((bits, ctx.jit().last_program_len()));
-            }
-            ctx.jit().set_simplify(true);
-            assert_eq!(results[0].0, results[1].0, "{name}: the bits");
-            if shorter {
-                assert!(results[1].1 < results[0].1, "{name}: {} instructions against {}", results[1].1, results[0].1);
-            } else {
-                assert_eq!(results[1].1, results[0].1, "{name}: not a rule");
-            }
-        }
-    }
-
-    #[test]
-    fn simplify_cast_through_f64() {
-        let ctx = context(false);
-        if !ctx.features().contains(luma_core::Features::SHADER_F64) {
-            return;
-        }
-        for simplify in [false, true] {
-            ctx.jit().set_simplify(simplify);
-            let x = Array::from_slice_on(&ctx, &X, X.len()).unwrap();
-            let back = (&x * 2.0).to_f64().to_f32();
-            assert_eq!(bits(&back.to_vec().unwrap()), bits(&X.map(|v| v * 2.0)));
-            assert_eq!(ctx.jit().last_program_len(), if simplify { 2 } else { 3 });
-        }
-    }
-
-    /// Fast rules: not applied without the flag, applied with it (checked by program length or
-    /// by the exact operation they turn into).
-    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::eq_op)]
-    fn fast_cases() -> Vec<(&'static str, bool, FloatCase, FloatCase)> {
-        vec![
-            ("add zero", false, |b, _| host(&(b + 0.0)), |b, _| host(b)),
-            ("mul zero", true, |b, _| host(&(b * 0.0)), |b, _| host(&(b - b))),
-            ("sub same", true, |b, _| host(&(b - b)), |b, _| host(&(b * 0.0 + 0.0))),
-            ("div same", true, |b, _| host(&(b / b)), |b, _| host(&(b * 0.0 + 1.0))),
-            ("le same", true, |b, _| compared(&b.le(b)), |b, _| compared(&b.ge(b))),
-            ("ne same", true, |b, _| compared(&b.ne(b)), |b, _| compared(&b.lt(b))),
-            ("mul chain", true, |b, _| host(&(&(b * 3.0) * 0.5)), |b, _| host(&(b * 1.5))),
-            ("add chain", true, |b, _| host(&(&(b + 1.0) + 2.0)), |b, _| host(&(b + 3.0))),
-            ("sub then add", true, |b, _| host(&(&(b - 1.0) + 3.0)), |b, _| host(&(b + 2.0))),
-            ("add then sub", true, |b, _| host(&(&(b + 5.0) - 2.0)), |b, _| host(&(b + 3.0))),
-            ("powf one", false, |b, _| host(&b.powf(1.0)), |b, _| host(b)),
-            ("powf two", false, |b, _| host(&b.powf(2.0)), |b, _| host(&(b * b))),
-            ("powf half", false, |b, _| host(&b.abs().powf(0.5)), |b, _| host(&b.abs().sqrt())),
-            ("div by constant", false, |b, _| host(&(b / 3.0)), |b, _| host(&(b * 0.333_333_34))),
-        ]
-    }
-
-    #[test]
-    fn simplify_fast_rules_only_with_the_flag() {
-        let strict = context(false);
-        let fast = context(true);
-        for (name, shorter, case, equivalent) in fast_cases() {
-            let data = (&W[..], &W[..]);
-            let (plain, plain_len) = run(&strict, false, data, case);
-            let (strict_out, strict_len) = run(&strict, true, data, case);
-            assert_eq!(strict_len, plain_len, "{name}: rewritten without fast math");
-            assert_eq!(strict_out, plain, "{name}: bits differ without fast math");
-            let (fast_out, fast_len) = run(&fast, true, data, case);
-            let (want, _) = run(&strict, true, data, equivalent);
-            if shorter {
-                assert!(fast_len < plain_len, "{name}: {fast_len} vs {plain_len}");
-            }
-            if name.contains("chain") || name.contains("then") {
-                let (got, expected) = (f32s(&fast_out), f32s(&want));
-                for (g, e) in got.iter().zip(&expected) {
-                    assert!((g - e).abs() <= 1e-5 * e.abs().max(1.0), "{name}: {g} vs {e}");
-                }
-            } else {
-                assert_eq!(fast_out, want, "{name}: not the operation the rule gives");
-            }
-        }
     }
 
     #[test]
@@ -682,7 +505,20 @@ mod tests {
         near(crate::fusion_limit(1, || &(&tiny * 1e30) * 1e30).to_vec().unwrap(), [1e30, 2e30]);
     }
 
-    fn f32s(bits: &[u32]) -> Vec<f32> {
-        bits.iter().map(|&b| f32::from_bits(b)).collect()
+    /// The binary shift by a multiple of 32 (an array method turns a constant amount into a
+    /// unary shift first, so only a pending binary operation reaches this arm).
+    #[test]
+    fn simplify_binary_shift_by_a_multiple_of_32() {
+        let ctx = context(false);
+        let u = Array::from_slice_on(&ctx, &[1u32, 2, 3], 3).unwrap();
+        let buffer = Src::Buffer(std::sync::Arc::clone(u.storage().ok().unwrap()));
+        let args = |amount: u32| [buffer.clone(), Src::Scalar(Scalar::u32(amount)), Src::unused()];
+        for bin in [BinOp::Shl, BinOp::Shr, BinOp::Rotl] {
+            let op = Op::new(OpKind::Binary(bin), ElemTy::U32);
+            let (kept, operands) = rewrite(&op, &args(64), false).unwrap();
+            assert_eq!(kept.kind, OpKind::Unary(UnOp::Id));
+            assert!(same(&operands[0], &buffer));
+            assert!(rewrite(&op, &args(33), false).is_none());
+        }
     }
 }

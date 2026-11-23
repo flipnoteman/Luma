@@ -177,6 +177,7 @@ mod readers;
 mod rerun;
 mod replay;
 mod simplify;
+mod rules;
 pub(crate) mod speculate;
 pub(crate) mod stack;
 mod staging;
