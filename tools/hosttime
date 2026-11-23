@@ -33,7 +33,7 @@ import tempfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # Rust symbols of the library crates: luma::..., luma_core::..., luma_cpu::..., <luma::T as ...>::f (not luma_bench)
-LUMA_FN = re.compile(r"^(?:<)*(luma(?:_(?!bench)[a-z0-9]+)*)::")
+LIB_FN = re.compile(r"^(?:<)*(luma(?:_(?!bench)[a-z0-9]+)*)::")
 LINE = re.compile(r"^\s*([\d,]+)\s+\(\s*[\d.]+%\)\s+(.*)$")
 
 
@@ -101,11 +101,11 @@ def measure(binary, backend, case, a, b, plan_cache, top):
     d = b - a
 
     def luma_self(s):
-        return sum(v for k, v in s.items() if LUMA_FN.match(k))
+        return sum(v for k, v in s.items() if LIB_FN.match(k))
 
     funcs = {}
     for name, v in incl[b].items():
-        if LUMA_FN.match(name) and name in incl[a]:
+        if LIB_FN.match(name) and name in incl[a]:
             per = (v - incl[a][name]) / d
             if per > 0:
                 funcs[name] = per
