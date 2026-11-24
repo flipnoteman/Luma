@@ -619,7 +619,7 @@ impl Kernel {
                     if desc_bytes > max_uniform {
                         return Err(LumaError::BufferTooLarge { requested: desc_bytes, max: max_uniform });
                     }
-                    raw[index] = RawArg::storage(pin.buffer(), *bytes, *writable);
+                    raw[index] = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
                     raw[index + 1] = RawArg::Uniform(bytemuck::bytes_of(desc));
                     index += 2;
                     continue;
@@ -629,7 +629,7 @@ impl Kernel {
                         return Err(LumaError::ContextMismatch);
                     }
                     check_storage(info, index, *element_size, *writable)?;
-                    raw[index] = RawArg::storage(pin.buffer(), *bytes, *writable);
+                    raw[index] = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
                 }
                 ArgRepr::Texture { ctx: arg_ctx, texture, .. } => {
                     if !arg_ctx.same_as(ctx) {
@@ -638,7 +638,7 @@ impl Kernel {
                     if !matches!(info.kind, BindingKind::Texture2d | BindingKind::Sampler) {
                         return Err(LumaError::KernelArgKind { index, expected: info.kind, actual: BindingKind::Texture2d });
                     }
-                    raw[index] = RawArg::storage(texture, texture.size(), false);
+                    raw[index] = RawArg::Storage { buffer: texture, bytes: texture.size(), writable: false };
                 }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {

@@ -660,7 +660,6 @@ impl WgpuBackend {
                 max_storage_buffers: limits.max_storage_buffers_per_shader_stage,
                 max_uniform_bytes: limits.max_uniform_buffer_binding_size,
                 uniform_align: u64::from(limits.min_uniform_buffer_offset_alignment).max(4),
-                storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 max_workgroups_per_dim: limits.max_compute_workgroups_per_dimension,
                 max_workgroup_size: [limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z],
@@ -668,7 +667,6 @@ impl WgpuBackend {
                 max_workgroup_storage_bytes: limits.max_compute_workgroup_storage_size,
             },
             compute_units: gpu.0.compute_units,
-            l2_cache_bytes: None,
         };
 
         let batch = Batch {
@@ -699,7 +697,7 @@ impl WgpuBackend {
             grid_layout,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             uniform_align: info.limits.uniform_align,
-            storage_offset_align: info.limits.storage_offset_align,
+            storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
             max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
             max_buffer_bytes,
             info,
@@ -1217,6 +1215,10 @@ impl Backend for WgpuBackend {
         &self.info
     }
 
+    fn storage_offset_align(&self) -> u64 {
+        self.storage_offset_align
+    }
+
     fn disk_cache(&self) -> &Arc<DiskCache> {
         &self.disk
     }
@@ -1457,7 +1459,7 @@ impl Backend for WgpuBackend {
         // this launch's slots were allocated from.
         let bindings = || {
             kernel.bound(args).map(|(_, arg)| match *arg {
-                RawArg::Storage { buffer, offset, bytes, .. } => (buffer, offset, bytes),
+                RawArg::Storage { buffer, bytes, .. } => (buffer, buffer.offset(), bytes),
                 RawArg::Uniform(data) => (uniforms, 0, data.len() as u64),
             })
         };
@@ -1768,7 +1770,8 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self) -> Result<Profile, BackendError> {
+    #[allow(deprecated)]
+    fn finish_profiling(&self, splits: Vec<luma_core::FusionSplit>) -> Result<Profile, BackendError> {
         let mut profiler = {
             let mut batch = self.batch()?;
             let Some(profiler) = batch.profiler.take() else {
@@ -1781,7 +1784,8 @@ impl Backend for WgpuBackend {
         self.take_gpu_error()?;
         // Everything profiled has completed; only now are its timestamps reliably written.
         self.read_timestamps(&mut profiler)?;
-        let profile = profiler.into_profile();
+        let mut profile = profiler.into_profile();
+        profile.splits = splits;
         Ok(profile)
     }
 
@@ -1904,19 +1908,20 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn profiling_reports_each_launch_or_says_it_is_unsupported() {
         let Some(backend) = open() else { return };
         assert!(!backend.is_profiling().unwrap());
         match backend.enable_profiling() {
             Ok(()) => {
                 assert!(backend.is_profiling().unwrap());
-                let profile = backend.finish_profiling().unwrap();
+                let profile = backend.finish_profiling(Vec::new()).unwrap();
                 assert_eq!(profile.launches(), 0);
                 assert!(!backend.is_profiling().unwrap());
             }
             Err(BackendError::Profiling(_)) => assert!(!backend.info().features.contains(Features::TIMESTAMP_QUERY)),
             Err(other) => panic!("{other}"),
         }
-        assert!(matches!(backend.finish_profiling(), Err(BackendError::Profiling(_))));
+        assert!(matches!(backend.finish_profiling(Vec::new()), Err(BackendError::Profiling(_))));
     }
 }

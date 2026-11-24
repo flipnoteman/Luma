@@ -412,7 +412,7 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
         luma_core::KernelTrust::Trusted,
     )
     .unwrap();
-    let align = ctx.info().limits.storage_offset_align.max(256);
+    let align = ctx.hal().storage_offset_align().max(256);
     let words = (align / 4) as usize;
     // [A | B | C | D]: A and C hold data, B and D are written.
     let buffer = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
@@ -427,8 +427,11 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
     data[..words].copy_from_slice(&a);
     data[2 * words..3 * words].copy_from_slice(&c);
     ctx.upload(&buffer, bytemuck::cast_slice(&data)).unwrap();
-    let range = |at: u64| RawArg::storage_at(&buffer, at * align, align, false);
-    let target = |at: u64| RawArg::storage_at(out, at * align, align, true);
+    // Views of the ranges (`Buffer::at`), made once: a launch binds a view from its offset.
+    let read_views: Vec<Buffer> = (0..4).map(|at| buffer.at(at * align)).collect();
+    let write_views: Vec<Buffer> = (0..4).map(|at| out.at(at * align)).collect();
+    let range = |at: usize| RawArg::read(&read_views[at], align);
+    let target = |at: usize| RawArg::write(&write_views[at], align);
     let size = [words as u32, 1, 1];
     let groups = [(words as u32).div_ceil(64), 1, 1];
     ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
@@ -442,13 +445,14 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
     assert_eq!(&got[2 * words..3 * words], &c[..], "C is untouched");
     assert_eq!(written[3 * words..], c.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
 
-    let misaligned = [RawArg::storage_at(&buffer, 2 * align + 4, 4, true), range(0)];
+    let (m, o, w1, w01) = (buffer.at(2 * align + 4), buffer.at(3 * align), buffer.at(align), buffer.at(0));
+    let misaligned = [RawArg::write(&m, 4), range(0)];
     let result = ctx.launch(&core, [1, 1, 1], [1, 1, 1], &misaligned);
     assert!(matches!(result, Err(LumaError::KernelBinding(_))), "{result:?}");
-    let outside = [RawArg::storage_at(&buffer, 3 * align, 2 * align, true), range(0)];
+    let outside = [RawArg::write(&o, 2 * align), range(0)];
     assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &outside), Err(LumaError::KernelBinding(_))));
     // Overlapping ranges of one buffer still alias.
-    let alias = [RawArg::storage_at(&buffer, 0, 2 * align, true), range(1)];
+    let alias = [RawArg::write(&w01, 2 * align), RawArg::read(&w1, align)];
     assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &alias), Err(LumaError::KernelArgAlias { .. })));
 }
 
@@ -458,18 +462,18 @@ fn memory_now_follows_allocations() {
     let ctx = ctx();
     let Some(before) = ctx.hal().memory_now() else {
         assert!(matches!(ctx.backend(), BackendKind::Wgpu | BackendKind::Cpu));
-        assert_eq!(ctx.memory_stats().device_free_bytes, None);
+        assert_eq!(ctx.paging_stats().device_free_bytes, None);
         return;
     };
     assert!(before.free <= before.total);
     // Other processes may use the device meanwhile: one run in which free memory fell is enough.
     let mut seen = Vec::new();
     for _ in 0..8 {
-        let before = ctx.memory_stats().device_free_bytes.unwrap();
+        let before = ctx.paging_stats().device_free_bytes.unwrap();
         let held = ctx.alloc_buffer(256 << 20, STORAGE_USAGE).unwrap();
         ctx.upload(&held, &vec![1u8; 256 << 20]).unwrap();
         ctx.sync().unwrap();
-        let after = ctx.memory_stats().device_free_bytes.unwrap();
+        let after = ctx.paging_stats().device_free_bytes.unwrap();
         drop(held);
         if after + (128 << 20) <= before {
             return;

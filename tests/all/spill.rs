@@ -155,9 +155,9 @@ fn evicting_unchanged_data_reads_nothing_back() {
     let arrays = twenty(&ctx);
     assert!(ctx.spilled_bytes() > 0);
     let first = sweep(&arrays);
-    let before = ctx.memory_stats();
+    let before = ctx.paging_stats();
     let second = sweep(&arrays);
-    let after = ctx.memory_stats();
+    let after = ctx.paging_stats();
     assert_eq!(first, second);
     assert!(after.clean_evictions > before.clean_evictions, "{before:?} {after:?}");
     assert_eq!(after.readback_evictions, before.readback_evictions, "unchanged data was read back");
@@ -178,11 +178,11 @@ fn a_write_invalidates_the_host_copy() {
     arrays[7] += 1.0;
     // Materialise the sum, so the kernel writes a buffer instead of fusing into the sweep.
     arrays[7].to_vec().unwrap();
-    let before = ctx.memory_stats();
+    let before = ctx.paging_stats();
     sweep(&arrays);
     sweep(&arrays);
     let again = sweep(&arrays);
-    let after = ctx.memory_stats();
+    let after = ctx.paging_stats();
     assert_eq!(after.readback_evictions - before.readback_evictions, 1, "{before:?} {after:?}");
     for (k, got) in again.iter().enumerate() {
         let expected: Vec<f32> = values(16_384, k).iter().map(|v| (v + if k == 7 { 1.0 } else { 0.0 }) * 2.0).collect();
@@ -197,7 +197,7 @@ fn the_host_budget_drops_copies_first() {
     let arrays = twenty(&ctx);
     let first = sweep(&arrays);
     let second = sweep(&arrays);
-    let stats = ctx.memory_stats();
+    let stats = ctx.paging_stats();
     assert_eq!(first, second);
     assert_eq!(stats.host_copy_bytes, 0, "{stats:?}");
     assert_eq!(stats.clean_evictions, 0, "{stats:?}");
@@ -207,8 +207,8 @@ fn the_host_budget_drops_copies_first() {
     let arrays = twenty(&ctx);
     let first = sweep(&arrays);
     let second = sweep(&arrays);
-    let stats = ctx.memory_stats();
+    let stats = ctx.paging_stats();
     assert_eq!(first, second);
     assert!(stats.host_copy_bytes <= 6 << 16, "{stats:?}");
-    assert!(stats.host_copy_bytes > 0 || stats.spilled_bytes > 0);
+    assert!(stats.host_copy_bytes > 0 || ctx.memory_stats().spilled_bytes > 0);
 }

@@ -74,7 +74,6 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_storage_buffers: 256,
             max_uniform_bytes: 65536,
             uniform_align: 16,
-            storage_offset_align: STORAGE_OFFSET_ALIGN,
             max_dynamic_uniforms: u32::MAX,
             max_workgroups_per_dim: 65535,
             max_workgroup_size: [1024, 1024, 64],
@@ -82,7 +81,6 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_workgroup_storage_bytes: 65536,
         },
         compute_units: Some(pool.threads() as u32),
-        l2_cache_bytes: None,
     };
     let key = format!(
         "cpu-{:016x}",
@@ -139,7 +137,6 @@ const STORAGE_OFFSET_ALIGN: u64 = 16;
 enum GraphArg {
     Storage {
         buffer: Buffer,
-        offset: u64,
         bytes: u64,
         writable: bool,
     },
@@ -405,9 +402,9 @@ impl CpuBackend {
         let (mut next_uniform, mut offset) = (0, 0);
         for (_, arg) in kernel.bound(args) {
             match arg {
-                RawArg::Storage { buffer, offset, bytes, .. } => {
+                RawArg::Storage { buffer, bytes, .. } => {
                     // SAFETY: `check_offsets` kept `offset + bytes` within the buffer.
-                    bindings.push(unsafe { raw(buffer)?.as_ptr().add(*offset as usize) });
+                    bindings.push(unsafe { raw(buffer)?.as_ptr().add(buffer.offset() as usize) });
                     binding_bytes.push(*bytes);
                 }
                 RawArg::Uniform(bytes) => {
@@ -529,6 +526,10 @@ impl CpuBackend {
 impl Backend for CpuBackend {
     fn info(&self) -> &DeviceInfo {
         &self.info
+    }
+
+    fn storage_offset_align(&self) -> u64 {
+        STORAGE_OFFSET_ALIGN
     }
 
     fn disk_cache(&self) -> &Arc<DiskCache> {
@@ -704,12 +705,10 @@ impl Backend for CpuBackend {
                 .map(|arg| match arg {
                     GraphArg::Storage {
                         buffer,
-                        offset,
                         bytes,
                         writable,
                     } => RawArg::Storage {
                         buffer,
-                        offset: *offset,
                         bytes: *bytes,
                         writable: *writable,
                     },
@@ -774,12 +773,13 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self) -> Result<Profile, BackendError> {
+    #[allow(deprecated)]
+    fn finish_profiling(&self, splits: Vec<luma_core::FusionSplit>) -> Result<Profile, BackendError> {
         self.dispatches.store(0, Ordering::Relaxed);
         let Some(samples) = lock(&self.profiler).take() else {
             return Err(BackendError::Profiling("profiling is not enabled".into()));
         };
-        let mut profile = Profile::default();
+        let mut profile = Profile { splits, ..Profile::default() };
         profile.add_samples(samples);
         Ok(profile)
     }
@@ -832,12 +832,10 @@ impl Backend for CpuBackend {
                     .map(|arg| match *arg {
                         RawArg::Storage {
                             buffer,
-                            offset,
                             bytes,
                             writable,
                         } => GraphArg::Storage {
                             buffer: buffer.clone(),
-                            offset,
                             bytes,
                             writable,
                         },

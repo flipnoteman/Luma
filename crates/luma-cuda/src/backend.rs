@@ -686,7 +686,7 @@ impl Params {
         for ((position, arg), abi) in kernel.bound(args).zip(&native.param_abis) {
             bound += 1;
             match (abi, arg) {
-                (CudaArgAbi::DevicePtr, RawArg::Storage { buffer, offset, .. }) => self.vals.push(device_ptr(buffer)? + offset),
+                (CudaArgAbi::DevicePtr, RawArg::Storage { buffer, .. }) => self.vals.push(device_ptr(buffer)? + buffer.offset()),
                 (CudaArgAbi::InlineUniform { size }, RawArg::Uniform(bytes)) => {
                     // Each uniform starts on a 16-byte boundary, zero-padded to its size.
                     let at = self.inline.len();
@@ -781,6 +781,8 @@ struct CudaShared {
     info: DeviceInfo,
     disk: Arc<DiskCache>,
     cost: Arc<OnceLock<CostModel>>,
+    /// L2 cache size, bytes, from the device attribute.
+    l2_cache_bytes: Option<u64>,
     cc: (i32, i32),
     nvvm: crate::nvvm::Nvvm,
     /// A dedicated stream-ordered memory pool, when the device supports them.
@@ -904,7 +906,6 @@ impl CudaShared {
                 max_storage_buffers: 256,
                 max_uniform_bytes: 65536,
                 uniform_align: 16,
-                storage_offset_align: STORAGE_OFFSET_ALIGN,
                 max_dynamic_uniforms: u32::MAX,
                 max_workgroups_per_dim: 65535,
                 max_workgroup_size: block.map(|d| d as u32),
@@ -912,11 +913,10 @@ impl CudaShared {
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
             compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
-            l2_cache_bytes: u64::try_from(l2_bytes).ok().filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
         let textures = texture::caps(&attribute);
-        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool, textures })
+        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), l2_cache_bytes: u64::try_from(l2_bytes).ok().filter(|&n| n > 0), cc: (major, minor), nvvm, pool, textures })
     }
 }
 
@@ -1434,6 +1434,14 @@ impl Backend for CudaBackend {
         &self.shared.info
     }
 
+    fn l2_cache_bytes(&self) -> Option<u64> {
+        self.shared.l2_cache_bytes
+    }
+
+    fn storage_offset_align(&self) -> u64 {
+        STORAGE_OFFSET_ALIGN
+    }
+
     fn disk_cache(&self) -> &Arc<DiskCache> {
         &self.shared.disk
     }
@@ -1841,7 +1849,8 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self) -> Result<Profile, BackendError> {
+    #[allow(deprecated)]
+    fn finish_profiling(&self, splits: Vec<luma_core::FusionSplit>) -> Result<Profile, BackendError> {
         let samples = {
             let mut st = lock(&self.state);
             let Some(samples) = st.profiler.take() else {
@@ -1861,7 +1870,7 @@ impl Backend for CudaBackend {
             };
             timings.push((Arc::clone(&sample.label), duration));
         }
-        let mut profile = Profile::default();
+        let mut profile = Profile { splits, ..Profile::default() };
         profile.add_samples(timings);
         Ok(profile)
     }

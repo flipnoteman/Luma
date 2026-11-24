@@ -71,6 +71,6 @@ LUMA_TRSV_INV_MIN	dev	W0	before-release	768
 LUMA_TRSV_KC	dev	W0	before-release	8
 LUMA_TUNING	dev	W0	before-release	auto by device
 LUMA_WGPU_DUMP	user	W0	never	unset
-LUMA_FAST_MATH	internal	W1-U0b	never	removed in 0.6 (replaced by LUMA_NUMERICS; named in CHANGELOG and the guide)
-LUMA_LINALG_TF32	internal	W1-U0b	never	removed in 0.6 (replaced by LUMA_NUMERICS)
-LUMA_TF32_MATMUL	internal	W1-U0b	never	removed in 0.6 (replaced by LUMA_NUMERICS)
+LUMA_FAST_MATH	dev	W1-U0b	before-release	off (read with a warning until 0.6; the deprecated alias of LUMA_NUMERICS=fast / +fast-math)
+LUMA_LINALG_TF32	dev	W1-U0b	before-release	off (read with a warning until 0.6; the deprecated alias of LUMA_NUMERICS=...+tf32-linalg)
+LUMA_TF32_MATMUL	dev	W1-U0b	before-release	on (read with a warning until 0.6; the deprecated alias of LUMA_NUMERICS=strict / -tf32-matmul)

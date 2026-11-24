@@ -42,7 +42,7 @@ pub(crate) struct Cmd {
 /// One captured argument of a launch.
 #[derive(Debug)]
 pub(crate) enum CmdArg {
-    Storage { buffer: Buffer, offset: u64, bytes: u64, writable: bool },
+    Storage { buffer: Buffer, bytes: u64, writable: bool },
     Uniform(Box<[u8]>),
 }
 
@@ -52,9 +52,9 @@ impl Cmd {
         self.args
             .iter()
             .map(|arg| match arg {
-                CmdArg::Storage { buffer, offset, bytes, writable } => {
+                CmdArg::Storage { buffer, bytes, writable } => {
                     let buffer = subst.iter().find(|(from, _)| from == buffer).map_or(buffer, |(_, to)| to);
-                    RawArg::Storage { buffer, offset: *offset, bytes: *bytes, writable: *writable }
+                    RawArg::Storage { buffer, bytes: *bytes, writable: *writable }
                 }
                 CmdArg::Uniform(data) => RawArg::Uniform(data),
             })
@@ -271,8 +271,9 @@ impl Context {
             let args = args
                 .iter()
                 .map(|arg| match *arg {
-                    RawArg::Storage { buffer, offset, bytes, writable } => {
-                        CmdArg::Storage { buffer: buffer.clone(), offset, bytes, writable }
+                    RawArg::Storage { buffer, bytes, writable } => {
+                        debug_assert_eq!(buffer.offset(), 0, "a recording captures whole buffers");
+                        CmdArg::Storage { buffer: buffer.clone(), bytes, writable }
                     }
                     RawArg::Uniform(data) => CmdArg::Uniform(data.into()),
                 })

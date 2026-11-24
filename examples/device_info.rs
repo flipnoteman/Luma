@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         Some(factor) => println!("f64 x{factor:.1}"),
         None => println!("no f64"),
     }
-    match cost.memory {
+    match ctx.memory_model() {
         Some(memory) => println!("memory: {memory}"),
         None => println!("memory: not calibrated (the profile's fixed numbers are in use)"),
     }

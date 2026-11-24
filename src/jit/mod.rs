@@ -3409,6 +3409,12 @@ impl JitState {
         lock(&self.decisions).take().unwrap_or_default()
     }
 
+    /// Keeps `decisions` (those of a profiled region) for the next [`JitState::drain_decisions`]
+    /// without recording more.
+    pub(crate) fn park_decisions(&self, decisions: Vec<Decision>) {
+        *lock(&self.decisions) = Some(decisions);
+    }
+
     /// Returns the decisions recorded so far and goes on recording (if it was on).
     pub(crate) fn drain_decisions(&self) -> Vec<Decision> {
         lock(&self.decisions).as_mut().map(std::mem::take).unwrap_or_default()

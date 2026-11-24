@@ -413,7 +413,7 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
     // The L2 sweep: `SWEEP_THREADS` invocations read a working set of `ws` words over and over,
     // `traffic` words in all (at least one pass).
     let traffic: u32 = if cpu { 1 << 22 } else { 1 << 24 }.min(cap);
-    let attribute = ctx.info().l2_cache_bytes;
+    let attribute = ctx.hal().l2_cache_bytes();
     let sizes: Vec<u64> = match attribute {
         Some(l2) => [l2 / 4, l2 / 2, l2, l2 * 2, l2 * 4].to_vec(),
         None => (20..=26).map(|shift| 1u64 << shift).collect(),
@@ -495,8 +495,9 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
 }
 
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
-/// arithmetic relative to it, and the cost of a launch.
-pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
+/// arithmetic relative to it, and the cost of a launch; and how bytes move inside it (the
+/// memory model, `None` if its measurement failed).
+pub(crate) fn calibrate(ctx: &Context) -> Result<(CostModel, Option<MemoryModel>)> {
     let cpu = ctx.is_cpu();
     let copy = || kernel_source("", "f32", "in0[i]", "", "x");
 
@@ -539,7 +540,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
             None
         }
     };
-    Ok(CostModel::new(t_launch / 1000.0, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor).with(|m| m.memory = memory))
+    Ok((CostModel::new(t_launch / 1000.0, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor), memory))
 }
 
 /// How much worse than the profile's numbers a measurement may be before it counts as taken
@@ -558,16 +559,15 @@ pub(crate) fn contended(measured: &CostModel, reference: &CostModel) -> bool {
         || lower(measured.f32_ops_per_ns, reference.f32_ops_per_ns)
         || slower(measured.df32_factor, reference.df32_factor)
         || matches!((measured.f64_factor, reference.f64_factor), (Some(m), Some(r)) if slower(m, r))
-        || matches!((&measured.memory, &reference.memory), (Some(m), Some(r)) if lower(m.l2_gbs, r.l2_gbs) || slower(m.latency_ns, r.latency_ns))
 }
 
 /// [`calibrate`], measured again once if the result looks contended (see [`contended`]):
 /// `None` if both measurements do, so that the caller neither uses nor keeps them.
-pub(crate) fn calibrate_clean(ctx: &Context, reference: &CostModel) -> Result<Option<CostModel>> {
+pub(crate) fn calibrate_clean(ctx: &Context, reference: &CostModel) -> Result<Option<(CostModel, Option<MemoryModel>)>> {
     for _ in 0..2 {
-        let model = calibrate(ctx)?;
+        let (model, memory) = calibrate(ctx)?;
         if !contended(&model, reference) {
-            return Ok(Some(model));
+            return Ok(Some((model, memory)));
         }
     }
     Ok(None)
@@ -630,8 +630,8 @@ mod tests {
     fn the_memory_calibration_on_the_cpu_gives_sane_factors() {
         let options = crate::ContextOptions::default().backend(luma_core::BackendKind::Cpu).calibrate(false);
         let ctx = Context::with_options(options).unwrap();
-        let cost = calibrate(&ctx).unwrap();
-        let memory = cost.memory.expect("the CPU backend measures the memory model");
+        let (_, memory) = calibrate(&ctx).unwrap();
+        let memory = memory.expect("the CPU backend measures the memory model");
         assert_eq!(memory.shared_gbs, None);
         let factors = [memory.strided_factor[0], memory.strided_factor[1], memory.strided_factor[2], memory.gather_factor, memory.transpose_factor];
         for factor in factors {
@@ -641,21 +641,10 @@ mod tests {
     }
 
     #[test]
-    fn a_much_slower_l2_or_latency_counts_as_contended_when_both_have_memory_numbers() {
-        let memory = MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0);
-        let reference = CostModel::NVIDIA.with(|m| m.memory = Some(memory));
-        assert!(!contended(&reference, &reference));
-        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 400.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0))), &reference));
-        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 130.0))), &reference));
-        assert!(!contended(&reference.with(|m| m.memory = None), &reference), "nothing to compare");
-        assert!(!contended(&reference, &CostModel::NVIDIA), "the presets have no memory numbers");
-    }
-
-    #[test]
     fn calibrating_a_context_with_small_chunks_leaves_it_usable() {
         let options = crate::ContextOptions::default().calibrate(false).chunk_bytes(1024);
         let ctx = Context::with_options(options).unwrap();
-        let cost = calibrate(&ctx).unwrap();
+        let (cost, _) = calibrate(&ctx).unwrap();
         for number in [cost.launch_us, cost.bandwidth_gbs, cost.f32_ops_per_ns, cost.df32_factor] {
             assert!(number.is_finite() && number > 0.0, "{cost:?}");
         }

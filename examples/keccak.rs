@@ -465,14 +465,18 @@ fn main() -> Result<()> {
         assert!(matches_host(&out)?, "{name}: result differs from the reference");
         let seconds = best_of(&ctx, 5, || run(&state, reps).map(drop))?;
         let (_, profile) = ctx.profile(|| run(&state, reps).and_then(|_| ctx.sync()))?;
+        let decisions = ctx.take_decisions();
         row(name, n, reps, seconds, &profile);
-        profiles.push((name, profile));
+        profiles.push((name, profile, decisions));
     }
     println!("{}", "=".repeat(90));
-    for (name, profile) in &profiles {
-        let cuts: Vec<&Decision> = profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).collect();
+    for (name, profile, decisions) in &profiles {
+        let cuts: Vec<&Decision> = decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).collect();
         println!("\n{name}: {} launches, {} splits", profile.launches(), cuts.len());
-        print!("{}", { let mut bare = profile.clone(); bare.decisions.clear(); bare });
+        // The kernel table without the cut lines (listed below with their reasons).
+        #[allow(deprecated)]
+        let bare = Profile { splits: Vec::new(), ..profile.clone() };
+        print!("{bare}");
         let mut reasons: Vec<(String, usize)> = Vec::new();
         for split in cuts {
             let text = split.to_string();

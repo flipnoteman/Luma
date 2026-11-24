@@ -803,32 +803,41 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
     }
 }
 
-/// What a launch binds to read an input: the pinned buffer, the byte range of it, from `offset`.
+/// What a launch binds to read an input: the pinned buffer, or a view of it that starts at the
+/// input's window (see [`Buffer::at`]), and the bytes of it.
 pub(super) struct InPin {
     pin: Pin,
-    offset: u64,
+    view: Option<Buffer>,
     bytes: u64,
 }
 
 impl InPin {
     fn new(pin: Pin, bytes: u64) -> Self {
-        InPin { pin, offset: 0, bytes }
+        InPin { pin, view: None, bytes }
     }
 
     /// Pins the only segment of `input`. A window whose range starts where the device allows a
-    /// binding to is bound as that range of its pack's buffer, instead of being copied out.
+    /// binding to is bound as that range of its pack's buffer, instead of being copied out. A
+    /// recording captures buffers whole (its commands are replayed with other buffers swapped
+    /// in), so it keeps copying.
     fn of(input: &Storage) -> Result<Self, LumaError> {
-        if let Some((pack, at)) = input.window() {
+        let ctx = input.ctx();
+        if let Some((pack, at)) = input.window()
+            && !ctx.recording_here()
+        {
             let offset = pack.layout().bytes(at);
-            if offset % input.ctx().info().limits.storage_offset_align.max(1) == 0 {
-                return Ok(InPin { pin: pack.pin_read(0)?, offset, bytes: input.byte_len() });
+            let align = ctx.hal().storage_offset_align();
+            if offset == 0 || (align != 0 && offset % align == 0) {
+                let pin = pack.pin_read(0)?;
+                let view = (offset != 0).then(|| pin.buffer().at(offset));
+                return Ok(InPin { pin, view, bytes: input.byte_len() });
             }
         }
         Ok(InPin::new(input.pin_read(0)?, input.byte_len()))
     }
 
     pub(super) fn raw(&self) -> RawArg<'_> {
-        RawArg::storage_at(self.pin.buffer(), self.offset, self.bytes, false)
+        RawArg::read(self.view.as_ref().unwrap_or(self.pin.buffer()), self.bytes)
     }
 }
 

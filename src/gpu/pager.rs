@@ -709,6 +709,13 @@ impl Context {
             pooled_bytes: self.pooled_bytes(),
             spilled_bytes: pager.spilled_bytes.load(Ordering::Relaxed),
             budget_bytes: pager.budget,
+        }
+    }
+
+    /// How the context pages data between the device and host memory (see [`PagingStats`]).
+    pub fn paging_stats(&self) -> PagingStats {
+        let pager = self.pager();
+        PagingStats {
             device_free_bytes: self.hal().memory_now().map(|now| now.free),
             host_copy_bytes: pager.host_copy_bytes.load(Ordering::Relaxed),
             clean_evictions: pager.clean_evictions.load(Ordering::Relaxed),
@@ -728,7 +735,6 @@ impl Context {
 /// on CUDA, the driver's pool reserve of memory that was freed but not yet returned to the
 /// device ([`Context::trim`] returns it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct MemoryStats {
     /// Bytes of device buffers in use: array data; what recordings, recorded plans and loops
     /// keep (the intermediates of a plan, state placeholders, a loop's work buffers, a captured
@@ -742,6 +748,14 @@ pub struct MemoryStats {
     /// Bytes of array data the context keeps on the device (`None`: no budget; data only moves
     /// to host memory when the device reports that it is full).
     pub budget_bytes: Option<u64>,
+}
+
+/// How the context pages array data between the device and host memory, from
+/// [`Context::paging_stats`]; what [`MemoryStats`] does not say. (A separate type because
+/// `MemoryStats` can be built by a struct literal and so cannot grow fields.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PagingStats {
     /// Bytes of device memory free right now, as the device reports them (everything on it, not
     /// only this context's); `None` where the backend cannot tell (wgpu, CPU).
     pub device_free_bytes: Option<u64>,

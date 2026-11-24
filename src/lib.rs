@@ -197,9 +197,10 @@ mod vision;
 pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
-pub use gpu::pager::MemoryStats;
+pub use gpu::pager::{MemoryStats, PagingStats};
 pub use numerics::{Numerics, Reduced};
-pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
+#[allow(deprecated)]
+pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
 pub use luma_core::hal::HostBytes;
 pub use error::{LumaError, Result};
 pub use fields::Fields;

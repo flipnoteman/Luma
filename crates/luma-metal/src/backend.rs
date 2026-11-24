@@ -313,7 +313,6 @@ mod imp {
                     max_storage_buffers: if device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2 { 256 } else { 28 },
                     max_uniform_bytes: 65536,
                     uniform_align: 16,
-                    storage_offset_align: STORAGE_OFFSET_ALIGN,
                     max_dynamic_uniforms: u32::MAX,
                     max_workgroups_per_dim: 65535,
                     max_workgroup_size: [threads.width as u32, threads.height as u32, threads.depth as u32],
@@ -322,7 +321,6 @@ mod imp {
                 },
                 // Metal does not report the GPU core count.
                 compute_units: None,
-                l2_cache_bytes: None,
             };
             let identity = format!("{name}\n{}\n{apple_silicon}", std::env::consts::ARCH);
             let key = format!("metal-{:016x}", cache::fnv1a(identity.as_bytes()));
@@ -867,10 +865,10 @@ mod imp {
                     let mut slot = 1;
                     for (_, arg) in kernel.bound(args) {
                         match arg {
-                            RawArg::Storage { buffer, offset, .. } => {
+                            RawArg::Storage { buffer, .. } => {
                                 let buf = raw(buffer)?;
                                 self.mark_used(buf, next_seq);
-                                set_buffer(encoder, &mut batch.bound, buf, *offset as usize, slot);
+                                set_buffer(encoder, &mut batch.bound, buf, buffer.offset() as usize, slot);
                             }
                             RawArg::Uniform(bytes) if bytes.len() <= SET_BYTES_MAX => set_bytes(encoder, &mut batch.bound, bytes, slot),
                             RawArg::Uniform(bytes) => {
@@ -893,10 +891,10 @@ mod imp {
                     packed.clear();
                     for (_, arg) in kernel.bound(args) {
                         let address = match arg {
-                            RawArg::Storage { buffer, offset, writable, .. } => {
+                            RawArg::Storage { buffer, writable, .. } => {
                                 let buf = raw(buffer)?;
                                 self.mark_used(buf, next_seq);
-                                use_resource(encoder, &mut batch.resident, buf, *writable) + offset
+                                use_resource(encoder, &mut batch.resident, buf, *writable) + buffer.offset()
                             }
                             RawArg::Uniform(bytes) => {
                                 let (buf, offset) = self.uniform_slot(batch, bytes)?;
@@ -1034,6 +1032,10 @@ mod imp {
     impl Backend for MetalBackend {
         fn info(&self) -> &DeviceInfo {
             &self.info
+        }
+
+        fn storage_offset_align(&self) -> u64 {
+            STORAGE_OFFSET_ALIGN
         }
 
         fn memory_now(&self) -> Option<MemoryNow> {
@@ -1378,7 +1380,8 @@ mod imp {
             Ok(())
         }
 
-        fn finish_profiling(&self) -> Result<Profile, BackendError> {
+        #[allow(deprecated)]
+        fn finish_profiling(&self, splits: Vec<luma_core::FusionSplit>) -> Result<Profile, BackendError> {
             let samples = {
                 let mut batch = self.batch()?;
                 let Some(samples) = batch.profiler.take() else {
@@ -1402,7 +1405,7 @@ mod imp {
                 };
                 timed.push((label, duration));
             }
-            let mut profile = Profile::default();
+            let mut profile = Profile { splits, ..Profile::default() };
             profile.add_samples(timed);
             Ok(profile)
         }
@@ -1435,7 +1438,7 @@ mod imp {
                         let arg_start = u32::try_from(direct_args.len()).ok()?;
                         for (_, arg) in kernel.bound(launch.args) {
                             let entry = match arg {
-                                RawArg::Storage { buffer, offset, .. } => GraphDirectArg::Storage(ResolvedBuffer::new(buffer)?, *offset as usize),
+                                RawArg::Storage { buffer, .. } => GraphDirectArg::Storage(ResolvedBuffer::new(buffer)?, buffer.offset() as usize),
                                 RawArg::Uniform(data) if data.len() <= SET_BYTES_MAX => GraphDirectArg::InlineUniform(push_bytes(&mut bytes, data)?),
                                 RawArg::Uniform(data) => GraphDirectArg::LargeUniform(push_bytes(&mut bytes, data)?),
                             };
@@ -1448,8 +1451,8 @@ mod imp {
                         let mut entries = Vec::new();
                         for (_, arg) in kernel.bound(launch.args) {
                             entries.push(match arg {
-                                RawArg::Storage { buffer, offset, writable, .. } => {
-                                    GraphArgEntry::Storage { buffer: ResolvedBuffer::new(buffer)?, offset: *offset, writable: *writable }
+                                RawArg::Storage { buffer, writable, .. } => {
+                                    GraphArgEntry::Storage { buffer: ResolvedBuffer::new(buffer)?, offset: buffer.offset(), writable: *writable }
                                 }
                                 RawArg::Uniform(data) => GraphArgEntry::Uniform(push_bytes(&mut bytes, data)?),
                             });

@@ -148,5 +148,6 @@ fn profiling_returns_the_decisions_and_cuts() {
         })
         .unwrap();
     assert!(profile.cuts().any(|(_, _, reason)| matches!(reason, SplitReason::Nodes { .. })));
-    assert!(profile.decisions.len() >= profile.cuts().count());
+    let decisions = ctx.take_decisions();
+    assert!(decisions.len() >= profile.cuts().count());
 }

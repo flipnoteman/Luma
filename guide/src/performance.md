@@ -39,12 +39,14 @@ where the GPU time goes, not to measure throughput. For the host's time, time th
 
 ### Why was it cut: `cuts()` and `decisions`
 
-`Profile::decisions` lists every choice the planner made while profiling
+`Profile::cuts()` gives the cuts of expressions in a profiled region: the operation and
+source line where an expression was cut, and the
+[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html). Every choice the planner made
+while profiling
 ([`Decision`](https://docs.rs/luma/latest/luma/struct.Decision.html): the operation, its source line,
 the [`DecisionSite`](https://docs.rs/luma/latest/luma/enum.DecisionSite.html), the chosen label and the
-alternatives that lost). `Profile::cuts()` gives the cuts of expressions among them: the operation and
-source line where an expression was cut, and the
-[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html). To record decisions without
+alternatives that lost) is returned by `Context::take_decisions()` right after
+`Context::finish_profiling()` (or `Context::profile`). To record decisions without
 profiling (host paths, the plan cache and graph capture stay on), use `Context::record_decisions(true)`
 (or `LUMA_RECORD_DECISIONS=1`) and `Context::take_decisions()`.
 

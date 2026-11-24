@@ -358,6 +358,7 @@ impl Case {
                 eval_all(&out.iter().collect::<Vec<_>>())?;
                 ctx.sync()
             })?;
+            let decisions = ctx.take_decisions();
             let transfer = best_of(3, || {
                 let start = Instant::now();
                 let outs: Vec<Words> = match op {
@@ -387,7 +388,7 @@ impl Case {
                     let label: String = k.label.chars().take(150).collect();
                     println!("  {:>5}x {:>9.1} us  {}", k.launches, k.total.as_secs_f64() * 1e6, label);
                 }
-                for s in profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))) {
+                for s in decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))) {
                     println!("  {s}");
                 }
             }
@@ -402,7 +403,7 @@ impl Case {
                 gpu: profile.total(),
                 first_call: first,
                 cpu: cpu_rate(op),
-                splits: profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).map(ToString::to_string).collect(),
+                splits: decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).map(ToString::to_string).collect(),
             });
         }
         Ok(rows)

@@ -30,13 +30,15 @@ pub(super) const BATCH_LIMIT: u32 = 256;
 /// buffer through `reshape` make that reachable.
 fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     for (second, arg) in args.iter().enumerate() {
-        let RawArg::Storage { buffer, offset, bytes, writable } = arg else { continue };
+        let RawArg::Storage { buffer, bytes, writable } = arg else { continue };
+        let offset = buffer.offset();
         for (first, earlier) in args.iter().enumerate().take(second) {
-            let RawArg::Storage { buffer: other, offset: other_offset, bytes: other_bytes, writable: other_writable } = earlier else {
+            let RawArg::Storage { buffer: other, bytes: other_bytes, writable: other_writable } = earlier else {
                 continue;
             };
+            let other_offset = other.offset();
             // Disjoint ranges of one buffer do not alias.
-            let overlap = *offset < other_offset + other_bytes && *other_offset < offset + bytes;
+            let overlap = offset < other_offset + other_bytes && other_offset < offset + bytes;
             if buffer == other && overlap && (*writable || *other_writable) {
                 return Err(LumaError::KernelArgAlias { first, second });
             }

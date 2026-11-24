@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use log::{debug, info};
@@ -220,6 +220,8 @@ pub struct DiskCache {
     key: String,
     /// Hash of the pipeline blob last loaded or written, 0 if none.
     pipelines_hash: Mutex<u64>,
+    /// The memory model of the device, shared by the contexts that open it.
+    memory: OnceLock<Option<MemoryModel>>,
 }
 
 impl std::fmt::Debug for DiskCache {
@@ -231,7 +233,7 @@ impl std::fmt::Debug for DiskCache {
 impl DiskCache {
     /// Opens the cache of the device named by `key` in `dir` (`None`: caching is off).
     pub fn open(dir: Option<PathBuf>, key: String) -> Arc<DiskCache> {
-        Arc::new(DiskCache { dir, key, pipelines_hash: Mutex::new(0) })
+        Arc::new(DiskCache { dir, key, pipelines_hash: Mutex::new(0), memory: OnceLock::new() })
     }
 
     /// The directory, `None` when caching is off.
@@ -304,8 +306,20 @@ impl DiskCache {
         }
     }
 
-    /// The cost model stored for this device and driver, if there is a valid one.
+    /// The cost model stored for this device and driver, if there is a valid one (see
+    /// [`DiskCache::load_calibration`] for the memory model stored with it).
     pub fn load_cost(&self) -> Option<CostModel> {
+        self.load_calibration().map(|(cost, _)| cost)
+    }
+
+    /// Stores a cost model measured for this device and driver, without a memory model.
+    pub fn store_cost(&self, model: &CostModel) {
+        self.store_calibration(model, None);
+    }
+
+    /// The cost model and the memory model stored for this device and driver, if there is a valid
+    /// file.
+    pub fn load_calibration(&self) -> Option<(CostModel, Option<MemoryModel>)> {
         let bytes = self.load_blob(&format!("cost-{}", self.key), COST)?;
         let numbers: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|chunk| f64::from_le_bytes(*chunk)).collect();
         let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, l2_bytes, l2_gbs, shared_gbs, s2, s8, s32, gather, transpose, latency_ns, l2_exact] = numbers[..] else { return None };
@@ -323,14 +337,14 @@ impl DiskCache {
             }
             Some(MemoryModel::new(l2_bytes.map(|bytes| bytes as u64), l2_exact == 1.0, l2_gbs, shared_gbs, [s2, s8, s32], gather, transpose, latency_ns))
         };
-        let model = CostModel::new(launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor).with(|m| m.memory = memory);
-        (sane(launch_us) && sane(bandwidth_gbs) && sane(f32_ops_per_ns) && sane(df32_factor) && f64_factor.is_none_or(sane)).then_some(model)
+        let model = CostModel::new(launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor);
+        (sane(launch_us) && sane(bandwidth_gbs) && sane(f32_ops_per_ns) && sane(df32_factor) && f64_factor.is_none_or(sane)).then_some((model, memory))
     }
 
-    /// Stores the cost model measured for this device and driver.
-    pub fn store_cost(&self, model: &CostModel) {
+    /// Stores the cost model and the memory model measured for this device and driver.
+    pub fn store_calibration(&self, model: &CostModel, memory: Option<&MemoryModel>) {
         let mut numbers = vec![model.launch_us, model.bandwidth_gbs, model.f32_ops_per_ns, model.df32_factor, model.f64_factor.unwrap_or(f64::NAN)];
-        match &model.memory {
+        match memory {
             Some(m) => numbers.extend([
                 m.l2_bytes.map_or(f64::NAN, |bytes| bytes as f64),
                 m.l2_gbs,
@@ -347,6 +361,17 @@ impl DiskCache {
         }
         let bytes: Vec<u8> = numbers.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.store_blob(&format!("cost-{}", self.key), COST, &bytes);
+    }
+
+    /// The memory model of this device as measured or loaded by the context that opened it first
+    /// (the contexts of a device share this cache); `None` until one set it or where there is none.
+    pub fn memory_model(&self) -> Option<MemoryModel> {
+        self.memory.get().copied().flatten()
+    }
+
+    /// Records the memory model of this device for [`DiskCache::memory_model`]; the first call wins.
+    pub fn set_memory_model(&self, memory: Option<MemoryModel>) {
+        let _ = self.memory.set(memory);
     }
 
     /// Whether a calibration of this device and driver looked contended less than a day ago, so
@@ -476,17 +501,19 @@ mod tests {
         let model = CostModel::new(3.5, 123.0, 456.0, 7.0, None);
         disk.store_cost(&model);
         assert_eq!(disk.load_cost(), Some(model));
+        assert_eq!(disk.load_calibration(), Some((model, None)));
         let with_f64 = model.with(|m| m.f64_factor = Some(9.0));
         disk.store_cost(&with_f64);
-        let with_memory = with_f64.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.1, 1.9, 4.0], 7.5, 3.2, 180.0)));
-        disk.store_cost(&with_memory);
-        assert_eq!(disk.load_cost(), Some(with_memory), "memory numbers round-trip");
-        let unsized_memory = with_memory.with(|m| m.memory = m.memory.map(|x| MemoryModel::new(Some(8 << 20), false, x.l2_gbs, None, x.strided_factor, x.gather_factor, x.transpose_factor, x.latency_ns)));
-        disk.store_cost(&unsized_memory);
-        assert_eq!(disk.load_cost(), Some(unsized_memory), "an inexact size round-trip");
-        let no_size = with_memory.with(|m| m.memory = m.memory.map(|x| MemoryModel::new(None, false, x.l2_gbs, None, x.strided_factor, x.gather_factor, x.transpose_factor, x.latency_ns)));
-        disk.store_cost(&no_size);
-        assert_eq!(disk.load_cost(), Some(no_size), "unknown sizes round-trip");
+        let memory = MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.1, 1.9, 4.0], 7.5, 3.2, 180.0);
+        disk.store_calibration(&with_f64, Some(&memory));
+        assert_eq!(disk.load_calibration(), Some((with_f64, Some(memory))), "memory numbers round-trip");
+        assert_eq!(disk.load_cost(), Some(with_f64));
+        let unsized_memory = MemoryModel::new(Some(8 << 20), false, memory.l2_gbs, None, memory.strided_factor, memory.gather_factor, memory.transpose_factor, memory.latency_ns);
+        disk.store_calibration(&with_f64, Some(&unsized_memory));
+        assert_eq!(disk.load_calibration(), Some((with_f64, Some(unsized_memory))), "an inexact size round-trip");
+        let no_size = MemoryModel::new(None, false, memory.l2_gbs, None, memory.strided_factor, memory.gather_factor, memory.transpose_factor, memory.latency_ns);
+        disk.store_calibration(&with_f64, Some(&no_size));
+        assert_eq!(disk.load_calibration(), Some((with_f64, Some(no_size))), "unknown sizes round-trip");
         disk.store_cost(&with_f64);
         assert_eq!(DiskCache::open(Some(dir.clone()), "test-key".into()).load_cost(), Some(with_f64), "a second open reads it");
         assert_eq!(DiskCache::open(None, "test-key".into()).load_cost(), None, "no directory, no cache");

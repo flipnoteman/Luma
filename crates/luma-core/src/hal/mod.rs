@@ -205,7 +205,6 @@ bit_ops!(BufferUsage);
 
 /// Throughputs of a device, measured when a context opens or taken from a profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
 pub struct CostModel {
     /// Host + GPU time of one dispatch of a tiny kernel, microseconds.
     pub launch_us: f64,
@@ -217,9 +216,6 @@ pub struct CostModel {
     pub df32_factor: f64,
     /// Cost of one `f64` add or mul in f32-operation units; `None` without `SHADER_F64`.
     pub f64_factor: Option<f64>,
-    /// How bytes move inside the device (L2, workgroup memory, access patterns, latency);
-    /// measured by calibration, `None` for the fixed presets and where calibration is off.
-    pub memory: Option<MemoryModel>,
 }
 
 /// How bytes move inside a device, measured by calibration next to the [`CostModel`] numbers.
@@ -274,13 +270,12 @@ impl fmt::Display for MemoryModel {
 }
 
 impl CostModel {
-    /// A cost model of the given measurements, without a memory model.
+    /// A cost model of the given measurements.
     pub const fn new(launch_us: f64, bandwidth_gbs: f64, f32_ops_per_ns: f64, df32_factor: f64, f64_factor: Option<f64>) -> CostModel {
-        CostModel { launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, memory: None }
+        CostModel { launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor }
     }
 
-    /// This model with `change` applied (the struct is `#[non_exhaustive]`, so other crates
-    /// cannot use struct update syntax).
+    /// This model with `change` applied.
     pub fn with(mut self, change: impl FnOnce(&mut CostModel)) -> CostModel {
         change(&mut self);
         self
@@ -494,28 +489,63 @@ impl fmt::Display for Decision {
     }
 }
 
+/// A point where an expression was cut into several kernels, and why.
+///
+/// Deprecated with [`Profile::splits`]: [`Profile::cuts`] gives the same three values, and
+/// `Context::take_decisions` every decision of the planner (`DecisionSite::Cut` is a cut).
+#[deprecated(since = "0.5.3", note = "use `Profile::cuts()` (or `Decision` with `DecisionSite::Cut`); removed in 0.6")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FusionSplit {
+    /// The operation whose creation (or evaluation) caused the cut.
+    pub op: &'static str,
+    /// Where that operation was written.
+    pub location: &'static Location<'static>,
+    /// Why the expression was cut.
+    pub reason: SplitReason,
+}
+
+#[allow(deprecated)]
+impl fmt::Display for FusionSplit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "split at {} (`{}`): ", self.location, self.op)?;
+        match self.reason {
+            SplitReason::Nodes { nodes, limit } => write!(f, "{nodes} operations > {limit}"),
+            SplitReason::Depth { limit } => write!(f, "depth > {limit}"),
+            SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
+            SplitReason::Live { live, limit } => write!(f, "{live} live values > {limit}"),
+            SplitReason::Scalars { words, limit } => write!(f, "{words} scalar words > {limit}"),
+            SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
+            SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
+            SplitReason::Shared { weight } => write!(f, "an expression of {weight} operations read by pending operations outside the kernel is stored, not recomputed in each"),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "{:?}", self.reason),
+        }
+    }
+}
+
 /// GPU durations per kernel, measured with timestamp queries.
 ///
 /// A duration is the time from the start to the end of the compute pass of one launch, so it
 /// includes the GPU's own scheduling of that pass but not the time between launches or any host
-/// time.
-#[derive(Debug, Clone, Default, PartialEq)]
-#[non_exhaustive]
+/// time. The planner's decisions of the profiled region are not part of it: they are read with
+/// `Context::take_decisions` after `Context::finish_profiling`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(deprecated)]
 pub struct Profile {
     /// One entry per kernel label, the one with the most total time first.
     pub kernels: Vec<KernelTiming>,
-    /// Every choice the planner made while profiling, in the order it happened (see [`Decision`]).
-    pub decisions: Vec<Decision>,
+    /// Where lazy expressions were cut into several kernels while profiling, in the order they
+    /// happened (see [`SplitReason`]). Read them with [`Profile::cuts`].
+    #[deprecated(since = "0.5.3", note = "use `Profile::cuts()` (or `Context::take_decisions()`); removed in 0.6")]
+    pub splits: Vec<FusionSplit>,
 }
 
 impl Profile {
-    /// The cuts of lazy expressions into several kernels: the `Cut` decisions, with their
-    /// operation, location and reason, in the order they happened.
+    /// The cuts of lazy expressions into several kernels, with their operation, location and
+    /// reason, in the order they happened.
+    #[allow(deprecated)]
     pub fn cuts(&self) -> impl Iterator<Item = (&'static str, &'static Location<'static>, SplitReason)> + '_ {
-        self.decisions.iter().filter_map(|d| match d.site {
-            DecisionSite::Cut(reason) => Some((d.op, d.location, reason)),
-            _ => None,
-        })
+        self.splits.iter().map(|s| (s.op, s.location, s.reason))
     }
 
     /// The entry of the kernel with this label.
@@ -557,6 +587,7 @@ impl Profile {
     }
 }
 
+#[allow(deprecated)]
 impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self.kernels.iter().map(|k| k.label.len()).max().unwrap_or(0).max(6);
@@ -565,8 +596,8 @@ impl fmt::Display for Profile {
         for k in &self.kernels {
             writeln!(f, "{:<width$} {:>9} {:>12.2} {:>12.2} {:>12.2} {:>12.2}", k.label, k.launches, us(k.total), us(k.mean()), us(k.min), us(k.max))?;
         }
-        for decision in &self.decisions {
-            writeln!(f, "{decision}")?;
+        for split in &self.splits {
+            writeln!(f, "{split}")?;
         }
         Ok(())
     }
@@ -728,19 +759,33 @@ static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 /// A backend's own buffer object, held type-erased by [`Buffer`].
 pub trait NativeBuffer: Any + fmt::Debug + Send + Sync + 'static {}
 
-/// A device buffer of any backend. Cloning shares the buffer; equality is identity.
+/// A device buffer of any backend. Cloning shares the buffer; equality is identity (a view made
+/// by [`Buffer::at`] is equal to the buffer it views).
 #[derive(Clone, Debug)]
 pub struct Buffer {
     id: u64,
     size: u64,
     usage: BufferUsage,
     native: Arc<dyn NativeBuffer>,
+    offset: u64,
 }
 
 impl Buffer {
     /// Wraps a backend's buffer of `size` bytes.
     pub fn new(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
-        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native) }
+        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0 }
+    }
+    /// A view of this buffer that a launch binds from `offset` bytes on (a storage argument of a
+    /// backend whose [`Backend::storage_offset_align`] is not 0, with `offset` a multiple of it;
+    /// [`CompiledKernel::check_offsets`] checks). The view is the same buffer for everything
+    /// else: same id, same [`Buffer::size`] (the whole buffer), same memory.
+    #[must_use]
+    pub fn at(&self, offset: u64) -> Buffer {
+        Buffer { offset: self.offset + offset, ..self.clone() }
+    }
+    /// Where a launch starts binding this buffer: 0 except for a view made by [`Buffer::at`].
+    pub fn offset(&self) -> u64 {
+        self.offset
     }
     /// Unique per buffer.
     pub fn id(&self) -> u64 {
@@ -863,17 +908,19 @@ impl CompiledKernel {
         Ok(())
     }
 
-    /// Checks that each storage argument's range lies within its buffer and starts at a multiple
-    /// of `align` (the device's [`DeviceLimits::storage_offset_align`]).
+    /// Checks that each storage argument that is a view with an offset (see [`Buffer::at`]) lies
+    /// within its buffer and starts at a multiple of `align` (the device's
+    /// [`Backend::storage_offset_align`]; `0` allows no offset).
     pub fn check_offsets(&self, args: &[RawArg<'_>], align: u64) -> Result<(), BackendError> {
         for (position, arg) in self.bound(args) {
-            let RawArg::Storage { buffer, offset, bytes, .. } = arg else { continue };
-            if *offset == 0 {
+            let RawArg::Storage { buffer, bytes, .. } = arg else { continue };
+            let offset = buffer.offset();
+            if offset == 0 {
                 continue;
             }
-            if offset % align.max(1) != 0 {
+            if align == 0 || offset % align != 0 {
                 return Err(BackendError::KernelBinding(format!(
-                    "kernel `{}` argument {position}: offset {offset} is not a multiple of the device's storage offset alignment ({align})",
+                    "kernel `{}` argument {position}: offset {offset} is not a multiple of the device's storage offset alignment ({align}; 0: no offsets)",
                     self.label
                 )));
             }
@@ -915,13 +962,13 @@ impl CompiledKernel {
 /// One argument of a launch.
 #[derive(Clone, Copy, Debug)]
 pub enum RawArg<'a> {
-    /// A storage buffer, of which the kernel may reach `bytes` bytes from `offset`.
+    /// A storage buffer, of which the kernel may reach the first `bytes` bytes from the start
+    /// of the buffer, or, for a view made by [`Buffer::at`], from the view's offset
+    /// ([`Buffer::offset`]).
     Storage {
-        /// The buffer.
+        /// The buffer (or a view of a range of it).
         buffer: &'a Buffer,
-        /// Byte offset of the bound range; a multiple of [`DeviceLimits::storage_offset_align`].
-        offset: u64,
-        /// Bytes bound, from `offset`.
+        /// Bytes bound.
         bytes: u64,
         /// Whether the kernel may write it.
         writable: bool,
@@ -931,21 +978,13 @@ pub enum RawArg<'a> {
 }
 
 impl<'a> RawArg<'a> {
-    /// A storage argument over the first `bytes` of `buffer`.
-    pub fn storage(buffer: &'a Buffer, bytes: u64, writable: bool) -> Self {
-        RawArg::Storage { buffer, offset: 0, bytes, writable }
-    }
-    /// A storage argument over `bytes` bytes of `buffer` from `offset`.
-    pub fn storage_at(buffer: &'a Buffer, offset: u64, bytes: u64, writable: bool) -> Self {
-        RawArg::Storage { buffer, offset, bytes, writable }
-    }
     /// A read-only storage argument.
     pub fn read(buffer: &'a Buffer, bytes: u64) -> Self {
-        Self::storage(buffer, bytes, false)
+        RawArg::Storage { buffer, bytes, writable: false }
     }
     /// A writable storage argument.
     pub fn write(buffer: &'a Buffer, bytes: u64) -> Self {
-        Self::storage(buffer, bytes, true)
+        RawArg::Storage { buffer, bytes, writable: true }
     }
 }
 
@@ -1008,8 +1047,6 @@ pub struct DeviceLimits {
     pub max_uniform_bytes: u64,
     /// Alignment of uniform offsets, bytes.
     pub uniform_align: u64,
-    /// Alignment of the offset of a bound storage range, bytes.
-    pub storage_offset_align: u64,
     /// Most dynamic-offset uniform bindings.
     pub max_dynamic_uniforms: u32,
     /// Most workgroups per dispatch dimension.
@@ -1060,8 +1097,6 @@ pub struct DeviceInfo {
     /// worker threads, if the backend can tell. Plan constants that depend on how many workgroups
     /// fill the device scale with it.
     pub compute_units: Option<u32>,
-    /// L2 cache size, bytes, if the backend can tell (CUDA).
-    pub l2_cache_bytes: Option<u64>,
 }
 
 /// How much of a kernel's behaviour a backend may take on trust when it compiles it.
@@ -1165,6 +1200,17 @@ pub struct GemmSpec {
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
     fn info(&self) -> &DeviceInfo;
+    /// L2 cache size, bytes, if the backend can tell (CUDA); `None` by default.
+    fn l2_cache_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Alignment of the offset of a bound storage range, bytes: a [`Buffer::at`] view with an
+    /// offset that is a multiple of it may be passed as a storage argument ([`RawArg`]). `0`
+    /// (the default) means the backend binds a buffer only from its start and never gets a view
+    /// with an offset.
+    fn storage_offset_align(&self) -> u64 {
+        0
+    }
     /// Free and total device memory right now, where the API reports it (`None` otherwise).
     fn memory_now(&self) -> Option<MemoryNow> {
         None
@@ -1331,8 +1377,16 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn reclaim_idle(&self) -> Result<(), BackendError>;
     /// Starts timing launches.
     fn enable_profiling(&self) -> Result<(), BackendError>;
-    /// Stops timing and returns the profile (its `decisions` empty: the context fills them).
-    fn finish_profiling(&self) -> Result<Profile, BackendError>;
+    /// Stops timing and returns the profile with `splits` attached.
+    ///
+    /// Deprecated: the `splits` argument and [`Profile::splits`] go in 0.6, where this takes no
+    /// argument and a backend returns its `Profile` without them (the context reports the
+    /// planner's cuts through [`Profile::cuts`] and every other decision through
+    /// `Context::take_decisions`). Until then a backend attaches `splits` to the profile as it
+    /// always did; the context passes the cuts of the profiled region.
+    #[deprecated(since = "0.5.3", note = "0.6 drops the `splits` argument; the cuts are `Profile::cuts()`, every decision `Context::take_decisions()`")]
+    #[allow(deprecated)]
+    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError>;
     /// Whether profiling is enabled.
     fn is_profiling(&self) -> Result<bool, BackendError>;
     /// Captures launches into a replayable graph, `None` when unsupported.
