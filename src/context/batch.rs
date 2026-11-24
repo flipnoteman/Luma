@@ -57,6 +57,11 @@ impl Context {
         self.hal().gpu_busy()
     }
 
+    /// Whether [`Context::set_assume_busy`] is on.
+    pub(crate) fn assumes_busy(&self) -> bool {
+        self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Makes `eval` and the fusion-limit cuts behave as if earlier submissions were still
     /// running, whatever the GPU is doing: pending work is held until `SUBMIT_HOLD` dispatches,
     /// a sync point or the batch limit, so the batches (and the fused kernels they make) follow the

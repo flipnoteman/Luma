@@ -183,8 +183,11 @@ def self_test():
     assert diff(load(a, False), load(t, False), set()), "--exact compares them"
     EXACT = False
     # The unstable list: parsed with its reasons, and a listed case does not fail a diff.
-    names = load_unstable(UNSTABLE_FILE)
-    assert names and all(" " not in n for n in names), names
+    listed = os.path.join(tempfile.mkdtemp(), "unstable.txt")
+    with open(listed, "w") as fh:
+        fh.write("# comment\njit/launch/batch100\tflush timing\n")
+    names = load_unstable(listed)
+    assert names == ["jit/launch/batch100"] and all(" " not in n for n in names), names
     flaky = [dict(r, case=names[0] + "_n1") for r in rows]
     flaky2 = [dict(r, chosen="coarsen 2") if r.get("pass") == "cold" else dict(r) for r in flaky]
     f1, f2 = write("f1", flaky), write("f2", flaky2)
