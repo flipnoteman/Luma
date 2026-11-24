@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diff two luma-bench decision logs (W1-U0a).
 
-usage: decisiondiff OLD.jsonl NEW.jsonl [--allow-added-site SITE[,SITE...]] [--strict-locations] [--ordered]
+usage: decisiondiff OLD.jsonl NEW.jsonl [--allow-added-site SITE[,SITE...]] [--strict-locations] [--exact | --ordered] [--ignore-case SUBSTR[,...]]
        decisiondiff --self-test
 
 The logs come from `LUMA_BENCH_DECISIONS=<path> luma-bench ...` (pinned `LUMA_CALIBRATE=0`,
@@ -13,8 +13,13 @@ compared per case; the exit status is 1 on any difference.
   --allow-added-site  the named sites (the variant name: `ReducePlan`, `Cut`, ...) may appear in NEW
                       without appearing in OLD for that case and pass; any other difference fails,
                       and a site OLD has that NEW lacks always fails.
-  --ordered           compare the decisions of a pass in order; by default as a sorted list (threaded cases
-                      interleave their threads' decisions differently from run to run).
+  --exact             compare the decisions of a pass as sorted lists, with how often each occurs, and the launch
+                      count of every kernel label. By default a pass is the set of its distinct decisions and the
+                      kernels are their labels: the repeats of a case that runs many steps per call (replays,
+                      launches) follow when the GPU's flushes happen, which differs from run to run.
+  --ignore-case       skip the cases whose name contains one of the substrings (cases that batch by the timing
+                      of the GPU, e.g. jit/launch/batch100, give a different log from run to run).
+  --ordered           like --exact, and in order (threaded cases interleave their threads' decisions).
   --strict-locations  compare file:line:col of locations in luma's own sources too. By default only
                       the file of an internal location (anything outside crates/luma-bench) is
                       compared, since a spec that edits luma moves its lines; the locations of the
@@ -23,6 +28,7 @@ compared per case; the exit status is 1 on any difference.
 A case present in only one file is a difference.
 """
 import json
+import re
 import sys
 import tempfile
 import os
@@ -30,6 +36,8 @@ from collections import OrderedDict
 
 
 ORDERED = False
+EXACT = False
+IGNORED = []
 
 
 def site_name(site):
@@ -62,9 +70,27 @@ def load(path, strict):
     return cases
 
 
+def canon(decisions):
+    """The decisions as compared: in order (--ordered), as a sorted list (--exact), else as the set of
+    distinct decisions, since how often a case repeats a decision (the replays in one call of a case
+    that runs a hundred steps) follows the timing of the GPU's flushes."""
+    if ORDERED:
+        return list(decisions)
+    return sorted(decisions) if EXACT else sorted(set(decisions))
+
+
+def canon_kernels(kernels):
+    if kernels is None or EXACT:
+        return kernels
+    # `iterate` picks how many steps one stencil kernel runs from timings of the run: not compared.
+    return sorted({re.sub(r"\(\d+ steps", "(N steps", k[0]) for k in kernels})
+
+
 def diff(old, new, allowed):
     out = []
     for case in sorted(set(old) | set(new)):
+        if any(x in case for x in IGNORED):
+            continue
         if case not in new:
             out.append(f"{case}: only in OLD")
             continue
@@ -75,10 +101,10 @@ def diff(old, new, allowed):
         for p in ("cold", "warm"):
             have = {site_name(d[0]) for d in o[p]}
             keep = [d for d in n[p] if site_name(d[0]) not in allowed or site_name(d[0]) in have]
-            if (o[p] if ORDERED else sorted(o[p])) != (keep if ORDERED else sorted(keep)):
+            if canon(o[p]) != canon(keep):
                 out.append(f"{case} [{p}]:")
                 out += describe(o[p], keep)
-        if o["kernels"] != n["kernels"]:
+        if canon_kernels(o["kernels"]) != canon_kernels(n["kernels"]):
             out.append(f"{case} [kernels]: {o['kernels']} -> {n['kernels']}")
     return out
 
@@ -133,6 +159,13 @@ def self_test():
     m1, m2 = write("m1", moved), write("m2", moved2)
     assert not diff(load(m1, False), load(m2, False), set()), "internal line numbers are not compared"
     assert diff(load(m1, True), load(m2, True), set()), "--strict-locations compares them"
+    global EXACT
+    twice = rows + [rows[2]]
+    t = write("t", twice)
+    assert not diff(load(a, False), load(t, False), set()), "repeats are not compared by default"
+    EXACT = True
+    assert diff(load(a, False), load(t, False), set()), "--exact compares them"
+    EXACT = False
     print("decisiondiff self-test: ok")
 
 
@@ -147,6 +180,12 @@ def main(argv):
         if a == "--allow-added-site":
             i += 1
             allowed |= {s for s in argv[i].split(",") if s}
+        elif a == "--ignore-case":
+            i += 1
+            IGNORED.extend(x for x in argv[i].split(",") if x)
+        elif a == "--exact":
+            global EXACT
+            EXACT = True
         elif a == "--ordered":
             global ORDERED
             ORDERED = True
