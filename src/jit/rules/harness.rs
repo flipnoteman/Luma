@@ -534,13 +534,26 @@ struct Harness {
     strict: Context,
     /// The same with `fast_math`: for the fast gate of the rule-application check.
     fast: Context,
+    /// The backend flushes subnormal results of arithmetic to zero (wgpu): a property of the
+    /// device, so the bit checks read a subnormal as a zero of its sign.
+    ftz: bool,
+}
+
+/// A subnormal as a signed zero.
+fn flush(b: u32) -> u32 {
+    if b & 0x7f80_0000 == 0 { b & 0x8000_0000 } else { b }
 }
 
 impl Harness {
     fn new() -> Harness {
         assert!(std::env::var_os("LUMA_LINALG_TF32").is_none(), "the rule harness runs without TF32: unset LUMA_LINALG_TF32");
         let open = |fast: bool| Context::with_options(ContextOptions::from_env().fast_math(fast).tf32_matmul(false)).unwrap();
-        Harness { strict: open(false), fast: open(true) }
+        let strict = open(false);
+        strict.jit().set_simplify(false);
+        let probe = Array::from_slice_on(&strict, &[1e-40f32], [1, 1]).unwrap();
+        let ftz = (&probe * 1.0).to_vec().unwrap()[0].to_bits() & 0x7f80_0000 == 0;
+        strict.jit().set_simplify(true);
+        Harness { strict, fast: open(true), ftz }
     }
 
     /// The values of `e` over `batch` as the bits of its elements (a comparison: 0 or 1), with
@@ -631,7 +644,8 @@ fn check_class(h: &Harness, rule: &Rule) {
             for batch in batches(rule, kind) {
                 let (l, _) = h.bits(&h.strict, &rule.lhs, rule, &batch, false, false);
                 let (r, _) = h.bits(&h.strict, &rule.rhs, rule, &batch, false, false);
-                if let Some(i) = (0..l.len()).find(|&i| l[i] != r[i]) {
+                let same = |a: u32, b: u32| a == b || (h.ftz && flush(a) == flush(b));
+                if let Some(i) = (0..l.len()).find(|&i| !same(l[i], r[i])) {
                     let at: Vec<f32> = batch.iter().map(|v| v[if v.len() == l.len() { i } else { 0 }]).collect();
                     panic!("{}: {:?} bit check failed at element {i}, inputs {at:?}: lhs {:#010x}, rhs {:#010x}", rule.name, rule.class, l[i], r[i]);
                 }
@@ -686,9 +700,9 @@ fn check_application(h: &Harness, rule: &Rule) {
         }
     } else {
         // A reformulated exact-gate rule may differ where the backend flushes a subnormal.
-        let flush = |v: &[u32]| -> Vec<u32> { v.iter().map(|&b| if b & 0x7f80_0000 == 0 { b & 0x8000_0000 } else { b }).collect() };
-        if rule.class == Class::Reformulating {
-            assert_eq!(flush(&got), flush(&plain), "{}: simplified bits differ", rule.name);
+        let flushed = |v: &[u32]| -> Vec<u32> { v.iter().map(|&b| flush(b)).collect() };
+        if rule.class == Class::Reformulating || h.ftz {
+            assert_eq!(flushed(&got), flushed(&plain), "{}: simplified bits differ", rule.name);
         } else {
             assert_eq!(got, plain, "{}: simplified bits differ", rule.name);
         }
