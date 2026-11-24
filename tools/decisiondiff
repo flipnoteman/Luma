@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diff two luma-bench decision logs (W1-U0a).
 
-usage: decisiondiff OLD.jsonl NEW.jsonl [--allow-added-site SITE[,SITE...]] [--strict-locations] [--exact | --ordered] [--ignore-case SUBSTR[,...]]
+usage: decisiondiff OLD.jsonl NEW.jsonl [--allow-added-site SITE[,SITE...]] [--strict-locations] [--exact | --ordered] [--ignore-case SUBSTR[,...]] [--no-unstable]
        decisiondiff --self-test
 
 The logs come from `LUMA_BENCH_DECISIONS=<path> luma-bench ...` (pinned `LUMA_CALIBRATE=0`,
@@ -19,6 +19,8 @@ compared per case; the exit status is 1 on any difference.
                       launches) follow when the GPU's flushes happen, which differs from run to run.
   --ignore-case       skip the cases whose name contains one of the substrings (cases that batch by the timing
                       of the GPU, e.g. jit/launch/batch100, give a different log from run to run).
+  --no-unstable       also compare the cases listed in tools/decisiondiff-unstable.txt, which are skipped by default
+                      (each with the reason it is unstable).
   --ordered           like --exact, and in order (threaded cases interleave their threads' decisions).
   --strict-locations  compare file:line:col of locations in luma's own sources too. By default only
                       the file of an internal location (anything outside crates/luma-bench) is
@@ -84,6 +86,20 @@ def canon_kernels(kernels):
         return kernels
     # `iterate` picks how many steps one stencil kernel runs from timings of the run: not compared.
     return sorted({re.sub(r"\(\d+ steps", "(N steps", k[0]) for k in kernels})
+
+
+def load_unstable(path):
+    """The case-name substrings of tools/decisiondiff-unstable.txt (`substring<whitespace>reason`, `#` comments)."""
+    names = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                names.append(line.split(None, 1)[0])
+    return names
+
+
+UNSTABLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decisiondiff-unstable.txt")
 
 
 def diff(old, new, allowed):
@@ -166,6 +182,16 @@ def self_test():
     EXACT = True
     assert diff(load(a, False), load(t, False), set()), "--exact compares them"
     EXACT = False
+    # The unstable list: parsed with its reasons, and a listed case does not fail a diff.
+    names = load_unstable(UNSTABLE_FILE)
+    assert names and all(" " not in n for n in names), names
+    flaky = [dict(r, case=names[0] + "_n1") for r in rows]
+    flaky2 = [dict(r, chosen="coarsen 2") if r.get("pass") == "cold" else dict(r) for r in flaky]
+    f1, f2 = write("f1", flaky), write("f2", flaky2)
+    assert diff(load(f1, False), load(f2, False), set()), "a changed case differs"
+    IGNORED.extend(names)
+    assert not diff(load(f1, False), load(f2, False), set()), "a listed unstable case is skipped"
+    IGNORED.clear()
     print("decisiondiff self-test: ok")
 
 
@@ -173,7 +199,7 @@ def main(argv):
     if argv and argv[0] == "--self-test":
         self_test()
         return 0
-    pos, allowed, strict = [], set(), False
+    pos, allowed, strict, unstable = [], set(), False, True
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -183,6 +209,8 @@ def main(argv):
         elif a == "--ignore-case":
             i += 1
             IGNORED.extend(x for x in argv[i].split(",") if x)
+        elif a == "--no-unstable":
+            unstable = False
         elif a == "--exact":
             global EXACT
             EXACT = True
@@ -200,6 +228,8 @@ def main(argv):
     if len(pos) != 2:
         print(__doc__, file=sys.stderr)
         return 2
+    if unstable:
+        IGNORED.extend(load_unstable(UNSTABLE_FILE))
     out = diff(load(pos[0], strict), load(pos[1], strict), allowed)
     for line in out:
         print(line)

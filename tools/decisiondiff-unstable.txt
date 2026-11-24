@@ -1,0 +1,6 @@
+# Cases decisiondiff skips by default (--no-unstable includes them): one case-name substring per line, then a reason.
+# These batch their steps into fused kernels by the timing of the GPU's flushes, so two runs of one binary differ (W1-U0a baseline).
+jit/launch/batch100	one call queues 100 expressions; which of them fuse into one multi-output kernel follows the flush timing
+jit/launchcost/ew_chain64	the 64-op chain's cut points batch by flush timing: kernel counts and fusion groups differ between runs
+cfd/implicit/3d_step	kernel labels and replay counts follow the flush timing (also matches 3d_step_sub1)
+cfd/implicit/2d_step_sub1	the sub-step's fused reduce is grouped by flush timing
