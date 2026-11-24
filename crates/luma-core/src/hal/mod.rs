@@ -223,7 +223,9 @@ pub struct CostModel {
 #[non_exhaustive]
 pub struct MemoryModel {
     /// L2 cache size: the device attribute where the backend reports it (CUDA), else the
-    /// measured knee of the copy bandwidth over growing working sets.
+    /// measured knee of the copy bandwidth over power-of-two working sets, which is only an upper
+    /// bound (the largest size still much faster than DRAM, within one doubling of the real size):
+    /// consumers must not assume it is exact. `None` where no sharp knee was found.
     pub l2_bytes: Option<u64>,
     /// Read bandwidth, GB/s, of a copy whose traffic wraps over a working set inside L2 (the
     /// largest measured set that is at least 1.5 times faster than DRAM).
