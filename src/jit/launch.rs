@@ -1082,6 +1082,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
+    let taken_over = reused.is_some();
     let outputs = match reused {
         Some(storage) => vec![storage],
         None => {
@@ -1095,6 +1096,10 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     };
     let refs: Vec<&Storage> = outputs.iter().collect();
     launch_store(ctx, &core, &key, &refs, &inputs, &scalars, shifted.as_ref())?;
+    if !taken_over && count == 1 && shifted.is_none() && super::lineage::wanted(ctx, &key, &outputs[0], &inputs) {
+        let lineage = super::lineage::Lineage::new(core, key, scalars, len, &inputs);
+        outputs[0].only_segment().set_lineage(lineage, &inputs);
+    }
     Ok(outputs)
 }
 

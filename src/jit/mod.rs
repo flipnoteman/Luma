@@ -161,6 +161,7 @@ pub(crate) mod cost;
 mod inline;
 mod kirgen;
 mod launch;
+pub(crate) mod lineage;
 mod looped;
 mod operator;
 mod multireduce;

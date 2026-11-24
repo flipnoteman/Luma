@@ -212,3 +212,151 @@ fn the_host_budget_drops_copies_first() {
     assert!(stats.host_copy_bytes <= 6 << 16, "{stats:?}");
     assert!(stats.host_copy_bytes > 0 || ctx.memory_stats().spilled_bytes > 0);
 }
+
+/// Elements of an array that is one megabyte: big enough that recomputing it costs less than moving it over the link.
+const MEGABYTE: usize = 1 << 18;
+
+/// A context whose segments hold a megabyte and whose budget holds six of them.
+fn lineage_context() -> Context {
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 20).memory_budget(6 << 20)).unwrap()
+}
+
+fn megabyte(salt: usize) -> Vec<f32> {
+    values(MEGABYTE, salt)
+}
+
+/// Creates arrays until `done` holds of the context's statistics: the least recently used segment is evicted first.
+fn pressure(ctx: &Context, done: impl Fn(&luma::PagingStats) -> bool) -> Vec<Array<f32>> {
+    let mut fillers = Vec::new();
+    while !done(&ctx.paging_stats()) {
+        assert!(fillers.len() < 24, "{:?}", ctx.paging_stats());
+        fillers.push(Array::from_slice_on(ctx, &megabyte(100 + fillers.len()), MEGABYTE).unwrap());
+    }
+    fillers
+}
+
+/// `c = a * 2 + b` of two fresh arrays, computed and evicted by lineage, with the arrays and the fillers that kept the pressure on.
+fn evicted_by_lineage(ctx: &Context) -> (Array<f32>, Array<f32>, Array<f32>, Vec<Array<f32>>) {
+    let a = Array::from_slice_on(ctx, &megabyte(1), MEGABYTE).unwrap();
+    let b = Array::from_slice_on(ctx, &megabyte(2), MEGABYTE).unwrap();
+    let c = &a * 2.0 + &b;
+    c.eval().unwrap();
+    ctx.flush().unwrap();
+    let fillers = pressure(ctx, |stats| stats.recompute_evictions >= 1);
+    (a, b, c, fillers)
+}
+
+fn expected_c(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(a, b)| a * 2.0 + b).collect()
+}
+
+#[test]
+fn a_cheap_intermediate_is_recomputed_not_read_back() {
+    let ctx = lineage_context();
+    let before = ctx.paging_stats().readback_evictions;
+    let (_a, _b, c, _fillers) = evicted_by_lineage(&ctx);
+    let stats = ctx.paging_stats();
+    assert_eq!(stats.recompute_evictions, 1, "{stats:?}");
+    assert_eq!(stats.readback_evictions, before, "the intermediate was read back: {stats:?}");
+    assert!(stats.lineage_pinned_bytes >= 2 << 20, "{stats:?}");
+    let got = c.to_vec().unwrap();
+    let want = expected_c(&megabyte(1), &megabyte(2));
+    assert!(got.iter().zip(&want).all(|(g, w)| g.to_bits() == w.to_bits()), "the recomputed value differs");
+}
+
+#[test]
+fn writing_an_input_materialises_dependents_first() {
+    let ctx = lineage_context();
+    let (mut a, _b, c, _fillers) = evicted_by_lineage(&ctx);
+    a.write(&megabyte(7)).unwrap();
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)), "the dependent saw the new input");
+    assert_eq!(a.to_vec().unwrap(), megabyte(7));
+}
+
+#[test]
+fn a_two_cycle_write_does_not_resurrect_stale_lineage() {
+    let ctx = lineage_context();
+    let (mut a, _b, c, fillers) = evicted_by_lineage(&ctx);
+    let old = expected_c(&megabyte(1), &megabyte(2));
+    a.write(&megabyte(7)).unwrap();
+    assert_eq!(c.to_vec().unwrap(), old);
+    // Make `c` the least recently used segment again, with both inputs resident, and push it
+    // out: it has no lineage any more, so it is read back.
+    drop(fillers);
+    // A kernel pins what it reads; a host read of an idle buffer does not.
+    (&a * 2.0).to_vec().unwrap();
+    (&_b * 2.0).to_vec().unwrap();
+    let before = ctx.paging_stats();
+    let _fresh = pressure(&ctx, |stats| stats.readback_evictions + stats.recompute_evictions > before.readback_evictions + before.recompute_evictions);
+    let after = ctx.paging_stats();
+    assert_eq!(after.recompute_evictions, before.recompute_evictions, "{before:?} {after:?}");
+    assert_eq!(after.readback_evictions, before.readback_evictions + 1, "{before:?} {after:?}");
+    assert_eq!(c.to_vec().unwrap(), old, "the second round used the new input");
+}
+
+/// `c` resident, with its lineage, when the input is written; evicting it afterwards must not recompute it.
+#[test]
+fn writing_an_input_of_a_resident_dependent_drops_its_lineage() {
+    let ctx = lineage_context();
+    let mut a = Array::from_slice_on(&ctx, &megabyte(1), MEGABYTE).unwrap();
+    let b = Array::from_slice_on(&ctx, &megabyte(2), MEGABYTE).unwrap();
+    let c = &a * 2.0 + &b;
+    c.eval().unwrap();
+    ctx.flush().unwrap();
+    a.write(&megabyte(7)).unwrap();
+    let _fillers = pressure(&ctx, |stats| stats.readback_evictions >= 1);
+    let stats = ctx.paging_stats();
+    assert_eq!(stats.recompute_evictions, 0, "{stats:?}");
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+}
+
+/// A compound assignment writes through the kernel's own pin.
+#[test]
+fn an_in_place_update_of_an_input_keeps_the_dependent_old() {
+    let ctx = lineage_context();
+    let (mut a, _b, c, _fillers) = evicted_by_lineage(&ctx);
+    a += 1.0;
+    a.eval().unwrap();
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+    let new: Vec<f32> = megabyte(1).iter().map(|v| v + 1.0).collect();
+    assert_eq!(a.to_vec().unwrap(), new);
+}
+
+#[test]
+fn dropping_an_input_keeps_the_dependent_correct() {
+    let ctx = lineage_context();
+    let (a, b, c, _fillers) = evicted_by_lineage(&ctx);
+    drop(a);
+    drop(b);
+    assert!(ctx.paging_stats().lineage_pinned_bytes >= 2 << 20);
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+    assert_eq!(ctx.paging_stats().lineage_pinned_bytes, 0, "the recomputed segment still holds its inputs");
+}
+
+#[test]
+fn no_lineage_eviction_happens_while_recording() {
+    let ctx = lineage_context();
+    let x = Array::from_slice_on(&ctx, &megabyte(0), MEGABYTE).unwrap();
+    let fillers: Vec<Array<f32>> = (0..3).map(|k| Array::from_slice_on(&ctx, &megabyte(k + 1), MEGABYTE).unwrap()).collect();
+    let step = |[u]: &[Array<f32>; 1]| {
+        let a = (u * 0.5 + 1.0).cache();
+        let b = (&a * 0.5 + u).cache();
+        let c = (&b * 0.25 + &a).cache();
+        [c * 0.5]
+    };
+    let [got] = luma::iterate_all([&x], 5, step);
+    let mut want = megabyte(0);
+    for _ in 0..5 {
+        for v in &mut want {
+            let a = *v * 0.5 + 1.0;
+            let b = a * 0.5 + *v;
+            *v = (b * 0.25 + a) * 0.5;
+        }
+    }
+    let got = got.to_vec().unwrap();
+    assert!(got.iter().zip(&want).all(|(g, w)| (g - w).abs() <= w.abs() * 1e-5 + 1e-5));
+    for (k, f) in fillers.iter().enumerate() {
+        assert_eq!(f.to_vec().unwrap(), megabyte(k + 1));
+    }
+    assert_eq!(ctx.paging_stats().recompute_evictions, 0, "something recorded during a trace was evicted by lineage");
+}

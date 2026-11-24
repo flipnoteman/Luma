@@ -1909,8 +1909,9 @@ fn recompute_sweep(h: &mut Harness) {
     });
     let after = ctx.paging_stats();
     println!(
-        "  spill/recompute_sweep: {} MiB spilled, {} readback evictions",
+        "  spill/recompute_sweep: {} MiB spilled, {} readback evictions, {} recompute evictions",
         ctx.spilled_bytes() >> 20,
-        after.readback_evictions - before.readback_evictions
+        after.readback_evictions - before.readback_evictions,
+        after.recompute_evictions - before.recompute_evictions
     );
 }

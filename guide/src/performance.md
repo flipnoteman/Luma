@@ -309,9 +309,14 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
 - On unified memory, `from_slice` uploads into mappable buffers that are reused (zero-copy).
 - Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
   `LUMA_MEMORY_BUDGET` to something your machine can keep on the device. Arrays split over several
-  buffers are never staged and cannot be passed to custom kernels.
-- `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory, and the
-  budget; `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
+  buffers are never staged and cannot be passed to custom kernels. A moved array that the host
+  already holds a copy of (it came back and was only read since) moves nothing, and a cheap
+  elementwise result of arrays that stay on the device (at least 16 KiB, in one buffer) is
+  dropped and recomputed at its next use, which costs a kernel instead of a transfer; writing
+  to one of its inputs computes it first.
+- `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory and the
+  budget, `ctx.paging_stats()` the evictions by kind (`clean_evictions`, `readback_evictions`,
+  `recompute_evictions`); `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
   temporaries the next one cannot reuse.
 
 ## A checklist for a slow program

@@ -1227,6 +1227,10 @@ fn engine(config: &Config) -> Option<Context> {
         options = options.memory_budget(bytes);
     }
     let ctx = Context::with_options(options).ok()?;
+    if config.memory_budget.is_some() {
+        // The arrays are too small for recomputing to beat a transfer: evict by lineage whenever it is allowed.
+        ctx.pager().force_lineage();
+    }
     let jit = ctx.jit();
     jit.set_max_nodes(config.max_nodes);
     if let Some(n) = config.max_inlined {

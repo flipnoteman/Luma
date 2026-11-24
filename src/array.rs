@@ -245,6 +245,14 @@ impl Storage {
         &self.segments[j]
     }
 
+    /// The one segment of a storage that fits a single buffer, without marking the storage as
+    /// materialized: the pager's lineage bookkeeping (see [`crate::jit::lineage`]) looks at the
+    /// segments of arrays it does not hand out.
+    pub(crate) fn only_segment(&self) -> &Arc<Segment> {
+        debug_assert!(self.segments.len() == 1);
+        &self.segments[0]
+    }
+
     /// Pins segment `j` on the device (allocating its buffer if needed); marks the storage as
     /// materialized.
     pub(crate) fn pin(&self, j: usize) -> Result<Pin> {
