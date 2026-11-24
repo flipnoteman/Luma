@@ -16,8 +16,9 @@ iteration, so start-up, calibration probes and the case's one-off verification c
 
 The environment is pinned: fresh LUMA_CACHE_DIR, LUMA_CALIBRATE=0, LUMA_TELEMETRY=off, the plan cache on
 (`--plan-cache off` sets LUMA_PLAN_CACHE=off) and one CPU worker thread (LUMA_CPU_THREADS=1, unless already
-set) so counts are deterministic. Results are JSON; `--compare` prints the ratio per case and exits 1 if
-any case's total or luma_self grows by more than --max-regression percent (default 1.0).
+set) so counts are deterministic. `luma_self` is the gate metric (repeatable to ~0.001%); `total` also counts the
+allocator, libc and background threads and varies ~0.2% between runs, so it is informational. Results are JSON; `--compare` prints the ratio per case and exits 1 if
+any case's luma_self grows by more than --max-regression percent (default 1.0).
 
 Needs valgrind (the 3090 box through gpuq has it; the CPU backend works anywhere). Run `cargo build
 --release -p luma-bench` first or let this script do it (no --binary).
@@ -140,7 +141,7 @@ def compare(base_path, new_path, max_pct):
             x, y = base[key][metric], new[key][metric]
             ratio = y / x if x else float("inf")
             flag = ""
-            if (ratio - 1.0) * 100.0 > max_pct:
+            if metric == "luma_self" and (ratio - 1.0) * 100.0 > max_pct:
                 flag, bad = "  REGRESSION", True
             print(f"{key[0]:<44} {key[1]:<7} {metric:<10} {x:>14,.0f} {y:>14,.0f} {ratio:>8.4f}{flag}")
     return 1 if bad else 0
