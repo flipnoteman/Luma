@@ -383,7 +383,7 @@ if !p.is_empty() {
 
             #[test]
             fn matmul_against_the_host() {
-                let ctx = Context::with_options(ContextOptions::from_env().tf32_matmul(false)).unwrap();
+                let ctx = Context::with_options(ContextOptions::from_env().numerics(luma::Numerics::strict())).unwrap();
                 for (k, m, n) in [(1usize, 1usize, 1usize), (3, 4, 5), (17, 13, 9), (64, 48, 40), (130, 33, 70)] {
                     let (a, b) = (tame(k * m, 18), tame(k * n, 19));
                     let (ma, mb) = (Array::from_slice_on(&ctx, &a, [k, m]).unwrap(), Array::from_slice_on(&ctx, &b, [n, k]).unwrap());
