@@ -406,6 +406,11 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
     let words = (align / 4) as usize;
     // [A | B | C | D]: A and C hold data, B and D are written.
     let buffer = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
+    // wgpu tracks the usage of a whole buffer within a dispatch and rejects one that binds a
+    // buffer both for reading and for writing, whatever the ranges: the written ranges go to a
+    // second buffer there (same offsets).
+    let second = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
+    let out = if ctx.backend() == BackendKind::Wgpu { &second } else { &buffer };
     let a: Vec<u32> = (0..words as u32).collect();
     let c: Vec<u32> = (0..words as u32).map(|i| i * 10).collect();
     let mut data = vec![0u32; 4 * words];
@@ -413,7 +418,7 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
     data[2 * words..3 * words].copy_from_slice(&c);
     ctx.upload(&buffer, bytemuck::cast_slice(&data)).unwrap();
     let range = |at: u64| RawArg::storage_at(&buffer, at * align, align, false);
-    let target = |at: u64| RawArg::storage_at(&buffer, at * align, align, true);
+    let target = |at: u64| RawArg::storage_at(out, at * align, align, true);
     let size = [words as u32, 1, 1];
     let groups = [(words as u32).div_ceil(64), 1, 1];
     ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
@@ -421,10 +426,11 @@ fn a_launch_binds_byte_ranges_of_a_buffer() {
     // The first launch again, so the cached bind group of (buffer, 0..) is hit after (buffer, 2..).
     ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
     let got = ctx.read::<u32>(&buffer, 4 * align).unwrap();
+    let written = ctx.read::<u32>(out, 4 * align).unwrap();
     assert_eq!(&got[..words], &a[..], "A is untouched");
-    assert_eq!(got[words..2 * words], a.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+    assert_eq!(written[words..2 * words], a.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
     assert_eq!(&got[2 * words..3 * words], &c[..], "C is untouched");
-    assert_eq!(got[3 * words..], c.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+    assert_eq!(written[3 * words..], c.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
 
     let misaligned = [RawArg::storage_at(&buffer, 2 * align + 4, 4, true), range(0)];
     let result = ctx.launch(&core, [1, 1, 1], [1, 1, 1], &misaligned);
