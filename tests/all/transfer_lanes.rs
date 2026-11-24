@@ -140,15 +140,19 @@ fn cuda_upload_overlaps_a_kernel() {
     };
     upload(&*backend);
     let up = (0..3).map(|_| time(|| upload(&*backend))).min().unwrap();
-    // A kernel as long as the upload.
+    // A kernel as long as the upload: the iteration count is scaled until the two match (the
+    // launch's fixed cost makes one step overshoot).
     let mut iters = 1000u32;
-    let probe = affine_kernel(&*backend, iters);
-    run(&*backend, &probe);
-    let probe_time = (0..3).map(|_| time(|| run(&*backend, &probe))).min().unwrap();
-    iters = ((f64::from(iters) * up.as_secs_f64() / probe_time.as_secs_f64()) as u32).max(1);
-    let kernel = affine_kernel(&*backend, iters);
+    let mut kernel = affine_kernel(&*backend, iters);
+    let mut alone = Duration::ZERO;
+    for _ in 0..4 {
+        run(&*backend, &kernel);
+        alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
+        iters = ((f64::from(iters) * up.as_secs_f64() / alone.as_secs_f64()) as u32).max(1);
+        kernel = affine_kernel(&*backend, iters);
+    }
     run(&*backend, &kernel);
-    let alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
+    alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
     let both = (0..3)
         .map(|_| {
             time(|| {

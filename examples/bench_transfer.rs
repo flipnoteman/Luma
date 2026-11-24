@@ -218,19 +218,25 @@ fn overlap(slab: usize) {
     // The transfer alone.
     wait(&upload(&buffers[0], &[]));
     let up = best(Box::new(|| wait(&upload(&buffers[0], &[]))));
-    // A kernel as long as the upload (calibrated on a short one).
-    let probe_iters = 200;
-    let probe = lanes::affine_kernel(backend, probe_iters);
+    // A kernel as long as the upload, over the first `kwords` words of a slab (a dispatch of
+    // more than 65535 workgroups is not valid on every backend). The iteration count is scaled
+    // twice: the launch's fixed cost makes one step overshoot.
+    let kwords = words.min(1 << 21);
     let run = |kernel: &luma_core::CompiledKernel| {
-        lanes::launch(backend, kernel, &buffers[0], &out, words);
+        lanes::launch(backend, kernel, &buffers[0], &out, kwords);
         backend.sync(Duration::ZERO).unwrap();
     };
-    run(&probe);
-    let probe_time = best(Box::new(|| run(&probe)));
-    let iters = ((f64::from(probe_iters) * up.as_secs_f64() / probe_time.as_secs_f64()) as u32).max(1);
-    let kernel = lanes::affine_kernel(backend, iters);
+    let mut iters = 200u32;
+    let mut kernel = lanes::affine_kernel(backend, iters);
+    let mut alone = Duration::ZERO;
+    for _ in 0..3 {
+        run(&kernel);
+        alone = best(Box::new(|| run(&kernel)));
+        iters = ((f64::from(iters) * up.as_secs_f64() / alone.as_secs_f64()) as u32).max(1);
+        kernel = lanes::affine_kernel(backend, iters);
+    }
     run(&kernel);
-    let alone = best(Box::new(|| run(&kernel)));
+    alone = alone.min(best(Box::new(|| run(&kernel))));
 
     // The pipeline: the upload of slab k+1 (into the buffer slab k-1 used, after the kernel that
     // read it) runs while the kernel of slab k does.
@@ -241,7 +247,7 @@ fn overlap(slab: usize) {
         for k in 0..SLABS {
             wait(&loaded);
             backend.barrier(std::slice::from_ref(&loaded)).unwrap();
-            lanes::launch(backend, &kernel, &buffers[k % 2], &out, words);
+            lanes::launch(backend, &kernel, &buffers[k % 2], &out, kwords);
             let done = backend.barrier(&[]).unwrap();
             if k + 1 < SLABS {
                 let after: Vec<_> = finished.iter().cloned().collect();
