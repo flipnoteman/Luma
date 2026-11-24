@@ -112,6 +112,7 @@ impl std::fmt::Debug for Structured {
 }
 
 impl Structured {
+    #[inline(always)]
     pub(crate) fn new(family: Family, in_recording: bool, name: &'static str, location: &'static Location<'static>) -> Self {
         Structured {
             family,
@@ -126,12 +127,14 @@ impl Structured {
     }
 
     /// The payload of the reduce family, the only one for now.
+    #[inline(always)]
     pub(crate) fn comp(&self) -> &Comp {
         match &self.family {
             Family::Reduce(comp) => comp,
         }
     }
 
+    #[inline(always)]
     pub(crate) fn ty(&self) -> ElemTy {
         self.comp().meta.ty
     }
@@ -197,6 +200,7 @@ impl Structured {
     }
 
     /// Gives the leaves that stand for the value in expressions its buffer.
+    #[inline]
     fn hand_over(&self, storage: &Arc<Storage>) {
         for leaf in std::mem::take(&mut *crate::gpu::lock(&self.leaves)) {
             if let Some(leaf) = leaf.upgrade() {

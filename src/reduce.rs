@@ -267,6 +267,7 @@ impl Structured {
         }
     }
 
+    #[inline]
     fn record(&self, ctx: &Context, partners: &[Arc<Structured>]) -> Result<Arc<Storage>> {
         let comp = self.comp();
         if let Some(geom) = comp.meta.geom {
@@ -506,12 +507,17 @@ impl<T: ScalarType> Array<T> {
             let args = [operand, Src::unused(), Src::unused()];
             let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
             let ty = ElemTy::of::<T>()?;
-            let comp = Comp {
-                meta: Meta { ty, len: reader.len(), tag: OpTag::Reduce, geom: None },
-                run: RunState::Reduce { wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
-                origin: ReduceOrigin { operand: reader, ops },
-            };
-            let reduced = Arc::new(Structured::new(Family::Reduce(comp), ctx.recording_here(), name, location));
+            let len = reader.len();
+            let reduced = Arc::new(Structured::new(
+                Family::Reduce(Comp {
+                    meta: Meta { ty, len, tag: OpTag::Reduce, geom: None },
+                    run: RunState::Reduce { wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
+                    origin: ReduceOrigin { operand: reader, ops },
+                }),
+                ctx.recording_here(),
+                name,
+                location,
+            ));
             ctx.jit().register_reduction(&reduced);
             return Ok(Array::from_structured(ctx, shape, reduced));
         }
