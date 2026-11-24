@@ -175,9 +175,9 @@ fn run_stepper<T: ScalarType, const N: usize>(
     // The CPU backend has no workgroup memory to stage the shifted values of fused steps in: it
     // recomputes them, which is slower than the steps one by one for a large state.
     let site = (std::any::type_name_of_val(step), init[0].len(), N);
-    // A context that assumes a busy GPU (the decision log of luma-bench) must give the same unrolling
+    // A context that pins the GPU's state (the decision log of luma-bench) must give the same unrolling
     // in every run, which the measured host time would not.
-    let traced = if init[0].context().assumes_busy() { traced.map(|_| ASSUMED_TRACE_TIME) } else { traced };
+    let traced = if init[0].context().gpu_state_pinned() { traced.map(|_| ASSUMED_TRACE_TIME) } else { traced };
     if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu && !lock(&NOT_UNROLLED).contains(&site)) {
         let depth = unroll_depth(steps, stepper.plan(), traced);
         if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
@@ -198,7 +198,7 @@ type UnrollSite = (&'static str, usize, usize);
 
 static NOT_UNROLLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<UnrollSite>>> = std::sync::LazyLock::new(Default::default);
 
-/// The trace time [`unroll_depth`] assumes where the context assumes a busy GPU: about what tracing one
+/// The trace time [`unroll_depth`] assumes where the context pins the GPU's state: about what tracing one
 /// step of a few operations takes.
 const ASSUMED_TRACE_TIME: Duration = Duration::from_micros(50);
 

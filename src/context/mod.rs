@@ -84,6 +84,8 @@ struct Inner {
     waits: WaitHistory,
     /// Report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     assume_busy: std::sync::atomic::AtomicBool,
+    /// Report the GPU as idle regardless of the queue (see `Context::set_assume_idle`).
+    assume_idle: std::sync::atomic::AtomicBool,
     /// Tests: bytes of device buffers created so far (see [`Context::created_bytes`]).
     #[cfg(test)]
     created_bytes: std::sync::atomic::AtomicU64,
@@ -717,6 +719,7 @@ impl Context {
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
+                assume_idle: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 created_bytes: std::sync::atomic::AtomicU64::new(0),
                 max_buffer_bytes,

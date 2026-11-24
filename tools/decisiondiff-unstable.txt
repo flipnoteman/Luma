@@ -1,2 +1,2 @@
 # Cases decisiondiff skips by default (--no-unstable includes them): one case-name substring per line, then a reason.
-# None at present: the bench harness holds work back as on a busy GPU while it records (Context::set_assume_busy), so neither the GPU's flush timing nor the host time of a trace decides what is fused.
+# None at present: the bench harness treats the GPU as idle while it records (Context::set_assume_idle), so neither the GPU's flush timing nor the host time of a trace decides what is fused.

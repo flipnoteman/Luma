@@ -60,8 +60,9 @@ fn main() {
     println!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());
     if decisions.is_some() {
         // Whether `eval` postpones follows how busy the GPU is, so which steps fuse into one kernel
-        // would follow its timing: hold them as on a busy GPU, whatever it does.
-        ctx.set_assume_busy(true);
+        // would follow its timing: treat the GPU as idle, whatever it does (a busy GPU would leave
+        // the arrays the cases drop uncomputed).
+        ctx.set_assume_idle(true);
     }
     let mut h = harness::Harness::new(ctx, quick, only, json.as_deref());
     h.iters = iters;

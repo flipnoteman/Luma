@@ -54,22 +54,34 @@ impl Context {
         if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
         }
+        if self.inner.assume_idle.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         self.hal().gpu_busy()
     }
 
-    /// Whether [`Context::set_assume_busy`] is on.
-    pub(crate) fn assumes_busy(&self) -> bool {
-        self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed)
+    /// Whether [`Context::set_assume_busy`] or [`Context::set_assume_idle`] is on: the GPU's state
+    /// is pinned, so what runs does not depend on timing.
+    pub(crate) fn gpu_state_pinned(&self) -> bool {
+        self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) || self.inner.assume_idle.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Makes `eval` and the fusion-limit cuts behave as if earlier submissions were still
     /// running, whatever the GPU is doing: pending work is held until `SUBMIT_HOLD` dispatches,
     /// a sync point or the batch limit, so the batches (and the fused kernels they make) follow the
-    /// program instead of the GPU's speed. For tests of postponed evaluation and for the
-    /// luma-bench decision log, whose runs of one binary must agree.
+    /// program instead of the GPU's speed. For tests of postponed evaluation.
     #[doc(hidden)]
     pub fn set_assume_busy(&self, on: bool) {
         self.inner.assume_busy.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Makes `eval` and the fusion-limit cuts behave as if the GPU were always idle: every `eval`
+    /// computes its array and every cut submits, so which kernels run follows the program and not the
+    /// GPU's speed, and no array an `eval` requested is dropped uncomputed. For the luma-bench
+    /// decision log, whose runs of one binary must agree. [`Context::set_assume_busy`] wins if both are on.
+    #[doc(hidden)]
+    pub fn set_assume_idle(&self, on: bool) {
+        self.inner.assume_idle.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Submits the pending batch without waiting for it, like [`Context::flush`] but without
