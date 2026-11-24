@@ -20,6 +20,7 @@ base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,comp
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
 here=$(cd "$(dirname "$0")/.." && pwd)
+PRIO=${PRIO:-0}   # gpuq priority of the job (0-9, lower runs first): PRIO=5 for a bench that may wait
 GPUQ=${GPUQ:-$HOME/Documents/bowshock/tools/gpuq/gpuq}
 
 label_of() { if [ -d "$1" ]; then basename "$(cd "$1" && pwd)"; else echo "${1//\//_}"; fi; }
@@ -79,6 +80,6 @@ cmd="$run
 ${loop/BACKENDS/$backends}"
 cmd=${cmd//'$bin --suite'/'LUMA_BACKEND=$2 $bin --suite'}
 cd "$snap"
-id=$("$GPUQ" submit --host "$host" --prio 0 --name "ab-$la-$lb-$host" --timeout 7200 -- bash -c "$cmd")
+id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout 7200 -- bash -c "$cmd")
 echo "job: $id  (A $la vs B $lb, host $host, suites $suites, backends: $backends, rounds $rounds)"
 echo "results: ${GPUQ_DIR:-$HOME/.cache/bowshock-gpuq}/done/$id/out/ ; compare: tools/benchcmp.py --base 'OUT/$la-cuda-*' --new 'OUT/$lb-cuda-*'"
