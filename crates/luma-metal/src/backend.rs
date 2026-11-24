@@ -329,6 +329,7 @@ mod imp {
                 },
                 // Metal does not report the GPU core count.
                 compute_units: None,
+                l2_cache_bytes: None,
             };
             let identity = format!("{name}\n{}\n{apple_silicon}", std::env::consts::ARCH);
             let key = format!("metal-{:016x}", cache::fnv1a(identity.as_bytes()));

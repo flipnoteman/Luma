@@ -675,6 +675,7 @@ impl WgpuBackend {
                 max_workgroup_storage_bytes: limits.max_compute_workgroup_storage_size,
             },
             compute_units: gpu.0.compute_units,
+            l2_cache_bytes: None,
         };
 
         let batch = Batch {

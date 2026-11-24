@@ -243,7 +243,7 @@ fn calibration_is_measured_once_per_device() {
 #[test]
 fn the_cost_model_can_be_overridden_in_tests() {
     let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
-    let model = CostModel { launch_us: 123.0, ..CostModel::TEST };
+    let model = CostModel::TEST.with(|m| { m.launch_us = 123.0; });
     ctx.set_cost_model(model);
     assert_eq!(ctx.cost_model(), model);
 }

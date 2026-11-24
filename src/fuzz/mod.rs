@@ -1244,8 +1244,8 @@ fn engine(config: &Config) -> Option<Context> {
     jit.set_staging(config.staging);
     ctx.set_cost_model(match config.cost {
         CostChoice::Test => CostModel::TEST,
-        CostChoice::SlowLaunch => CostModel { launch_us: 1e6, ..CostModel::TEST },
-        CostChoice::SlowArithmetic => CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST },
+        CostChoice::SlowLaunch => CostModel::TEST.with(|m| { m.launch_us = 1e6; }),
+        CostChoice::SlowArithmetic => CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; }),
     });
     Some(ctx)
 }

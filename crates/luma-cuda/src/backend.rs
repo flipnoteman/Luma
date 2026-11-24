@@ -821,6 +821,7 @@ impl CudaShared {
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z)?,
         ];
         let multiprocessors = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+        let l2_bytes = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?;
         let shared_bytes = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?;
         let name = ctx.name().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         ctx.bind_to_thread().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
@@ -858,6 +859,7 @@ impl CudaShared {
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
             compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
+            l2_cache_bytes: u64::try_from(l2_bytes).ok().filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
         let textures = texture::caps(&attribute);

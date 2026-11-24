@@ -10,6 +10,14 @@ All notable changes to Luma are listed here. The format follows
 
 - Host time of long chains: `Flattener::scalar` finds an equal scalar through a hash index (first equal slot, same alias records) instead of a linear scan, and `pending_depth` no longer allocates per node. Callgrind, CPU backend, per iteration: a plan-cache-off 1000-op chain 14.41M instructions -> 8.75M (`memcmp` and `Flattener::scalar` out of the profile; `flatten_bounded` 3.41M -> 0.52M), a 100-op chain 0.811M -> 0.695M, a 10-op chain 116.8k -> 116.0k (plan cache on: 107.3k -> 107.5k, +0.14%). The per-op cost of `create` on a 1000-deep chain is still above the 100-op chain's: 4.97k Ir/op gross, 2.1k Ir/op net of the cut's own evaluation (`evaluate_alongside`), 1.25x the 100-op chain's 1.67k (report only: the depth re-walk the cliff was attributed to is not the cause). Plans and decisions are unchanged.
 
+### Added
+
+- Memory hierarchy calibration: `CostModel::memory: Option<MemoryModel>` (L2 size and bandwidth, workgroup-memory bandwidth, strided / gather / transposed-read factors relative to coalesced, dependent-load latency), measured by calibration through ordinary kernels on every backend and cached on disk (`LUMACOS3`; a `LUMACOS2` file is ignored once, which recalibrates). Nothing plans with the numbers yet. `examples/device_info` prints them.
+
+### Breaking
+
+- `CostModel` is `#[non_exhaustive]` and gains `memory` (build one with `CostModel::new`; `CostModel::with` adjusts fields). `DeviceInfo` gains `l2_cache_bytes`.
+
 ## [0.5.2] - 2026-11-22
 
 ### Added

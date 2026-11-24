@@ -96,6 +96,7 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_workgroup_storage_bytes: 65536,
         },
         compute_units: Some(pool.threads() as u32),
+        l2_cache_bytes: None,
     };
     let key = format!(
         "cpu-{:016x}",

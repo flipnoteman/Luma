@@ -200,6 +200,7 @@ bit_ops!(BufferUsage);
 
 /// Throughputs of a device, measured when a context opens or taken from a profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CostModel {
     /// Host + GPU time of one dispatch of a tiny kernel, microseconds.
     pub launch_us: f64,
@@ -211,18 +212,79 @@ pub struct CostModel {
     pub df32_factor: f64,
     /// Cost of one `f64` add or mul in f32-operation units; `None` without `SHADER_F64`.
     pub f64_factor: Option<f64>,
+    /// How bytes move inside the device (L2, workgroup memory, access patterns, latency);
+    /// measured by calibration, `None` for the fixed presets and where calibration is off.
+    pub memory: Option<MemoryModel>,
+}
+
+/// How bytes move inside a device, measured by calibration next to the [`CostModel`] numbers.
+/// Wave 1 only measures and exposes them; no planning decision reads them yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct MemoryModel {
+    /// L2 cache size: the device attribute where the backend reports it (CUDA), else the
+    /// measured knee of the copy bandwidth over growing working sets.
+    pub l2_bytes: Option<u64>,
+    /// Read bandwidth, GB/s, of a copy whose traffic wraps over a working set inside L2 (the
+    /// largest measured set that is at least 1.5 times faster than DRAM).
+    pub l2_gbs: f64,
+    /// Workgroup-memory read bandwidth, GB/s; `None` on the CPU.
+    pub shared_gbs: Option<f64>,
+    /// Time per byte relative to coalesced access for strides of 2, 8 and 32 elements.
+    pub strided_factor: [f64; 3],
+    /// Time per byte of random 4-byte gathers relative to coalesced access.
+    pub gather_factor: f64,
+    /// Time per byte of a naive transposed read relative to coalesced access.
+    pub transpose_factor: f64,
+    /// Nanoseconds per dependent load of a one-workgroup chain.
+    pub latency_ns: f64,
+}
+
+impl MemoryModel {
+    /// A memory model of the given numbers (see the fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(l2_bytes: Option<u64>, l2_gbs: f64, shared_gbs: Option<f64>, strided_factor: [f64; 3], gather_factor: f64, transpose_factor: f64, latency_ns: f64) -> MemoryModel {
+        MemoryModel { l2_bytes, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns }
+    }
+}
+
+impl fmt::Display for MemoryModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.l2_bytes {
+            Some(bytes) => write!(f, "L2 {:.2} MiB at {:.0} GB/s", bytes as f64 / (1 << 20) as f64, self.l2_gbs)?,
+            None => write!(f, "L2 unknown size at {:.0} GB/s", self.l2_gbs)?,
+        }
+        match self.shared_gbs {
+            Some(gbs) => write!(f, ", workgroup memory {gbs:.0} GB/s")?,
+            None => write!(f, ", no workgroup memory figure")?,
+        }
+        let [s2, s8, s32] = self.strided_factor;
+        write!(f, ", strided x{s2:.2} / x{s8:.2} / x{s32:.2} (2 / 8 / 32), gather x{:.2}, transpose x{:.2}, latency {:.0} ns", self.gather_factor, self.transpose_factor, self.latency_ns)
+    }
 }
 
 impl CostModel {
+    /// A cost model of the given measurements, without a memory model.
+    pub const fn new(launch_us: f64, bandwidth_gbs: f64, f32_ops_per_ns: f64, df32_factor: f64, f64_factor: Option<f64>) -> CostModel {
+        CostModel { launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, memory: None }
+    }
+
+    /// This model with `change` applied (the struct is `#[non_exhaustive]`, so other crates
+    /// cannot use struct update syntax).
+    pub fn with(mut self, change: impl FnOnce(&mut CostModel)) -> CostModel {
+        change(&mut self);
+        self
+    }
+
     /// RTX 3090 (Vulkan), measured by calibration (best of several runs).
-    pub const NVIDIA: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 27.0, f64_factor: Some(41.0) };
+    pub const NVIDIA: CostModel = CostModel::new(2.9, 740.0, 16000.0, 27.0, Some(41.0));
     /// Every other GPU, measured on a RADV Raphael iGPU (best of 5 runs).
-    pub const GENERIC: CostModel = CostModel { launch_us: 2.0, bandwidth_gbs: 62.0, f32_ops_per_ns: 370.0, df32_factor: 44.0, f64_factor: Some(11.0) };
+    pub const GENERIC: CostModel = CostModel::new(2.0, 62.0, 370.0, 44.0, Some(11.0));
     /// Mesa llvmpipe on a Ryzen 9 7950X (best of 5 runs).
-    pub const CPU: CostModel = CostModel { launch_us: 32.0, bandwidth_gbs: 31.0, f32_ops_per_ns: 30.0, df32_factor: 2.3, f64_factor: Some(1.1) };
+    pub const CPU: CostModel = CostModel::new(32.0, 31.0, 30.0, 2.3, Some(1.1));
     /// The numbers tests pin so that kernel counts do not depend on the machine.
     #[doc(hidden)]
-    pub const TEST: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 36.0, f64_factor: Some(41.0) };
+    pub const TEST: CostModel = CostModel::new(2.9, 740.0, 16000.0, 36.0, Some(41.0));
 
     /// The fixed numbers of a tuning profile, used when calibration is off or fails.
     pub fn fallback(profile: TuningProfile) -> CostModel {
@@ -824,6 +886,8 @@ pub struct DeviceInfo {
     /// worker threads, if the backend can tell. Plan constants that depend on how many workgroups
     /// fill the device scale with it.
     pub compute_units: Option<u32>,
+    /// L2 cache size, bytes, if the backend can tell (CUDA).
+    pub l2_cache_bytes: Option<u64>,
 }
 
 /// How much of a kernel's behaviour a backend may take on trust when it compiles it.
