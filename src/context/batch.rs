@@ -51,18 +51,19 @@ impl Context {
     /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
     /// idle, so that the submission goes ahead and the waiting paths report the error.
     fn gpu_busy(&self) -> bool {
-        #[cfg(test)]
         if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
         }
         self.hal().gpu_busy()
     }
 
-    /// Makes [`Context::submit`] and [`Context::submit_requested`] behave as if earlier
-    /// submissions were still running, so that tests of postponed evaluation do not depend on
-    /// how fast the GPU is.
-    #[cfg(test)]
-    pub(crate) fn set_assume_busy(&self, on: bool) {
+    /// Makes `eval` and the fusion-limit cuts behave as if earlier submissions were still
+    /// running, whatever the GPU is doing: pending work is held until `SUBMIT_HOLD` dispatches,
+    /// a sync point or the batch limit, so the batches (and the fused kernels they make) follow the
+    /// program instead of the GPU's speed. For tests of postponed evaluation and for the
+    /// luma-bench decision log, whose runs of one binary must agree.
+    #[doc(hidden)]
+    pub fn set_assume_busy(&self, on: bool) {
         self.inner.assume_busy.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 

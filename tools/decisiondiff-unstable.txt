@@ -1,9 +1,3 @@
 # Cases decisiondiff skips by default (--no-unstable includes them): one case-name substring per line, then a reason.
-# These batch their steps into fused kernels by the timing of the GPU's flushes, so two runs of one binary differ (W1-U0a baseline).
-jit/launch/batch100	one call queues 100 expressions; which of them fuse into one multi-output kernel follows the flush timing
-jit/launchcost/ew_chain64	the 64-op chain's cut points batch by flush timing: kernel counts and fusion groups differ between runs
-cfd/implicit/3d_step	kernel labels and replay counts follow the flush timing (also matches 3d_step_sub1)
-cfd/implicit/2d_step_sub1	the sub-step's fused reduce is grouped by flush timing
-mlkem/decaps	wgpu: two runs of one binary differ in warm decisions and kernels (W1-U0b repeat run)
-mlkem/encaps	wgpu: two runs of one binary differ (W1-U0b repeat run)
-jit/launch/indep100	independent 100-expression batches group by flush timing (W1-U0b repeat run)
+# The bench harness holds work back as on a busy GPU while it records (Context::set_assume_busy), so the GPU's flush timing no longer decides how steps batch; what is left follows host time.
+compute/fractal/mandelbrot_df32	`iterate_all` picks how many steps it unrolls into one body from the host time its trace took (src/iterate.rs `unroll_depth`), so the fused kernel sizes of the kernels line differ between two runs (cold/warm decisions agree)
