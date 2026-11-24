@@ -21,12 +21,21 @@ impl BufferPool {
         BufferPool { free: HashMap::new(), pooled_bytes: 0, clock: 0, cap }
     }
 
-    /// Takes the most recently returned idle buffer of exactly `class` bytes with exactly
-    /// `usage`, if one exists.
+    /// Takes the most recently returned idle buffer with exactly `usage` of `class` bytes or, if
+    /// there is none, of the nearest larger class within the same octave (up to the next power of
+    /// two, the size a power-of-two rule would have given the request), if one exists. A request
+    /// then reuses everything the old rule would have, at most as wasteful, so finer classes
+    /// cannot leave more idle buffers behind.
     pub(crate) fn take(&mut self, class: u64, usage: BufferUsage) -> Option<Buffer> {
-        let (_, buffer) = self.free.get_mut(&(class, usage))?.pop_back()?;
-        self.pooled_bytes -= class;
-        Some(buffer)
+        let octave = class.next_power_of_two();
+        let mut at = class;
+        loop {
+            if let Some((_, buffer)) = self.free.get_mut(&(at, usage)).and_then(VecDeque::pop_back) {
+                self.pooled_bytes -= at;
+                return Some(buffer);
+            }
+            at = luma_core::hal::size_class(at + 1, u64::MAX).filter(|&next| next <= octave)?;
+        }
     }
 
     /// Returns a buffer to the pool and releases the least recently returned ones while the
