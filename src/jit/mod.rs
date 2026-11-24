@@ -30,7 +30,7 @@
 //!   buffers as the device can bind (the evaluated arrays beyond that are first copied into one
 //!   buffer that they are windows of, see `pack`, which a kernel binds once). A new node that would exceed one of them evaluates its
 //!   biggest (for the depth: its deepest) operand first, which splits long chains into several
-//!   kernels. Profiles list every such cut with its reason ([`FusionSplit`]).
+//!   kernels. Profiles list every such cut with its reason ([`Decision`]).
 //!   The biggest operand is not evaluated alone if other live arrays *of the same length* share pending operations with
 //!   it (they read nodes that its expression contains): those are computed in the same
 //!   multi-output kernel, as far as the limits allow. Arrays that advance in lock step (`x`, `y`,
@@ -202,7 +202,7 @@ use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
 use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::kernel::{self, KernelCore, KernelKey};
-use crate::profile::{FusionSplit, SplitReason};
+use crate::profile::{Decision, DecisionSite, SplitReason, Verdict as DecisionVerdict};
 use luma_core::kir::KernelModule;
 
 use inline::{inline, Judgement, Lowered, Verdict};
@@ -2311,7 +2311,7 @@ fn settle(
             } else {
                 SplitReason::Depth { limit: usize::from(MAX_DEPTH) }
             };
-            jit.note_split(name, location, reason);
+            jit.note_cut(name, location, reason);
         }
         if !too_big {
             // Only the nesting: evaluating the deepest operand cuts the chain.
@@ -2935,8 +2935,8 @@ pub(crate) struct JitState {
     recipe_hits: AtomicU64,
     /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
     write_epoch: AtomicU64,
-    /// The cuts of expressions made while profiling (or recording them in tests), if on.
-    splits: Mutex<Option<Vec<FusionSplit>>>,
+    /// The planner's decisions made while profiling or after `record_decisions`, if on.
+    decisions: Mutex<Option<Vec<Decision>>>,
     /// Instructions of the program of the last kernel looked up (tests).
     #[cfg(test)]
     last_program_len: AtomicUsize,
@@ -2972,8 +2972,8 @@ pub(crate) struct JitState {
     plan_stats: plancache::Stats,
     /// Evaluations the plan cache still sits out (see [`plancache`]).
     plan_skip: AtomicU32,
-    /// Whether [`JitState::splits`] is recording (kept apart so that looking is a load).
-    splits_on: AtomicBool,
+    /// Whether [`JitState::decisions`] is recording (kept apart so that looking is a load).
+    decisions_on: AtomicBool,
     /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
     /// replays only if the graph it walked is all of them.
     pending_nodes: std::sync::atomic::AtomicI64,
@@ -3064,7 +3064,7 @@ impl JitState {
             #[cfg(test)]
             recipe_hits: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
-            splits: Mutex::new(None),
+            decisions: Mutex::new(env_records_decisions().then(Vec::new)),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
             #[cfg(test)]
@@ -3086,7 +3086,7 @@ impl JitState {
             plan_epoch: AtomicU64::new(0),
             plan_stats: plancache::Stats::default(),
             plan_skip: AtomicU32::new(0),
-            splits_on: AtomicBool::new(false),
+            decisions_on: AtomicBool::new(env_records_decisions()),
             pending_nodes: std::sync::atomic::AtomicI64::new(0),
         }
     }
@@ -3141,7 +3141,7 @@ impl JitState {
 
     /// How to run `key` (which [`inlines`](program::FusedKey::inlines)) over about `len`
     /// elements, found once per program structure and length class (see [`inline::judge`]).
-    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize) -> Arc<Judgement> {
+    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize, op: &'static str, location: &'static Location<'static>) -> Arc<Judgement> {
         use std::hash::{Hash, Hasher};
         let cap = self.max_inlined(ctx.tuning());
         let class = len.next_power_of_two();
@@ -3162,9 +3162,11 @@ impl JitState {
                 && entry.outputs == key.outputs
                 && entry.tail == key.tail
         };
-        let (judgement, _estimates) = match entries.iter().find(|entry| same(entry)) {
+        let mut cached = true;
+        let (judgement, estimates) = match entries.iter().find(|entry| same(entry)) {
             Some(entry) => (Arc::clone(&entry.judgement), entry.estimates),
             None => {
+                cached = false;
                 let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model(), ctx.tuning(), ctx.tuning().staging && self.staging_enabled());
                 let judgement = Arc::new(judgement);
                 entries.push(JudgementEntry {
@@ -3181,11 +3183,53 @@ impl JitState {
                 (judgement, estimates)
             }
         };
+        drop(judgements);
+        if self.recording_decisions() {
+            self.note_judgement(&judgement, estimates, cached, op, location);
+        }
         #[cfg(test)]
         {
-            *lock(&self.last_judgement) = Some(format!("{judgement:?} {_estimates:?}"));
+            *lock(&self.last_judgement) = Some(format!("{judgement:?} {estimates:?}"));
         }
         judgement
+    }
+
+    /// Records what the inliner decided (and, when it ran the program in one kernel, whether the
+    /// stencil staging was used).
+    fn note_judgement(&self, judgement: &Judgement, estimates: inline::Estimates, cached: bool, op: &'static str, location: &'static Location<'static>) {
+        let ns = |ns: f64| DecisionVerdict::Estimate { ns };
+        let mut decision;
+        match judgement {
+            Judgement::Run { staging } => {
+                decision = Decision::new(op, location, DecisionSite::Inline, "inline").cached(cached);
+                if let Some(&(sub, t)) = estimates.best_sub.as_ref() {
+                    decision = decision.candidate(format!("materialise sub={sub}"), ns(t));
+                }
+                self.note_decision(decision);
+                let staged = match staging {
+                    Some(staging) => Decision::new(op, location, DecisionSite::Staging, format!("staged tile={}x{} subs={}", staging.tile[0], staging.tile[1], staging.subs.len())),
+                    None => Decision::new(op, location, DecisionSite::Staging, "direct"),
+                };
+                let mut staged = staged.cached(cached);
+                if staging.is_none()
+                    && let Some(t) = estimates.staged_ns
+                {
+                    staged = staged.candidate("staged", ns(t));
+                }
+                if staging.is_some() {
+                    staged = staged.candidate("direct", ns(estimates.inline_ns));
+                }
+                self.note_decision(staged);
+            }
+            Judgement::Materialise { subs, .. } => {
+                decision = Decision::new(op, location, DecisionSite::Inline, format!("materialise subs={}", subs.len())).cached(cached);
+                decision = decision.candidate("inline", ns(estimates.inline_ns));
+                if let Some(t) = estimates.staged_ns {
+                    decision = decision.candidate("staged", ns(t));
+                }
+                self.note_decision(decision);
+            }
+        }
     }
 
     /// Counts a reduction pass other than the fused first one (see [`Stats`]).
@@ -3281,33 +3325,73 @@ impl JitState {
         LIVE.with_borrow_mut(|slots| f(slots.of(self)))
     }
 
-    /// Starts recording the cuts of expressions (see [`FusionSplit`]).
-    pub(crate) fn start_splits(&self) {
-        *lock(&self.splits) = Some(Vec::new());
-        self.splits_on.store(true, Ordering::Relaxed);
+    /// Starts recording decisions (see [`Decision`]); an earlier list is kept.
+    pub(crate) fn start_decisions(&self) {
+        lock(&self.decisions).get_or_insert_with(Vec::new);
+        self.decisions_on.store(true, Ordering::Relaxed);
     }
 
-    /// Stops recording cuts and returns them.
-    pub(crate) fn take_split_notes(&self) -> Vec<FusionSplit> {
-        self.splits_on.store(false, Ordering::Relaxed);
-        lock(&self.splits).take().unwrap_or_default()
+    /// Whether decisions are recorded: call sites build a [`Decision`] only if so.
+    #[inline]
+    pub(crate) fn recording_decisions(&self) -> bool {
+        self.decisions_on.load(Ordering::Relaxed)
     }
 
-    /// Notes that an expression was cut into several kernels, if anyone listens.
-    pub(crate) fn note_split(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
-        if let Some(splits) = lock(&self.splits).as_mut() {
-            splits.push(FusionSplit { op, location, reason });
+    /// Mutes (or unmutes) the recording without dropping the list: for a replay, whose launches
+    /// would re-derive decisions the plan already holds.
+    pub(crate) fn pause_decisions(&self, paused: bool) {
+        self.decisions_on.store(!paused, Ordering::Relaxed);
+    }
+
+    /// Stops recording decisions and returns them.
+    pub(crate) fn stop_decisions(&self) -> Vec<Decision> {
+        self.decisions_on.store(false, Ordering::Relaxed);
+        lock(&self.decisions).take().unwrap_or_default()
+    }
+
+    /// Returns the decisions recorded so far and goes on recording (if it was on).
+    pub(crate) fn drain_decisions(&self) -> Vec<Decision> {
+        lock(&self.decisions).as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Records a decision, if anyone listens.
+    pub(crate) fn note_decision(&self, decision: Decision) {
+        if let Some(list) = lock(&self.decisions).as_mut() {
+            list.push(decision);
+        }
+    }
+
+    /// Records the decision `build` makes, if anyone listens; `build` gets the caller's location
+    /// (for sites that have no operation of the user's to point at).
+    #[track_caller]
+    pub(crate) fn note_with(&self, build: impl FnOnce(&'static Location<'static>) -> Decision) {
+        if self.recording_decisions() {
+            self.note_decision(build(Location::caller()));
+        }
+    }
+
+    /// Records that an expression was cut into several kernels, if anyone listens.
+    pub(crate) fn note_cut(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
+        if self.recording_decisions() {
+            self.note_decision(Decision::new(op, location, DecisionSite::Cut(reason), cut_label(reason)));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn record_splits(&self) {
-        self.start_splits();
+        self.start_decisions();
     }
 
+    /// The `Cut` decisions recorded since `record_splits` (what `Profile::cuts` gives).
     #[cfg(test)]
-    pub(crate) fn take_splits(&self) -> Vec<FusionSplit> {
-        self.take_split_notes()
+    pub(crate) fn take_splits(&self) -> Vec<TestCut> {
+        self.stop_decisions()
+            .into_iter()
+            .filter_map(|d| match d.site {
+                DecisionSite::Cut(reason) => Some(TestCut { op: d.op, location: d.location, reason, decision: d }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Overrides the most input buffers of a kernel (tests, to behave like a device with fewer bindings).
@@ -4012,6 +4096,45 @@ impl FastKernel {
             && self.tile == key.tile
             && self.guard == key.guard
             && self.coarsen == key.coarsen
+    }
+}
+
+/// A cut as the tests read it.
+#[cfg(test)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct TestCut {
+    pub(crate) op: &'static str,
+    pub(crate) location: &'static Location<'static>,
+    pub(crate) reason: SplitReason,
+    decision: Decision,
+}
+
+#[cfg(test)]
+impl std::fmt::Display for TestCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.decision.fmt(f)
+    }
+}
+
+/// `LUMA_RECORD_DECISIONS=1`: contexts start with decision recording on.
+fn env_records_decisions() -> bool {
+    std::env::var("LUMA_RECORD_DECISIONS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+}
+
+/// The stable label of a cut: its values are counts and limits, never addresses.
+fn cut_label(reason: SplitReason) -> String {
+    match reason {
+        SplitReason::Nodes { nodes, limit } => format!("nodes {nodes}>{limit}"),
+        SplitReason::Depth { limit } => format!("depth >{limit}"),
+        SplitReason::Inputs { inputs, limit } => format!("inputs {inputs}>{limit}"),
+        SplitReason::Live { live, limit } => format!("live {live}>{limit}"),
+        SplitReason::Scalars { words, limit } => format!("scalars {words}>{limit}"),
+        SplitReason::Inlined { instructions, limit } => format!("inlined {instructions}>{limit}"),
+        SplitReason::Materialised { instances } => format!("materialised x{instances}"),
+        SplitReason::Shared { weight } => format!("shared weight {weight}"),
+        #[allow(unreachable_patterns)]
+        _ => format!("{reason:?}"),
     }
 }
 

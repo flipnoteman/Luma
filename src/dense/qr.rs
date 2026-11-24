@@ -370,7 +370,7 @@ struct TParams {
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Node {
     let [w, m, ..] = a.shape().dims();
     if w <= PANEL
-        && let Some(plan) = super::tsqr::plan(a.context(), m, w)
+        && let Some(plan) = super::tsqr::plan(a.context(), m, w, op, loc)
     {
         return tsqr_panel(a, plan, op, loc);
     }
@@ -406,7 +406,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
     };
     if d.batch == 1
         && d.cols <= PANEL
-        && let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols)
+        && let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols, op, loc)
     {
         return tsqr_panel(a, plan, op, loc).into_qr();
     }

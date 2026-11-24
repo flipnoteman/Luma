@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Diff two luma-bench decision logs (W1-U0a).
+
+usage: decisiondiff OLD.jsonl NEW.jsonl [--allow-added-site SITE[,SITE...]] [--strict-locations]
+       decisiondiff --self-test
+
+The logs come from `LUMA_BENCH_DECISIONS=<path> luma-bench ...` (pinned `LUMA_CALIBRATE=0`,
+`LUMA_TELEMETRY=off`, set by the harness). Each case has two passes, `cold` (plan cache empty:
+every planning decision) and `warm` (the cache replays: `PlanReplay`), and one `kernels` line (the
+launches per kernel label of the harness's profile run). Both passes and the kernels line are
+compared per case; the exit status is 1 on any difference.
+
+  --allow-added-site  the named sites (the variant name: `ReducePlan`, `Cut`, ...) may appear in NEW
+                      without appearing in OLD for that case and pass; any other difference fails,
+                      and a site OLD has that NEW lacks always fails.
+  --strict-locations  compare file:line:col of locations in luma's own sources too. By default only
+                      the file of an internal location (anything outside crates/luma-bench) is
+                      compared, since a spec that edits luma moves its lines; the locations of the
+                      benchmarks are compared in full.
+
+A case present in only one file is a difference.
+"""
+import json
+import sys
+import tempfile
+import os
+from collections import OrderedDict
+
+
+def site_name(site):
+    for i, ch in enumerate(site):
+        if ch in "( {":
+            return site[:i]
+    return site
+
+
+def norm_location(loc, strict):
+    if strict or loc.startswith("crates/luma-bench/"):
+        return loc
+    return loc.rsplit(":", 2)[0]
+
+
+def load(path, strict):
+    """{case: {"cold": [tuple...], "warm": [tuple...], "kernels": list|None}}"""
+    cases = OrderedDict()
+    with open(path) as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            r = json.loads(line)
+            c = cases.setdefault(r["case"], {"cold": [], "warm": [], "kernels": None})
+            if "kernels" in r:
+                c["kernels"] = r["kernels"]
+            else:
+                c[r["pass"]].append((r["site"], r["op"], norm_location(r["location"], strict), r["chosen"]))
+    return cases
+
+
+def diff(old, new, allowed):
+    out = []
+    for case in sorted(set(old) | set(new)):
+        if case not in new:
+            out.append(f"{case}: only in OLD")
+            continue
+        if case not in old:
+            out.append(f"{case}: only in NEW")
+            continue
+        o, n = old[case], new[case]
+        for p in ("cold", "warm"):
+            have = {site_name(d[0]) for d in o[p]}
+            keep = [d for d in n[p] if site_name(d[0]) not in allowed or site_name(d[0]) in have]
+            if o[p] != keep:
+                out.append(f"{case} [{p}]:")
+                out += describe(o[p], keep)
+        if o["kernels"] != n["kernels"]:
+            out.append(f"{case} [kernels]: {o['kernels']} -> {n['kernels']}")
+    return out
+
+
+def describe(a, b):
+    out = []
+    i = 0
+    while i < max(len(a), len(b)):
+        x = a[i] if i < len(a) else None
+        y = b[i] if i < len(b) else None
+        if x != y:
+            out.append(f"  #{i}: - {x}")
+            out.append(f"  #{i}: + {y}")
+            if len(out) >= 12:
+                out.append("  ...")
+                break
+        i += 1
+    return out
+
+
+def self_test():
+    rows = [
+        {"case": "jit/a", "pass": "cold", "site": "Coarsen", "op": "add", "location": "crates/luma-bench/src/x.rs:10:5", "chosen": "coarsen 4"},
+        {"case": "jit/a", "pass": "cold", "site": "Cut(Nodes { nodes: 17, limit: 16 })", "op": "mul", "location": "crates/luma-bench/src/x.rs:11:5", "chosen": "nodes 17>16"},
+        {"case": "jit/a", "pass": "warm", "site": "PlanReplay", "op": "add", "location": "crates/luma-bench/src/x.rs:10:5", "chosen": "replay"},
+        {"case": "jit/a", "kernels": [["k", 2]]},
+    ]
+    d = tempfile.mkdtemp()
+
+    def write(name, rs):
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            for r in rs:
+                fh.write(json.dumps(r) + "\n")
+        return p
+
+    a, b = write("a", rows), write("b", rows)
+    assert not diff(load(a, False), load(b, False), set()), "identical logs must diff clean"
+    changed = [dict(r) for r in rows]
+    changed[0]["chosen"] = "coarsen 2"
+    c = write("c", changed)
+    assert diff(load(a, False), load(c, False), set()), "a changed label must differ"
+    added = rows + [{"case": "jit/a", "pass": "cold", "site": "ReducePlan", "op": "sum", "location": "src/reduce.rs:1:1", "chosen": "x"}]
+    e = write("e", added)
+    assert diff(load(a, False), load(e, False), set()), "an added site must differ"
+    assert not diff(load(a, False), load(e, False), {"ReducePlan"}), "an allowed added site must not"
+    assert diff(load(e, False), load(a, False), {"ReducePlan"}), "a removed site must differ"
+    moved = [dict(r) for r in rows]
+    moved[1]["location"] = "src/jit/mod.rs:5:5"
+    moved2 = [dict(r) for r in rows]
+    moved2[1]["location"] = "src/jit/mod.rs:9:5"
+    m1, m2 = write("m1", moved), write("m2", moved2)
+    assert not diff(load(m1, False), load(m2, False), set()), "internal line numbers are not compared"
+    assert diff(load(m1, True), load(m2, True), set()), "--strict-locations compares them"
+    print("decisiondiff self-test: ok")
+
+
+def main(argv):
+    if argv and argv[0] == "--self-test":
+        self_test()
+        return 0
+    pos, allowed, strict = [], set(), False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--allow-added-site":
+            i += 1
+            allowed |= {s for s in argv[i].split(",") if s}
+        elif a == "--strict-locations":
+            strict = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            pos.append(a)
+        i += 1
+    if len(pos) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    out = diff(load(pos[0], strict), load(pos[1], strict), allowed)
+    for line in out:
+        print(line)
+    if out:
+        print(f"decisiondiff: {len([l for l in out if not l.startswith('  ')])} difference(s)")
+        return 1
+    print("decisiondiff: identical")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

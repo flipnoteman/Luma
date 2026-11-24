@@ -470,10 +470,11 @@ fn main() -> Result<()> {
     }
     println!("{}", "=".repeat(90));
     for (name, profile) in &profiles {
-        println!("\n{name}: {} launches, {} splits", profile.launches(), profile.splits.len());
-        print!("{}", Profile { splits: Vec::new(), ..profile.clone() });
+        let cuts: Vec<&Decision> = profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).collect();
+        println!("\n{name}: {} launches, {} splits", profile.launches(), cuts.len());
+        print!("{}", { let mut bare = profile.clone(); bare.decisions.clear(); bare });
         let mut reasons: Vec<(String, usize)> = Vec::new();
-        for split in &profile.splits {
+        for split in cuts {
             let text = split.to_string();
             let reason = text.split("): ").nth(1).unwrap_or("").trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
             match reasons.iter_mut().find(|(r, _)| r == reason) {

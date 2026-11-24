@@ -127,7 +127,7 @@ those forced together are recorded in one kernel (up to 16 accumulators; `LUMA_M
 
 An expression is cut into several kernels when it would grow past a limit (`LUMA_FUSION_MAX_NODES`,
 `LUMA_FUSION_MAX_LIVE`, `LUMA_FUSION_MAX_INLINED`) or when evaluating a shared piece first is
-cheaper. [`Profile::splits`](https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits) tells you where
+cheaper. [`Profile::cuts`](https://docs.rs/luma/latest/luma/struct.Profile.html#method.cuts) tells you where
 and why.
 
 ## `cache()`

@@ -24,7 +24,7 @@ use luma_core::hal::cache::{self, PTX_MAGIC};
 use luma_core::hal::{copy_parallel, size_class};
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
-    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
+    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
     KernelTrust, NativeBuffer, NativeKernel, NativeStage, Profile, RawArg, RawKernel, GemmSpec, Stage, StageDir, Ticket, TuningProfile,
 };
 use luma_core::hal::check_transfer;
@@ -1841,7 +1841,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError> {
+    fn finish_profiling(&self) -> Result<Profile, BackendError> {
         let samples = {
             let mut st = lock(&self.state);
             let Some(samples) = st.profiler.take() else {
@@ -1863,7 +1863,6 @@ impl Backend for CudaBackend {
         }
         let mut profile = Profile::default();
         profile.add_samples(timings);
-        profile.splits = splits;
         Ok(profile)
     }
 

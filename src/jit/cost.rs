@@ -9,6 +9,7 @@ use crate::builtin::{df_library, BinOp, CmpOp, Part, UnOp};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
+use crate::profile::{Decision, DecisionSite};
 use crate::ops::launch_1d;
 
 pub(crate) use luma_core::{CostModel, MemoryModel};
@@ -181,7 +182,17 @@ fn gather_saving(pattern: ReadPattern, taps: u32) -> f64 {
 /// a write of it and a launch, and is made per use, so it pays only when the saving exceeds that.
 /// The saving is the table of [`gather_saving`] where measured (NVIDIA); every other device reads
 /// from the buffer.
+#[track_caller]
 pub(crate) fn read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
+    let path = choose_read_path(ctx, read);
+    ctx.jit().note_with(|loc| {
+        let chosen = if path == ReadPath::Texture { "texture" } else { "plain" };
+        Decision::new("read", loc, DecisionSite::ReadPath, chosen)
+    });
+    path
+}
+
+fn choose_read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
     if ctx.hal().texture_caps().is_none() || ctx.tuning().profile != luma_core::TuningProfile::Nvidia {
         return ReadPath::Plain;
     }

@@ -387,7 +387,7 @@ impl Case {
                     let label: String = k.label.chars().take(150).collect();
                     println!("  {:>5}x {:>9.1} us  {}", k.launches, k.total.as_secs_f64() * 1e6, label);
                 }
-                for s in &profile.splits {
+                for s in profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))) {
                     println!("  {s}");
                 }
             }
@@ -402,7 +402,7 @@ impl Case {
                 gpu: profile.total(),
                 first_call: first,
                 cpu: cpu_rate(op),
-                splits: profile.splits.iter().map(ToString::to_string).collect(),
+                splits: profile.decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).map(ToString::to_string).collect(),
             });
         }
         Ok(rows)

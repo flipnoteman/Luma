@@ -5,6 +5,7 @@
 #![allow(clippy::duplicate_mod)]
 
 mod common;
+mod decisions;
 mod dense_host;
 
 mod argmax;

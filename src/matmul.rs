@@ -37,6 +37,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
+use crate::profile::{Decision, DecisionSite, Verdict};
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::ops::{fold_grid, Outcome};
 use crate::tuning::Tuning;
@@ -306,7 +307,7 @@ pub fn matmul_f32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
 #[track_caller]
 fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32> {
     let location = Location::caller();
-    let result = run(lhs, rhs, tf32.unwrap_or_else(|| lhs.context().tf32_matmul()));
+    let result = run(lhs, rhs, tf32.unwrap_or_else(|| lhs.context().tf32_matmul()), location);
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     Array::resolve(lhs.context(), shape, result, "matmul", location)
@@ -533,7 +534,7 @@ fn gemm_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> Option<[u32; 3]> {
 /// padded with zero columns up to one on the backend's own kernels and sliced back: `None` if the
 /// product is not of that kind. The padded operand is an expression, evaluated first like any
 /// other (a copy of a few thousand elements); the slice of the result is a lazy view.
-fn padded_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Option<Outcome<Array<f32>>> {
+fn padded_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool, location: &'static Location<'static>) -> Option<Outcome<Array<f32>>> {
     let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
     let (k, m, n) = (ld[0], ld[1], rd[0]);
     let padded = n.next_multiple_of(4);
@@ -546,8 +547,11 @@ fn padded_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool)
     if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || ctx.hal().gemm_tiles(!tf32).is_empty() {
         return None;
     }
+    if ctx.jit().recording_decisions() {
+        ctx.jit().note_decision(Decision::new("matmul", location, DecisionSite::MatmulPlan, format!("padded n={n} to {padded}")));
+    }
     let wide = rhs.pad([(0, padded - n), (0, 0)], PadMode::Zero);
-    Some(run(lhs, &wide, tf32).map(|out| out.slice(0, ..n)))
+    Some(run(lhs, &wide, tf32, location).map(|out| out.slice(0, ..n)))
 }
 
 /// Whether the backend's own kernels can take `array` as an operand: they read buffers (or the
@@ -761,12 +765,29 @@ fn host_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Option<Arr
     crate::host::try_matmul(ctx, lhs, rhs, m, n, k)
 }
 
-fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
+/// The stable label of a plan, for the decision log.
+fn plan_label(plan: &Plan) -> String {
+    let tile = match plan.tile {
+        MatmulTile::T128 => "tiled 128x128".to_string(),
+        MatmulTile::T128x32 => "tiled 128x32".to_string(),
+        MatmulTile::T32x128 => "tiled 32x128".to_string(),
+        MatmulTile::T32 => "tiled 32x32".to_string(),
+        MatmulTile::Native { edge, .. } => format!("native {edge}"),
+        MatmulTile::Gemm { rows, cols, exact, .. } => format!("gemm {rows}x{cols}{}", if exact { " exact" } else { "" }),
+        MatmulTile::Skinny { rows, cols, groups, width, along_k } => format!("skinny {rows}x{cols} groups={groups} width={width}{}", if along_k { " along-k" } else { "" }),
+    };
+    format!("{tile} split={}{}", plan.slices, if plan.aligned { " aligned" } else { "" })
+}
+
+fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool, location: &'static Location<'static>) -> Outcome<Array<f32>> {
     let ctx = lhs.context();
     if let Some(out) = host_product(ctx, lhs, rhs) {
+        if ctx.jit().recording_decisions() {
+            ctx.jit().note_decision(Decision::new("matmul", location, DecisionSite::MatmulPlan, "host"));
+        }
         return Ok(out);
     }
-    if let Some(out) = padded_product(ctx, lhs, rhs, tf32) {
+    if let Some(out) = padded_product(ctx, lhs, rhs, tf32, location) {
         return out;
     }
     // Operands first, so that a poisoned one reports its own error.
@@ -804,6 +825,10 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
         let along_k = jit::stored_along_k(&sides[0], [k32, m32]);
         plan(ctx.tuning(), m32, n32, k32, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     };
+    let mut chosen = None;
+    if ctx.jit().recording_decisions() {
+        chosen = Some(plan_label(&plan));
+    }
     // A skinny kernel computes a fused operand once per tile that reads it. A few reads of an
     // expression of several buffers already cost more than the staged tiles, which compute each
     // element twice (a correlation matrix, `(x - mean) / std` against itself: 1.2 ms against 1.7);
@@ -814,7 +839,15 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
         let costly = [lhs, rhs].into_iter().zip(reads).any(|(array, reads)| (SKINNY_FUSED_READS..SKINNY_EVALUATE_READS).contains(&reads) && array.pending().is_some_and(jit::is_recomputed));
         if costly {
             plan = tiled_plan(ctx.tuning(), m32, n32, k32, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?;
+            if let Some(skinny) = chosen.take() {
+                ctx.jit().note_decision(
+                    Decision::new("matmul", location, DecisionSite::MatmulPlan, plan_label(&plan)).candidate(skinny, Verdict::Rejected("fused operand read too often")),
+                );
+            }
         }
+    }
+    if let Some(label) = chosen.take() {
+        ctx.jit().note_decision(Decision::new("matmul", location, DecisionSite::MatmulPlan, label));
     }
     if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
         let reads = [n32.div_ceil(u32::from(cols)), m32.div_ceil(u32::from(rows))];

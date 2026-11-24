@@ -193,7 +193,7 @@ pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoment
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;
-pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, MemoryModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
+pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
 pub use complex::C32;

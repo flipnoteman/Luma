@@ -30,18 +30,23 @@ if ctx.profiling_supported() {
 
 A [`Profile`](https://docs.rs/luma/latest/luma/struct.Profile.html) has `kernels` (one
 [`KernelTiming`](https://docs.rs/luma/latest/luma/struct.KernelTiming.html) per label, the most
-expensive first: label, launches, total, min, max, and a `mean()` method), `splits`, `launches()` and `total()`.
+expensive first: label, launches, total, min, max, and a `mean()` method), `decisions`, `cuts()`, `launches()` and `total()`.
 Fused kernels are labelled by what they hold (`Fused(Mul, Add, Sqrt) f32`, `FusedReduce(Sum: Mul)
 f32`); your own kernels by `.label(..)` or their entry point.
 
 While profiling, every launch gets a compute pass of its own so that it can be timed. Use it to find
 where the GPU time goes, not to measure throughput. For the host's time, time the calls themselves.
 
-### Why was it cut: `splits`
+### Why was it cut: `cuts()` and `decisions`
 
-Each [`FusionSplit`](https://docs.rs/luma/latest/luma/struct.FusionSplit.html) names the operation
-and source line where an expression was cut, and the
-[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html):
+`Profile::decisions` lists every choice the planner made while profiling
+([`Decision`](https://docs.rs/luma/latest/luma/struct.Decision.html): the operation, its source line,
+the [`DecisionSite`](https://docs.rs/luma/latest/luma/enum.DecisionSite.html), the chosen label and the
+alternatives that lost). `Profile::cuts()` gives the cuts of expressions among them: the operation and
+source line where an expression was cut, and the
+[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html). To record decisions without
+profiling (host paths, the plan cache and graph capture stay on), use `Context::record_decisions(true)`
+(or `LUMA_RECORD_DECISIONS=1`) and `Context::take_decisions()`.
 
 | Reason | Meaning |
 | --- | --- |
@@ -68,10 +73,10 @@ if ctx.profiling_supported() {
     })?;
     r?;
     assert!(profile.launches() > 1);
-    for split in &profile.splits {
-        println!("{split}");                            // split at file:line:col (`op`): N operations > 2
+    for (op, location, reason) in profile.cuts() {
+        println!("{op} at {location}: {reason:?}");     // add at file:line:col: Nodes { nodes: 3, limit: 2 }
     }
-    assert!(profile.splits.iter().any(|s| matches!(s.reason, SplitReason::Nodes { .. })));
+    assert!(profile.cuts().any(|(_, _, reason)| matches!(reason, SplitReason::Nodes { .. })));
 }
 # Ok::<(), luma::LumaError>(())
 ```
@@ -313,7 +318,7 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
    dominates? Is the time in kernels at all, or in the host (then it is `eval`, readbacks, or
    array construction)?
 2. **Count launches** per step. A step that should be one fused kernel and is ten means a cut:
-   print `profile.splits` and read the reason.
+   print `profile.cuts()` and read the reason.
 3. **Look for readbacks** inside loops: `item()`, `to_vec()`, `max().item()?` per iteration. Move
    them out of the loop or use `iterate_until_all`.
 4. **Use the loop primitives** where the step fits; check that the step is elementwise (register

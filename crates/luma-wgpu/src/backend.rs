@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
-    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
+    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
 use luma_core::hal::{check_transfer, copy_parallel, size_class};
@@ -1767,7 +1767,7 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError> {
+    fn finish_profiling(&self) -> Result<Profile, BackendError> {
         let mut profiler = {
             let mut batch = self.batch()?;
             let Some(profiler) = batch.profiler.take() else {
@@ -1780,8 +1780,7 @@ impl Backend for WgpuBackend {
         self.take_gpu_error()?;
         // Everything profiled has completed; only now are its timestamps reliably written.
         self.read_timestamps(&mut profiler)?;
-        let mut profile = profiler.into_profile();
-        profile.splits = splits;
+        let profile = profiler.into_profile();
         Ok(profile)
     }
 
@@ -1910,13 +1909,13 @@ mod tests {
         match backend.enable_profiling() {
             Ok(()) => {
                 assert!(backend.is_profiling().unwrap());
-                let profile = backend.finish_profiling(Vec::new()).unwrap();
+                let profile = backend.finish_profiling().unwrap();
                 assert_eq!(profile.launches(), 0);
                 assert!(!backend.is_profiling().unwrap());
             }
             Err(BackendError::Profiling(_)) => assert!(!backend.info().features.contains(Features::TIMESTAMP_QUERY)),
             Err(other) => panic!("{other}"),
         }
-        assert!(matches!(backend.finish_profiling(Vec::new()), Err(BackendError::Profiling(_))));
+        assert!(matches!(backend.finish_profiling(), Err(BackendError::Profiling(_))));
     }
 }

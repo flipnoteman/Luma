@@ -63,6 +63,8 @@ pub struct Harness {
     /// `--iters N`: every case runs exactly N timed calls, no calibration or profile run.
     pub iters: Option<usize>,
     json: Option<std::io::BufWriter<std::fs::File>>,
+    /// `LUMA_BENCH_DECISIONS`: the decision log (see [`Harness::log_decisions`]).
+    decisions: Option<std::io::BufWriter<std::fs::File>>,
     header_printed: bool,
 }
 
@@ -74,7 +76,57 @@ impl Harness {
             let loc = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
             *PANIC.lock().unwrap() = format!("{msg}{loc}");
         }));
-        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), iters: None, json, header_printed: false }
+        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), iters: None, json, decisions: None, header_printed: false }
+    }
+
+    /// Writes the decision log of every case that runs from now on to `path` (see
+    /// [`Harness::record_decisions`]).
+    pub fn log_decisions(&mut self, path: &str) {
+        self.decisions = Some(std::io::BufWriter::new(std::fs::File::create(path).expect("cannot create the decision log")));
+    }
+
+    /// Records the decisions of `f` on the harness context, after the timed runs: with the plan cache
+    /// emptied (`set_plan_cache(true)` drops every plan) one call is the **cold** pass, every planning
+    /// decision made and logged; the next call is the **warm** pass, which replays the plan (`PlanReplay`).
+    /// `kernels` is the harness's profile run of the case (the launches per kernel label), `None` where
+    /// profiling is unsupported. One JSONL line per decision and one `kernels` line per case.
+    fn record_decisions(&mut self, case: &str, f: &mut dyn FnMut(), kernels: Option<&Profile>) {
+        if self.decisions.is_none() {
+            return;
+        }
+        let name = self.full(case);
+        let ctx = self.ctx.clone();
+        ctx.set_plan_cache(true);
+        ctx.record_decisions(true);
+        let mut lines = String::new();
+        for pass in ["cold", "warm"] {
+            f();
+            ctx.sync().expect("sync");
+            for d in ctx.take_decisions() {
+                let _ = writeln!(
+                    lines,
+                    "{{\"case\":\"{}\",\"pass\":\"{pass}\",\"site\":\"{}\",\"op\":\"{}\",\"location\":\"{}:{}:{}\",\"chosen\":\"{}\"}}",
+                    esc(&name),
+                    esc(&format!("{:?}", d.site)),
+                    esc(d.op),
+                    esc(d.location.file()),
+                    d.location.line(),
+                    d.location.column(),
+                    esc(&d.chosen)
+                );
+            }
+        }
+        ctx.record_decisions(false);
+        if let Some(p) = kernels {
+            let mut counts: Vec<(&str, u32)> = p.kernels.iter().map(|k| (k.label.as_str(), k.launches)).collect();
+            counts.sort_unstable();
+            let list: Vec<String> = counts.iter().map(|(label, n)| format!("[\"{}\",{n}]", esc(label))).collect();
+            let _ = writeln!(lines, "{{\"case\":\"{}\",\"kernels\":[{}]}}", esc(&name), list.join(","));
+        }
+        if let Some(out) = self.decisions.as_mut() {
+            let _ = out.write_all(lines.as_bytes());
+            let _ = out.flush();
+        }
     }
 
     fn full(&self, case: &str) -> String {
@@ -170,6 +222,7 @@ impl Harness {
                 run(f);
             }
             println!("{:<40} {:>14} {n} iterations, {:.3} ms each", self.full(case), size, t.elapsed().as_secs_f64() * 1e3 / n as f64);
+            self.record_decisions(case, f, None);
             return;
         }
         let warm = run(f).max(run(f));
@@ -202,6 +255,7 @@ impl Harness {
             Work::None => (None, ""),
         };
         let kernels = std::env::var_os("LUMA_BENCH_KERNELS").is_some();
+        let mut profile = None;
         let (launches, gpu_ms) = match self.ctx.profile(&mut *f) {
             Ok(((), p)) => {
                 if kernels {
@@ -210,11 +264,14 @@ impl Harness {
                         println!("    {:>9.1} us x{:<3} {}", k.total.as_secs_f64() * 1e6, k.launches, k.label.chars().take(110).collect::<String>());
                     }
                 }
-                (Some(p.launches()), Some(p.total().as_secs_f64() * 1e3))
+                let measured = (Some(p.launches()), Some(p.total().as_secs_f64() * 1e3));
+                profile = Some(p);
+                measured
             }
             Err(_) => (None, None),
         };
         let _ = self.ctx.sync();
+        self.record_decisions(case, f, profile.as_ref());
         if !build_only && launches == Some(0) {
             let why = "the profiled call launched no kernel: the case does not evaluate and flush its work (build_case and transfer_case register cases that launch none by design)";
             println!("FAILED: {}: {why}", self.full(case));

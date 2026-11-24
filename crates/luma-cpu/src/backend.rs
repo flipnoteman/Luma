@@ -15,7 +15,7 @@ use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel,
     CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads,
-    FusionSplit, GraphLaunch, LineSolveSpec, MatmulSpec, Profile, RawArg, RawKernel, TuningProfile,
+    GraphLaunch, LineSolveSpec, MatmulSpec, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::CompiledCpuKernel;
@@ -774,14 +774,13 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError> {
+    fn finish_profiling(&self) -> Result<Profile, BackendError> {
         self.dispatches.store(0, Ordering::Relaxed);
         let Some(samples) = lock(&self.profiler).take() else {
             return Err(BackendError::Profiling("profiling is not enabled".into()));
         };
         let mut profile = Profile::default();
         profile.add_samples(samples);
-        profile.splits = splits;
         Ok(profile)
     }
 

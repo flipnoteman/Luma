@@ -2,6 +2,7 @@
 //! every GPU backend implements.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::panic::Location;
@@ -330,7 +331,7 @@ impl KernelTiming {
 }
 
 /// Why the fusion engine ended a kernel before the expression did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SplitReason {
     /// The expression held more operations than the fusion limit allows.
@@ -389,21 +390,94 @@ pub enum SplitReason {
     },
 }
 
-/// A point where an expression was cut into several kernels, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FusionSplit {
-    /// The operation whose creation (or evaluation) caused the cut.
+/// Where the planner chose between alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecisionSite {
+    /// An expression was cut into several kernels (see [`SplitReason`]).
+    Cut(SplitReason),
+    /// The inliner judged whether a shared sub-expression is recomputed or stored.
+    Inline,
+    /// An operand was staged (through shared memory or registers) or read directly.
+    Staging,
+    /// Work per thread of an elementwise kernel.
+    Coarsen,
+    /// A transpose fused with its consumer or not.
+    TransposeFusion,
+    /// How a view is read (direct, texture, packed).
+    ReadPath,
+    /// Matrix product strategy.
+    MatmulPlan,
+    /// Sort strategy.
+    SortPlan,
+    /// Line solver (cyclic reduction) strategy.
+    LineSolvePlan,
+    /// QR panel strategy.
+    QrPanel,
+    /// A cached plan was replayed: no planning decision was made.
+    PlanReplay,
+}
+
+/// What became of a candidate that was not chosen.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Verdict {
+    /// Its estimated cost.
+    Estimate {
+        /// Nanoseconds.
+        ns: f64,
+    },
+    /// It did not apply, for this reason.
+    Rejected(&'static str),
+}
+
+/// One choice of the planner between alternatives, recorded while profiling or after
+/// [`Context::record_decisions`](https://docs.rs/luma). Labels are stable strings (no pointers or ids).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Decision {
+    /// The operation whose creation (or evaluation) caused the decision.
     pub op: &'static str,
     /// Where that operation was written.
     pub location: &'static Location<'static>,
-    /// Why the expression was cut.
-    pub reason: SplitReason,
+    /// What was decided.
+    pub site: DecisionSite,
+    /// The chosen alternative, e.g. `tiled 128x64 split=4`, `coarsen 4`, `texture`.
+    pub chosen: Cow<'static, str>,
+    /// The alternatives that were not chosen (may be empty).
+    pub candidates: Vec<(Cow<'static, str>, Verdict)>,
+    /// The choice came from a memo (judgement cache, recipes).
+    pub cached: bool,
 }
 
-impl fmt::Display for FusionSplit {
+impl Decision {
+    /// A decision with no candidates, not cached.
+    pub fn new(op: &'static str, location: &'static Location<'static>, site: DecisionSite, chosen: impl Into<Cow<'static, str>>) -> Decision {
+        Decision { op, location, site, chosen: chosen.into(), candidates: Vec::new(), cached: false }
+    }
+
+    /// Adds a rejected alternative.
+    #[must_use]
+    pub fn candidate(mut self, label: impl Into<Cow<'static, str>>, verdict: Verdict) -> Decision {
+        self.candidates.push((label.into(), verdict));
+        self
+    }
+
+    /// Sets whether the choice came from a memo.
+    #[must_use]
+    pub fn cached(mut self, cached: bool) -> Decision {
+        self.cached = cached;
+        self
+    }
+}
+
+impl fmt::Display for Decision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let DecisionSite::Cut(reason) = self.site else {
+            return write!(f, "{:?} at {} (`{}`): {}", self.site, self.location, self.op, self.chosen);
+        };
         write!(f, "split at {} (`{}`): ", self.location, self.op)?;
-        match self.reason {
+        match reason {
             SplitReason::Nodes { nodes, limit } => write!(f, "{nodes} operations > {limit}"),
             SplitReason::Depth { limit } => write!(f, "depth > {limit}"),
             SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
@@ -412,6 +486,8 @@ impl fmt::Display for FusionSplit {
             SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
             SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
             SplitReason::Shared { weight } => write!(f, "an expression of {weight} operations read by pending operations outside the kernel is stored, not recomputed in each"),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "{}", self.chosen),
         }
     }
 }
@@ -421,16 +497,25 @@ impl fmt::Display for FusionSplit {
 /// A duration is the time from the start to the end of the compute pass of one launch, so it
 /// includes the GPU's own scheduling of that pass but not the time between launches or any host
 /// time.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Profile {
     /// One entry per kernel label, the one with the most total time first.
     pub kernels: Vec<KernelTiming>,
-    /// Where lazy expressions were cut into several kernels while profiling, in the order they
-    /// happened (see [`SplitReason`]).
-    pub splits: Vec<FusionSplit>,
+    /// Every choice the planner made while profiling, in the order it happened (see [`Decision`]).
+    pub decisions: Vec<Decision>,
 }
 
 impl Profile {
+    /// The cuts of lazy expressions into several kernels: the `Cut` decisions, with their
+    /// operation, location and reason, in the order they happened.
+    pub fn cuts(&self) -> impl Iterator<Item = (&'static str, &'static Location<'static>, SplitReason)> + '_ {
+        self.decisions.iter().filter_map(|d| match d.site {
+            DecisionSite::Cut(reason) => Some((d.op, d.location, reason)),
+            _ => None,
+        })
+    }
+
     /// The entry of the kernel with this label.
     pub fn get(&self, label: &str) -> Option<&KernelTiming> {
         self.kernels.iter().find(|k| k.label == label)
@@ -478,8 +563,8 @@ impl fmt::Display for Profile {
         for k in &self.kernels {
             writeln!(f, "{:<width$} {:>9} {:>12.2} {:>12.2} {:>12.2} {:>12.2}", k.label, k.launches, us(k.total), us(k.mean()), us(k.min), us(k.max))?;
         }
-        for split in &self.splits {
-            writeln!(f, "{split}")?;
+        for decision in &self.decisions {
+            writeln!(f, "{decision}")?;
         }
         Ok(())
     }
@@ -1244,8 +1329,8 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn reclaim_idle(&self) -> Result<(), BackendError>;
     /// Starts timing launches.
     fn enable_profiling(&self) -> Result<(), BackendError>;
-    /// Stops timing and returns the profile with `splits` attached.
-    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError>;
+    /// Stops timing and returns the profile (its `decisions` empty: the context fills them).
+    fn finish_profiling(&self) -> Result<Profile, BackendError>;
     /// Whether profiling is enabled.
     fn is_profiling(&self) -> Result<bool, BackendError>;
     /// Captures launches into a replayable graph, `None` when unsupported.

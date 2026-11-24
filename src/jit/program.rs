@@ -1281,7 +1281,7 @@ impl Plain {
 fn note_shared(root: &Arc<Node>, shared: &[Arc<Node>]) {
     let jit = root.context().jit();
     for node in shared {
-        jit.note_split(node.name, node.location, SplitReason::Shared { weight: node.weight() as usize });
+        jit.note_cut(node.name, node.location, SplitReason::Shared { weight: node.weight() as usize });
     }
 }
 
@@ -1507,10 +1507,10 @@ fn flatten_unpacked(
             continue;
         }
         if fused.key.inlines() {
-            let judgement = jit.judgement(ctx, &fused.key, first.len());
+            let judgement = jit.judgement(ctx, &fused.key, first.len(), first.name, first.location);
             match &*judgement {
                 Judgement::Materialise { subs, reason } => {
-                    jit.note_split(first.name, first.location, *reason);
+                    jit.note_cut(first.name, first.location, *reason);
                     let nodes: Vec<Arc<Node>> = subs.iter().filter_map(|&sub| fused.sub_roots.get(sub as usize).cloned()).collect();
                     drop(fused);
                     // A cut forced by the instruction cap takes along the live arrays that

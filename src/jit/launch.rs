@@ -19,7 +19,8 @@ use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
 use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
-use crate::profile::SplitReason;
+use crate::profile::{Decision, DecisionSite, SplitReason};
+use std::panic::Location;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
@@ -228,7 +229,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
         if fused.inputs.len() > max_inputs
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
-            jit.note_split(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
+            jit.note_cut(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;
@@ -245,7 +246,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
                 .max_by_key(|&(_, size)| size)
                 .map(|(i, _)| i)
         {
-            jit.note_split(node.name, node.location, SplitReason::Scalars { words: fused.scalars.len(), limit: max_words });
+            jit.note_cut(node.name, node.location, SplitReason::Scalars { words: fused.scalars.len(), limit: max_words });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;
@@ -254,7 +255,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
             && let Some((outs, live)) = live_split(&fused, max_inputs, max_live)
         {
             rounds += 1;
-            jit.note_split(node.name, node.location, SplitReason::Live { live, limit: max_live });
+            jit.note_cut(node.name, node.location, SplitReason::Live { live, limit: max_live });
             drop(fused);
             evaluate_group(&outs);
             continue;
@@ -988,6 +989,22 @@ fn launch_store(
     Ok(())
 }
 
+/// The operation and location of the first output of `fused`, for the decision log (`None` for
+/// traced steps, which keep no nodes).
+fn origin_of(fused: &Fused) -> Option<(&'static str, &'static Location<'static>)> {
+    let node = fused.instr_nodes.get(*fused.key.outputs.first()? as usize)?.as_ref()?;
+    Some((node.name, node.location))
+}
+
+/// Records how many elements per invocation the launch of `key` computes, if it could have been
+/// more than one.
+fn note_coarsen(ctx: &crate::context::Context, key: &FusedKey, origin: (&'static str, &'static Location<'static>)) {
+    let jit = ctx.jit();
+    if jit.recording_decisions() && super::coarsen::coarsenable(key) {
+        jit.note_decision(Decision::new(origin.0, origin.1, DecisionSite::Coarsen, format!("coarsen {}", key.coarsen.max(1))));
+    }
+}
+
 /// Drops the staging the judgement chose (see `inline::judge`) if the launch cannot run it: the
 /// kernel runs over segments (`key.spans`), or `len` is not the cells of the staged output.
 fn settle_staging(key: &mut FusedKey, len: usize) {
@@ -1014,6 +1031,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
 /// [`run_store`] without the plan cache's recording.
 fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
+    let origin = ctx.jit().recording_decisions().then(|| origin_of(&fused)).flatten().unwrap_or(("elementwise", Location::caller()));
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
     drop((fused_nodes, instr_nodes, sub_roots));
@@ -1043,7 +1061,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     if let Some(plan) = super::transpose::plan(ctx, &key, &inputs, len) {
         return Ok(vec![super::transpose::run(ctx, &plan, &inputs[0], len)?]);
     }
-    if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len)? {
+    if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len, origin.0, origin.1)? {
         return Ok(vec![super::transpose::run_fused(ctx, &plan, &inputs, len, reused)?]);
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
@@ -1052,6 +1070,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
         key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
     }
     key.coarsen = super::coarsen::plan(ctx, &key, len);
+    note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
     let outputs = match reused {
@@ -1088,6 +1107,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     fused.mark_fused();
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     drop((fused_nodes, instr_nodes, sub_roots));
+    let origin = (node.name, node.location);
     let at = inputs.iter().position(|input| Arc::ptr_eq(input, target));
     if let Some(k) = at {
         if !in_place_eligible(&key, k as u32) {
@@ -1102,6 +1122,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
         key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
     }
     key.coarsen = super::coarsen::plan(ctx, &key, node.len());
+    note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     check_finite(ctx, target, node.op().out_ty())?;

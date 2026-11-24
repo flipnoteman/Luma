@@ -1727,7 +1727,7 @@ fn print_profiles(b: &Bench) {
             println!("   ... {} more labels", p.kernels.len() - 12);
         }
         let mut notes: BTreeMap<String, usize> = BTreeMap::new();
-        for s in &p.splits {
+        for s in p.decisions.iter().filter(|d| matches!(d.site, luma::DecisionSite::Cut(_))) {
             *notes.entry(s.to_string()).or_default() += 1;
         }
         for (note, count) in notes {

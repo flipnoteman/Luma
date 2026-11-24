@@ -7,6 +7,10 @@ All notable changes to Luma are listed here. The format follows
 ## [Unreleased]
 
 ### Breaking
+- `Profile.splits` and `FusionSplit` are replaced by `Profile.decisions` (`Vec<Decision>`: every choice the planner makes, `DecisionSite`, a stable `chosen` label, the rejected `candidates`) and `Profile::cuts()` (an iterator over the `Cut` decisions: operation, location, `SplitReason`). `Profile` is `#[non_exhaustive]`; `SplitReason` derives `Hash`.
+- HAL: `Backend::finish_profiling` loses its `splits` parameter in all four backends (CPU, CUDA, wgpu, Metal); a backend returns its `Profile` with `decisions` empty and the context fills them.
+
+
 
 - `Backend` gains `create_buffer_unordered`, `stage_alloc`, `stage_ptr`, `transfer_in`, `transfer_out`, `barrier`, `ticket_done` and `ticket_wait`, all with defaults: existing implementers compile unchanged (new `Stage`, `StageDir`, `NativeStage` and `Ticket` types in `luma-core`).
 - `CostModel` is `#[non_exhaustive]` and gains `memory` (build one with `CostModel::new`; `CostModel::with` adjusts fields). `DeviceInfo` gains `l2_cache_bytes`.
@@ -15,6 +19,8 @@ All notable changes to Luma are listed here. The format follows
 ### Added
 
 - Transfer lane of the HAL: `Backend::stage_alloc` / `stage_ptr` (`Stage`, host memory a transfer copies from or to without another host copy), `transfer_in` / `transfer_out` (asynchronous copies behind `Ticket`s, with `after` dependencies), `barrier` (compute work recorded later waits for tickets; with none it returns a ticket for the compute work so far), `ticket_done` / `ticket_wait`, and `create_buffer_unordered` (buffers a transfer may target). Every method has a default (heap `Stage`, `transfer_in` = `record_upload` + flush, `transfer_out` = `read_into`), so CPU and Metal work unchanged. CUDA has a real second stream: a `Stage` is a pinned block held out of the pool for its lifetime and transfers wait on and signal events, so an upload overlaps a kernel. wgpu keeps its single queue (the ticket is the `SubmissionIndex`; only host staging overlaps compute). `examples/bench_transfer overlap` prints the pipelined wall time against the sum of the two run alone. Nothing in luma uses the lane yet.
+- `Context::record_decisions(bool)` (also `LUMA_RECORD_DECISIONS=1`) and `Context::take_decisions()`: records the planner's decisions without the HAL profiler, so host paths, deferred axis reductions, the plan cache and graph capture stay as they are. Instrumented sites: cuts, inlining, staging, coarsening, fused transposes, texture read paths, matrix product plans, the sort sweep, line solvers, QR panels, and `PlanReplay` for a plan-cache replay. A plan-cache evaluation no longer stops while decisions are recorded.
+- `LUMA_BENCH_DECISIONS=<path>` (luma-bench) writes every case's decisions as JSONL, cold (plan cache emptied) then warm (replay), plus the launches per kernel; `tools/decisiondiff OLD NEW [--allow-added-site SITE,...]` compares two logs (gate 4 of the wave-1 specs).
 - Memory hierarchy calibration: `CostModel::memory: Option<MemoryModel>` (L2 size and bandwidth, workgroup-memory bandwidth, strided / gather / transposed-read factors relative to coalesced, dependent-load latency), measured by calibration through ordinary kernels on every backend and cached on disk (`LUMACOS3`; a `LUMACOS2` file is ignored once, which recalibrates). Nothing plans with the numbers yet. `examples/device_info` prints them.
 - `Backend::memory_now` (live free and total device memory on CUDA and Metal, `None` on wgpu and CPU) and `MemoryStats::device_free_bytes`.
 - Windows of a packed output that start at the device's `storage_offset_align` are bound by offset into the pack instead of being copied out when a later kernel reads them.

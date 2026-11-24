@@ -33,7 +33,7 @@ mod imp {
     use luma_core::kir::KernelModule;
     use luma_core::{
         Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
-        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
+        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
         RawKernel, TuningProfile, MemoryNow,
     };
     use objc2::rc::{Retained, autoreleasepool};
@@ -1378,7 +1378,7 @@ mod imp {
             Ok(())
         }
 
-        fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError> {
+        fn finish_profiling(&self) -> Result<Profile, BackendError> {
             let samples = {
                 let mut batch = self.batch()?;
                 let Some(samples) = batch.profiler.take() else {
@@ -1404,7 +1404,6 @@ mod imp {
             }
             let mut profile = Profile::default();
             profile.add_samples(timed);
-            profile.splits = splits;
             Ok(profile)
         }
 

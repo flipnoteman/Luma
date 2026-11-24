@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, Decision, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
@@ -701,6 +701,25 @@ impl Context {
         self.jit().set_plan_cache(on);
     }
 
+    /// Switches the recording of the planner's decisions on or off (also on at open with
+    /// `LUMA_RECORD_DECISIONS=1`). It sets nothing else: host paths, deferred axis reductions, the
+    /// plan cache and graph capture stay as they are, unlike [`Context::enable_profiling`], which
+    /// records decisions too. Read them with [`Context::take_decisions`]. Switching off drops
+    /// the decisions not yet taken.
+    pub fn record_decisions(&self, on: bool) {
+        if on {
+            self.jit().start_decisions();
+        } else {
+            drop(self.jit().stop_decisions());
+        }
+    }
+
+    /// Returns the decisions recorded since the last call (or since recording began) and keeps
+    /// recording if it is on.
+    pub fn take_decisions(&self) -> Vec<Decision> {
+        self.jit().drain_decisions()
+    }
+
     /// How many evaluations ran from a cached plan so far.
     #[doc(hidden)]
     pub fn plan_cache_hits(&self) -> u64 {
@@ -1058,7 +1077,7 @@ impl Context {
         }
         if !self.hal().is_profiling()? {
             self.hal().enable_profiling()?;
-            self.jit().start_splits();
+            self.jit().start_decisions();
         }
         Ok(())
     }
@@ -1076,9 +1095,11 @@ impl Context {
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();
-        let splits = self.jit().take_split_notes();
+        let decisions = self.jit().stop_decisions();
         self.notify_released();
-        Ok(self.hal().finish_profiling(splits)?)
+        let mut profile = self.hal().finish_profiling()?;
+        profile.decisions = decisions;
+        Ok(profile)
     }
 
     /// Runs `f` and measures the GPU time of every kernel launch recorded during it (and, since
