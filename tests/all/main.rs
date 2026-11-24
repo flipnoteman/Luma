@@ -67,6 +67,7 @@ mod sparse;
 mod spill;
 mod threads;
 mod transfer;
+mod transfer_lanes;
 mod tridiagonal;
 mod vector_reductions;
 mod views;

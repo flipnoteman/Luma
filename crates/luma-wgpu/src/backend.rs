@@ -22,7 +22,8 @@ use luma_core::{
     DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
-use luma_core::hal::copy_parallel;
+use luma_core::hal::{check_transfer, copy_parallel};
+use luma_core::{Stage, StageDir, Ticket};
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
 use crate::codegen;
@@ -74,6 +75,10 @@ fn wgpu_usage(usage: BufferUsage) -> wgpu::BufferUsages {
 /// A wgpu buffer held by a [`Buffer`].
 #[derive(Debug)]
 struct WgpuBuffer(wgpu::Buffer);
+
+/// The submission a transfer or barrier ticket waits for.
+#[derive(Debug)]
+struct WgpuTicket(wgpu::SubmissionIndex);
 
 impl NativeBuffer for WgpuBuffer {}
 
@@ -936,6 +941,41 @@ impl WgpuBackend {
         matches!(self.device().poll(wgpu::PollType::Poll), Ok(status) if !status.is_queue_empty())
     }
 
+    /// Records a copy of `data` into `dst` at `offset`, ordered after everything recorded so
+    /// far. `data.len()` must be a multiple of 4.
+    ///
+    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
+    /// copies out of one is submitted it is mapped again, and the next upload of its size class
+    /// writes straight into it.
+    fn upload_at(&self, dst: &Buffer, offset: u64, data: &[u8], max_buffer_bytes: u64) -> Result<(), BackendError> {
+        let dst = raw(dst)?;
+        let bytes = data.len() as u64;
+        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
+        {
+            let mut view = own(&staging).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
+            write_parallel(data, view.slice(..));
+        }
+        own(&staging).unmap();
+
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_buffer(own(&staging), 0, dst, offset, bytes);
+        lock(&self.uploads).in_flight += staging.size();
+        guard.uploads.push(staging);
+        Ok(())
+    }
+
+    /// Submits the pending batch; the ticket is its submission (done when nothing was pending).
+    fn submitted_ticket(&self) -> Ticket {
+        match self.batch() {
+            Ok(mut batch) => match self.flush_locked(&mut batch) {
+                Some(index) => Ticket::new(WgpuTicket(index)),
+                None => Ticket::done(),
+            },
+            Err(_) => Ticket::done(),
+        }
+    }
+
     /// Submits the pending batch (if there is one) and prepares the next. Never waits.
     fn flush_locked(&self, batch: &mut Batch) -> Option<wgpu::SubmissionIndex> {
         // The open pass has to end before the encoder can be finished.
@@ -1538,28 +1578,46 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
-    /// Records a copy of `data` into the start of `dst`, ordered after everything recorded so
-    /// far. `data.len()` must be a multiple of 4.
-    ///
-    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
-    /// copies out of one is submitted it is mapped again, and the next upload of its size class
-    /// writes straight into it.
     fn record_upload(&self, dst: &Buffer, data: &[u8], max_buffer_bytes: u64) -> Result<(), BackendError> {
-        let dst = raw(dst)?;
-        let bytes = data.len() as u64;
-        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
-        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
-        {
-            let mut view = own(&staging).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
-            write_parallel(data, view.slice(..));
-        }
-        own(&staging).unmap();
+        self.upload_at(dst, 0, data, max_buffer_bytes)
+    }
 
-        let mut guard = self.batch()?;
-        self.encoder(&mut guard).copy_buffer_to_buffer(own(&staging), 0, dst, 0, bytes);
-        lock(&self.uploads).in_flight += staging.size();
-        guard.uploads.push(staging);
-        Ok(())
+    fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, _after: &[Ticket]) -> Result<Ticket, BackendError> {
+        // One queue, in order: `after` is satisfied by everything recorded so far. The only
+        // overlap is host staging against compute: the copy shares the queue with the kernels.
+        check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
+        self.upload_at(dst, dst_offset, &stage.as_slice()[..bytes as usize], self.info().limits.max_buffer_bytes)?;
+        Ok(self.submitted_ticket())
+    }
+
+    fn barrier(&self, _after: &[Ticket]) -> Result<Ticket, BackendError> {
+        Ok(self.submitted_ticket())
+    }
+
+    fn ticket_done(&self, t: &Ticket) -> Result<bool, BackendError> {
+        let Some(WgpuTicket(index)) = t.downcast_ref() else {
+            return if t.is_done_marker() { Ok(true) } else { Err(BackendError::Unsupported("a ticket of another backend".into())) };
+        };
+        match self.device().poll(wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: Some(Duration::ZERO) }) {
+            Ok(_) => Ok(true),
+            Err(wgpu::PollError::Timeout) => Ok(false),
+            Err(e) => Err(BackendError::Poll(e.to_string())),
+        }
+    }
+
+    fn ticket_wait(&self, t: &Ticket, spin: Duration) -> Result<(), BackendError> {
+        let Some(WgpuTicket(index)) = t.downcast_ref() else {
+            return if t.is_done_marker() { Ok(()) } else { Err(BackendError::Unsupported("a ticket of another backend".into())) };
+        };
+        let deadline = Instant::now() + spin;
+        while Instant::now() < deadline {
+            if self.ticket_done(t)? {
+                return self.take_gpu_error();
+            }
+            std::hint::spin_loop();
+        }
+        self.device().poll(wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None }).map_err(|e| BackendError::Poll(e.to_string()))?;
+        self.take_gpu_error()
     }
 
     fn record_graph(&self, _graph: &dyn ExecGraph, _dispatches: u32) -> Result<u32, BackendError> {

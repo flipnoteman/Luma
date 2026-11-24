@@ -15,7 +15,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, DriverError, result, sys};
@@ -25,8 +25,9 @@ use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
-    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, GemmSpec, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, NativeStage, Profile, RawArg, RawKernel, GemmSpec, Stage, StageDir, Ticket, TuningProfile,
 };
+use luma_core::hal::check_transfer;
 
 use crate::codegen::{self, CudaArgAbi};
 
@@ -219,6 +220,53 @@ impl Drop for Pinned {
         }
     }
 }
+
+/// A [`Stage`] on a pinned block taken out of the pool for the stage's lifetime.
+#[derive(Debug)]
+struct CudaStage {
+    /// `None` only while dropping.
+    pinned: Option<Pinned>,
+    len: usize,
+    /// The last copy that read or wrote the block: the block goes back to the pool only after it.
+    last: Mutex<Option<Arc<CudaEvent>>>,
+    state: Weak<Mutex<State>>,
+}
+
+impl NativeStage for CudaStage {
+    fn bytes(&self) -> &[u8] {
+        match &self.pinned {
+            // SAFETY: the block holds at least `len` initialized bytes and lives as long as `self`.
+            Some(pinned) => unsafe { std::slice::from_raw_parts(pinned.ptr, self.len) },
+            None => &[],
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match &self.pinned {
+            // SAFETY: as above, and `&mut self` makes the host the only user.
+            Some(pinned) => unsafe { std::slice::from_raw_parts_mut(pinned.ptr, self.len) },
+            None => &mut [],
+        }
+    }
+}
+
+impl Drop for CudaStage {
+    fn drop(&mut self) {
+        // Drains the lane: the block must not be reused (or freed) under a copy still running.
+        if let Some(event) = lock(&self.last).take() {
+            let _ = event.synchronize();
+        }
+        let Some(pinned) = self.pinned.take() else { return };
+        match self.state.upgrade() {
+            Some(state) => keep_pinned(&mut lock(&state), pinned),
+            None => drop(pinned),
+        }
+    }
+}
+
+/// The completion of a copy on the transfer lane, or of the compute lane up to a barrier.
+#[derive(Debug)]
+struct CudaTicket(Arc<CudaEvent>);
 
 /// Returns a pinned block to the idle pool. When it would push the pool over [`PINNED_IDLE_CAP`],
 /// idle blocks larger than it are freed (largest first) to make room, and if it still does not
@@ -876,10 +924,14 @@ impl CudaShared {
 pub struct CudaBackend {
     shared: Arc<CudaShared>,
     stream: Arc<CudaStream>,
+    /// The transfer lane: [`Backend::transfer_in`] / [`Backend::transfer_out`] copy on it while
+    /// kernels run on `stream`. Ordered against `stream` only through events.
+    transfer: Arc<CudaStream>,
     /// The stream graphs are captured on, created on first use.
     capture: Mutex<Option<Arc<CudaStream>>>,
     pending: AtomicU32,
-    state: Mutex<State>,
+    /// Shared with the stages, which give their pinned block back to it when dropped.
+    state: Arc<Mutex<State>>,
 }
 
 impl fmt::Debug for CudaBackend {
@@ -890,7 +942,8 @@ impl fmt::Debug for CudaBackend {
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
-        // Everything the state holds is released only after the stream has run dry.
+        // Everything the state holds is released only after both lanes have run dry.
+        let _ = self.transfer.synchronize();
         let _ = self.stream.synchronize();
     }
 }
@@ -900,6 +953,7 @@ impl CudaBackend {
     pub fn new() -> Result<CudaBackend, BackendError> {
         let shared = CudaShared::acquire()?;
         let stream = shared.ctx.new_stream().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
+        let transfer = shared.ctx.new_stream().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         let state = State {
             dispatches: 0,
             dirty: false,
@@ -917,7 +971,7 @@ impl CudaBackend {
             params: Params::default(),
             profiler: None,
         };
-        Ok(CudaBackend { shared, stream, capture: Mutex::new(None), pending: AtomicU32::new(0), state: Mutex::new(state) })
+        Ok(CudaBackend { shared, stream, transfer, capture: Mutex::new(None), pending: AtomicU32::new(0), state: Arc::new(Mutex::new(state)) })
     }
 
     fn bind(&self) -> Result<(), BackendError> {
@@ -951,6 +1005,36 @@ impl CudaBackend {
             Err(e) if is_out_of_memory(&e) => Err(BackendError::OutOfMemory { requested: bytes }),
             Err(e) => Err(gpu(e)),
         }
+    }
+
+    /// The device address of a buffer of a transfer, which must not be a stream-ordered pool
+    /// block: its free is queued on the compute stream and could run under the transfer lane.
+    fn unordered_ptr(&self, buffer: &Buffer) -> Result<sys::CUdeviceptr, BackendError> {
+        let block = buffer.downcast_ref::<CudaBuffer>().ok_or_else(|| BackendError::KernelBinding("a buffer of another backend was passed to a CUDA transfer".into()))?;
+        if block.ordered.is_some() {
+            return Err(BackendError::Unsupported("the buffer of a transfer must come from create_buffer_unordered".into()));
+        }
+        Ok(block.dptr)
+    }
+
+    /// Makes the transfer lane wait for the events of `after`.
+    fn transfer_waits(&self, after: &[Ticket]) -> Result<(), BackendError> {
+        for ticket in after {
+            if let Some(CudaTicket(event)) = ticket.downcast_ref() {
+                self.transfer.wait(event).map_err(gpu)?;
+            } else if !ticket.is_done_marker() {
+                return Err(BackendError::Unsupported("a ticket of another backend".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The ticket of the copy just queued on the transfer lane; the stage remembers it.
+    fn transfer_ticket(&self, stage: &CudaStage) -> Result<Ticket, BackendError> {
+        let event = Arc::new(self.shared.ctx.new_event(None).map_err(gpu)?);
+        event.record(&self.transfer).map_err(gpu)?;
+        *lock(&stage.last) = Some(Arc::clone(&event));
+        Ok(Ticket::new(CudaTicket(event)))
     }
 
     /// Records an event after the work so far, taking the batch's resources with it. `None` when
@@ -1374,6 +1458,18 @@ impl Backend for CudaBackend {
         Some(Buffer::new(size, usage, block))
     }
 
+    fn create_buffer_unordered(&self, size: u64, usage: BufferUsage) -> Option<Buffer> {
+        let block = match self.alloc_block_sync(size) {
+            Ok(block) => block,
+            Err(BackendError::OutOfMemory { .. }) => {
+                self.relieve(&mut lock(&self.state)).ok()?;
+                self.alloc_block_sync(size).ok()?
+            }
+            Err(_) => return None,
+        };
+        Some(Buffer::new(size, usage, block))
+    }
+
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
         let bytes = data.len() as u64;
         if bytes > max_buffer_bytes {
@@ -1648,6 +1744,83 @@ impl Backend for CudaBackend {
             return Err(error);
         }
         Ok(longest)
+    }
+
+    fn stage_alloc(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        let len = usize::try_from(bytes).map_err(|_| BackendError::OutOfMemory { requested: bytes })?;
+        // Waits on the compute lane when too much pinned memory is in flight: no lock the
+        // completion path needs is held across it besides the state's own.
+        let pinned = self.take_pinned(&mut lock(&self.state), len)?;
+        // SAFETY: the block holds at least `len` bytes.
+        unsafe { std::ptr::write_bytes(pinned.ptr, 0, len) };
+        Ok(Stage::new(dir, CudaStage { pinned: Some(pinned), len, last: Mutex::new(None), state: Arc::downgrade(&self.state) }))
+    }
+
+    fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
+        let native = stage.downcast_ref::<CudaStage>().ok_or_else(|| BackendError::Unsupported("a stage of another backend".into()))?;
+        let to = self.unordered_ptr(dst)?;
+        self.bind()?;
+        self.transfer_waits(after)?;
+        let host = native.bytes();
+        // SAFETY: the destination range lies inside `dst`, a block the transfer lane may use; the
+        // pinned bytes stay untouched until the ticket completes (the stage waits for it on drop).
+        unsafe { result::memcpy_htod_async(to + dst_offset, &host[..bytes as usize], self.transfer.cu_stream()) }.map_err(gpu)?;
+        self.transfer_ticket(native)
+    }
+
+    fn transfer_out(&self, src: &Buffer, src_offset: u64, stage: &mut Stage, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        check_transfer(stage, StageDir::FromDevice, src, src_offset, bytes)?;
+        let from = self.unordered_ptr(src)?;
+        self.bind()?;
+        self.transfer_waits(after)?;
+        let native = stage.downcast_ref::<CudaStage>().ok_or_else(|| BackendError::Unsupported("a stage of another backend".into()))?;
+        let host = native.pinned.as_ref().ok_or_else(|| BackendError::Gpu("a stage without memory".into()))?.ptr;
+        // SAFETY: the source range lies inside `src`; the stage holds `bytes` bytes of pinned memory
+        // that the host leaves alone until the ticket completes.
+        unsafe {
+            let host = std::slice::from_raw_parts_mut(host.cast::<MaybeUninit<u8>>(), bytes as usize);
+            result::memcpy_dtoh_async(host, from + src_offset, self.transfer.cu_stream())
+        }
+        .map_err(gpu)?;
+        self.transfer_ticket(native)
+    }
+
+    fn barrier(&self, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let mut st = lock(&self.state);
+        self.bind()?;
+        for ticket in after {
+            if let Some(CudaTicket(event)) = ticket.downcast_ref() {
+                self.stream.wait(event).map_err(gpu)?;
+                st.dirty = true;
+            } else if !ticket.is_done_marker() {
+                return Err(BackendError::Unsupported("a ticket of another backend".into()));
+            }
+        }
+        // The batch's event follows the waits just queued and everything recorded before them.
+        match self.flush_locked(&mut st)? {
+            Some(event) => Ok(Ticket::new(CudaTicket(event))),
+            None => Ok(st.submitted.back().map_or_else(Ticket::done, |(event, _)| Ticket::new(CudaTicket(Arc::clone(event))))),
+        }
+    }
+
+    fn ticket_done(&self, t: &Ticket) -> Result<bool, BackendError> {
+        match t.downcast_ref() {
+            Some(CudaTicket(event)) => {
+                self.bind()?;
+                event.try_is_complete().map_err(poll)
+            }
+            None if t.is_done_marker() => Ok(true),
+            None => Err(BackendError::Unsupported("a ticket of another backend".into())),
+        }
+    }
+
+    fn ticket_wait(&self, t: &Ticket, spin: Duration) -> Result<(), BackendError> {
+        match t.downcast_ref() {
+            Some(CudaTicket(event)) => self.wait_event(event, spin).map(|_| ()),
+            None if t.is_done_marker() => Ok(()),
+            None => Err(BackendError::Unsupported("a ticket of another backend".into())),
+        }
     }
 
     fn reclaim_idle(&self) -> Result<(), BackendError> {

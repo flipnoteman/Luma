@@ -13,11 +13,13 @@ pub mod cache;
 pub mod copy;
 mod deferred;
 pub mod texture;
+mod transfer;
 pub mod topology;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
 pub use texture::{TextureCaps, TextureDesc, TextureFilter, TextureFormat};
+pub use transfer::{NativeStage, Stage, StageDir, Ticket};
 
 /// Which backend a context runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1055,6 +1057,13 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn create_buffer(&self, size: u64, usage: BufferUsage, mapped: bool) -> Option<Buffer>;
     /// Allocates a buffer holding `data`.
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError>;
+    /// Allocates a buffer that is the destination or source of [`Backend::transfer_in`] /
+    /// [`Backend::transfer_out`]: one whose free is not ordered on the compute lane (on CUDA a
+    /// stream-ordered pool block could be freed while the transfer lane still copies). The
+    /// default is [`Backend::create_buffer`].
+    fn create_buffer_unordered(&self, size: u64, usage: BufferUsage) -> Option<Buffer> {
+        self.create_buffer(size, usage, false)
+    }
     /// Returns a `MAP_WRITE` buffer for reuse.
     fn recycle_mappable(&self, buffer: Buffer);
     /// Host pointer to the first `bytes` of `buffer` when directly CPU-accessible and idle (no
@@ -1117,6 +1126,86 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn sync(&self, spin_budget: Duration) -> Result<Duration, BackendError>;
     /// Reads `src` into `dst`; `spill` allows a larger-than-memory chunked readback.
     fn read_into(&self, src: &Buffer, dst: &mut [MaybeUninit<u8>], spill: bool, spin_budget: Duration) -> Result<Duration, BackendError>;
+    /// Host memory of `bytes` bytes for transfers in direction `dir`, zeroed. The default is heap
+    /// memory; CUDA hands out pinned memory held until the stage is dropped.
+    fn stage_alloc(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        Ok(Stage::heap(bytes, dir))
+    }
+    /// The bytes of `stage`, valid while the host owns it.
+    fn stage_ptr<'a>(&self, stage: &'a mut Stage) -> &'a mut [u8] {
+        stage.as_mut_slice()
+    }
+    /// Copies the first `bytes` bytes of `stage` into `dst` at `dst_offset` once every ticket of
+    /// `after` has completed, without waiting for the copy. `dst` must come from
+    /// [`Backend::create_buffer_unordered`]. Offset and length are multiples of 4. Compute work
+    /// recorded afterwards does not wait for the copy unless it follows [`Backend::barrier`] with
+    /// the returned ticket. Until the ticket completes the host leaves `stage` alone and `dst`
+    /// alive.
+    ///
+    /// The default records an upload on the compute lane (which orders it after everything
+    /// recorded, so `after` is already satisfied) and submits; the ticket is that submission.
+    fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
+        let data = &stage.as_slice()[..bytes as usize];
+        let max = self.info().limits.max_buffer_bytes;
+        if dst_offset == 0 {
+            self.record_upload(dst, data, max)?;
+        } else {
+            let scratch = self.create_buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST, false).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.record_upload(&scratch, data, max)?;
+            self.record_copy(&scratch, 0, dst, dst_offset, bytes)?;
+        }
+        self.flush_batch()?;
+        Ok(Ticket::flushed())
+    }
+    /// Copies `bytes` bytes of `src` from `src_offset` into the start of `stage` once every
+    /// ticket of `after` has completed. The default reads back synchronously, so the ticket is
+    /// done on return.
+    fn transfer_out(&self, src: &Buffer, src_offset: u64, stage: &mut Stage, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        check_transfer(stage, StageDir::FromDevice, src, src_offset, bytes)?;
+        let host = &mut stage.as_mut_slice()[..bytes as usize];
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `read_into` only writes.
+        let host = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<MaybeUninit<u8>>(), host.len()) };
+        if src_offset == 0 {
+            self.read_into(src, host, false, Duration::ZERO)?;
+        } else {
+            let scratch = self.create_buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST, false).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.record_copy(src, src_offset, &scratch, 0, bytes)?;
+            self.read_into(&scratch, host, false, Duration::ZERO)?;
+        }
+        Ok(Ticket::done())
+    }
+    /// Orders compute work recorded after this call behind every ticket of `after`, and returns
+    /// a ticket for the compute work recorded so far (and `after`): with an empty `after` it is
+    /// how a transfer is made to wait for a kernel. The default submits the pending batch (the
+    /// compute lane is in order, so there is nothing to wait for).
+    fn barrier(&self, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        self.flush_batch()?;
+        Ok(Ticket::flushed())
+    }
+    /// Whether the work of `t` has completed.
+    fn ticket_done(&self, t: &Ticket) -> Result<bool, BackendError> {
+        if t.is_done_marker() {
+            Ok(true)
+        } else if t.is_flushed_marker() {
+            Ok(!self.gpu_busy())
+        } else {
+            Err(BackendError::Unsupported("a ticket of another backend".into()))
+        }
+    }
+    /// Waits for the work of `t`, polling for `spin` before blocking.
+    fn ticket_wait(&self, t: &Ticket, spin: Duration) -> Result<(), BackendError> {
+        if t.is_done_marker() {
+            Ok(())
+        } else if t.is_flushed_marker() {
+            self.sync(spin).map(|_| ())
+        } else {
+            Err(BackendError::Unsupported("a ticket of another backend".into()))
+        }
+    }
     /// Releases cached resources that are idle.
     fn reclaim_idle(&self) -> Result<(), BackendError>;
     /// Starts timing launches.
@@ -1168,6 +1257,23 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_line_solve(&self, _spec: &LineSolveSpec) -> Option<RawKernel> {
         None
     }
+}
+
+/// Checks the direction and ranges of a transfer between `stage` and `buffer`.
+pub fn check_transfer(stage: &Stage, dir: StageDir, buffer: &Buffer, offset: u64, bytes: u64) -> Result<(), BackendError> {
+    if stage.dir() != dir {
+        return Err(BackendError::Unsupported(format!("a stage for {:?} was used for {dir:?}", stage.dir())));
+    }
+    if bytes > stage.len() {
+        return Err(BackendError::MapRange(format!("transferring {bytes} bytes through a stage of {}", stage.len())));
+    }
+    if offset.checked_add(bytes).is_none_or(|end| end > buffer.size()) {
+        return Err(BackendError::MapRange(format!("transferring {bytes} bytes at {offset} of a buffer of {}", buffer.size())));
+    }
+    if offset % 4 != 0 || bytes % 4 != 0 {
+        return Err(BackendError::MapRange(format!("a transfer of {bytes} bytes at {offset} is not a multiple of 4")));
+    }
+    Ok(())
 }
 
 /// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.

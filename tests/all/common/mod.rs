@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod lanes;
+
 /// Deterministic pseudo-random values in `lo..hi` (a small LCG; no dependencies).
 pub fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
     let mut state = seed
