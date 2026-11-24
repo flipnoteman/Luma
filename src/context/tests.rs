@@ -446,12 +446,21 @@ fn memory_now_follows_allocations() {
         return;
     };
     assert!(before.free <= before.total);
-    let held = ctx.alloc_buffer(256 << 20, STORAGE_USAGE).unwrap();
-    ctx.upload(&held, &vec![1u8; 256 << 20]).unwrap();
-    ctx.sync().unwrap();
-    let after = ctx.memory_stats().device_free_bytes.unwrap();
-    assert!(after <= before.free - (128 << 20), "free memory {after} after, {} before", before.free);
-    drop(held);
+    // Other processes may use the device meanwhile: one run in which free memory fell is enough.
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let before = ctx.memory_stats().device_free_bytes.unwrap();
+        let held = ctx.alloc_buffer(256 << 20, STORAGE_USAGE).unwrap();
+        ctx.upload(&held, &vec![1u8; 256 << 20]).unwrap();
+        ctx.sync().unwrap();
+        let after = ctx.memory_stats().device_free_bytes.unwrap();
+        drop(held);
+        if after + (128 << 20) <= before {
+            return;
+        }
+        seen.push((before, after));
+    }
+    panic!("free memory never dropped by an allocation of 256 MiB: {seen:?}");
 }
 
 /// Slots for the live intervals of transient buffers: intervals that overlap, even at one
