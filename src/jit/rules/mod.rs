@@ -226,7 +226,7 @@ pub(crate) fn rules() -> Vec<Rule> {
         rule("one by mul", Exact, mul(k(1.0), x(0)), x(0), V1, None, None, ex(false), &["mul-one"]),
         rule("mul by minus one", Exact, mul(x(0), k(-1.0)), neg(x(0)), V1, None, None, ex(false), &["mul-minus-one"]),
         rule("minus one by mul", Exact, mul(k(-1.0), x(0)), neg(x(0)), V1, None, None, ex(false), &["mul-minus-one"]),
-        rule("div by one", Exact, div(x(0), k(1.0)), x(0), V1, None, None, ex(false), &["div-one"]),
+        rule("div by one", Reformulating, div(x(0), k(1.0)), x(0), V1, Some(1e-6), Some("x subnormal (the backend division flushes it to zero; x * 1 keeps it)"), ex(false), &["div-one"]),
         rule("sub plus zero", Exact, sub(x(0), k(0.0)), x(0), V1, None, None, ex(false), &["sub-zero"]),
         rule("add minus zero", Exact, add(x(0), k(-0.0)), x(0), V1, None, None, ex(false), &["add-neutral"]),
         rule("minus zero add", Exact, add(k(-0.0), x(0)), x(0), V1, None, None, ex(false), &["add-neutral"]),

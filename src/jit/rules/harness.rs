@@ -685,7 +685,13 @@ fn check_application(h: &Harness, rule: &Rule) {
             }
         }
     } else {
-        assert_eq!(got, plain, "{}: simplified bits differ", rule.name);
+        // A reformulated exact-gate rule may differ where the backend flushes a subnormal.
+        let flush = |v: &[u32]| -> Vec<u32> { v.iter().map(|&b| if b & 0x7f80_0000 == 0 { b & 0x8000_0000 } else { b }).collect() };
+        if rule.class == Class::Reformulating {
+            assert_eq!(flush(&got), flush(&plain), "{}: simplified bits differ", rule.name);
+        } else {
+            assert_eq!(got, plain, "{}: simplified bits differ", rule.name);
+        }
     }
     if shortens {
         assert!(len < plain_len, "{}: program of {len} instructions, {plain_len} unsimplified", rule.name);
