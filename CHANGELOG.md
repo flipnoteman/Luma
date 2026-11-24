@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Host time of long chains: `Flattener::scalar` finds an equal scalar through a hash index (first equal slot, same alias records) instead of a linear scan, and `pending_depth` no longer allocates per node. Callgrind, CPU backend, per iteration: a plan-cache-off 1000-op chain 14.41M instructions -> 8.75M (`memcmp` and `Flattener::scalar` out of the profile; `flatten_bounded` 3.41M -> 0.52M), a 100-op chain 0.811M -> 0.695M, a 10-op chain 116.8k -> 116.0k (plan cache on: 107.3k -> 107.5k, +0.14%). Plans and decisions are unchanged.
+
 ## [0.5.2] - 2026-11-22
 
 ### Added
