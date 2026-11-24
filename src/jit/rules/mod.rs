@@ -74,7 +74,7 @@ pub(crate) enum Gate {
     None,
     /// `simplify::exact`: runs always.
     Exact { shortens: bool },
-    /// `simplify::fast`: runs only with `ContextOptions::fast_math`.
+    /// `simplify::fast`: runs only with `Reduced::FAST_MATH`.
     Fast { shortens: bool },
 }
 

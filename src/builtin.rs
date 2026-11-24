@@ -1527,7 +1527,7 @@ impl<'a> ReduceElem<'a> {
 /// (an accuracy of about 2^-45), instead of three Newton steps of full double-float products
 /// and sums.
 ///
-/// `sloppy_add` (`fast_math`) adds with one error-free sum of the high words and a plain sum of
+/// `sloppy_add` (`Reduced::FAST_MATH`) adds with one error-free sum of the high words and a plain sum of
 /// the low ones, about half the operations: the error stays below 2^-47 of the larger operand,
 /// but the relative error of a sum grows with the cancellation (a result 2^k times smaller than
 /// the operands has about 2^(k-47)), where the default addition keeps 2^-46 of the result.

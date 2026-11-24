@@ -2,8 +2,7 @@
 //! rule-application check against `simplify.rs`.
 //!
 //! Every context is pinned to exact `f32` semantics: no fast math, no TF32
-//! (`Numerics::strict()` once W1-U0b has merged; until then `fast_math(false).tf32_matmul(false)`
-//! with `LUMA_LINALG_TF32` unset). The simplify gate a rule belongs to is the only one enabled
+//! (`Numerics::strict()`, plus `FAST_MATH` for the fast gate). The simplify gate a rule belongs to is the only one enabled
 //! in the rule-application check.
 
 use super::*;
@@ -546,8 +545,7 @@ fn flush(b: u32) -> u32 {
 
 impl Harness {
     fn new() -> Harness {
-        assert!(std::env::var_os("LUMA_LINALG_TF32").is_none(), "the rule harness runs without TF32: unset LUMA_LINALG_TF32");
-        let open = |fast: bool| Context::with_options(ContextOptions::from_env().fast_math(fast).tf32_matmul(false)).unwrap();
+        let open = |fast: bool| Context::with_options(ContextOptions::from_env().numerics(if fast { crate::Numerics::strict().with_reduced(crate::Reduced::FAST_MATH, true) } else { crate::Numerics::strict() })).unwrap();
         let strict = open(false);
         strict.jit().set_simplify(false);
         let probe = Array::from_slice_on(&strict, &[1e-40f32], [1, 1]).unwrap();

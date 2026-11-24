@@ -166,7 +166,7 @@ pub(crate) struct Tuning {
     /// `ContextOptions::df_fma`; the constants say `false` and the context fills it in.
     pub(crate) df_fma: bool,
     /// Whether `Df32` additions use the cheaper algorithm whose relative error grows with the
-    /// cancellation (set by `ContextOptions::fast_math`, see `builtin::df_library`).
+    /// cancellation (set by `Reduced::FAST_MATH`, see `builtin::df_library`).
     pub(crate) df_sloppy_add: bool,
     /// Workgroup memory the rows of one line of a cyclic-reduction tridiagonal solve may take; the
     /// rows beyond it live in global memory (see `cyclic`).

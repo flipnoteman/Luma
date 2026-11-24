@@ -7,6 +7,7 @@ All notable changes to Luma are listed here. The format follows
 ## [Unreleased]
 
 ### Breaking
+- `ContextOptions::fast_math` / `tf32_matmul` (and `Context::tf32_matmul()`) are replaced by `ContextOptions::numerics(Numerics)`; `LUMA_FAST_MATH` / `LUMA_TF32_MATMUL` / `LUMA_LINALG_TF32` by `LUMA_NUMERICS=strict|default|algebraic|fast` with `+name` / `-name` modifiers (`tf32-matmul`, `tf32-linalg`, `fast-math`, ...). `LUMA_NUMERICS` rejects an unknown value (`ContextOptions::from_env` panics). The linear-algebra TF32 switch is read per context, no longer once per process. Behaviour is unchanged: `Numerics::default()` is TF32 `matmul`, `strict()` is exact `f32`, `fast()` is the old fast math.
 - `Profile.splits` and `FusionSplit` are replaced by `Profile.decisions` (`Vec<Decision>`: every choice the planner makes, `DecisionSite`, a stable `chosen` label, the rejected `candidates`) and `Profile::cuts()` (an iterator over the `Cut` decisions: operation, location, `SplitReason`). `Profile` is `#[non_exhaustive]`; `SplitReason` derives `Hash`.
 - HAL: `Backend::finish_profiling` loses its `splits` parameter in all four backends (CPU, CUDA, wgpu, Metal); a backend returns its `Profile` with `decisions` empty and the context fills them.
 - `Backend` gains `create_buffer_unordered`, `stage_alloc`, `stage_ptr`, `transfer_in`, `transfer_out`, `barrier`, `ticket_done` and `ticket_wait`, all with defaults: existing implementers compile unchanged (new `Stage`, `StageDir`, `NativeStage` and `Ticket` types in `luma-core`).
@@ -17,7 +18,6 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
-- `ContextOptions::host_budget` / `LUMA_HOST_BUDGET`: bytes of host memory for host copies of device data (the segments moved off the device plus the copies kept of segments brought back); default half of the available host memory, capped by the cgroup limit. Over budget, kept copies are dropped first (least recently pinned first); segments that only exist in host memory stay, with a warning once. `MemoryStats::host_copy_bytes`, `clean_evictions` and `readback_evictions`. `luma::HostBytes` (`luma_core::hal::HostBytes`): an owned 64-byte-aligned host buffer with a stable address; it replaces the `Vec<u8>` of spilled segments and is the heap `Stage` of the HAL.
 - Transfer lane of the HAL: `Backend::stage_alloc` / `stage_ptr` (`Stage`, host memory a transfer copies from or to without another host copy), `transfer_in` / `transfer_out` (asynchronous copies behind `Ticket`s, with `after` dependencies), `barrier` (compute work recorded later waits for tickets; with none it returns a ticket for the compute work so far), `ticket_done` / `ticket_wait`, and `create_buffer_unordered` (buffers a transfer may target). Every method has a default (heap `Stage`, `transfer_in` = `record_upload` + flush, `transfer_out` = `read_into`), so CPU and Metal work unchanged. CUDA has a real second stream: a `Stage` is a pinned block held out of the pool for its lifetime and transfers wait on and signal events, so an upload overlaps a kernel. wgpu keeps its single queue (the ticket is the `SubmissionIndex`; only host staging overlaps compute). `examples/bench_transfer overlap` prints the pipelined wall time against the sum of the two run alone. Nothing in luma uses the lane yet.
 - `Context::record_decisions(bool)` (also `LUMA_RECORD_DECISIONS=1`) and `Context::take_decisions()`: records the planner's decisions without the HAL profiler, so host paths, deferred axis reductions, the plan cache and graph capture stay as they are. Instrumented sites: cuts, inlining, staging, coarsening, fused transposes, texture read paths, matrix product plans, the sort sweep, line solvers, QR panels, and `PlanReplay` for a plan-cache replay. A plan-cache evaluation no longer stops while decisions are recorded.
 - `LUMA_BENCH_DECISIONS=<path>` (luma-bench) writes every case's decisions as JSONL, cold (plan cache emptied) then warm (replay), plus the launches per kernel; `tools/decisiondiff OLD NEW [--allow-added-site SITE,...]` compares two logs (gate 4 of the wave-1 specs).
@@ -37,6 +37,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - `Interp::LinearHardware`: bilinear by the texture unit's own filter, an explicit opt-in that luma never chooses (8 bits of the fraction of a position: along each axis a result is off from `Interp::Linear` by up to the difference of the two neighbours over 256, see the guide); exactly `Interp::Linear` where the source cannot be a texture.
 - Accumulators: `u8`, `i8`, `u16` and `i16` batches (`AccumInput` for the compact types; processed as `i32`, the cast fuses into the reduction), per-position top-k (`TopK::largest_along` / `smallest_along`), and `Covariance` computes one product per epoch of pushes instead of one per push (the centered batches are joined, a long `K`): 32 pushes of `[512, 1024]` take 1.26 ms on an RTX 3090 (1.99 before; one-shot from the concatenated array 1.11) and 2.78 ms on an RTX 3080 Laptop (3.7 before; one-shot 2.45); ArrayFire on the concatenated data takes 1.04 and 2.26 ms. Measured and dropped: submitting each push's reductions at once (1.3x slower than leaving them pending until the merge), a full-shape pivot instead of the `[F, 1]` broadcast one (the broadcast operand makes an axis reduction run its index arithmetic per element, 2.0 ms against 1.1 ms for 64 reductions of `[4096, 256]` when each is evaluated alone, but inside the accumulator the pending reductions already run at 0.76 ms, about the bare `reduce_axis`; the full pivot was 9 % slower) and one scatter for several histogram pushes (1.1x slower for one dimension, 1.1x faster for two). The profiled launch test of the accumulators runs on a context of its own (the other tests of the binary launched on the default one while it profiled).
 - Disk cache: compiled CPU blobs and CUDA PTX are keyed by a hash of the sources that generate them (the code generators, the CPU math-table ABI, the packet math routines, the planners; `luma_core::hal::cache::source_revision`), so a build whose code generation differs from the one that wrote a cached kernel never loads it, with no revision constant to remember to bump (a change to the layout of the CPU math table had given stale cached kernels calling the wrong routines). A unit test checks that a blob stored under one revision is not found under another.
@@ -165,6 +166,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - Six-crate workspace: `luma-hal-core` (kernel IR and backend interface), `luma-hal-wgpu`, `luma-hal-metal`, `luma-hal-cuda` and `luma-hal-cpu` (each a backend with its own code generator), and the root `luma` crate. Cargo features `wgpu`, `metal` and `cuda` (all default) each enable one GPU backend; the CPU backend is always built, so every build runs on any machine.
 - Native Metal and CUDA backends next to wgpu. `ContextOptions::backend`, `Context::{cuda, metal, wgpu, cpu, backend}` and `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `cpu`, `auto`) choose one; `Auto` tries CUDA, then Metal, then wgpu, then the native CPU backend. `LUMA_DEVICE` also accepts a backend name. The CUDA backend needs only the NVIDIA driver: kernels are emitted as NVVM IR and compiled to PTX by the driver's own NVVM library (`libnvidia-nvvm`), linking NVIDIA's `libdevice` (embedded) for math; no CUDA toolkit or NVRTC is needed. Custom WGSL kernels run on the native backends through the kernel IR; cooperative matrix stays wgpu-only. CUDA, Metal and the CPU backend replay traced fixed-iteration steps from a cached graph; wgpu does not capture graphs.
 - A native CPU backend (`luma-hal-cpu`, always built): the kernel IR compiled with Cranelift to SIMD code that runs on a pool of host threads (`LUMA_CPU_THREADS`, default the available parallelism), with its compiled code cached on disk. It replaces the llvmpipe fallback.
@@ -288,6 +290,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - `Array::filter(&mask)` (the elements where an `Array<bool>` or non-zero `Array<u32>` mask holds, in
   flat order) and `nonzero()` (their flat indices) for every `ScalarType` incl. `bool`, as a
   count / scan / scatter compaction on the GPU: about as fast as a copy (0.15 ms for 2^24 `f32`
@@ -396,6 +399,7 @@ All notable changes to Luma are listed here. The format follows
 ## [0.4.0] - 2026-11-14
 
 ### Breaking
+- `ContextOptions::fast_math` / `tf32_matmul` (and `Context::tf32_matmul()`) are replaced by `ContextOptions::numerics(Numerics)`; `LUMA_FAST_MATH` / `LUMA_TF32_MATMUL` / `LUMA_LINALG_TF32` by `LUMA_NUMERICS=strict|default|algebraic|fast` with `+name` / `-name` modifiers (`tf32-matmul`, `tf32-linalg`, `fast-math`, ...). `LUMA_NUMERICS` rejects an unknown value (`ContextOptions::from_env` panics). The linear-algebra TF32 switch is read per context, no longer once per process. Behaviour is unchanged: `Numerics::default()` is TF32 `matmul`, `strict()` is exact `f32`, `fast()` is the old fast math.
 
 - Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) and `is_finite` / `is_nan` / `is_inf` return
   `Array<bool>` instead of `Array<u32>`; `select`, `sum_where` and `Fields::select` take an
@@ -428,6 +432,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
   version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
@@ -542,6 +547,7 @@ All notable changes to Luma are listed here. The format follows
 ## [0.3.0] - 2026-11-13
 
 ### Breaking
+- `ContextOptions::fast_math` / `tf32_matmul` (and `Context::tf32_matmul()`) are replaced by `ContextOptions::numerics(Numerics)`; `LUMA_FAST_MATH` / `LUMA_TF32_MATMUL` / `LUMA_LINALG_TF32` by `LUMA_NUMERICS=strict|default|algebraic|fast` with `+name` / `-name` modifiers (`tf32-matmul`, `tf32-linalg`, `fast-math`, ...). `LUMA_NUMERICS` rejects an unknown value (`ContextOptions::from_env` panics). The linear-algebra TF32 switch is read per context, no longer once per process. Behaviour is unchanged: `Numerics::default()` is TF32 `matmul`, `strict()` is exact `f32`, `fast()` is the old fast math.
 
 - Reductions (`sum`, `min`, `max`, `mean`, `norm`, `reduce`) are lazy and return a one-element
   `Array`; read it with `.item()?` (or `.to_array()?` for `reduce`). `[f32; 2]` / `[f32; 4]`
@@ -551,6 +557,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - Views that fuse into the reading kernel: `slice`, `shift_fill` / `shift_clamp` /
   `shift_mirror`, `pad` (`Edge`, `Mirror`, `Wrap`, `Zero`), `flip`, `transpose`, `index`, `take`,
   `concat` / `concat_slice`, `broadcast_to`, and `Array::copy` (`Fields::copy`).
@@ -678,6 +685,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - Generator arrays: `Array::uniform`, `Array::normal`, `Array::random_bits` (Threefry-2x32-20, a
   counter-based generator: element `i` depends only on the seed and `i`), `Array::range` and
   `Array::linspace`, each with an `_on` variant. They are computed inside the kernels that read
@@ -809,6 +817,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - `array!` macro for creating an `Array`.
 - A global `Executor` that is created once and shared by all arrays.
 
@@ -823,6 +832,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `Numerics` (presets `strict`, `default`, `algebraic`, `fast`; `reassociate`, `reformulate`, `exact_finite` flags with no readers yet; `Reduced` bit set `TF32_MATMUL`, `TF32_LINALG`, `FAST_MATH`) and `Context::numerics()`. Internally one `Caps` bit set replaces the scattered capability tests (`SHADER_F64`, texture profile, TF32).
 - First crate with a `wgpu` dependency and an `Array` struct holding data and four dimensions.
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.

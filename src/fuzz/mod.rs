@@ -1216,7 +1216,7 @@ impl Arr {
 
 /// The context of a program under its configuration; `None` if the device refuses it.
 fn engine(config: &Config) -> Option<Context> {
-    let mut options = ContextOptions::from_env().calibrate(false).fast_math(config.fast_math);
+    let mut options = ContextOptions::from_env().calibrate(false).numerics(if config.fast_math { crate::Numerics::fast() } else { crate::Numerics::default() });
     if config.df_split {
         options = options.df_fma(false);
     }

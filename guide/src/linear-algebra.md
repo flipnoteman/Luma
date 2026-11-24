@@ -73,9 +73,9 @@ assert!((back.to_vec()?[0] - 0.25).abs() < 1e-5);
     warps that solve the rows below, about 100 launches at 4096 rows. `LUMA_CHOL_NB` and
     `LUMA_CHOL_WIDE` pick the block sizes.
   * The update products of Cholesky and of the blocked triangular solves are exact `f32` too;
-    `LUMA_LINALG_TF32=1` runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
+    `LUMA_NUMERICS=default+tf32-linalg` (`Reduced::TF32_LINALG`) runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
     backward error of about 1e-3 of the entries of the updates instead of 1e-7. It is off by
-    default and is independent of `ContextOptions::tf32_matmul`, which governs `matmul` only.
+    default and is independent of the `TF32_MATMUL` bit of `ContextOptions::numerics`, which governs `matmul` only.
 * A triangular solve with up to 32 right-hand sides (`solve_triangular`, and the two solves inside
   `solve` and `solve_spd`) of a triangle of more than 64 rows is one launch on CUDA devices: one
   workgroup per block of 64 rows takes its turn from an atomic ticket, waits for the solved blocks

@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
+use crate::caps::Caps;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::profile::{Decision, DecisionSite, Verdict};
@@ -139,7 +140,7 @@ impl Array<f32> {
     ///
     /// **Precision.** On the CUDA backend with tensor cores (compute capability 8.0 and up) this
     /// is [`Array::matmul_tf32`] unless the context turned that off
-    /// ([`ContextOptions::tf32_matmul`](crate::ContextOptions::tf32_matmul), `LUMA_TF32_MATMUL=0`):
+    /// ([`Numerics::strict`](crate::Numerics::strict) in [`ContextOptions::numerics`](crate::ContextOptions::numerics), `LUMA_NUMERICS=strict`):
     /// the operands are rounded to TF32 (a 10-bit mantissa) and the sums are `f32`, an error of
     /// about 2e-4 of the RMS of the product (at most 1.5e-3 of the sum of the absolute terms of
     /// an entry). Use [`Array::matmul_f32`] where full `f32` precision matters; every other
@@ -176,7 +177,7 @@ impl Array<f32> {
     }
 
     /// [`Array::matmul`] on the tensor cores of the device, whatever the context's
-    /// [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says: the operands are rounded to TF32
+    /// [`numerics`](crate::ContextOptions::numerics) say: the operands are rounded to TF32
     /// (a 10-bit mantissa, the range of `f32`) and the products accumulated in `f32`, so the
     /// result differs from the `f32` product by up to 1.5e-3 of the sum of the absolute terms of
     /// an entry (about 2e-4 of the RMS of the product for operands of random sign), the
@@ -199,7 +200,7 @@ impl Array<f32> {
     }
 
     /// [`Array::matmul`] in full `f32` precision on every backend, whatever the context's
-    /// [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says: each entry is a sum of `f32`
+    /// [`numerics`](crate::ContextOptions::numerics) say: each entry is a sum of `f32`
     /// products accumulated with fused multiply-adds in a fixed order. Slower than the tensor
     /// cores of `matmul` where those apply (about 1.7x on large products on an RTX 3090).
     ///
@@ -307,7 +308,7 @@ pub fn matmul_f32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
 #[track_caller]
 fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32> {
     let location = Location::caller();
-    let result = run(lhs, rhs, tf32.unwrap_or_else(|| lhs.context().tf32_matmul()), location);
+    let result = run(lhs, rhs, tf32.unwrap_or_else(|| lhs.context().numerics().tf32_matmul()), location);
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     Array::resolve(lhs.context(), shape, result, "matmul", location)
@@ -544,7 +545,7 @@ fn padded_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool,
     if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) || !ctx.same_as(rhs.context()) {
         return None;
     }
-    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || ctx.hal().gemm_tiles(!tf32).is_empty() {
+    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || (if tf32 { !ctx.caps().contains(Caps::TF32) } else { ctx.hal().gemm_tiles(true).is_empty() }) {
         return None;
     }
     if ctx.jit().recording_decisions() {
@@ -793,7 +794,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool, location: &'static Locati
     // Operands first, so that a poisoned one reports its own error.
     let cores = ctx.tuning().native_gemm;
     let shape = gemm_shape(lhs, rhs).filter(|_| ctx.same_as(rhs.context()));
-    let tensor_tiles = if tf32 && shape.is_some() { ctx.hal().gemm_tiles(false) } else { &[] };
+    let tensor_tiles = if tf32 && ctx.caps().contains(Caps::TF32) && shape.is_some() { ctx.hal().gemm_tiles(false) } else { &[] };
     // The default product runs on the backend's own `f32` kernels when it reads its operands as
     // they are stored and is not one of the skinny shapes (see `skinny_plan`).
     let exact_tiles = match shape {

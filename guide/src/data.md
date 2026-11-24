@@ -103,7 +103,7 @@ at 21 instead of 13, and the small and skinny products of a network (a 256-row b
 
 Where the precision matters, ask for `f32`: `a.matmul_f32(&b)` is the full-precision product of
 one call (a chain of fused multiply-adds in a fixed order per entry), and
-`ContextOptions::tf32_matmul(false)` (`LUMA_TF32_MATMUL=0`) makes every `matmul` of a context
+`ContextOptions::numerics(Numerics::strict())` (`LUMA_NUMERICS=strict`) makes every `matmul` of a context
 that product. `matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always
 `f32`. On CUDA the `f32` product has kernels of its own for the shapes above (an RTX 3090: 23
 TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions

@@ -18,8 +18,8 @@ off for a context:
 ```rust
 use luma::*;
 
-let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
-assert!(!exact.tf32_matmul());
+let exact = Context::with_options(ContextOptions::default().numerics(Numerics::strict()))?;  // or LUMA_NUMERICS=strict
+assert!(!exact.numerics().tf32_matmul());
 let a = Array::from_slice_on(&exact, &[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
 let b = Array::from_slice_on(&exact, &[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
 assert_eq!(a.matmul_f32(&b).to_vec()?, a.to_vec()?);   // the exact product of one call
@@ -90,7 +90,7 @@ implementations.
 - `matmul_nt`, `matmul_tn`, `matmul_tt` and `dot`; `prod` / `product` and the `*_by_key` reductions;
   `sort_by_key`, `set_unique`, `set_union` and `set_intersect`; the elementwise functions of ArrayFire's
   `arith.h`.
-- `ContextOptions::tf32_matmul`, `Context::tf32_matmul()`, `matmul_f32`, `matmul_tf32`
+- `ContextOptions::numerics`, `Context::numerics()`, `matmul_f32`, `matmul_tf32`
   ([Performance guide](performance.md#matrix-products)).
 - The plan cache of eager evaluation (`LUMA_PLAN_CACHE`), compile worker threads (`LUMA_COMPILE_THREADS`)
   and the CPU backend's native matrix products ([Performance guide](performance.md)).

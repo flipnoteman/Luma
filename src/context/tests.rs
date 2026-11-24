@@ -577,3 +577,54 @@ fn a_context_that_ran_linear_algebra_is_freed_with_its_last_handle() {
     drop(ctx);
     assert!(weak.upgrade().is_none(), "something outlives its context");
 }
+
+#[test]
+fn the_context_reports_the_numerics_it_was_opened_with() {
+    for numerics in [Numerics::strict(), Numerics::default(), Numerics::algebraic(), Numerics::fast()] {
+        let ctx = Context::with_options(ContextOptions::from_env().calibrate(false).numerics(numerics)).unwrap();
+        assert_eq!(ctx.numerics(), numerics);
+        assert_eq!(ctx.fast_math(), numerics.fast_math());
+    }
+}
+
+#[test]
+fn caps_match_what_the_device_reports() {
+    let ctx = ctx();
+    let (caps, info) = (ctx.caps(), ctx.info());
+    assert_eq!(caps.contains(Caps::F64), info.features.contains(Features::SHADER_F64));
+    assert_eq!(caps.contains(Caps::F16), info.features.contains(Features::SHADER_F16));
+    assert_eq!(caps.contains(Caps::SUBGROUP), info.features.contains(Features::SUBGROUP));
+    assert_eq!(caps.contains(Caps::TEXTURE), ctx.hal().texture_caps().is_some());
+    assert_eq!(caps.contains(Caps::TEXTURE_PROFITABLE), caps.contains(Caps::TEXTURE) && ctx.tuning().profile == TuningProfile::Nvidia);
+    assert_eq!(caps.contains(Caps::TF32), !ctx.hal().gemm_tiles(false).is_empty());
+    assert_eq!(caps.contains(Caps::UNIFIED_MEMORY), info.zero_copy);
+    assert_eq!(caps.contains(Caps::HOST_PATH), !info.cpu && info.zero_copy);
+    assert_eq!(caps.contains(Caps::NATIVE_GEMM), ctx.hal().native_matmul().is_some());
+    assert_eq!(caps.contains(Caps::NATIVE_LINE_SOLVE), ctx.hal().native_line_solve());
+    assert_eq!(caps.contains(Caps::LOOKBACK), ctx.tuning().lookback_scan);
+    assert_eq!(caps.contains(Caps::SUBGROUP32), ctx.tuning().subgroup32);
+}
+
+#[test]
+fn without_tf32_the_default_matmul_is_exact_and_matmul_tf32_falls_back() {
+    let options = || ContextOptions::from_env().calibrate(false);
+    let plain = Context::with_options(options()).unwrap();
+    let forced = Context::with_caps_removed(options(), Caps::TF32).unwrap();
+    assert!(!forced.caps().contains(Caps::TF32));
+    let n = 256;
+    let a: Vec<f32> = (0..n * n).map(|i| ((i * 7 % 101) as f32) * 0.0137 + 0.1).collect();
+    let b: Vec<f32> = (0..n * n).map(|i| ((i * 13 % 89) as f32) * 0.0211 - 0.3).collect();
+    let run = |ctx: &Context, tf32: Option<bool>| {
+        let (x, y) = (Array::from_slice_on(ctx, &a, [n, n]).unwrap(), Array::from_slice_on(ctx, &b, [n, n]).unwrap());
+        match tf32 {
+            None => x.matmul(&y),
+            Some(true) => x.matmul_tf32(&y),
+            Some(false) => x.matmul_f32(&y),
+        }
+        .to_vec()
+        .unwrap()
+    };
+    let exact = run(&plain, Some(false));
+    assert_eq!(run(&forced, None), exact);
+    assert_eq!(run(&forced, Some(true)), exact);
+}

@@ -2,7 +2,7 @@
 //!
 //! The rules in [`exact`] never change a result bit (up to the payload of a NaN). The rules in
 //! [`fast`] assume finite values and ignore the sign of zero and rounding, so they only run with
-//! [`ContextOptions::fast_math`](crate::context::ContextOptions::fast_math).
+//! [`Reduced::FAST_MATH`](crate::Reduced::FAST_MATH).
 //!
 //! A rewrite never returns an existing node: an identity becomes a `Unary(Id)` of the surviving
 //! operand and a constant a `Unary(Id)` of a scalar, because a node an array holds must not
@@ -381,7 +381,7 @@ mod tests {
     use crate::gpu_type::Df32;
 
     fn context(fast: bool) -> Context {
-        Context::with_options(ContextOptions::from_env().fast_math(fast)).unwrap()
+        Context::with_options(ContextOptions::from_env().numerics(if fast { crate::Numerics::fast() } else { crate::Numerics::default() })).unwrap()
     }
 
     /// Bit patterns with every NaN as one NaN.

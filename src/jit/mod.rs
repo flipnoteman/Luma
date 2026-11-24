@@ -2060,7 +2060,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
     if !exists {
         return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
     }
-    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
+    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.caps().contains(crate::caps::Caps::F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
     }
     // WGSL has no `f64` math functions: they exist where the backend lowers them itself.

@@ -193,7 +193,7 @@ pub(crate) fn read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
 }
 
 fn choose_read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
-    if ctx.hal().texture_caps().is_none() || ctx.tuning().profile != luma_core::TuningProfile::Nvidia {
+    if !ctx.caps().contains(crate::caps::Caps::TEXTURE_PROFITABLE) {
         return ReadPath::Plain;
     }
     let cost = ctx.cost_model();
@@ -523,7 +523,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let t_df = time_kernel(ctx, df, "CostDf32", n_alu, k_df, REPS)?;
     let df32_factor = t_df / (2.0 * f64::from(k_df) * f64::from(n_alu)) / per_op_f32;
 
-    let f64_factor = if ctx.features().contains(luma_core::Features::SHADER_F64) {
+    let f64_factor = if ctx.caps().contains(crate::caps::Caps::F64) {
         let wide = kernel_source("", "f64", "f64(in0[i])", "x = x * f64(1.0001) + f64(0.5);", "f32(x)");
         let t_f64 = time_kernel(ctx, wide, "CostF64", n_alu, k_f64, REPS)?;
         Some(t_f64 / (2.0 * f64::from(k_f64) * f64::from(n_alu)) / per_op_f32)

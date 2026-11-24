@@ -29,7 +29,7 @@ fn forms() -> Vec<(&'static str, ContextOptions)> {
     vec![
         ("default", ContextOptions::from_env()),
         ("dekker", ContextOptions::from_env().df_fma(false)),
-        ("fast_math", ContextOptions::from_env().fast_math(true)),
+        ("fast_math", ContextOptions::from_env().numerics(luma::Numerics::fast())),
     ]
 }
 

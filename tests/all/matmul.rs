@@ -9,7 +9,7 @@ use luma::{matmul, Array, Context, ContextOptions, LumaError};
 /// A context whose products are `f32` on every backend (tensor cores round their operands, which
 /// these tests compare to a host product to 1e-4; `tests/matmul_tf32.rs` covers those).
 fn exact() -> Result<Context, LumaError> {
-    Context::with_options(ContextOptions::from_env().tf32_matmul(false))
+    Context::with_options(ContextOptions::from_env().numerics(luma::Numerics::strict()))
 }
 
 /// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` in `f64`. Every element is summed in order of `k`, as
@@ -353,7 +353,7 @@ fn a_gram_matrix_of_a_lazy_expression_reads_it_through_a_transposed_view() {
 #[test]
 fn operands_or_a_result_split_over_several_buffers_poison_the_result() {
     // Buffers of 4096 bytes: 1024 `f32`.
-    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).tf32_matmul(false)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).numerics(luma::Numerics::strict())).unwrap();
     let array = |e: usize, f: usize| Array::<f32>::zeros_on(&ctx, [e, f]).unwrap();
     let chunked = |c: &Array<f32>| match c.error().map(LumaError::root) {
         Some(LumaError::Chunked(_)) => Some(true),

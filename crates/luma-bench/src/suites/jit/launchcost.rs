@@ -81,7 +81,7 @@ pub fn run(h: &mut Harness) {
             // 32 chained TF32 products compound a per-product error of about 2^-11 roughly linearly
             // (1.0e-3 observed on CUDA), so the tolerance follows the backend instead of the case
             // switching to `matmul_f32`, which would change what it measures.
-            let rel = if ctx.tf32_matmul() { 1e-2 } else { 1e-3 };
+            let rel = if ctx.numerics().tf32_matmul() { 1e-2 } else { 1e-3 };
             check("launchcost/matmul", &mm(&a).to_vec().unwrap(), &to_f32(&want), rel, 1e-4);
         }
         h.case("launchcost/matmul32", &format!("{d}x{d}"), per_sec(CHAIN / 2, "launch/s"), &mut || force(&mm(&a)));

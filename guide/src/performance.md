@@ -277,8 +277,8 @@ loop primitives, which trace the step once, are the cheaper form where they fit.
 On a CUDA device with tensor cores (compute capability 8.0 and up) `matmul` runs in TF32 by default: the
 operands are rounded to 10 bits of mantissa and the products accumulated in `f32`, so results differ from
 the exact `f32` product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
-RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. `ContextOptions::tf32_matmul(false)`
-or `LUMA_TF32_MATMUL=0` turns it off for a context, `matmul_f32` is the exact product of one call, and
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. `ContextOptions::numerics(Numerics::strict())`
+or `LUMA_NUMERICS=strict` turns it off for a context, `matmul_f32` is the exact product of one call, and
 `matmul_tf32` forces TF32 ([Tensor cores](data.md#tensor-cores-tf32)). `matmul_batched` is always `f32`.
 Other backends compute `f32` products as before. A product whose output is small and whose `K` is long (a
 Gram matrix, a gradient `Xᵀr`) runs as a kernel family with no workgroup staging, and `matmul_nt`,

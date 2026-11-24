@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, Decision, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
+use crate::caps::Caps;
+use crate::numerics::Numerics;
 use crate::error::{LumaError, Result};
 use crate::jit::cost;
 use crate::jit::JitState;
@@ -58,10 +60,10 @@ struct Inner {
     segment_bytes: u64,
     /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
     check_finite: bool,
-    /// Whether value-changing algebraic rewrites are allowed (see [`ContextOptions::fast_math`]).
-    fast_math: bool,
-    /// Whether `matmul` runs on tensor cores where it can (see [`ContextOptions::tf32_matmul`]).
-    tf32_matmul: bool,
+    /// The numerics policy (see [`ContextOptions::numerics`]).
+    numerics: Numerics,
+    /// What the device can do, computed once when the context opens.
+    caps: Caps,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -193,26 +195,26 @@ pub struct ContextOptions {
     /// the process then uses the profile's fixed numbers and nothing is stored. `false` uses
     /// the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
-    /// Allows rewrites of expressions that are not exact: `x + 0` becomes `x` (a `-0.0`
-    /// stays `-0.0` instead of becoming `0.0`), `x * 0` becomes `0` and `x - x` becomes `0` (wrong
-    /// for NaN and infinity), `x / x` becomes `1`, `x <= x`, `x >= x`, `x == x` become true and
-    /// `x != x` false (wrong for NaN), `(x * a) * b` and `(x + a) + b` combine their constants
-    /// (different rounding), `x / a` for a constant `a` becomes `x * (1 / a)`, and `powf(x, e)`
-    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. `Df32` additions and
-    /// subtractions take the cheaper algorithm whose relative error grows with the cancellation
-    /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
-    /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
-    pub fast_math: bool,
-    /// Runs [`Array::matmul`](crate::Array::matmul) as [`Array::matmul_tf32`](crate::Array::matmul_tf32)
-    /// does: on a device with tensor cores (the CUDA backend, compute capability 8.0 and up) the
-    /// operands of the products it can take are rounded to TF32 (a 10-bit mantissa) and the
-    /// products accumulated in `f32`, which costs about `2^-11` of the magnitudes summed in
-    /// accuracy (2e-4 of the RMS of a product of random operands) and gains up to 1.7x on large
-    /// products and several times on small ones. On by default; `false` (`LUMA_TF32_MATMUL=0`)
-    /// makes `matmul` the `f32` product on every backend, as does calling
-    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product. No effect on other
-    /// backends, whose products are `f32` anyway.
-    pub tf32_matmul: bool,
+    /// The numerics policy: which departures from exact `f32` semantics the context allows (see
+    /// [`Numerics`]). The default has `matmul` run in TF32 on tensor cores where the device has
+    /// them (compute capability 8.0 and up on CUDA; about `2^-11` of the magnitudes summed in
+    /// accuracy, up to 1.7x on large products and several times on small ones);
+    /// [`Numerics::strict`] makes every product `f32`, as does
+    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product.
+    ///
+    /// `Reduced::FAST_MATH` (in [`Numerics::fast`]) allows rewrites of expressions that are not
+    /// exact: `x + 0` becomes `x` (a `-0.0` stays `-0.0` instead of becoming `0.0`), `x * 0`
+    /// becomes `0` and `x - x` becomes `0` (wrong for NaN and infinity), `x / x` becomes `1`,
+    /// `x <= x`, `x >= x`, `x == x` become true and `x != x` false (wrong for NaN), `(x * a) * b`
+    /// and `(x + a) + b` combine their constants (different rounding), `x / a` for a constant `a`
+    /// becomes `x * (1 / a)`, and `powf(x, e)` with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or
+    /// `sqrt(x)`. `Df32` additions and subtractions take the cheaper algorithm whose relative
+    /// error grows with the cancellation (below 2^-47 of the larger operand instead of 2^-46 of
+    /// the result), except in reductions. Rewrites that keep every bit (`x * 1`, `-(-x)`,
+    /// `min(x, x)` and the like) always run. `Reduced::TF32_LINALG` runs the trailing-update
+    /// products of the factorisations in TF32 (CUDA, compute capability 8.0 and up).
+    /// `LUMA_NUMERICS` sets it from the environment (see [`Numerics::parse`]).
+    pub numerics: Numerics,
     /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
     /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
     /// small test kernel when the device is first opened (`true` on Vulkan GPUs that fuse,
@@ -232,8 +234,7 @@ impl Default for ContextOptions {
             chunk_bytes: None,
             check_finite: false,
             calibrate: true,
-            fast_math: false,
-            tf32_matmul: true,
+            numerics: Numerics::default(),
             df_fma: None,
         }
     }
@@ -291,16 +292,9 @@ impl ContextOptions {
         self
     }
 
-    /// Allows the value-changing rewrites of expressions (see [`ContextOptions::fast_math`]).
-    pub fn fast_math(mut self, on: bool) -> Self {
-        self.fast_math = on;
-        self
-    }
-
-    /// Runs the matrix products on tensor cores in TF32 where the device has them (the default),
-    /// or with `false` always in `f32` (see [`ContextOptions::tf32_matmul`]).
-    pub fn tf32_matmul(mut self, on: bool) -> Self {
-        self.tf32_matmul = on;
+    /// Sets the numerics policy (see [`ContextOptions::numerics`]).
+    pub fn numerics(mut self, numerics: Numerics) -> Self {
+        self.numerics = numerics;
         self
     }
 
@@ -308,10 +302,14 @@ impl ContextOptions {
     /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
     /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
-    /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
-    /// [`ContextOptions::fast_math`], `LUMA_TF32_MATMUL` = `0` | `off` | `false` to turn
-    /// [`ContextOptions::tf32_matmul`] off, `LUMA_CALIBRATE` = `0` |
+    /// `1` | `on` | `true` for the finite check, `LUMA_NUMERICS` =
+    /// `strict` | `default` | `algebraic` | `fast` with modifiers (see [`Numerics::parse`]) for
+    /// [`ContextOptions::numerics`], `LUMA_CALIBRATE` = `0` |
     /// `off` | `false` to skip calibration.
+    ///
+    /// # Panics
+    ///
+    /// If `LUMA_NUMERICS` is set to something [`Numerics::parse`] rejects.
     pub fn from_env() -> ContextOptions {
         let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_ascii_lowercase());
         let backend_named = |name: &str| match name {
@@ -347,10 +345,10 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
             calibrate: !std::env::var("LUMA_CALIBRATE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
-            fast_math: std::env::var("LUMA_FAST_MATH")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
-            tf32_matmul: !std::env::var("LUMA_TF32_MATMUL")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
+            numerics: match std::env::var("LUMA_NUMERICS") {
+                Ok(text) => Numerics::parse(&text).unwrap_or_else(|why| panic!("LUMA_NUMERICS={text:?}: {why}")),
+                Err(_) => Numerics::default(),
+            },
             df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" => Some(true),
                 "0" | "off" | "false" => Some(false),
@@ -533,15 +531,19 @@ impl Context {
         &self.inner.backend.info().name
     }
 
-    /// Whether value-changing algebraic rewrites are allowed.
-    pub(crate) fn fast_math(&self) -> bool {
-        self.inner.fast_math
+    /// The numerics policy of this context (see [`ContextOptions::numerics`]); fixed when it opens.
+    pub fn numerics(&self) -> Numerics {
+        self.inner.numerics
     }
 
-    /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can
-    /// (see [`ContextOptions::tf32_matmul`]).
-    pub fn tf32_matmul(&self) -> bool {
-        self.inner.tf32_matmul
+    /// What the device can do.
+    pub(crate) fn caps(&self) -> Caps {
+        self.inner.caps
+    }
+
+    /// Whether value-changing algebraic rewrites are allowed.
+    pub(crate) fn fast_math(&self) -> bool {
+        self.inner.numerics.fast_math()
     }
 
     /// Whether this context runs on a software (CPU) device.
@@ -552,17 +554,23 @@ impl Context {
     /// Opens a device as `options` say, without looking at the environment. Blocks until the
     /// device is ready.
     pub fn with_options(options: ContextOptions) -> Result<Context> {
-        Context::open(options, |_| {})
+        Context::open(options, |_| {}, Caps::empty())
     }
 
     /// [`Context::with_options`] with `tune` changing the kernel parameters of the device (tests
     /// run kernels the device would not choose).
     #[cfg(test)]
     pub(crate) fn with_tuning(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
-        Context::open(options, tune)
+        Context::open(options, tune, Caps::empty())
     }
 
-    fn open(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
+    /// [`Context::with_options`] reporting the device without the capabilities of `removed`.
+    #[cfg(test)]
+    pub(crate) fn with_caps_removed(options: ContextOptions, removed: Caps) -> Result<Context> {
+        Context::open(options, |_| {}, removed)
+    }
+
+    fn open(options: ContextOptions, tune: impl FnOnce(&mut Tuning), removed: Caps) -> Result<Context> {
         let backend = open_backend(options.backend, options.device)?;
         let info = backend.info();
         let limits = info.limits;
@@ -595,10 +603,11 @@ impl Context {
                 None => device_fma(&*backend),
             },
         };
-        tuning.df_sloppy_add = options.fast_math;
+        tuning.df_sloppy_add = options.numerics.fast_math();
         tuning.native_solve = Tuning::native_solve_for(backend.native_line_solve());
         tuning.native_gemm = Tuning::native_gemm_for(backend.native_matmul());
         tune(&mut tuning);
+        let caps = Caps::of(info, &*backend, &tuning).without(removed);
 
         let ctx = Context {
             inner: Arc::new(Inner {
@@ -619,8 +628,8 @@ impl Context {
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
                 check_finite: options.check_finite,
-                fast_math: options.fast_math,
-                tf32_matmul: options.tf32_matmul,
+                numerics: options.numerics,
+                caps,
                 pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),

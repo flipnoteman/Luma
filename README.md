@@ -142,7 +142,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 ### Environment variables
 
-Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, `LUMA_TF32_MATMUL=0` (exact `f32` `matmul` on CUDA; TF32 tensor cores are the default), and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
+Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_NUMERICS` (`strict`, `default`, `algebraic`, `fast`, with `+tf32-linalg` / `-tf32-matmul` style modifiers), `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
 
 ### Examples
 

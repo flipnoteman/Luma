@@ -51,7 +51,7 @@
 //!   [`Df32`] (double-float) and `f64` where the device has it.
 //! * **Matrix products**: [`Array::matmul`] runs on tensor cores in TF32 on CUDA devices of compute
 //!   capability 8.0 and up (results differ from the exact product by TF32 rounding);
-//!   [`ContextOptions::tf32_matmul`] or `LUMA_TF32_MATMUL=0` turns that off for a context and
+//!   [`ContextOptions::numerics`] with [`Numerics::strict`] or `LUMA_NUMERICS=strict` turns that off for a context and
 //!   [`Array::matmul_f32`] is the exact product of one call.
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
@@ -133,6 +133,7 @@ mod accum;
 mod arg;
 mod array;
 mod builtin;
+mod caps;
 mod bykey;
 mod context;
 mod conv;
@@ -164,6 +165,7 @@ mod linalg;
 mod bmm;
 mod matmul;
 mod nan;
+mod numerics;
 mod ops;
 mod precision;
 mod profile;
@@ -196,6 +198,7 @@ pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoment
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;
+pub use numerics::{Numerics, Reduced};
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
 pub use luma_core::hal::HostBytes;
 pub use error::{LumaError, Result};

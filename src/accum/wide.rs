@@ -120,7 +120,7 @@ impl Wide for f64 {
 
 /// `f64` states need a device with 64-bit shader floats.
 pub fn check_wide<W: Wide>(ctx: &Context) -> Result<()> {
-    if std::any::TypeId::of::<W>() == std::any::TypeId::of::<f64>() && !ctx.features().contains(luma_core::Features::SHADER_F64) {
+    if std::any::TypeId::of::<W>() == std::any::TypeId::of::<f64>() && !ctx.caps().contains(crate::caps::Caps::F64) {
         return Err(LumaError::Unsupported("an f64 accumulator needs a device with 64-bit shader floats (CUDA, the CPU backend); use Df32".into()));
     }
     Ok(())

@@ -178,7 +178,7 @@ impl Array<f32> {
     ///
     /// The whole batch is one launch when the products are up to 128 on a side (and `K` up to
     /// 1024); bigger ones are one [`matmul_f32`](Array::matmul_f32) each: batched products are always in full `f32`
-    /// precision, whatever the context's [`tf32_matmul`](crate::ContextOptions::tf32_matmul) says. The operands are evaluated
+    /// precision, whatever the context's [`numerics`](crate::ContextOptions::numerics) say. The operands are evaluated
     /// first, and the product is recorded when this is called, like [`Array::matmul`]'s.
     ///
     /// # Errors
