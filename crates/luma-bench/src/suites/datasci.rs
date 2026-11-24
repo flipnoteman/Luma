@@ -38,6 +38,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("pipeline", pipeline_cases);
     h.guarded("small", small_cases);
     h.guarded("half", half::run);
+    h.guarded("spill", spill_cases);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1832,4 +1833,31 @@ fn small_cases(h: &mut Harness) {
         check("small/corr_1kx16", &run().to_vec().unwrap(), &as_f32(&host_corr(&hx, rows, feats)), 0.0, 2e-3);
         case_trim(h, "small/corr_1kx16", "1000x16", Work::None, &mut || run().eval().unwrap());
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Paging
+// -------------------------------------------------------------------------------------------------
+
+/// Twelve columns of which a quarter fit the device budget, each read by a reduction per sweep:
+/// every sweep pages the columns through the budget.
+fn spill_cases(h: &mut Harness) {
+    if !h.want("spill/column_sweep") {
+        return;
+    }
+    let n: usize = if h.quick { 1 << 20 } else { 1 << 22 };
+    let columns = 12;
+    let budget = (n * 4 * columns / 4) as u64;
+    let ctx = Context::with_options(ContextOptions::from_env().memory_budget(budget)).expect("no device");
+    let cols: Vec<Array<f32>> = (0..columns).map(|k| Array::from_slice_on(&ctx, &values(n, 300 + k as u64, -1.0, 1.0), n).unwrap()).collect();
+    let sweep = || {
+        let sums: Vec<f32> = cols.iter().map(|c| (c * 2.0).sum().item().unwrap()).collect();
+        sums.iter().sum::<f32>()
+    };
+    let want = sweep();
+    let size = format!("{columns}x{}", label(n));
+    h.transfer_case("spill/column_sweep", &size, Work::Bytes((n * 4 * columns) as f64), &mut || {
+        assert_eq!(sweep().to_bits(), want.to_bits());
+    });
+    println!("  spill/column_sweep: {} MiB spilled", ctx.spilled_bytes() >> 20);
 }
