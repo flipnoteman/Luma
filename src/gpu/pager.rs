@@ -79,6 +79,13 @@ pub(crate) struct Segment {
     has_dependents: AtomicBool,
     /// Number of live [`Pin`]s; a pinned segment must keep its buffer.
     pins: AtomicU32,
+    /// How many of them were taken by a may-write pin. A pin that is held (a stepper's, a
+    /// recording's, a captured graph's) can launch writes long after it was taken, which no
+    /// later pin call announces: no lineage is used to evict over an input while one is held.
+    write_pins: AtomicU32,
+    /// Counts the write announcements ([`Segment::note_write`]): a lineage is not used to evict
+    /// once an input's count differs from the one it recorded.
+    epoch: AtomicU64,
     /// Value of the pager's clock at the last pin.
     stamp: AtomicU64,
     /// The texture of this segment's data made last (see [`crate::texture`]).
@@ -99,6 +106,8 @@ struct Dependents {
 pub(crate) struct Pin {
     segment: Arc<Segment>,
     buffer: Buffer,
+    /// Whether this pin may be written through (see [`Segment::write_pins`]).
+    write: bool,
 }
 
 impl Pin {
@@ -110,7 +119,10 @@ impl Pin {
     /// Another pin of the same segment.
     pub(crate) fn dup(&self) -> Pin {
         self.segment.pins.fetch_add(1, Ordering::Acquire);
-        Pin { segment: Arc::clone(&self.segment), buffer: self.buffer.clone() }
+        if self.write {
+            self.segment.write_pins.fetch_add(1, Ordering::Acquire);
+        }
+        Pin { segment: Arc::clone(&self.segment), buffer: self.buffer.clone(), write: self.write }
     }
 
     /// The segment's device buffer.
@@ -122,6 +134,9 @@ impl Pin {
 impl Drop for Pin {
     fn drop(&mut self) {
         self.segment.pins.fetch_sub(1, Ordering::Release);
+        if self.write {
+            self.segment.write_pins.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -372,6 +387,8 @@ impl Segment {
             dependents: Mutex::new(Dependents::default()),
             has_dependents: AtomicBool::new(false),
             pins: AtomicU32::new(0),
+            write_pins: AtomicU32::new(0),
+            epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
             texture: Mutex::new(None),
         })
@@ -479,17 +496,35 @@ impl Segment {
         if !write {
             return self.pin_device(false);
         }
-        // A write: what is evicted by lineage over this data is recomputed first, while it holds
-        // the old values, and no lineage over it survives (see `jit::lineage`).
-        if self.has_dependents.load(Ordering::Acquire) {
-            self.release_dependents()?;
-        }
+        self.note_write()?;
         let pin = self.pin_device(true)?;
         if self.has_lineage.load(Ordering::Acquire) {
             // The data is about to change: the pin keeps the segment resident, so it is not evicted by lineage meanwhile.
             self.clear_lineage();
         }
         Ok(pin)
+    }
+
+    /// The one announcement of a write to this segment's data, made before every may-write pin
+    /// and host write (`Segment::pin`, `pin_quiet`, `with_host_bytes_mut`; every writer of a
+    /// buffer gets it through one of them): counts the write, and settles the dependents (see
+    /// [`Segment::release_dependents`]) while the data still is the old.
+    fn note_write(self: &Arc<Self>) -> Result<()> {
+        self.epoch.fetch_add(1, Ordering::Release);
+        if self.has_dependents.load(Ordering::Acquire) {
+            self.release_dependents()?;
+        }
+        Ok(())
+    }
+
+    /// The count of write announcements so far.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether a may-write pin is held: whoever holds it may write without announcing it.
+    pub(crate) fn write_held(&self) -> bool {
+        self.write_pins.load(Ordering::Acquire) != 0
     }
 
     /// Before a write to this segment: recomputes the dependents that are evicted by lineage,
@@ -573,12 +608,12 @@ impl Segment {
     }
 
     /// The inputs, strongly, if evicting this segment by lineage is allowed and cheaper than
-    /// moving it (a segment with a valid host copy, `clean`, only needs an upload later; see [`crate::jit::lineage::Snapshot::evictable_inputs`]). Besides that, no
+    /// a readback and an upload (see [`crate::jit::lineage::Snapshot::evictable_inputs`]). Besides that, no
     /// segment that reads this one may be evicted by lineage itself, and (checked there) neither
     /// may an input: with both, a recomputation never reaches through more than one level.
     ///
     /// Takes the state locks of other segments, one at a time: the caller holds none.
-    fn lineage_candidate(&self, clean: bool) -> Option<Box<[Arc<Storage>]>> {
+    fn lineage_candidate(&self) -> Option<Box<[Arc<Storage>]>> {
         if !self.has_lineage.load(Ordering::Acquire) {
             return None;
         }
@@ -587,7 +622,7 @@ impl Segment {
         if dependents.iter().any(|dependent| matches!(&*lock(&dependent.state), State::Lineage)) {
             return None;
         }
-        snapshot.evictable_inputs(&self.ctx, self.bytes, clean)
+        snapshot.evictable_inputs(&self.ctx, self.bytes)
     }
 
     /// Makes `inputs` the strong inputs of the lineage (the caller evicts the segment by
@@ -624,8 +659,11 @@ impl Segment {
                     self.invalidate_host_copy();
                 }
                 self.pins.fetch_add(1, Ordering::Acquire);
+                if write {
+                    self.write_pins.fetch_add(1, Ordering::Acquire);
+                }
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-                return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone() });
+                return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write });
             }
             let evicted_by_lineage = matches!(&*lock(&self.state), State::Lineage);
             if evicted_by_lineage || matches!(&*lock(&self.state), State::Host(_)) {
@@ -738,7 +776,7 @@ impl Segment {
             return None;
         }
         // A write: what is evicted by lineage over this data is recomputed first (the pin path reports a failure of that).
-        if self.has_dependents.load(Ordering::Acquire) && self.release_dependents().is_err() {
+        if self.note_write().is_err() {
             return None;
         }
         match &mut *lock(&self.state) {
@@ -840,7 +878,7 @@ impl Context {
         let Some(victim) = victim else { return Ok(false) };
         // Whether recomputing the victim beats reading it back; looked at before its state is
         // locked, because it takes the state locks of the inputs.
-        let candidate = victim.lineage_candidate(victim.has_copy.load(Ordering::Acquire));
+        let candidate = if victim.has_copy.load(Ordering::Acquire) { None } else { victim.lineage_candidate() };
 
         // Held to the end: a concurrent pin of the victim waits for the move to finish.
         let mut state = lock(&victim.state);
@@ -850,14 +888,10 @@ impl Context {
         }
         let buffer = buffer.clone();
         let kept = if victim.has_copy.load(Ordering::Acquire) { lock(&victim.host_copy).take() } else { None };
-        if let Some(inputs) = candidate
+        if kept.is_none()
+            && let Some(inputs) = candidate
             && let Some(bytes) = victim.hold_lineage_inputs(inputs)
         {
-            // A kept host copy is dropped: the segment is cheaper to recompute than to upload again.
-            if let Some(copy) = &kept {
-                victim.has_copy.store(false, Ordering::Release);
-                pager.host_copy_bytes.fetch_sub(copy.len() as u64, Ordering::Relaxed);
-            }
             // Nothing moves: the next pin runs the kernel again into a new buffer.
             pager.lineage_pinned_bytes.fetch_add(bytes, Ordering::Relaxed);
             pager.recompute_evictions.fetch_add(1, Ordering::Relaxed);

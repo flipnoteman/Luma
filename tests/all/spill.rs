@@ -360,3 +360,110 @@ fn no_lineage_eviction_happens_while_recording() {
     }
     assert_eq!(ctx.paging_stats().recompute_evictions, 0, "something recorded during a trace was evicted by lineage");
 }
+
+/// `c = a * 2 + b`, then `write` on `a` (through some path), then pressure that pushes `c` out
+/// again, then a read of `c`: it must have the old values. `evicted`: `c` is evicted by lineage
+/// before the write (else it is resident, with its lineage, at the write).
+fn a_write_path_keeps_the_dependent_old(evicted: bool, write: impl FnOnce(&mut Array<f32>, &Context)) {
+    let ctx = lineage_context();
+    let (mut a, b, c, _fillers) = if evicted {
+        evicted_by_lineage(&ctx)
+    } else {
+        let a = Array::from_slice_on(&ctx, &megabyte(1), MEGABYTE).unwrap();
+        let b = Array::from_slice_on(&ctx, &megabyte(2), MEGABYTE).unwrap();
+        let c = &a * 2.0 + &b;
+        c.eval().unwrap();
+        ctx.flush().unwrap();
+        (a, b, c, Vec::new())
+    };
+    write(&mut a, &ctx);
+    // Keep both inputs the most recently used, so that `c` is the next victim whatever it costs.
+    (&a * 2.0).to_vec().unwrap();
+    (&b * 2.0).to_vec().unwrap();
+    let before = ctx.paging_stats();
+    let _more = pressure(&ctx, |stats| stats.readback_evictions + stats.recompute_evictions > before.readback_evictions + before.recompute_evictions);
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+}
+
+#[test]
+fn a_region_assignment_keeps_the_dependent_old() {
+    for evicted in [true, false] {
+        a_write_path_keeps_the_dependent_old(evicted, |a, _| a.slice_mut(0, 0..4096).assign(-1.0).unwrap());
+    }
+}
+
+#[test]
+fn a_scatter_keeps_the_dependent_old() {
+    for evicted in [true, false] {
+        a_write_path_keeps_the_dependent_old(evicted, |a, ctx| {
+            let at = Array::<u32>::from_slice_on(ctx, &[0, 7, 4096, 99_999], 4).unwrap();
+            a.put(&at, -1.0).unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_scatter_add_keeps_the_dependent_old() {
+    for evicted in [true, false] {
+        a_write_path_keeps_the_dependent_old(evicted, |a, ctx| {
+            let at = Array::<u32>::from_slice_on(ctx, &[0, 7, 4096, 99_999], 4).unwrap();
+            a.put_add(&at, 1.0).unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_compound_assignment_keeps_the_dependent_old() {
+    for evicted in [true, false] {
+        a_write_path_keeps_the_dependent_old(evicted, |a, _| {
+            *a += 1.0;
+            a.eval().unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_write_keeps_the_dependent_old() {
+    for evicted in [true, false] {
+        a_write_path_keeps_the_dependent_old(evicted, |a, _| a.write(&megabyte(7)).unwrap());
+    }
+}
+
+/// A solely owned input consumed by a store kernel gives its buffer to the result.
+#[test]
+fn an_input_taken_over_by_a_kernel_keeps_the_dependent_old() {
+    let ctx = lineage_context();
+    let a = Array::from_slice_on(&ctx, &megabyte(1), MEGABYTE).unwrap();
+    let b = Array::from_slice_on(&ctx, &megabyte(2), MEGABYTE).unwrap();
+    let c = &a * 2.0 + &b;
+    c.eval().unwrap();
+    ctx.flush().unwrap();
+    let d = a * 3.0;
+    d.eval().unwrap();
+    ctx.flush().unwrap();
+    (&b * 2.0).to_vec().unwrap();
+    let before = ctx.paging_stats();
+    let _more = pressure(&ctx, |stats| stats.readback_evictions + stats.recompute_evictions > before.readback_evictions + before.recompute_evictions);
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+    assert_eq!(d.to_vec().unwrap(), megabyte(1).iter().map(|v| v * 3.0).collect::<Vec<f32>>());
+}
+
+/// A state advanced by a loop, whose launches write buffers that the loop pins once.
+#[test]
+fn a_loop_state_written_by_held_pins_keeps_the_dependent_old() {
+    let ctx = lineage_context();
+    let b = Array::from_slice_on(&ctx, &megabyte(2), MEGABYTE).unwrap();
+    let mut x = Array::from_slice_on(&ctx, &megabyte(1), MEGABYTE).unwrap();
+    let c = &x * 2.0 + &b;
+    c.eval().unwrap();
+    ctx.flush().unwrap();
+    for _ in 0..30 {
+        x = &x * 0.5 + &b;
+        x.eval().unwrap();
+        (&x * 1.0).to_vec().unwrap();
+    }
+    (&b * 2.0).to_vec().unwrap();
+    let before = ctx.paging_stats();
+    let _more = pressure(&ctx, |stats| stats.readback_evictions + stats.recompute_evictions > before.readback_evictions + before.recompute_evictions);
+    assert_eq!(c.to_vec().unwrap(), expected_c(&megabyte(1), &megabyte(2)));
+}

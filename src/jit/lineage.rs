@@ -57,6 +57,8 @@ pub(crate) struct Lineage {
     weak_inputs: Box<[Weak<Storage>]>,
     /// [`Readers::generation`](super::readers::Readers::generation) of each input at record time.
     input_generations: Box<[u64]>,
+    /// [`Segment::epoch`](crate::gpu::pager::Segment::epoch) of each input's segment at record time.
+    input_epochs: Box<[u64]>,
 }
 
 impl std::fmt::Debug for Lineage {
@@ -72,6 +74,7 @@ pub(crate) struct Snapshot {
     len: usize,
     weak_inputs: Box<[Weak<Storage>]>,
     input_generations: Box<[u64]>,
+    input_epochs: Box<[u64]>,
 }
 
 /// Everything one recomputation needs, copied out of a [`Lineage`] so that it runs without its lock.
@@ -112,6 +115,7 @@ impl Lineage {
             inputs: Box::new([]),
             weak_inputs: inputs.iter().map(Arc::downgrade).collect(),
             input_generations: inputs.iter().map(|input| input.readers.generation()).collect(),
+            input_epochs: inputs.iter().map(|input| input.only_segment().epoch()).collect(),
         }
     }
 
@@ -122,6 +126,7 @@ impl Lineage {
             len: self.len,
             weak_inputs: self.weak_inputs.clone(),
             input_generations: self.input_generations.clone(),
+            input_epochs: self.input_epochs.clone(),
         }
     }
 
@@ -164,12 +169,16 @@ impl Snapshot {
     /// pays: every input is alive, was not written since the lineage was made, and is resident
     /// on the device (so that none is itself recomputed or read back, which also keeps the
     /// recursion of a pin one level deep); and the kernel costs less than reading the segment
-    /// back and uploading it again (only uploading it again if `clean`: a valid host copy is kept).
+    /// back and uploading it again.
     ///
     /// Takes the input segments' state locks one at a time; the caller holds none.
-    pub(crate) fn evictable_inputs(&self, ctx: &Context, bytes: u64, clean: bool) -> Option<Box<[Arc<Storage>]>> {
+    pub(crate) fn evictable_inputs(&self, ctx: &Context, bytes: u64) -> Option<Box<[Arc<Storage>]>> {
         let inputs = self.weak_inputs.iter().map(Weak::upgrade).collect::<Option<Box<[_]>>>()?;
         if inputs.iter().zip(&self.input_generations).any(|(input, &generation)| input.readers.generation() != generation) {
+            return None;
+        }
+        // Written since (a write announced to the segment), or open to writes nobody announces (a held may-write pin).
+        if inputs.iter().zip(&self.input_epochs).any(|(input, &epoch)| input.only_segment().epoch() != epoch || input.only_segment().write_held()) {
             return None;
         }
         if !inputs.iter().all(|input| input.only_segment().on_device()) {
@@ -182,7 +191,7 @@ impl Snapshot {
         let weight: f64 = self.key.instrs.iter().chain(self.key.subs.iter().flatten()).map(|instr| op_weight(&instr.op, &cost)).sum();
         let traffic = bytes as f64 + inputs.iter().map(|input| input.byte_len() as f64).sum::<f64>();
         let recompute_ns = kernel_ns(&cost, traffic, weight * self.len as f64);
-        let transfer_ns = if clean { 1.0 } else { 2.0 } * bytes as f64 / TRANSFER_BYTES_PER_NS;
+        let transfer_ns = 2.0 * bytes as f64 / TRANSFER_BYTES_PER_NS;
         (recompute_ns < transfer_ns).then_some(inputs)
     }
 }
