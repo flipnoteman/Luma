@@ -9,9 +9,6 @@ All notable changes to Luma are listed here. The format follows
 ### Breaking
 - `Profile.splits` and `FusionSplit` are replaced by `Profile.decisions` (`Vec<Decision>`: every choice the planner makes, `DecisionSite`, a stable `chosen` label, the rejected `candidates`) and `Profile::cuts()` (an iterator over the `Cut` decisions: operation, location, `SplitReason`). `Profile` is `#[non_exhaustive]`; `SplitReason` derives `Hash`.
 - HAL: `Backend::finish_profiling` loses its `splits` parameter in all four backends (CPU, CUDA, wgpu, Metal); a backend returns its `Profile` with `decisions` empty and the context fills them.
-
-
-
 - `Backend` gains `create_buffer_unordered`, `stage_alloc`, `stage_ptr`, `transfer_in`, `transfer_out`, `barrier`, `ticket_done` and `ticket_wait`, all with defaults: existing implementers compile unchanged (new `Stage`, `StageDir`, `NativeStage` and `Ticket` types in `luma-core`).
 - `CostModel` is `#[non_exhaustive]` and gains `memory` (build one with `CostModel::new`; `CostModel::with` adjusts fields). `DeviceInfo` gains `l2_cache_bytes`.
 - `RawArg::Storage` has an `offset` (a byte range of a buffer is bound; `bytes` counts from it). `RawArg::storage(buffer, bytes, writable)` is the offset-0 constructor and `RawArg::storage_at` takes an offset. `DeviceLimits` has `storage_offset_align`.
