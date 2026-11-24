@@ -374,6 +374,9 @@ pub enum IrUnOp {
     F32ToF16Bits,
     /// The `f32` value of the `f16` held by the low 16 bits of a `u32` (`unpack2x16float`).
     F16BitsToF32,
+    /// An `f32` rounded to the nearest `f16` and widened again (`luma_half_round_f16`): ties to
+    /// even, overflow to infinity, subnormals kept, a NaN stays a NaN.
+    RoundF16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -410,6 +410,10 @@ struct FnCtx<'m> {
 /// The operation a stub function named `luma_ir_<op>` of a WGSL module stands for: calls of it
 /// lower to the operation, whatever the stub's body says.
 fn intrinsic_of(name: Option<&str>) -> Option<IrUnOp> {
+    if name? == "luma_half_round_f16" {
+        // The helper of the half-float library has a body (for the sources that are not lowered); the operation is the same.
+        return Some(IrUnOp::RoundF16);
+    }
     Some(match name?.strip_prefix("luma_ir_")? {
         "erf" => IrUnOp::Erf,
         "erfc" => IrUnOp::Erfc,

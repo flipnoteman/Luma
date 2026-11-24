@@ -562,6 +562,14 @@ impl Em<'_> {
                 }
             }
             IrUnOp::F32ToF16Bits => format!("(pack2x16float(vec2<f32>({a}, 0.0)) & 0xffffu)"),
+            IrUnOp::RoundF16 => {
+                let name = self.helper("luma_round_f16".to_owned(), |name| {
+                    format!(
+                        "fn {name}(x: f32) -> f32 {{\n    let b = bitcast<u32>(x);\n    let a = b & 0x7fffffffu;\n    let k = max(bitcast<f32>((a & 0x7f800000u) + 0x06800000u), 0.5);\n    let n = bitcast<u32>(bitcast<f32>(a) + k) - bitcast<u32>(k);\n    let r = bitcast<u32>(f32(n) * (k * 1.1920929e-7)) | (b & 0x80000000u);\n    return bitcast<f32>(select(select(r, 0x7f800000u | (b & 0x80000000u), a >= 0x477ff000u), 0x7fc00000u, a > 0x7f800000u));\n}}\n"
+                    )
+                });
+                format!("{name}({a})")
+            }
             IrUnOp::F16BitsToF32 => format!("unpack2x16float({a}).x"),
             IrUnOp::Not => format!("(!{a})"),
             IrUnOp::BitNot => format!("(~{a})"),

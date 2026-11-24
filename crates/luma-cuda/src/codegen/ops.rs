@@ -105,6 +105,10 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
             let h = to_half(fb, a);
             return (U32, fb.def(&format!("zext i16 {h} to i32")));
         }
+        (RoundF16, F32) => {
+            let h = to_half(fb, a);
+            return (F32, from_half(fb, &h));
+        }
         (F16BitsToF32, U32) => {
             let h = fb.def(&format!("trunc i32 {a} to i16"));
             return (F32, from_half(fb, &h));

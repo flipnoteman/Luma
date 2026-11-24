@@ -3539,6 +3539,10 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let h = self.f32_to_f16bits(a.a);
                 return Leaf { s: ScalarTy::U32, a: h, b: None, k: a.k };
             }
+            RoundF16 => {
+                let r = self.round_f16(a.a);
+                return Leaf { s: ScalarTy::F32, a: r, b: None, k: a.k };
+            }
             F16BitsToF32 => {
                 let f = self.f16bits_to_f32(a.a);
                 return Leaf { s: ScalarTy::F32, a: f, b: None, k: a.k };

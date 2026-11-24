@@ -744,6 +744,7 @@ impl<'a> Em<'a> {
                 }
             }
             IrUnOp::F32ToF16Bits => format!("uint(as_type<ushort>(half({a})))"),
+            IrUnOp::RoundF16 => format!("float(half({a}))"),
             IrUnOp::F16BitsToF32 => format!("float(as_type<half>(ushort({a})))"),
             IrUnOp::Not => format!("(!{a})"),
             IrUnOp::BitNot => format!("(~{a})"),
