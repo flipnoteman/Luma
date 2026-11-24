@@ -753,7 +753,7 @@ fn top_k_keeps_the_best_with_global_indices() {
 fn batches_split_over_several_buffers() {
     use luma::{Context, ContextOptions};
     // 1024 f32 to a buffer: 10_001 elements are ten full segments and a partial one.
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(4096)).expect("a device");
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096)).expect("a device");
     let n = 10_001;
     let data = f32s(&normal(n, 50));
     let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
@@ -1005,7 +1005,7 @@ fn one_accumulator_shared_by_threads() {
 fn a_pushed_expression_is_computed_inside_the_reduction() {
     // A context of its own: the other tests of the process launch on the default one while this
     // one profiles, and their kernels would be counted.
-    let ctx = luma::Context::with_options(luma::ContextOptions::default()).expect("a device");
+    let ctx = luma::Context::with_options(luma::ContextOptions::from_env()).expect("a device");
     if !ctx.profiling_supported() {
         return;
     }
@@ -1117,7 +1117,7 @@ fn top_k_per_position_along_an_axis() {
 fn states_merge_across_contexts() {
     use luma::{Context, ContextOptions};
     // Two contexts stand for two devices: the other's state travels through the host.
-    let other = Context::with_options(ContextOptions::default()).expect("a device");
+    let other = Context::with_options(ContextOptions::from_env()).expect("a device");
     let data = f32s(&normal(3000, 90));
     let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
     let (first, second) = data.split_at(1800);

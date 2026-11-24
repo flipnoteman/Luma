@@ -268,7 +268,7 @@ fn f64_arrays_compute_in_double_precision() {
 #[test]
 fn arrays_split_over_buffers_keep_one_element_size_per_program() {
     use luma::ContextOptions;
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
     let data = values(1000, 4, 0.0, 1.0);
     let x = Array::from_slice_on(&ctx, &data, 1000).unwrap();
 

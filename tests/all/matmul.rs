@@ -353,7 +353,7 @@ fn a_gram_matrix_of_a_lazy_expression_reads_it_through_a_transposed_view() {
 #[test]
 fn operands_or_a_result_split_over_several_buffers_poison_the_result() {
     // Buffers of 4096 bytes: 1024 `f32`.
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(4096).tf32_matmul(false)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).tf32_matmul(false)).unwrap();
     let array = |e: usize, f: usize| Array::<f32>::zeros_on(&ctx, [e, f]).unwrap();
     let chunked = |c: &Array<f32>| match c.error().map(LumaError::root) {
         Some(LumaError::Chunked(_)) => Some(true),

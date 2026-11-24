@@ -24,7 +24,7 @@ const SIZES: [usize; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 31, 33, 1000, 4097];
 
 /// A context whose buffers hold 1024 bytes: arrays of 256 or more elements span several buffers.
 fn chunked() -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(1024)).expect("a device is available")
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).expect("a device is available")
 }
 
 /// The values every type is tested on first: both ends of the range, around zero and the sign bit.

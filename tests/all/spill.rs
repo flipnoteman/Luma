@@ -4,7 +4,7 @@ use luma::{Array, Context, ContextOptions};
 
 /// A context with 64 KiB segments and a 1 MiB budget, so small arrays already spill.
 fn small_budget() -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(1 << 16).memory_budget(1 << 20))
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(1 << 20))
     .unwrap()
 }
 
@@ -137,7 +137,7 @@ fn readbacks_in_a_loop_under_a_budget_do_not_deadlock() {
 
 /// `ctx` with 64 KiB segments, a 1 MiB device budget and `host` bytes of host budget.
 fn with_host_budget(host: u64) -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(1 << 16).memory_budget(1 << 20).host_budget(Some(host))).unwrap()
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(1 << 20).host_budget(Some(host))).unwrap()
 }
 
 /// Reads every array through a kernel (which only reads it), so a spilled one comes back.

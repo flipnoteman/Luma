@@ -121,7 +121,7 @@ fn a_step_with_a_shift_runs_step_by_step() {
 
 #[test]
 fn chunked_arrays_compute_correctly() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1 << 12)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 12)).unwrap();
     let n = 10_000;
     let (cx, cy) = (values(n, 7, -2.0, 0.5), values(n, 8, -1.2, 1.2));
     let (gcx, gcy) = (f32s_on(&ctx, &cx), f32s_on(&ctx, &cy));

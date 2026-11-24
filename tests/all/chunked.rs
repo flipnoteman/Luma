@@ -8,7 +8,7 @@ const N: usize = 10_001;
 
 /// A context whose buffers hold 4096 bytes: 1024 `f32` per segment.
 fn chunked() -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(4096))
+    Context::with_options(ContextOptions::from_env().chunk_bytes(4096))
         .expect("a device is available")
 }
 
@@ -77,7 +77,7 @@ fn vector_array_round_trip() {
 #[test]
 fn chunk_bytes_must_be_a_power_of_two_of_at_least_1024() {
     for bytes in [1000, 512] {
-        let options = ContextOptions::default().chunk_bytes(bytes);
+        let options = ContextOptions::from_env().chunk_bytes(bytes);
         assert!(
             matches!(Context::with_options(options), Err(LumaError::InvalidShape(_))),
             "chunk_bytes {bytes} must be rejected"
@@ -314,7 +314,7 @@ fn iterate_on_chunked_arrays_matches_the_unchunked_result() {
 
 /// A context whose buffers hold 16384 `f32` each.
 fn chunked_64k() -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(65536)).unwrap()
+    Context::with_options(ContextOptions::from_env().chunk_bytes(65536)).unwrap()
 }
 
 fn input_data(len: usize) -> Vec<f32> {
