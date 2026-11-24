@@ -255,10 +255,15 @@ impl Rig {
     /// Best wall-clock nanoseconds per launch with uniform `{k, g}`: one warm-up measurement,
     /// then the best of [`BEST_OF`], each `reps` launches and one `sync`.
     fn time(&self, ctx: &Context, k: u32, g: u32, reps: u32) -> Result<f64> {
+        self.time_best_of(ctx, k, g, reps, BEST_OF)
+    }
+
+    /// [`Rig::time`] with the best of `best_of` measurements.
+    fn time_best_of(&self, ctx: &Context, k: u32, g: u32, reps: u32, best_of: usize) -> Result<f64> {
         let words = [k, g];
         let raw = [RawArg::read(&self.input, self.bytes), RawArg::write(&self.output, self.bytes), RawArg::Uniform(bytemuck::cast_slice(&words))];
         let mut best = f64::INFINITY;
-        for round in 0..=BEST_OF {
+        for round in 0..=best_of {
             let start = Instant::now();
             for _ in 0..reps {
                 launch_1d(ctx, &self.core, self.threads, &raw)?;
@@ -311,25 +316,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 ";
 
-/// A copy over a working set of `p.g` words: invocation `i` reads the words `(i + q * n) % p.g`
-/// for `q` in `0..8` (`n` is the number of invocations; the launch is an eighth of the traffic),
-/// one modulo per invocation instead of one per word (the modulo costs as much as the load), and
-/// writes the sum to `out0[i]` (a distinct word each: invocations writing the same word would
-/// make the CPU backend's threads fight over its line).
+/// A copy over a working set of `p.g` words: every invocation sweeps the set `p.k` times with a
+/// stride of the number of invocations, so the invocations together read the whole set once per
+/// pass and a word is read again only after the rest of the set (the reuse distance is the set
+/// size, which is what makes the bandwidth drop where the set leaves L2). Each invocation writes
+/// its sum to its own word of `out0` (invocations writing one word would make the CPU backend's
+/// threads fight over its line).
 const WORKING_SET: &str = "
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let i = gid.x + gid.y * nwg.x * 64u;
-    if (i >= luma.size.x) { return; }
-    var j = i % p.g;
-    let step = luma.size.x % p.g;
+    let t = gid.x + gid.y * nwg.x * 64u;
+    if (t >= luma.size.x) { return; }
+    let stride = luma.size.x;
     var sum = 0.0;
-    for (var q = 0u; q < 8u; q++) {
-        sum += in0[j];
-        j += step;
-        if (j >= p.g) { j -= p.g; }
+    for (var pass = 0u; pass < p.k; pass++) {
+        for (var j = t; j < p.g; j += stride) { sum += in0[j]; }
     }
-    out0[i] = sum;
+    out0[t] = sum;
 }
 ";
 
@@ -368,6 +371,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// A working set inside L2 moves at least this much faster than DRAM.
 const L2_FASTER: f64 = 1.5;
+/// Invocations of the L2 sweep, and the launches and measurements per working set.
+const SWEEP_THREADS: u32 = 1 << 17;
+const SWEEP_REPS: u32 = 16;
 /// Dependent loads of the latency chain.
 const CHAIN_STEPS: u32 = 4096;
 /// Reads per invocation of the workgroup-memory kernel (times 4).
@@ -393,24 +399,25 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
     let cpu = ctx.is_cpu();
     let cap = u32::try_from(ctx.max_buffer_bytes() / 4).unwrap_or(u32::MAX);
 
-    // The L2 sweep: a copy whose traffic (`n` words) wraps over a working set of `ws` words.
-    let n: u32 = if cpu { 1 << 22 } else { 1 << 24 }.min(cap);
+    // The L2 sweep: `SWEEP_THREADS` invocations read a working set of `ws` words over and over,
+    // `traffic` words in all (at least one pass).
+    let traffic: u32 = if cpu { 1 << 22 } else { 1 << 24 }.min(cap);
     let attribute = ctx.info().l2_cache_bytes;
     let sizes: Vec<u64> = match attribute {
         Some(l2) => [l2 / 4, l2 / 2, l2, l2 * 2, l2 * 4].to_vec(),
         None => (20..=26).map(|shift| 1u64 << shift).collect(),
     };
-    let threads = n / 8;
-    let rig = Rig::new(ctx, with_header(WORKING_SET), "CostL2", threads, n)?;
+    let rig = Rig::new(ctx, with_header(WORKING_SET), "CostL2", SWEEP_THREADS, traffic)?;
     let mut curve = Vec::new();
     let mut failed = None;
     for bytes in sizes {
         let words = bytes / 4;
-        if words == 0 || words > u64::from(n) {
+        if words < u64::from(SWEEP_THREADS) || words > u64::from(traffic) {
             continue;
         }
-        match rig.time(ctx, 0, words as u32, REPS) {
-            Ok(t) => curve.push((bytes, 4.0 * (f64::from(n) + f64::from(threads)) / t)),
+        let passes = (u64::from(traffic) / words).max(1) as u32;
+        match rig.time_best_of(ctx, passes, words as u32, SWEEP_REPS, 3) {
+            Ok(t) => curve.push((bytes, 4.0 * words as f64 * f64::from(passes) / t)),
             Err(err) => {
                 failed = Some(err);
                 break;
@@ -421,28 +428,34 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
     if let Some(err) = failed {
         return Err(err);
     }
-    let inside: Vec<&(u64, f64)> = curve.iter().filter(|(_, gbs)| *gbs >= L2_FASTER * dram_gbs).collect();
+    let inside: Vec<usize> = (0..curve.len()).filter(|&i| curve[i].1 >= L2_FASTER * dram_gbs).collect();
     let l2_gbs = match inside.last() {
-        Some((_, gbs)) => *gbs,
+        Some(&i) => curve[i].1,
         None => curve.iter().map(|(_, gbs)| *gbs).fold(0.0, f64::max),
     };
-    let l2_bytes = attribute.or_else(|| inside.last().map(|(bytes, _)| *bytes));
+    // Without a device attribute the size is the knee, taken only where it is sharp: the next
+    // size up (a doubling) is at least `L2_FASTER` times slower.
+    let l2_bytes = attribute.or_else(|| {
+        let &i = inside.last()?;
+        let next = curve.get(i + 1)?;
+        (next.0 == 2 * curve[i].0 && next.1 * L2_FASTER <= curve[i].1).then_some(curve[i].0)
+    });
 
     // Access patterns over one array of a power-of-four number of words.
-    let n_pat = 1u32 << (n.ilog2() & !1);
+    let n_pat = 1u32 << (traffic.ilog2() & !1);
     let side = 1u32 << (n_pat.ilog2() / 2);
     let rig = Rig::new(ctx, with_header(PATTERN), "CostPattern", n_pat, n_pat)?;
     let patterns = (|| -> Result<[f64; 5]> {
-        let before = rig.time(ctx, side, 1, REPS)?;
+        let before = rig.time_best_of(ctx, side, 1, 2, 3)?;
         let mut times = [0.0; 5];
         for (slot, stride) in times.iter_mut().zip(STRIDES) {
-            *slot = rig.time(ctx, side, stride, REPS)?;
+            *slot = rig.time_best_of(ctx, side, stride, 2, 3)?;
         }
-        times[3] = rig.time(ctx, side, 0, REPS)?;
-        times[4] = rig.time(ctx, side, u32::MAX, REPS)?;
+        times[3] = rig.time_best_of(ctx, side, 0, 2, 3)?;
+        times[4] = rig.time_best_of(ctx, side, u32::MAX, 2, 3)?;
         // Coalesced again at the end: a device (or the CPU backend) that is still warming up at
         // the start measures the first kernel slow.
-        let coalesced = before.min(rig.time(ctx, side, 1, REPS)?);
+        let coalesced = before.min(rig.time_best_of(ctx, side, 1, 2, 3)?);
         Ok(times.map(|t| t / coalesced))
     })();
     rig.release(ctx);
@@ -463,7 +476,7 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
 
     // Latency: one workgroup, one dependent chain per invocation.
     let rig = Rig::new(ctx, with_header(CHAIN), "CostChain", 64, 1024)?;
-    let t = rig.time(ctx, CHAIN_STEPS, 0, LAUNCHES);
+    let t = rig.time_best_of(ctx, CHAIN_STEPS, 0, 8, 3);
     rig.release(ctx);
     let latency_ns = (t? - launch_ns).max(launch_ns * 0.1) / f64::from(CHAIN_STEPS);
 
