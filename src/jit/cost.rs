@@ -634,8 +634,10 @@ mod tests {
         let memory = memory.expect("the CPU backend measures the memory model");
         assert_eq!(memory.shared_gbs, None);
         let factors = [memory.strided_factor[0], memory.strided_factor[1], memory.strided_factor[2], memory.gather_factor, memory.transpose_factor];
+        // Ratios of two timings: a loaded machine (parallel test jobs, builds) can push one below 1, so
+        // the test only checks that they are sane, not that strided access is measurably slower.
         for factor in factors {
-            assert!(factor.is_finite() && factor >= 0.9, "{memory}");
+            assert!(factor.is_finite() && factor >= 0.5, "{memory}");
         }
         assert!(memory.l2_gbs.is_finite() && memory.l2_gbs > 0.0 && memory.latency_ns.is_finite() && memory.latency_ns > 0.0, "{memory}");
     }
