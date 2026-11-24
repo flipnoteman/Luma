@@ -79,7 +79,7 @@ pub(crate) struct Segment {
     has_dependents: AtomicBool,
     /// Number of live [`Pin`]s; a pinned segment must keep its buffer.
     pins: AtomicU32,
-    /// How many of them were taken by a may-write pin. A pin that is held (a stepper's, a
+    /// How many of them were taken by a may-write pin while a lineage read this segment. A pin that is held (a stepper's, a
     /// recording's, a captured graph's) can launch writes long after it was taken, which no
     /// later pin call announces: no lineage is used to evict over an input while one is held.
     write_pins: AtomicU32,
@@ -510,11 +510,18 @@ impl Segment {
     /// buffer gets it through one of them): counts the write, and settles the dependents (see
     /// [`Segment::release_dependents`]) while the data still is the old.
     fn note_write(self: &Arc<Self>) -> Result<()> {
-        self.epoch.fetch_add(1, Ordering::Release);
+        // Nothing reads this segment through a lineage: nothing to count or settle.
         if self.has_dependents.load(Ordering::Acquire) {
+            self.epoch.fetch_add(1, Ordering::Release);
             self.release_dependents()?;
         }
         Ok(())
+    }
+
+    /// Whether any pin is held: it may be written through without another announcement, so no
+    /// lineage is recorded over this segment then.
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pins.load(Ordering::Acquire) != 0
     }
 
     /// The count of write announcements so far.
@@ -659,11 +666,13 @@ impl Segment {
                     self.invalidate_host_copy();
                 }
                 self.pins.fetch_add(1, Ordering::Acquire);
-                if write {
+                // Counted only while lineage reads this segment (one load otherwise); a pin held from before that is refused at record time (see `Segment::is_pinned`).
+                let counted = write && self.has_dependents.load(Ordering::Acquire);
+                if counted {
                     self.write_pins.fetch_add(1, Ordering::Acquire);
                 }
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-                return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write });
+                return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write: counted });
             }
             let evicted_by_lineage = matches!(&*lock(&self.state), State::Lineage);
             if evicted_by_lineage || matches!(&*lock(&self.state), State::Host(_)) {

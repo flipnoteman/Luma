@@ -94,14 +94,35 @@ pub(crate) struct PinnedInputs(Vec<InPin>);
 /// on a context that evicts under a budget (without one a segment only moves when the device is
 /// full, and the cost of keeping lineage for every kernel is not paid).
 pub(super) fn wanted(ctx: &Context, key: &FusedKey, output: &Storage, inputs: &[Arc<Storage>]) -> bool {
-    ctx.pager().evicts_under_budget()
-        && matches!(key.tail, Tail::Store)
-        && key.outputs.len() == 1
-        && key.in_place.is_empty()
-        && output.segments() == 1
-        && (output.byte_len() >= MIN_BYTES || ctx.pager().lineage_forced())
-        && inputs.iter().all(|input| input.segments() == 1 && !input.is_window())
-        && !ctx.recording_here()
+    refusal(ctx, key, output, inputs).is_none()
+}
+
+/// Why no lineage is kept for the store `key` into `output` from `inputs` (`None`: it is).
+pub(super) fn refusal(ctx: &Context, key: &FusedKey, output: &Storage, inputs: &[Arc<Storage>]) -> Option<&'static str> {
+    if !ctx.pager().evicts_under_budget() {
+        Some("no budget")
+    } else if !matches!(key.tail, Tail::Store) {
+        Some("not a plain store")
+    } else if key.outputs.len() != 1 {
+        Some("several outputs")
+    } else if !key.in_place.is_empty() {
+        Some("in place")
+    } else if output.segments() != 1 {
+        Some("output in several segments")
+    } else if output.byte_len() < MIN_BYTES && !ctx.pager().lineage_forced() {
+        Some("under the size floor")
+    } else if inputs.iter().any(|input| input.segments() != 1) {
+        Some("input in several segments")
+    } else if inputs.iter().any(|input| input.is_window()) {
+        Some("window input")
+    } else if ctx.recording_here() {
+        Some("recording")
+    } else if inputs.iter().any(|input| input.only_segment().is_pinned()) {
+        // A held pin (a stepper's, a graph's) can write without announcing it.
+        Some("input pinned")
+    } else {
+        None
+    }
 }
 
 impl Lineage {
