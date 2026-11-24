@@ -632,3 +632,20 @@ fn without_tf32_the_default_matmul_is_exact_and_matmul_tf32_falls_back() {
     assert_eq!(run(&forced, None), exact);
     assert_eq!(run(&forced, Some(true)), exact);
 }
+
+/// The 0.5.2 options still work: the deprecated fields are applied over `numerics` when the
+/// context opens, and `Context::tf32_matmul` still reports.
+#[test]
+#[allow(deprecated)]
+fn the_deprecated_numerics_options_apply_over_numerics() {
+    use crate::numerics::Reduced;
+    let fast = ContextOptions::default().fast_math(true);
+    assert_eq!(fast.effective_numerics(), Numerics::default().with_reduced(Reduced::FAST_MATH, true));
+    let exact = ContextOptions::default().tf32_matmul(false);
+    assert_eq!(exact.effective_numerics(), Numerics::strict());
+    assert_eq!(ContextOptions::default().numerics(Numerics::fast()).effective_numerics(), Numerics::fast());
+    let ctx = Context::with_options(exact.backend(BackendKind::Cpu).calibrate(false)).unwrap();
+    assert!(!ctx.tf32_matmul() && !ctx.numerics().tf32_matmul());
+    let ctx = Context::with_options(fast.backend(BackendKind::Cpu).calibrate(false)).unwrap();
+    assert!(ctx.tf32_matmul() && ctx.numerics().fast_math());
+}
