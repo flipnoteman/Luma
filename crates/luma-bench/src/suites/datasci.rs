@@ -1842,6 +1842,11 @@ fn small_cases(h: &mut Harness) {
 /// Twelve columns of which a quarter fit the device budget, each read by a reduction per sweep:
 /// every sweep pages the columns through the budget.
 fn spill_cases(h: &mut Harness) {
+    column_sweep(h);
+    recompute_sweep(h);
+}
+
+fn column_sweep(h: &mut Harness) {
     if !h.want("spill/column_sweep") {
         return;
     }
@@ -1860,4 +1865,52 @@ fn spill_cases(h: &mut Harness) {
         assert_eq!(sweep().to_bits(), want.to_bits());
     });
     println!("  spill/column_sweep: {} MiB spilled", ctx.spilled_bytes() >> 20);
+}
+
+/// Twelve cheap intermediates of two inputs that stay hot, `a * s + b`, held by the program: the
+/// arrays together are one and a half times the device budget, so every sweep that reads them all
+/// pages the intermediates. Each is a function of resident inputs: evicting one is free of
+/// transfers when the pager recomputes it at the next read instead of reading it back.
+fn recompute_sweep(h: &mut Harness) {
+    if !h.want("spill/recompute_sweep") {
+        return;
+    }
+    let n: usize = if h.quick { 1 << 20 } else { 1 << 22 };
+    let steps = 12;
+    let total = n * 4 * (steps + 2);
+    let ctx = Context::with_options(ContextOptions::from_env().memory_budget((total * 2 / 3) as u64)).expect("no device");
+    let a = Array::from_slice_on(&ctx, &values(n, 400, -1.0, 1.0), n).unwrap();
+    let b = Array::from_slice_on(&ctx, &values(n, 401, -1.0, 1.0), n).unwrap();
+    let held: Vec<Array<f32>> = (0..steps)
+        .map(|k| {
+            let t = &a * (k as f32 + 1.0) + &b;
+            t.eval().unwrap();
+            t
+        })
+        .collect();
+    ctx.flush().unwrap();
+    // The inputs are read at every step, so they stay resident (the least recently used segments
+    // are the intermediates) while the intermediates page.
+    let sweep = || {
+        let sums: Vec<f32> = held
+            .iter()
+            .map(|t| {
+                std::hint::black_box((&a + &b).sum().item().unwrap());
+                t.sum().item().unwrap()
+            })
+            .collect();
+        sums.iter().sum::<f32>()
+    };
+    let want = sweep();
+    let size = format!("{steps}x{}", label(n));
+    let before = ctx.paging_stats();
+    h.transfer_case("spill/recompute_sweep", &size, Work::Bytes((n * 4 * steps) as f64), &mut || {
+        assert_eq!(sweep().to_bits(), want.to_bits());
+    });
+    let after = ctx.paging_stats();
+    println!(
+        "  spill/recompute_sweep: {} MiB spilled, {} readback evictions",
+        ctx.spilled_bytes() >> 20,
+        after.readback_evictions - before.readback_evictions
+    );
 }
