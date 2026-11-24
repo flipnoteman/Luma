@@ -134,3 +134,81 @@ fn readbacks_in_a_loop_under_a_budget_do_not_deadlock() {
     let total = finished.recv_timeout(std::time::Duration::from_secs(240)).expect("deadlock in a readback under a memory budget");
     assert!(total > 0.0);
 }
+
+/// `ctx` with 64 KiB segments, a 1 MiB device budget and `host` bytes of host budget.
+fn with_host_budget(host: u64) -> Context {
+    Context::with_options(ContextOptions::default().chunk_bytes(1 << 16).memory_budget(1 << 20).host_budget(Some(host))).unwrap()
+}
+
+/// Reads every array through a kernel (which only reads it), so a spilled one comes back.
+fn sweep(arrays: &[Array<f32>]) -> Vec<Vec<f32>> {
+    arrays.iter().map(|array| (array * 2.0).to_vec().unwrap()).collect()
+}
+
+fn twenty(ctx: &Context) -> Vec<Array<f32>> {
+    (0..20).map(|k| Array::from_slice_on(ctx, &values(16_384, k), 16_384).unwrap()).collect()
+}
+
+#[test]
+fn evicting_unchanged_data_reads_nothing_back() {
+    let ctx = with_host_budget(1 << 30);
+    let arrays = twenty(&ctx);
+    assert!(ctx.spilled_bytes() > 0);
+    let first = sweep(&arrays);
+    let before = ctx.memory_stats();
+    let second = sweep(&arrays);
+    let after = ctx.memory_stats();
+    assert_eq!(first, second);
+    assert!(after.clean_evictions > before.clean_evictions, "{before:?} {after:?}");
+    assert_eq!(after.readback_evictions, before.readback_evictions, "unchanged data was read back");
+    assert!(after.host_copy_bytes > 0);
+    for (k, got) in second.iter().enumerate() {
+        let expected: Vec<f32> = values(16_384, k).iter().map(|v| v * 2.0).collect();
+        assert_eq!(got, &expected, "array {k}");
+    }
+}
+
+#[test]
+fn a_write_invalidates_the_host_copy() {
+    let ctx = with_host_budget(1 << 30);
+    let mut arrays = twenty(&ctx);
+    sweep(&arrays);
+    sweep(&arrays);
+    // Every array holds a copy by now; change one on the device.
+    arrays[7] += 1.0;
+    // Materialise the sum, so the kernel writes a buffer instead of fusing into the sweep.
+    arrays[7].to_vec().unwrap();
+    let before = ctx.memory_stats();
+    sweep(&arrays);
+    sweep(&arrays);
+    let again = sweep(&arrays);
+    let after = ctx.memory_stats();
+    assert_eq!(after.readback_evictions - before.readback_evictions, 1, "{before:?} {after:?}");
+    for (k, got) in again.iter().enumerate() {
+        let expected: Vec<f32> = values(16_384, k).iter().map(|v| (v + if k == 7 { 1.0 } else { 0.0 }) * 2.0).collect();
+        assert_eq!(got, &expected, "array {k}");
+    }
+}
+
+#[test]
+fn the_host_budget_drops_copies_first() {
+    // Room for the spilled arrays only: no copy is kept, every eviction reads back.
+    let ctx = with_host_budget(1 << 16);
+    let arrays = twenty(&ctx);
+    let first = sweep(&arrays);
+    let second = sweep(&arrays);
+    let stats = ctx.memory_stats();
+    assert_eq!(first, second);
+    assert_eq!(stats.host_copy_bytes, 0, "{stats:?}");
+    assert_eq!(stats.clean_evictions, 0, "{stats:?}");
+
+    // Room for a few copies: they never exceed what is left of the budget.
+    let ctx = with_host_budget(6 << 16);
+    let arrays = twenty(&ctx);
+    let first = sweep(&arrays);
+    let second = sweep(&arrays);
+    let stats = ctx.memory_stats();
+    assert_eq!(first, second);
+    assert!(stats.host_copy_bytes <= 6 << 16, "{stats:?}");
+    assert!(stats.host_copy_bytes > 0 || stats.spilled_bytes > 0);
+}

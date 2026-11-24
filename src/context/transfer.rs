@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytemuck::Pod;
-use luma_core::hal::advise_huge_pages;
+use luma_core::hal::{advise_huge_pages, HostBytes};
 use luma_core::{BackendError, Buffer};
 
 use crate::array::Storage;
@@ -218,9 +218,10 @@ impl Context {
     /// Reads the first `bytes` bytes of `buffer` like [`Context::read`], but through one staging
     /// buffer of a bounded size and without noting the waits in [`WaitHistory`].
     /// For readbacks made while the device is full.
-    pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<HostBytes> {
         self.abort_recording()?;
-        self.read_vec(bytes, |dst| {
+        let len = usize::try_from(bytes).map_err(|_| LumaError::InvalidShape(format!("{bytes} bytes do not fit in host memory")))?;
+        HostBytes::filled_by::<LumaError>(len, |dst| {
             self.notify_released();
             self.hal().read_into(buffer, dst, true, self.inner.waits.budget())?;
             Ok(())

@@ -178,7 +178,7 @@ fn launch_loop(
     let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ElemLayout::plain(4))).collect();
     let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
-    let in_pins = fixed.iter().map(|input| input.pin(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let in_pins = fixed.iter().map(|input| input.pin_read(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
     let mut words = Vec::with_capacity(scalars.len() + 1);
     words.push(steps);
     words.extend_from_slice(scalars);
@@ -821,10 +821,10 @@ impl InPin {
         if let Some((pack, at)) = input.window() {
             let offset = pack.layout().bytes(at);
             if offset % input.ctx().info().limits.storage_offset_align.max(1) == 0 {
-                return Ok(InPin { pin: pack.pin(0)?, offset, bytes: input.byte_len() });
+                return Ok(InPin { pin: pack.pin_read(0)?, offset, bytes: input.byte_len() });
             }
         }
-        Ok(InPin::new(input.pin(0)?, input.byte_len()))
+        Ok(InPin::new(input.pin_read(0)?, input.byte_len()))
     }
 
     pub(super) fn raw(&self) -> RawArg<'_> {
@@ -857,18 +857,18 @@ pub(super) fn pin_inputs(
             // An input of the length of the output is bound by segment; a single buffer of
             // another length (the source of a view) is bound whole.
             pins.push(if input.segments() > 1 {
-                InPin::new(input.pin(j)?, input.segment_byte_len(j))
+                InPin::new(input.pin_read(j)?, input.segment_byte_len(j))
             } else {
                 InPin::of(input)?
             });
             continue;
         };
         if direct(&key.instrs, k as u32) {
-            pins.push(InPin::new(input.pin(j)?, bytes(input)));
+            pins.push(InPin::new(input.pin_read(j)?, bytes(input)));
         }
         for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
             let id = id as usize;
-            pins.push(InPin::new(input.pin(id)?, input.segment_byte_len(id)));
+            pins.push(InPin::new(input.pin_read(id)?, input.segment_byte_len(id)));
         }
     }
     Ok(pins)
@@ -1667,7 +1667,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
     for j in 0..storage.segments() {
         let bytes = storage.segment_byte_len(j);
         let words = len_u32((bytes / 4) as usize)?;
-        let pin = storage.pin(j)?;
+        let pin = storage.pin_read(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;
         launch_1d(ctx, &core, words, &[RawArg::write(&flags, u64::from(words) * 4), RawArg::read(pin.buffer(), bytes)])?;
         let result = crate::reduce::finish_passes(ctx, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;

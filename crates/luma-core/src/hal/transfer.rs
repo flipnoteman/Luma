@@ -5,6 +5,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use super::hostbytes::HostBytes;
+
 /// Which way the bytes of a [`Stage`] travel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageDir {
@@ -24,15 +26,15 @@ pub trait NativeStage: Any + fmt::Debug + Send + Sync + 'static {
 
 /// The default representation: plain heap memory.
 #[derive(Debug)]
-struct HeapStage(Vec<u8>);
+struct HeapStage(HostBytes);
 
 impl NativeStage for HeapStage {
     fn bytes(&self) -> &[u8] {
-        &self.0
+        self.0.as_slice()
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0
+        self.0.as_mut_slice()
     }
 }
 
@@ -50,7 +52,7 @@ pub struct Stage {
 impl Stage {
     /// A stage on plain heap memory, the default of `Backend::stage_alloc`.
     pub fn heap(bytes: u64, dir: StageDir) -> Stage {
-        Stage { dir, native: Box::new(HeapStage(vec![0; bytes as usize])) }
+        Stage { dir, native: Box::new(HeapStage(HostBytes::zeroed(bytes as usize))) }
     }
 
     /// A stage on a backend's own memory.

@@ -1046,7 +1046,7 @@ fn reduce_into<T: GpuType>(
             for j in 0..storage.segments() {
                 let n = len_u32(storage.range(j).len())?;
                 // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
-                let pin = storage.pin(j)?;
+                let pin = storage.pin_read(j)?;
                 let rest = if single { finish } else { Finish::default() };
                 if bits {
                     let (words, groups) = bits_first_pass(ctx, scratch, ops, pin.buffer(), n, target)?;

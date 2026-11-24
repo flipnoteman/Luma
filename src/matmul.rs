@@ -727,7 +727,7 @@ fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([
                 continue;
             }
         };
-        sides.push((MatmulSide::Ready(storage.pin_single()?, storage.byte_len()), transposed));
+        sides.push((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), transposed));
     }
     let [(lhs_side, lhs_t), (rhs_side, rhs_t)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
     Ok(([lhs_side, rhs_side], [lhs_t, rhs_t]))

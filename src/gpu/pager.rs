@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use luma_core::hal::{copy_parallel, copy_parallel_host};
+use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
 use luma_core::Buffer;
 
 use crate::array::Storage;
@@ -33,7 +33,7 @@ enum State {
     /// In a device buffer (possibly larger than the data it holds).
     Device(Buffer),
     /// Moved to host memory to make room; copied back at the next pin.
-    Host(Vec<u8>),
+    Host(HostBytes),
     /// A range of the buffer of another storage (see [`Segment::windowed`]); gets a buffer of its
     /// own, a copy of the range, at the first pin.
     Window(Window),
@@ -56,6 +56,12 @@ pub(crate) struct Segment {
     /// Bytes of array data it holds (the buffer may be larger).
     bytes: u64,
     state: Mutex<State>,
+    /// A valid copy of the device bytes, held while the segment is on the device: if it is
+    /// `Some`, nothing wrote the device buffer since the copy was made. Taken by every write
+    /// pin ([`Segment::pin`]); lock order: after `state`.
+    host_copy: Mutex<Option<HostBytes>>,
+    /// Whether `host_copy` may be `Some` (a cheap check for the write pins).
+    has_copy: AtomicBool,
     /// Number of live [`Pin`]s; a pinned segment must keep its buffer.
     pins: AtomicU32,
     /// Value of the pager's clock at the last pin.
@@ -173,6 +179,7 @@ pub(crate) fn take_dead_buffers(pins: &mut Vec<Pin>, fresh: &FxSet<u64>) -> Vec<
         let pager = segment.ctx.pager();
         pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), key));
+        segment.invalidate_host_copy();
         drop(state);
         dead.insert(key);
         taken.push(buffer);
@@ -203,6 +210,18 @@ pub(crate) struct Pager {
     budget: Option<u64>,
     /// Bytes of array data moved to host memory so far.
     spilled_bytes: AtomicU64,
+    /// Bytes of host memory the context may use for host copies of device data.
+    host_budget: u64,
+    /// Bytes of array data in [`State::Host`] now (the only copy of it).
+    host_state_bytes: AtomicU64,
+    /// Bytes of kept host copies of segments on the device.
+    host_copy_bytes: AtomicU64,
+    /// Evictions that moved a valid host copy instead of reading the buffer back.
+    clean_evictions: AtomicU64,
+    /// Evictions that read the buffer back.
+    readback_evictions: AtomicU64,
+    /// Whether the over-budget warning has been printed.
+    host_warned: AtomicBool,
     /// Windows given a buffer of their own, a copy of their range (see [`Segment::windowed`]).
     window_copies: AtomicU64,
     /// Whether the spill warning has been printed.
@@ -236,17 +255,33 @@ impl Pager {
     }
 
     /// A pager with nothing resident that keeps `budget` bytes of array data on the device.
-    pub(crate) fn new(budget: Option<u64>) -> Self {
+    pub(crate) fn new(budget: Option<u64>, host_budget: u64) -> Self {
         Pager {
             resident: Mutex::new(Resident::default()),
             resident_bytes: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             budget,
             spilled_bytes: AtomicU64::new(0),
+            host_budget,
+            host_state_bytes: AtomicU64::new(0),
+            host_copy_bytes: AtomicU64::new(0),
+            clean_evictions: AtomicU64::new(0),
+            readback_evictions: AtomicU64::new(0),
+            host_warned: AtomicBool::new(false),
             window_copies: AtomicU64::new(0),
             warned: AtomicBool::new(false),
             evicting: Mutex::new(()),
         }
+    }
+
+    /// Whether host copies are kept at all: only where segments move off the device.
+    fn keeps_copies(&self) -> bool {
+        self.budget.is_some() && self.host_budget > 0
+    }
+
+    /// Bytes of host memory held for device data: the segments in host memory and the copies.
+    fn host_bytes(&self) -> u64 {
+        self.host_state_bytes.load(Ordering::Relaxed) + self.host_copy_bytes.load(Ordering::Relaxed)
     }
 
     /// Records that `segment` now holds a device buffer of `size` bytes.
@@ -274,6 +309,8 @@ impl Segment {
             ctx: ctx.clone(),
             bytes,
             state: Mutex::new(State::Empty),
+            host_copy: Mutex::new(None),
+            has_copy: AtomicBool::new(false),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
             texture: Mutex::new(None),
@@ -288,6 +325,8 @@ impl Segment {
             ctx: ctx.clone(),
             bytes,
             state: Mutex::new(State::Device(buffer)),
+            host_copy: Mutex::new(None),
+            has_copy: AtomicBool::new(false),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
             texture: Mutex::new(None),
@@ -305,6 +344,8 @@ impl Segment {
             ctx: ctx.clone(),
             bytes,
             state: Mutex::new(State::Window(Window { pack, offset })),
+            host_copy: Mutex::new(None),
+            has_copy: AtomicBool::new(false),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
             texture: Mutex::new(None),
@@ -335,6 +376,7 @@ impl Segment {
             _ => return false,
         }
         let State::Device(buffer) = std::mem::replace(&mut *state, State::Window(Window { pack, offset })) else { return false };
+        self.invalidate_host_copy();
         let pager = self.ctx.pager();
         pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(self)));
@@ -354,16 +396,45 @@ impl Segment {
     /// The segment's buffer, allocating it (and bringing its data back from host memory) on
     /// first use; a window gets a buffer holding a copy of its range. It stays on the device
     /// until the returned [`Pin`] is dropped.
+    ///
+    /// The pin may be used to write: the host copy of the data, if the segment keeps one, is
+    /// dropped. [`Segment::pin_read`] keeps it.
     pub(crate) fn pin(self: &Arc<Self>) -> Result<Pin> {
-        let pin = self.pin_unrecorded()?;
+        let pin = self.pin_unrecorded(true)?;
         self.ctx.keep_pin(&pin);
         Ok(pin)
     }
 
-    fn pin_unrecorded(self: &Arc<Self>) -> Result<Pin> {
+    /// [`Segment::pin`] for a command that only reads the buffer: a host copy stays valid.
+    pub(crate) fn pin_read(self: &Arc<Self>) -> Result<Pin> {
+        let pin = self.pin_unrecorded(false)?;
+        self.ctx.keep_pin(&pin);
+        Ok(pin)
+    }
+
+    /// [`Segment::pin`] without keeping the pin for the recording (see `keep_pin`).
+    pub(crate) fn pin_quiet(self: &Arc<Self>) -> Result<Pin> {
+        self.pin_unrecorded(true)
+    }
+
+    /// Drops the kept host copy: the device buffer is about to be, or was, written.
+    pub(crate) fn invalidate_host_copy(&self) {
+        if self.has_copy.load(Ordering::Acquire) {
+            let mut copy = lock(&self.host_copy);
+            if let Some(data) = copy.take() {
+                self.ctx.pager().host_copy_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
+            }
+            self.has_copy.store(false, Ordering::Release);
+        }
+    }
+
+    fn pin_unrecorded(self: &Arc<Self>, write: bool) -> Result<Pin> {
         let pager = self.ctx.pager();
         loop {
             if let State::Device(buffer) = &*lock(&self.state) {
+                if write {
+                    self.invalidate_host_copy();
+                }
                 self.pins.fetch_add(1, Ordering::Acquire);
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone() });
@@ -384,7 +455,7 @@ impl Segment {
             };
             if let Some((pack, offset)) = window {
                 // The copy runs after the launch that wrote the pack and before any later one.
-                let source = pack.pin(0)?;
+                let source = pack.pin_read(0)?;
                 pager.window_copies.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = self.ctx.copy(source.buffer(), offset, &buffer, 0, self.bytes) {
                     self.ctx.recycle(buffer);
@@ -392,25 +463,34 @@ impl Segment {
                 }
             }
             let mut state = lock(&self.state);
-            match &*state {
-                State::Device(_) => {
-                    // Another thread pinned it meanwhile.
+            if matches!(&*state, State::Device(_)) {
+                // Another thread pinned it meanwhile.
+                drop(state);
+                self.ctx.recycle(buffer);
+                continue;
+            }
+            if matches!(&*state, State::Host(_)) {
+                let State::Host(data) = std::mem::replace(&mut *state, State::Empty) else { unreachable!() };
+                if let Err(e) = self.ctx.upload(&buffer, data.as_slice()) {
+                    *state = State::Host(data);
                     drop(state);
                     self.ctx.recycle(buffer);
+                    return Err(e);
                 }
-                State::Host(data) => {
-                    if let Err(e) = self.ctx.upload(&buffer, data) {
-                        drop(state);
-                        self.ctx.recycle(buffer);
-                        return Err(e);
-                    }
-                    pager.register(self, buffer.size());
-                    *state = State::Device(buffer);
+                pager.register(self, buffer.size());
+                *state = State::Device(buffer);
+                let len = data.len() as u64;
+                pager.host_state_bytes.fetch_sub(len, Ordering::Relaxed);
+                // The device holds what the host does: keep the copy while the budget allows, unless this pin may change the data.
+                if !write && pager.keeps_copies() && pager.host_bytes() + len <= pager.host_budget {
+                    let mut copy = lock(&self.host_copy);
+                    *copy = Some(data);
+                    pager.host_copy_bytes.fetch_add(len, Ordering::Relaxed);
+                    self.has_copy.store(true, Ordering::Release);
                 }
-                State::Empty | State::Window(_) => {
-                    pager.register(self, buffer.size());
-                    *state = State::Device(buffer);
-                }
+            } else {
+                pager.register(self, buffer.size());
+                *state = State::Device(buffer);
             }
         }
     }
@@ -423,7 +503,7 @@ impl Segment {
         if self.with_host_bytes(|data| copy(&data[..dst.len()], dst)).is_some() {
             return Ok(());
         }
-        let pin = self.pin()?;
+        let pin = self.pin_read()?;
         self.ctx.read_into(pin.buffer(), dst)
     }
 
@@ -434,7 +514,7 @@ impl Segment {
             return None;
         }
         match &*lock(&self.state) {
-            State::Host(data) => Some(f(&data[..self.bytes as usize])),
+            State::Host(data) => Some(f(&data.as_slice()[..self.bytes as usize])),
             State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
                 // SAFETY: `host_ptr` vouches for `self.bytes` readable bytes no GPU command writes, and the state lock keeps the buffer from being evicted.
                 f(unsafe { std::slice::from_raw_parts(ptr, self.bytes as usize) })
@@ -449,8 +529,9 @@ impl Segment {
             return None;
         }
         match &mut *lock(&self.state) {
-            State::Host(data) => Some(f(&mut data[..self.bytes as usize])),
+            State::Host(data) => Some(f(&mut data.as_mut_slice()[..self.bytes as usize])),
             State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                self.invalidate_host_copy();
                 // SAFETY: as in `with_host_bytes`; the state lock and the absent pins make this the only access.
                 f(unsafe { std::slice::from_raw_parts_mut(ptr, self.bytes as usize) })
             }),
@@ -463,10 +544,17 @@ impl Drop for Segment {
     fn drop(&mut self) {
         // The texture reads the buffer: it goes before the buffer does.
         self.texture.get_mut().unwrap_or_else(PoisonError::into_inner).take();
+        self.invalidate_host_copy();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if let State::Device(buffer) = std::mem::replace(state, State::Empty) {
-            self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
-            self.ctx.recycle(buffer);
+        match std::mem::replace(state, State::Empty) {
+            State::Device(buffer) => {
+                self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+                self.ctx.recycle(buffer);
+            }
+            State::Host(data) => {
+                self.ctx.pager().host_state_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
+            }
+            State::Empty | State::Window(_) => {}
         }
     }
 }
@@ -538,8 +626,28 @@ impl Context {
             return Ok(true);
         }
         let buffer = buffer.clone();
-        // Flushes and waits, so every recorded use of the buffer has run.
-        let data = self.read_spill(&buffer, victim.bytes)?;
+        let kept = if victim.has_copy.load(Ordering::Acquire) { lock(&victim.host_copy).take() } else { None };
+        let data = match kept {
+            Some(data) => {
+                // Nothing wrote the buffer since the copy was made: it is the data, no readback.
+                victim.has_copy.store(false, Ordering::Release);
+                pager.host_copy_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
+                #[cfg(debug_assertions)]
+                if pager.clean_evictions.load(Ordering::Relaxed) % 16 == 0 {
+                    let real = self.read_spill(&buffer, victim.bytes)?;
+                    assert!(real.as_slice() == data.as_slice(), "a kept host copy differs from the device buffer: a write did not invalidate it");
+                }
+                pager.clean_evictions.fetch_add(1, Ordering::Relaxed);
+                data
+            }
+            None => {
+                // Flushes and waits, so every recorded use of the buffer has run.
+                let data = self.read_spill(&buffer, victim.bytes)?;
+                pager.readback_evictions.fetch_add(1, Ordering::Relaxed);
+                data
+            }
+        };
+        pager.host_state_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         *state = State::Host(data);
         // The texture holds the buffer the data just left.
         lock(&victim.texture).take();
@@ -548,6 +656,7 @@ impl Context {
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
         self.recycle(buffer);
         drop(state);
+        self.enforce_host_budget();
 
         if !pager.warned.swap(true, Ordering::Relaxed) {
             if log::log_enabled!(log::Level::Warn) {
@@ -557,6 +666,34 @@ impl Context {
             }
         }
         Ok(true)
+    }
+
+    /// Drops kept host copies, least recently pinned first, until the host holds no more than
+    /// its budget; the segments in host memory are the only copy of their data and stay.
+    fn enforce_host_budget(&self) {
+        let pager = self.pager();
+        if pager.host_bytes() <= pager.host_budget {
+            return;
+        }
+        let mut holders: Vec<Arc<Segment>> = {
+            let resident = lock(&pager.resident);
+            resident.list.iter().filter_map(Weak::upgrade).filter(|segment| segment.has_copy.load(Ordering::Acquire)).collect()
+        };
+        holders.sort_by_key(|segment| segment.stamp.load(Ordering::Relaxed));
+        for segment in holders {
+            if pager.host_bytes() <= pager.host_budget {
+                break;
+            }
+            segment.invalidate_host_copy();
+        }
+        if pager.host_state_bytes.load(Ordering::Relaxed) > pager.host_budget && !pager.host_warned.swap(true, Ordering::Relaxed) {
+            let message = "luma: array data moved off the device exceeds the host budget (ContextOptions::host_budget / LUMA_HOST_BUDGET); it stays in host memory.";
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("{message}");
+            } else {
+                eprintln!("{message}");
+            }
+        }
     }
 
     /// Bytes of array data moved from the device to host memory so far.
@@ -573,6 +710,9 @@ impl Context {
             spilled_bytes: pager.spilled_bytes.load(Ordering::Relaxed),
             budget_bytes: pager.budget,
             device_free_bytes: self.hal().memory_now().map(|now| now.free),
+            host_copy_bytes: pager.host_copy_bytes.load(Ordering::Relaxed),
+            clean_evictions: pager.clean_evictions.load(Ordering::Relaxed),
+            readback_evictions: pager.readback_evictions.load(Ordering::Relaxed),
         }
     }
 }
@@ -588,6 +728,7 @@ impl Context {
 /// on CUDA, the driver's pool reserve of memory that was freed but not yet returned to the
 /// device ([`Context::trim`] returns it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MemoryStats {
     /// Bytes of device buffers in use: array data; what recordings, recorded plans and loops
     /// keep (the intermediates of a plan, state placeholders, a loop's work buffers, a captured
@@ -604,6 +745,53 @@ pub struct MemoryStats {
     /// Bytes of device memory free right now, as the device reports them (everything on it, not
     /// only this context's); `None` where the backend cannot tell (wgpu, CPU).
     pub device_free_bytes: Option<u64>,
+    /// Bytes of host copies kept of segments that are on the device (valid until the segment is
+    /// written; evicting such a segment moves nothing).
+    pub host_copy_bytes: u64,
+    /// Evictions that needed no transfer because a valid host copy was kept.
+    pub clean_evictions: u64,
+    /// Evictions that read the buffer back.
+    pub readback_evictions: u64,
+}
+
+/// The default host budget: half of the available host memory, capped by the cgroup limit; 0
+/// (no kept copies) where neither is known.
+pub(crate) fn default_host_budget() -> u64 {
+    let available = available_host_memory().unwrap_or(0);
+    let limit = cgroup_limit().unwrap_or(u64::MAX);
+    (available / 2).min(limit / 2)
+}
+
+#[cfg(target_os = "linux")]
+fn available_host_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn available_host_memory() -> Option<u64> {
+    let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn available_host_memory() -> Option<u64> {
+    None
+}
+
+/// The memory limit of the process's cgroup, if there is one.
+#[cfg(target_os = "linux")]
+fn cgroup_limit() -> Option<u64> {
+    ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_limit() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -612,11 +800,11 @@ mod tests {
 
     #[test]
     fn pressure_starts_at_three_quarters_of_the_budget() {
-        let pager = Pager::new(Some(1000));
+        let pager = Pager::new(Some(1000), 0);
         pager.resident_bytes.store(749, Ordering::Relaxed);
         assert!(!pager.under_pressure());
         pager.resident_bytes.store(750, Ordering::Relaxed);
         assert!(pager.under_pressure());
-        assert!(!Pager::new(None).under_pressure());
+        assert!(!Pager::new(None, 0).under_pressure());
     }
 }

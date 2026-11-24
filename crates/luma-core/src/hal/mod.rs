@@ -13,6 +13,7 @@ use std::time::Duration;
 pub mod cache;
 pub mod copy;
 mod deferred;
+pub mod hostbytes;
 pub mod texture;
 mod transfer;
 pub mod topology;
@@ -20,6 +21,7 @@ pub mod topology;
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
 pub use texture::{TextureCaps, TextureDesc, TextureFilter, TextureFormat};
+pub use hostbytes::HostBytes;
 pub use transfer::{NativeStage, Stage, StageDir, Ticket};
 
 /// Which backend a context runs on.

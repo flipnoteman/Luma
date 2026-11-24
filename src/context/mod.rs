@@ -171,6 +171,12 @@ pub struct ContextOptions {
     /// Bytes of array data kept on the device. `None`: 80% of the device's memory where the
     /// backend reports it (never on CPU devices), otherwise unlimited.
     pub memory_budget: Option<u64>,
+    /// Bytes of host memory the context may use for host copies of device data: the segments it
+    /// moved off the device plus the copies it keeps of segments that were brought back (see
+    /// [`MemoryStats::host_copy_bytes`]). Kept copies are dropped first when it is exceeded.
+    /// `None`: half of the available host memory at open, capped by the cgroup limit.
+    /// `LUMA_HOST_BUDGET`.
+    pub host_budget: Option<u64>,
     /// Largest buffer an array is split into: a power of two from 1024 up to the largest
     /// bindable size. `None`: that size, or less when a memory budget is set.
     pub chunk_bytes: Option<u64>,
@@ -222,6 +228,7 @@ impl Default for ContextOptions {
             backend: BackendKind::default(),
             device: DeviceKind::default(),
             memory_budget: None,
+            host_budget: None,
             chunk_bytes: None,
             check_finite: false,
             calibrate: true,
@@ -261,6 +268,13 @@ impl ContextOptions {
     /// Sets the number of bytes of array data kept on the device.
     pub fn memory_budget(mut self, bytes: u64) -> Self {
         self.memory_budget = Some(bytes);
+        self
+    }
+
+    /// Sets the bytes of host memory for host copies of device data (see
+    /// [`ContextOptions::host_budget`]); `None` is the default.
+    pub fn host_budget(mut self, bytes: Option<u64>) -> Self {
+        self.host_budget = bytes;
         self
     }
 
@@ -327,6 +341,7 @@ impl ContextOptions {
             backend,
             device,
             memory_budget: bytes("LUMA_MEMORY_BUDGET"),
+            host_budget: bytes("LUMA_HOST_BUDGET"),
             chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
             check_finite: std::env::var("LUMA_CHECK_FINITE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
@@ -606,7 +621,7 @@ impl Context {
                 check_finite: options.check_finite,
                 fast_math: options.fast_math,
                 tf32_matmul: options.tf32_matmul,
-                pager: Pager::new(budget),
+                pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
                 #[cfg(test)]

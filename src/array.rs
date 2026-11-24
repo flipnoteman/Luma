@@ -251,10 +251,26 @@ impl Storage {
         self.segment(j).pin()
     }
 
+    /// [`Storage::pin`] for a command that only reads the buffer: a kept host copy stays valid,
+    /// so evicting the segment later moves no data. Use it only where nothing writes through
+    /// the pin; an unconverted site calling [`Storage::pin`] costs a readback, never a wrong
+    /// result.
+    pub(crate) fn pin_read(&self, j: usize) -> Result<Pin> {
+        self.segment(j).pin_read()
+    }
+
+    /// [`Storage::pin_single`] for a command that only reads the buffer.
+    pub(crate) fn pin_single_read(&self) -> Result<Pin> {
+        if self.segments.len() > 1 {
+            return Err(LumaError::Chunked("this operation needs an array that fits one buffer"));
+        }
+        self.pin_read(0)
+    }
+
     /// [`Storage::pin`] without marking the storage as materialized: the tracers of `iterate` take
     /// a materialized probe for one that was used eagerly.
     pub(crate) fn pin_quiet(&self, j: usize) -> Result<Pin> {
-        self.segments[j].pin()
+        self.segments[j].pin_quiet()
     }
 
     /// Pins the only segment of a storage that fits one buffer; operations that cannot run
@@ -871,7 +887,7 @@ impl<T: GpuType> Array<T> {
         let out = Self::alloc(&self.ctx, self.shape)?;
         let to = out.storage()?;
         for j in 0..from.segments() {
-            let (source, target) = (from.pin(j)?, to.pin(j)?);
+            let (source, target) = (from.pin_read(j)?, to.pin(j)?);
             self.ctx.copy(source.buffer(), 0, target.buffer(), 0, from.segment_byte_len(j))?;
         }
         Ok(out)
