@@ -260,15 +260,9 @@ fn luma_half_f32_to_f16(x: f32) -> u32 {
     let a = b & 0x7fffffffu;
     let r = a - 0x38000000u;
     let normal = (r + 0xfffu + ((r >> 13u) & 1u)) >> 13u;
-    let e = a >> 23u;
-    let shift = min(max(126u - min(e, 126u), 1u), 31u);
-    let m = (a & 0x7fffffu) | 0x800000u;
-    let q = m >> shift;
-    let rem = m & ((1u << shift) - 1u);
-    let half = 1u << (shift - 1u);
-    let sub = q + select(0u, 1u, (rem > half) | ((rem == half) & ((q & 1u) == 1u)));
+    // Below the normal range the float addition rounds to the unit of the subnormals (2^-24).
+    let sub = bitcast<u32>(bitcast<f32>(a) + 0.5) - 0x3f000000u;
     var v = select(sub, normal, a >= 0x38800000u);
-    v = select(v, 0u, a <= 0x33000000u);
     v = select(v, 0x7c00u, a >= 0x477ff000u);
     return select(sign | v, 0x7e00u, a > 0x7f800000u);
 }
