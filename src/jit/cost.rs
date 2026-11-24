@@ -329,7 +329,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (t >= luma.size.x) { return; }
     let stride = luma.size.x;
     var sum = 0.0;
-    for (var pass = 0u; pass < p.k; pass++) {
+    for (var rep = 0u; rep < p.k; rep++) {
         for (var j = t; j < p.g; j += stride) { sum += in0[j]; }
     }
     out0[t] = sum;
