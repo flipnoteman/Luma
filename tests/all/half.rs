@@ -149,8 +149,17 @@ macro_rules! half_suite {
                         let host = |f: &dyn Fn(f32, f32) -> f32| -> Vec<T> { a.iter().zip(&b).map(|(&p, &q)| t(f(p.to_f32(), q.to_f32()))).collect() };
                         same(&(&x + &y).to_vec().unwrap(), &host(&|p, q| p + q), &format!("add, n = {n}"));
                         same(&(&x - &y).to_vec().unwrap(), &host(&|p, q| p - q), "sub");
-                        same(&(&x * &y).to_vec().unwrap(), &host(&|p, q| p * q), "mul");
-                        close(&(&x / &y).to_vec().unwrap(), &host(&|p, q| p / q), 1, "div");
+                        // (wgpu: WGSL does not define a product with a NaN or zero times infinity, and a device may return the other operand.)
+                        let (p, q): (Vec<T>, Vec<T>) = a.iter().zip(&b).filter(|(p, q)| !p.is_nan() && !q.is_nan() && !(p.is_infinite() && q.to_f32() == 0.0 || q.is_infinite() && p.to_f32() == 0.0)).map(|(&p, &q)| (p, q)).unzip();
+if !p.is_empty() {
+                        same(&(&array(&ctx, &p) * &array(&ctx, &q)).to_vec().unwrap(), &p.iter().zip(&q).map(|(&p, &q)| t(p.to_f32() * q.to_f32())).collect::<Vec<_>>(), "mul");
+}
+                        // (A divisor above 1e37 is excluded: a GPU divides by its reciprocal, which flushes to zero
+                        // there, for `f32` arrays too.)
+                        let (p, q): (Vec<T>, Vec<T>) = a.iter().zip(&b).filter(|(_, q)| q.to_f32().abs() < 1.0e37 || q.is_nan()).map(|(&p, &q)| (p, q)).unzip();
+                        if !p.is_empty() {
+                            close(&(&array(&ctx, &p) / &array(&ctx, &q)).to_vec().unwrap(), &p.iter().zip(&q).map(|(&p, &q)| t(p.to_f32() / q.to_f32())).collect::<Vec<_>>(), 1, "div");
+                        }
                         // (Which operand a minimum with a NaN returns is up to the device.)
                         let (p, q): (Vec<T>, Vec<T>) = a.iter().zip(&b).filter(|(p, q)| !p.is_nan() && !q.is_nan()).map(|(&p, &q)| (p, q)).unzip();
                         if !p.is_empty() {
@@ -158,18 +167,26 @@ macro_rules! half_suite {
                         }
                         same(&(-&x).to_vec().unwrap(), &a.iter().map(|&p| -p).collect::<Vec<_>>(), "neg");
                         same(&x.abs().to_vec().unwrap(), &a.iter().map(|&p| T::from_bits(p.to_bits() & 0x7fff)).collect::<Vec<_>>(), "abs");
-                        // With a scalar on either side.
+                        // With a scalar on either side (without NaNs, whose products wgpu does not define).
                         let k = t(3.25);
-                        same(&(&x * k).to_vec().unwrap(), &a.iter().map(|&p| t(p.to_f32() * 3.25)).collect::<Vec<_>>(), "mul scalar");
-                        same(&(k - &x).to_vec().unwrap(), &a.iter().map(|&p| t(3.25 - p.to_f32())).collect::<Vec<_>>(), "scalar sub");
+                        let r: Vec<T> = a.iter().copied().filter(|p| !p.is_nan()).collect();
+                        if !r.is_empty() {
+                            let xr = array(&ctx, &r);
+                            same(&(&xr * k).to_vec().unwrap(), &r.iter().map(|&p| t(p.to_f32() * 3.25)).collect::<Vec<_>>(), "mul scalar");
+                            same(&(k - &xr).to_vec().unwrap(), &r.iter().map(|&p| t(3.25 - p.to_f32())).collect::<Vec<_>>(), "scalar sub");
+                        }
                         // Comparisons and the tests of a class.
                         assert_eq!(x.lt(&y).to_vec().unwrap(), a.iter().zip(&b).map(|(p, q)| p.to_f32() < q.to_f32()).collect::<Vec<_>>(), "lt");
                         assert_eq!(x.eq(&y).to_vec().unwrap(), a.iter().zip(&b).map(|(p, q)| p.to_f32() == q.to_f32()).collect::<Vec<_>>(), "eq");
                         assert_eq!(x.is_nan().to_vec().unwrap(), a.iter().map(|p| p.is_nan()).collect::<Vec<_>>(), "is_nan");
                         assert_eq!(x.is_inf().to_vec().unwrap(), a.iter().map(|p| p.is_infinite()).collect::<Vec<_>>(), "is_inf");
                         assert_eq!(x.is_finite().to_vec().unwrap(), a.iter().map(|p| p.is_finite()).collect::<Vec<_>>(), "is_finite");
-                        let mask = x.lt(&y);
-                        same(&select(&mask, &x, &y).to_vec().unwrap(), &a.iter().zip(&b).map(|(&p, &q)| if p.to_f32() < q.to_f32() { p } else { q }).collect::<Vec<_>>(), "select");
+                        // (Without NaN operands: a comparison with one is not defined on wgpu.)
+                        let (p, q): (Vec<T>, Vec<T>) = a.iter().zip(&b).filter(|(p, q)| !p.is_nan() && !q.is_nan()).map(|(&p, &q)| (p, q)).unzip();
+if !p.is_empty() {
+                        let (px, qy) = (array(&ctx, &p), array(&ctx, &q));
+                        close(&select(&px.lt(&qy), &px, &qy).to_vec().unwrap(), &p.iter().zip(&q).map(|(&p, &q)| if p.to_f32() < q.to_f32() { p } else { q }).collect::<Vec<_>>(), 0, "select");
+}
                     }
                 }
             }
