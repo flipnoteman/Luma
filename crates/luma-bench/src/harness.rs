@@ -230,10 +230,14 @@ impl Harness {
         // ~50 ms, which made a 12 us kernel take 150 us in a case, and a laptop GPU can start a
         // 1 ms case in P8 and take 12 ms); keep calling the case until it has run for 250 ms so
         // the clocks are up when the timed calls start, whatever the case's length.
-        while started.elapsed().as_millis() < 250 {
+        // A decision log needs the same calls before the recording whatever the speed of the run
+        // (cases that vary their program per call, adaptive loops), so it skips the timed warm-up.
+        while self.decisions.is_none() && started.elapsed().as_millis() < 250 {
             run(f);
         }
-        let reps = if let Some(r) = std::env::var("LUMA_BENCH_REPS").ok().and_then(|v| v.parse().ok()) {
+        let reps = if self.decisions.is_some() {
+            3
+        } else if let Some(r) = std::env::var("LUMA_BENCH_REPS").ok().and_then(|v| v.parse().ok()) {
             r
         } else if warm > 1000.0 {
             3
