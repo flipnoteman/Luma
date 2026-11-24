@@ -144,15 +144,14 @@ fn cuda_upload_overlaps_a_kernel() {
     // launch's fixed cost makes one step overshoot).
     let mut iters = 1000u32;
     let mut kernel = affine_kernel(&*backend, iters);
-    let mut alone = Duration::ZERO;
     for _ in 0..4 {
         run(&*backend, &kernel);
-        alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
+        let alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
         iters = ((f64::from(iters) * up.as_secs_f64() / alone.as_secs_f64()) as u32).max(1);
         kernel = affine_kernel(&*backend, iters);
     }
     run(&*backend, &kernel);
-    alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
+    let alone = (0..3).map(|_| time(|| run(&*backend, &kernel))).min().unwrap();
     let both = (0..3)
         .map(|_| {
             time(|| {

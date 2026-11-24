@@ -228,15 +228,14 @@ fn overlap(slab: usize) {
     };
     let mut iters = 200u32;
     let mut kernel = lanes::affine_kernel(backend, iters);
-    let mut alone = Duration::ZERO;
     for _ in 0..3 {
         run(&kernel);
-        alone = best(Box::new(|| run(&kernel)));
+        let alone = best(Box::new(|| run(&kernel)));
         iters = ((f64::from(iters) * up.as_secs_f64() / alone.as_secs_f64()) as u32).max(1);
         kernel = lanes::affine_kernel(backend, iters);
     }
     run(&kernel);
-    alone = alone.min(best(Box::new(|| run(&kernel))));
+    let alone = best(Box::new(|| run(&kernel)));
 
     // The pipeline: the upload of slab k+1 (into the buffer slab k-1 used, after the kernel that
     // read it) runs while the kernel of slab k does.
