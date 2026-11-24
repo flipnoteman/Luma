@@ -480,7 +480,7 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
     rig.release(ctx);
     let latency_ns = (t? - launch_ns).max(launch_ns * 0.1) / f64::from(CHAIN_STEPS);
 
-    Ok(MemoryModel::new(l2_bytes, l2_gbs, shared_gbs, [patterns[0], patterns[1], patterns[2]], patterns[3], patterns[4], latency_ns))
+    Ok(MemoryModel::new(l2_bytes, attribute.is_some() && l2_bytes.is_some(), l2_gbs, shared_gbs, [patterns[0], patterns[1], patterns[2]], patterns[3], patterns[4], latency_ns))
 }
 
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
@@ -631,11 +631,11 @@ mod tests {
 
     #[test]
     fn a_much_slower_l2_or_latency_counts_as_contended_when_both_have_memory_numbers() {
-        let memory = MemoryModel::new(Some(6 << 20), 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0);
+        let memory = MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0);
         let reference = CostModel::NVIDIA.with(|m| m.memory = Some(memory));
         assert!(!contended(&reference, &reference));
-        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), 400.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0))), &reference));
-        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 130.0))), &reference));
+        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 400.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 30.0))), &reference));
+        assert!(contended(&reference.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.0, 2.0, 4.0], 8.0, 4.0, 130.0))), &reference));
         assert!(!contended(&reference.with(|m| m.memory = None), &reference), "nothing to compare");
         assert!(!contended(&reference, &CostModel::NVIDIA), "the presets have no memory numbers");
     }

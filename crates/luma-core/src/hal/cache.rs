@@ -308,7 +308,7 @@ impl DiskCache {
     pub fn load_cost(&self) -> Option<CostModel> {
         let bytes = self.load_blob(&format!("cost-{}", self.key), COST)?;
         let numbers: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|chunk| f64::from_le_bytes(*chunk)).collect();
-        let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, l2_bytes, l2_gbs, shared_gbs, s2, s8, s32, gather, transpose, latency_ns] = numbers[..] else { return None };
+        let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, l2_bytes, l2_gbs, shared_gbs, s2, s8, s32, gather, transpose, latency_ns, l2_exact] = numbers[..] else { return None };
         let f64_factor = (!f64_factor.is_nan()).then_some(f64_factor);
         let sane = |x: f64| x.is_finite() && x > 0.0;
         // A model without memory numbers stores NaN in every one of them.
@@ -317,11 +317,11 @@ impl DiskCache {
         } else {
             let l2_bytes = (!l2_bytes.is_nan()).then_some(l2_bytes);
             let shared_gbs = (!shared_gbs.is_nan()).then_some(shared_gbs);
-            let ok = sane(l2_gbs) && l2_bytes.is_none_or(sane) && shared_gbs.is_none_or(sane) && [s2, s8, s32, gather, transpose, latency_ns].into_iter().all(sane);
+            let ok = sane(l2_gbs) && l2_bytes.is_none_or(sane) && shared_gbs.is_none_or(sane) && [s2, s8, s32, gather, transpose, latency_ns].into_iter().all(sane) && (l2_exact == 0.0 || l2_exact == 1.0);
             if !ok {
                 return None;
             }
-            Some(MemoryModel::new(l2_bytes.map(|bytes| bytes as u64), l2_gbs, shared_gbs, [s2, s8, s32], gather, transpose, latency_ns))
+            Some(MemoryModel::new(l2_bytes.map(|bytes| bytes as u64), l2_exact == 1.0, l2_gbs, shared_gbs, [s2, s8, s32], gather, transpose, latency_ns))
         };
         let model = CostModel::new(launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor).with(|m| m.memory = memory);
         (sane(launch_us) && sane(bandwidth_gbs) && sane(f32_ops_per_ns) && sane(df32_factor) && f64_factor.is_none_or(sane)).then_some(model)
@@ -341,8 +341,9 @@ impl DiskCache {
                 m.gather_factor,
                 m.transpose_factor,
                 m.latency_ns,
+                f64::from(u8::from(m.l2_exact)),
             ]),
-            None => numbers.extend([f64::NAN; 9]),
+            None => numbers.extend([f64::NAN; 10]),
         }
         let bytes: Vec<u8> = numbers.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.store_blob(&format!("cost-{}", self.key), COST, &bytes);
@@ -477,12 +478,15 @@ mod tests {
         assert_eq!(disk.load_cost(), Some(model));
         let with_f64 = model.with(|m| m.f64_factor = Some(9.0));
         disk.store_cost(&with_f64);
-        let with_memory = with_f64.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), 2000.0, Some(5000.0), [1.1, 1.9, 4.0], 7.5, 3.2, 180.0)));
+        let with_memory = with_f64.with(|m| m.memory = Some(MemoryModel::new(Some(6 << 20), true, 2000.0, Some(5000.0), [1.1, 1.9, 4.0], 7.5, 3.2, 180.0)));
         disk.store_cost(&with_memory);
         assert_eq!(disk.load_cost(), Some(with_memory), "memory numbers round-trip");
-        let unsized_memory = with_memory.with(|m| m.memory = m.memory.map(|x| MemoryModel::new(None, x.l2_gbs, None, x.strided_factor, x.gather_factor, x.transpose_factor, x.latency_ns)));
+        let unsized_memory = with_memory.with(|m| m.memory = m.memory.map(|x| MemoryModel::new(Some(8 << 20), false, x.l2_gbs, None, x.strided_factor, x.gather_factor, x.transpose_factor, x.latency_ns)));
         disk.store_cost(&unsized_memory);
-        assert_eq!(disk.load_cost(), Some(unsized_memory), "unknown sizes round-trip");
+        assert_eq!(disk.load_cost(), Some(unsized_memory), "an inexact size round-trip");
+        let no_size = with_memory.with(|m| m.memory = m.memory.map(|x| MemoryModel::new(None, false, x.l2_gbs, None, x.strided_factor, x.gather_factor, x.transpose_factor, x.latency_ns)));
+        disk.store_cost(&no_size);
+        assert_eq!(disk.load_cost(), Some(no_size), "unknown sizes round-trip");
         disk.store_cost(&with_f64);
         assert_eq!(DiskCache::open(Some(dir.clone()), "test-key".into()).load_cost(), Some(with_f64), "a second open reads it");
         assert_eq!(DiskCache::open(None, "test-key".into()).load_cost(), None, "no directory, no cache");
@@ -492,7 +496,7 @@ mod tests {
         assert_eq!(disk.load_cost(), None, "a LUMACOS2 file is ignored");
         std::fs::write(&file, b"garbage that is not a cost file at all").unwrap();
         assert_eq!(disk.load_cost(), None, "a corrupt file is ignored");
-        write_blob(&file, COST, &[0u8; 112]).unwrap();
+        write_blob(&file, COST, &[0u8; 120]).unwrap();
         assert_eq!(disk.load_cost(), None, "zeros are not a cost model");
         let _ = std::fs::remove_dir_all(&dir);
     }

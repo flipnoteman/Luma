@@ -227,6 +227,9 @@ pub struct MemoryModel {
     /// bound (the largest size still much faster than DRAM, within one doubling of the real size):
     /// consumers must not assume it is exact. `None` where no sharp knee was found.
     pub l2_bytes: Option<u64>,
+    /// Whether `l2_bytes` is exact (a device attribute) rather than the power-of-two upper bound
+    /// of the knee; `false` when `l2_bytes` is `None`.
+    pub l2_exact: bool,
     /// Read bandwidth, GB/s, of a copy whose traffic wraps over a working set inside L2 (the
     /// largest measured set that is at least 1.5 times faster than DRAM).
     pub l2_gbs: f64,
@@ -245,15 +248,15 @@ pub struct MemoryModel {
 impl MemoryModel {
     /// A memory model of the given numbers (see the fields).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(l2_bytes: Option<u64>, l2_gbs: f64, shared_gbs: Option<f64>, strided_factor: [f64; 3], gather_factor: f64, transpose_factor: f64, latency_ns: f64) -> MemoryModel {
-        MemoryModel { l2_bytes, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns }
+    pub fn new(l2_bytes: Option<u64>, l2_exact: bool, l2_gbs: f64, shared_gbs: Option<f64>, strided_factor: [f64; 3], gather_factor: f64, transpose_factor: f64, latency_ns: f64) -> MemoryModel {
+        MemoryModel { l2_bytes, l2_exact, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns }
     }
 }
 
 impl fmt::Display for MemoryModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.l2_bytes {
-            Some(bytes) => write!(f, "L2 {:.2} MiB at {:.0} GB/s", bytes as f64 / (1 << 20) as f64, self.l2_gbs)?,
+            Some(bytes) => write!(f, "L2 {}{:.2} MiB at {:.0} GB/s", if self.l2_exact { "" } else { "up to " }, bytes as f64 / (1 << 20) as f64, self.l2_gbs)?,
             None => write!(f, "L2 unknown size at {:.0} GB/s", self.l2_gbs)?,
         }
         match self.shared_gbs {
