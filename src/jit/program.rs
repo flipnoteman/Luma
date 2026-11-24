@@ -578,8 +578,8 @@ fn leaf_reads_probes(leaf: &Arc<Node>, probes: &[u64]) -> bool {
                 if node.looped.get().is_some() {
                     return true;
                 }
-                if let Some(reduced) = node.deferred.get() {
-                    stack.push(Arc::clone(reduced.operand()));
+                if let Some(value) = node.deferred.get() {
+                    stack.push(Arc::clone(value.operand()));
                 }
             }
         }

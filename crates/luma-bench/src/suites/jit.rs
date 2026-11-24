@@ -12,6 +12,7 @@ mod launchcost;
 mod loops;
 mod memory;
 mod readback;
+mod reduce_build;
 mod threads;
 mod trace;
 
@@ -22,11 +23,12 @@ use crate::harness::Harness;
 type Group = fn(&mut Harness);
 
 pub fn run(h: &mut Harness) {
-    let groups: [(&str, Group); 10] = [
+    let groups: [(&str, Group); 11] = [
         ("compile", compile::run),
         ("launch", launch::run),
         ("launchcost", launchcost::run),
         ("hoststep", hoststep::run),
+        ("reduce_build", reduce_build::run),
         ("loop", loops::run),
         ("fusion", fusion::run),
         ("trace", trace::run),

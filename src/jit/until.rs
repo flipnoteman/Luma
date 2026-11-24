@@ -117,7 +117,7 @@ pub(crate) fn force_with_record<T: GpuType>(
     if SEPARATE_RECORD.with(std::cell::Cell::get) {
         return None;
     }
-    let (operand, ops, finish) = record.reduced()?.fusable()?;
+    let (operand, ops, finish) = record.structured()?.fusable()?;
     if ops.as_slice().len() != 1 || ctx.check_finite() || !operand.is_pending() {
         return None;
     }

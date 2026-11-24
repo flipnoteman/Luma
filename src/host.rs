@@ -16,7 +16,7 @@ use crate::gpu::hash::FxMap;
 use crate::gpu_type::{ElemLayout, GpuType, ScalarType};
 use crate::jit::{AxisMap, Edge, ElemTy, Gen, Node, OpKind, Scalar, ShiftKind, Src, ViewMap};
 use crate::ops::Rhs;
-use crate::reduce::Reduced;
+use crate::jit::structured::Structured;
 use crate::shape::Shape;
 use crate::sort::{KeyTransform, SortKey};
 
@@ -182,7 +182,7 @@ impl<'a> Eval<'a> {
         }
         let words = if let Some(storage) = node.evaluated() {
             self.buffer(storage)?
-        } else if let Some(reduced) = node.deferred_reduced() {
+        } else if let Some(reduced) = node.deferred_value() {
             let storage = reduced.host_result(self.ctx)?;
             self.buffer(&storage)?
         } else {
@@ -215,7 +215,7 @@ impl<'a> Eval<'a> {
                 node.finish_shared(storage);
             }
             words
-        } else if let Some(reduced) = array.reduced() {
+        } else if let Some(reduced) = array.structured() {
             match reduced.result_if_recorded() {
                 Some(Ok(storage)) => self.buffer(storage)?,
                 Some(Err(_)) => return None,
@@ -668,7 +668,7 @@ pub(crate) fn try_eval_node(node: &Arc<Node>) -> Option<Arc<Storage>> {
     if !host_ok(ctx) || !supported(node.op().out_ty()) {
         return None;
     }
-    if let Some(reduced) = node.deferred_reduced() {
+    if let Some(reduced) = node.deferred_value() {
         return reduced.host_result(ctx).map(|storage| node.finish_host(storage));
     }
     let words = Eval::new(ctx).node(node)?;
@@ -704,7 +704,7 @@ pub(crate) fn try_eval_group(nodes: &[Arc<Node>]) -> bool {
 }
 
 /// The words a reduction leaves (one per op; the bit of a `bool`'s word), epilogue applied.
-pub(crate) fn reduced_words(reduced: &Reduced, ctx: &Context) -> Option<Vec<u32>> {
+pub(crate) fn reduced_words(reduced: &Structured, ctx: &Context) -> Option<Vec<u32>> {
     let operand = reduced.operand();
     if reduced.is_axis() || !host_ok(ctx) || operand.len() > MAX_HOST_ELEMS || operand.failure().is_some() {
         return None;
@@ -731,7 +731,7 @@ pub(crate) fn reduced_words(reduced: &Reduced, ctx: &Context) -> Option<Vec<u32>
 }
 
 /// The buffer of a reduction computed on the host.
-pub(crate) fn try_eval_reduced(reduced: &Reduced, ctx: &Context) -> Option<Arc<Storage>> {
+pub(crate) fn try_eval_reduced(reduced: &Structured, ctx: &Context) -> Option<Arc<Storage>> {
     let words = reduced_words(reduced, ctx)?;
     let layout = reduced.layout();
     Storage::alloc_host(ctx, words.len(), layout, |dst| {

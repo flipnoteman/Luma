@@ -164,6 +164,7 @@ mod launch;
 mod looped;
 mod operator;
 mod multireduce;
+pub(crate) mod structured;
 mod pack;
 mod params;
 mod plancache;
@@ -959,9 +960,9 @@ pub(crate) struct Node {
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     ctx: Context,
-    /// Set when the node stands for a reduction that is recorded when the node is evaluated (see
-    /// [`deferred`]).
-    deferred: OnceLock<Arc<crate::reduce::Reduced>>,
+    /// Set when the node stands for a structured value that is recorded when the node is evaluated (see
+    /// [`deferred_value`]).
+    deferred: OnceLock<Arc<structured::Structured>>,
     /// What failures of this node are reported as.
     name: &'static str,
     location: &'static Location<'static>,
@@ -1278,8 +1279,8 @@ impl Node {
         self.id
     }
 
-    /// The reduction this node stands for the value of, if it is such a node.
-    pub(crate) fn deferred_reduced(&self) -> Option<&Arc<crate::reduce::Reduced>> {
+    /// The structured value this node stands for the value of, if it is such a node.
+    pub(crate) fn deferred_value(&self) -> Option<&Arc<structured::Structured>> {
         self.deferred.get()
     }
 
@@ -1302,7 +1303,7 @@ impl Node {
             Some(args) => evaluate(self, args).map(Arc::new),
             None => match (self.looped.get(), self.deferred.get()) {
                 (Some((plan, j)), _) => plan.output(&self.ctx, *j, self.name, self.location),
-                (None, Some(reduced)) => reduced.record_once(&self.ctx).clone().map_err(Failure::Inherited),
+                (None, Some(value)) => value.record_once(&self.ctx).clone().map_err(Failure::Inherited),
                 (None, None) => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
             },
         };
@@ -2436,12 +2437,12 @@ fn settle(
     }
 }
 
-/// A node of `len` elements of type `ty` that stands for the value of `reduced`: evaluating it
-/// records the reduction. Operations on a reduction that cannot extend its last pass (any on a
+/// A node of `len` elements of type `ty` that stands for the value of `value`: evaluating it
+/// records the value. Operations on a reduction that cannot extend its last pass (any on a
 /// `Df32` sum) read this node, so that building them evaluates nothing; the reduction is
 /// recorded when something that needs the value is, after the arrays it shares work with. It has
 /// no operands: expressions that read it find it evaluated first, like a loop leaf.
-pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate::reduce::Reduced>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
+pub(crate) fn deferred_value(ctx: &Context, len: usize, ty: ElemTy, value: Arc<structured::Structured>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
     let measured = measure(&[]);
     let node = Arc::new(Node {
         trace: 0,
@@ -2472,7 +2473,7 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
     });
-    let _ = node.deferred.set(reduced);
+    let _ = node.deferred.set(value);
     ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
     ctx.jit().pending_nodes.fetch_add(1, Ordering::Relaxed);
     node
@@ -2956,8 +2957,8 @@ pub(crate) struct JitState {
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
-    /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
-    reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
+    /// The structured values made and not yet recorded (see [`multireduce`]), oldest first.
+    structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
     merged_seen: Mutex<FxMap<u64, u32>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
@@ -3101,7 +3102,7 @@ impl JitState {
             scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
-            reductions: Mutex::new(Vec::new()),
+            structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),

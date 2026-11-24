@@ -775,7 +775,7 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
         // step is summed, and is also what the update of the state reads) is computed once, by
         // their kernel, and not by the reduction alone with every intermediate evaluated on its
         // own.
-        if array.reduced().is_some_and(|reduced| reduced.is_unforced()) {
+        if array.structured().is_some_and(|value| value.is_unforced()) {
             ctx.jit().evaluate_requested();
         }
         array.request()?;
