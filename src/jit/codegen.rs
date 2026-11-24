@@ -150,6 +150,9 @@ pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
 fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
     let value = operation_unrounded(op, a, b, c, index)?;
     Some(if op.rounds_half() {
+        if op.out_ty() == ElemTy::F16 {
+            return Some(format!("luma_half_round_f16({value})"));
+        }
         let (to, from) = if op.out_ty() == ElemTy::F16 { ("luma_half_f32_to_f16", "luma_half_f16_to_f32") } else { ("luma_half_f32_to_bf16", "luma_half_bf16_to_f32") };
         format!("{from}({to}({value}))")
     } else {

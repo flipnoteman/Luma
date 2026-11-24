@@ -825,6 +825,9 @@ impl<'a> Lower<'a> {
 
     /// `x` rounded to the half type `ty`, as an `f32`.
     fn round_half(&self, fb: &FnBuilder<'_>, ty: ElemTy, x: Val) -> Val {
+        if ty == ElemTy::F16 {
+            return self.call(fb, "luma_half_round_f16", &[x]);
+        }
         let bits = self.f32_to_half(fb, ty, x);
         self.half_to_f32(fb, ty, bits)
     }

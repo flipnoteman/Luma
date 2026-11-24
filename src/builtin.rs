@@ -246,25 +246,24 @@ fn luma_tgamma(x: f32) -> f32 {
 /// the low 16 bits of a `u32`; every shift amount is below 32.
 const HALF_WGSL: &str = "
 fn luma_half_f16_to_f32(h: u32) -> f32 {
-    let sign = (h & 0x8000u) << 16u;
-    let e = (h >> 10u) & 0x1fu;
-    let m = h & 0x3ffu;
-    let sub = bitcast<f32>(bitcast<u32>(f32(m) * 5.9604645e-8) | sign);
-    let normal = bitcast<f32>(sign | ((e + 112u) << 23u) | (m << 13u));
-    let special = select(bitcast<f32>(sign | 0x7f800000u), bitcast<f32>(0x7fc00000u), m != 0u);
-    return select(select(normal, special, e == 31u), sub, e == 0u);
+    return select(unpack2x16float(h).x, bitcast<f32>(0x7fc00000u), (h & 0x7fffu) > 0x7c00u);
 }
 fn luma_half_f32_to_f16(x: f32) -> u32 {
+    let p = pack2x16float(vec2<f32>(x, 0.0)) & 0xffffu;
+    return select(p, 0x7e00u, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+// `x` rounded to the nearest `f16`, as an `f32`, without leaving the 32-bit registers: adding
+// `k` = 2^(e+13) (an exponent above the 11 bits of the mantissa; 0.5 in the subnormals) makes the float
+// addition round `x` to a multiple of the target's ulp `k * 2^-23`; the multiple is read back as an
+// integer difference of bit patterns (a float subtraction of `k` is folded away by some drivers, as is
+// a round trip through `pack2x16float`).
+fn luma_half_round_f16(x: f32) -> f32 {
     let b = bitcast<u32>(x);
-    let sign = (b >> 16u) & 0x8000u;
     let a = b & 0x7fffffffu;
-    let r = a - 0x38000000u;
-    let normal = (r + 0xfffu + ((r >> 13u) & 1u)) >> 13u;
-    // Below the normal range the float addition rounds to the unit of the subnormals (2^-24).
-    let sub = bitcast<u32>(bitcast<f32>(a) + 0.5) - 0x3f000000u;
-    var v = select(sub, normal, a >= 0x38800000u);
-    v = select(v, 0x7c00u, a >= 0x477ff000u);
-    return select(sign | v, 0x7e00u, a > 0x7f800000u);
+    let k = max(bitcast<f32>((a & 0x7f800000u) + 0x06800000u), 0.5);
+    let n = bitcast<u32>(bitcast<f32>(a) + k) - bitcast<u32>(k);
+    let r = bitcast<u32>(f32(n) * (k * 1.1920929e-7)) | (b & 0x80000000u);
+    return bitcast<f32>(select(select(r, 0x7f800000u | (b & 0x80000000u), a >= 0x477ff000u), 0x7fc00000u, a > 0x7f800000u));
 }
 fn luma_half_bf16_to_f32(h: u32) -> f32 {
     return select(bitcast<f32>(h << 16u), bitcast<f32>(0x7fc00000u), (h & 0x7fffu) > 0x7f80u);

@@ -100,6 +100,17 @@ fn first_bit(fb: &mut Fb, v: &Op, leading: bool) -> Op {
 pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, Op) {
     use IrUnOp::*;
     use ScalarTy::*;
+    match (op, s) {
+        (F32ToF16Bits, F32) => {
+            let h = to_half(fb, a);
+            return (U32, fb.def(&format!("zext i16 {h} to i32")));
+        }
+        (F16BitsToF32, U32) => {
+            let h = fb.def(&format!("trunc i32 {a} to i16"));
+            return (F32, from_half(fb, &h));
+        }
+        _ => {}
+    }
     if s == F16 {
         let f = from_half(fb, a);
         let (r, v) = unary(fb, op, F32, &f);

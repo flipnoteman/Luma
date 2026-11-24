@@ -369,6 +369,11 @@ pub enum IrUnOp {
     All,
     /// `any(vec<bool>)`.
     Any,
+    /// An `f32` as the 16 bits (in the low half of a `u32`) of the `f16` nearest to it, ties to
+    /// even, overflow to infinity, subnormals kept; the bits of a NaN are the device's (`pack2x16float`).
+    F32ToF16Bits,
+    /// The `f32` value of the `f16` held by the low 16 bits of a `u32` (`unpack2x16float`).
+    F16BitsToF32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

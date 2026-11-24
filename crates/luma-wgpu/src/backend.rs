@@ -500,7 +500,8 @@ struct Batch {
 /// What a kernel may use of the shader features the device was opened with.
 fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
     use naga::valid::Capabilities as Caps;
-    let mut caps = Caps::empty();
+    // `pack2x16float` / `unpack2x16float` (the half-float conversions) need no device feature on a GPU.
+    let mut caps = Caps::SHADER_FLOAT16_IN_FLOAT32;
     if features.contains(wgpu::Features::SUBGROUP) {
         caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
     }
