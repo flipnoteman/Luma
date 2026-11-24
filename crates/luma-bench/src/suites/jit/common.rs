@@ -135,7 +135,9 @@ pub fn recipe(seed: u64, len: usize) -> Vec<Step> {
 fn fresh_rng() -> Rng {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let k = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut rng = Rng((salt() ^ k.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    // A decision log compares two runs: its recipes depend on the call count only, not on the process.
+    let salt = if std::env::var_os("LUMA_BENCH_DECISIONS").is_some() { 0x5EED } else { salt() };
+    let mut rng = Rng((salt ^ k.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     for _ in 0..4 {
         rng.next();
     }
