@@ -1885,6 +1885,8 @@ fn recompute_sweep(h: &mut Harness) {
         .map(|k| {
             let t = &a * (k as f32 + 1.0) + &b;
             t.eval().unwrap();
+            // One kernel each: evaluations that are pending together fuse into one multi-output kernel, which has no lineage.
+            ctx.flush().unwrap();
             t
         })
         .collect();
