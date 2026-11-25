@@ -223,12 +223,12 @@ pub struct ContextOptions {
     /// Allows the value-changing rewrites of expressions: set, it adds `Reduced::FAST_MATH` to
     /// [`ContextOptions::numerics`] when the context opens (`LUMA_FAST_MATH` still sets it,
     /// with a warning).
-    #[deprecated(since = "0.5.3", note = "use `ContextOptions::numerics` with `Numerics::fast()` (`LUMA_NUMERICS=fast`); removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics` with `Numerics::fast()` (`LUMA_NUMERICS=fast`); removed in 0.6")]
     pub fast_math: bool,
     /// Runs [`Array::matmul`](crate::Array::matmul) in TF32 on tensor cores where it can
     /// (default): `false` clears `Reduced::TF32_MATMUL` from [`ContextOptions::numerics`] when the
     /// context opens (`LUMA_TF32_MATMUL=0` still sets it, with a warning).
-    #[deprecated(since = "0.5.3", note = "use `ContextOptions::numerics` with `Numerics::strict()` (`LUMA_NUMERICS=strict`); removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics` with `Numerics::strict()` (`LUMA_NUMERICS=strict`); removed in 0.6")]
     pub tf32_matmul: bool,
     /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
     /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
@@ -331,7 +331,7 @@ impl ContextOptions {
 
     /// Allows the value-changing rewrites of expressions (see [`Numerics::fast`]): the
     /// `fast_math` field is applied over [`ContextOptions::numerics`] when the context opens.
-    #[deprecated(since = "0.5.3", note = "use `ContextOptions::numerics(Numerics::fast())` (or `.with_reduced(Reduced::FAST_MATH, true)`); removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics(Numerics::fast())` (or `.with_reduced(Reduced::FAST_MATH, true)`); removed in 0.6")]
     #[allow(deprecated)]
     pub fn fast_math(mut self, on: bool) -> Self {
         self.fast_math = on;
@@ -342,7 +342,7 @@ impl ContextOptions {
     /// or with `false` always in `f32`: the `tf32_matmul` field is applied over
     /// [`ContextOptions::numerics`] when the context opens (`false` clears
     /// `Reduced::TF32_MATMUL`; `true` changes nothing).
-    #[deprecated(since = "0.5.3", note = "use `ContextOptions::numerics(Numerics::strict())` (or `.with_reduced(Reduced::TF32_MATMUL, false)`); removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics(Numerics::strict())` (or `.with_reduced(Reduced::TF32_MATMUL, false)`); removed in 0.6")]
     #[allow(deprecated)]
     pub fn tf32_matmul(mut self, on: bool) -> Self {
         self.tf32_matmul = on;
@@ -615,7 +615,7 @@ impl Context {
     }
 
     /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can.
-    #[deprecated(since = "0.5.3", note = "use `Context::numerics().tf32_matmul()`; removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `Context::numerics().tf32_matmul()`; removed in 0.6")]
     pub fn tf32_matmul(&self) -> bool {
         self.inner.numerics.tf32_matmul()
     }

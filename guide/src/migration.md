@@ -1,13 +1,16 @@
 # Migration
 
-## From 0.5.2 to the next release
+## From 0.5.1 to 0.5.2
 
-Programs written against 0.5.2 compile and behave as before; the items below are deprecated (removed in 0.6)
-and have replacements already.
+0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
+algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
+reads, `f16` / `bf16`) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they
+are. One behaviour changes without a compile error: `matmul` runs in TF32 on CUDA devices with tensor cores.
+Some items are deprecated (removed in 0.6) and have replacements already.
 
 ### `Numerics` replaces `fast_math`, `tf32_matmul` and the TF32 variables
 
-| 0.5.2 | now |
+| Before | Now |
 | --- | --- |
 | `ContextOptions::fast_math(true)` | `ContextOptions::numerics(Numerics::fast())` |
 | `ContextOptions::tf32_matmul(false)` | `ContextOptions::numerics(Numerics::strict())` |
@@ -42,13 +45,6 @@ Use `Profile::cuts()` for the cuts (an iterator of operation, location and `Spli
 `kir::ir::IrUnOp` gained `F32ToF16Bits`, `F16BitsToF32` and `RoundF16`: a backend that matches it exhaustively
 needs three more arms. Everything else the HAL gained (the transfer lane: `stage_alloc`, `transfer_in`,
 `transfer_out`, `barrier`, tickets; `memory_now`, `l2_cache_bytes`, `storage_offset_align`) has a default.
-
-## From 0.5.1 to 0.5.2
-
-0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
-algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
-reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
-behaviour changes without a compile error: `matmul` runs in TF32 on CUDA devices with tensor cores.
 
 ### `matmul` is TF32 by default on CUDA
 

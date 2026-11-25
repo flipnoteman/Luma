@@ -493,7 +493,7 @@ impl fmt::Display for Decision {
 ///
 /// Deprecated with [`Profile::splits`]: [`Profile::cuts`] gives the same three values, and
 /// `Context::take_decisions` every decision of the planner (`DecisionSite::Cut` is a cut).
-#[deprecated(since = "0.5.3", note = "use `Profile::cuts()` (or `Decision` with `DecisionSite::Cut`); removed in 0.6")]
+#[deprecated(since = "0.5.2", note = "use `Profile::cuts()` (or `Decision` with `DecisionSite::Cut`); removed in 0.6")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionSplit {
     /// The operation whose creation (or evaluation) caused the cut.
@@ -536,7 +536,7 @@ pub struct Profile {
     pub kernels: Vec<KernelTiming>,
     /// Where lazy expressions were cut into several kernels while profiling, in the order they
     /// happened (see [`SplitReason`]). Read them with [`Profile::cuts`].
-    #[deprecated(since = "0.5.3", note = "use `Profile::cuts()` (or `Context::take_decisions()`); removed in 0.6")]
+    #[deprecated(since = "0.5.2", note = "use `Profile::cuts()` (or `Context::take_decisions()`); removed in 0.6")]
     pub splits: Vec<FusionSplit>,
 }
 
@@ -1384,7 +1384,7 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// planner's cuts through [`Profile::cuts`] and every other decision through
     /// `Context::take_decisions`). Until then a backend attaches `splits` to the profile as it
     /// always did; the context passes the cuts of the profiled region.
-    #[deprecated(since = "0.5.3", note = "0.6 drops the `splits` argument; the cuts are `Profile::cuts()`, every decision `Context::take_decisions()`")]
+    #[deprecated(since = "0.5.2", note = "0.6 drops the `splits` argument; the cuts are `Profile::cuts()`, every decision `Context::take_decisions()`")]
     #[allow(deprecated)]
     fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError>;
     /// Whether profiling is enabled.
