@@ -10,6 +10,8 @@
 use std::any::Any;
 use std::panic::Location;
 
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
 use crate::array::{Array, Failure};
 use crate::error::LumaError;
 use crate::ops::select;
@@ -102,6 +104,7 @@ fn search<T: SortKey>(sorted: &Array<T>, values: &Array<T>, side: Side) -> Array
     let n = sorted.len();
     let mut step = 1u32 << (usize::BITS - 1 - n.leading_zeros());
     let before = Before::new(values, side);
+    note_light(sorted.context(), FamilyTag::Search, "search", Location::caller(), "search::unrolled");
     let first = sorted.slice(0, step as usize - 1..step as usize);
     let mut pos = select(&before.probe(&first), step, 0u32);
     while step > 1 {
