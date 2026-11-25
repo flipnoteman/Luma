@@ -2962,6 +2962,12 @@ pub(crate) struct JitState {
     structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
     merged_seen: Mutex<FxMap<u64, u32>>,
+    /// Strategy rankings by subject (see [`structured::select`]).
+    pub(crate) selections: structured::select::SelectionCache,
+    /// Sampled launch timings of strategies (see [`structured::telemetry`]).
+    pub(crate) telemetry: structured::telemetry::Telemetry,
+    /// Kernels of non-baseline strategies built so far, against the variant budget.
+    pub(crate) variants: structured::select::Variants,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
@@ -3105,6 +3111,9 @@ impl JitState {
             loops: Mutex::new(FxMap::default()),
             structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
+            selections: Mutex::new(FxMap::default()),
+            telemetry: structured::telemetry::Telemetry::default(),
+            variants: structured::select::Variants::default(),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),

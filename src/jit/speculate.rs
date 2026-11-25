@@ -18,6 +18,8 @@ use crate::builtin::{Finish, ReduceList};
 use crate::context::{Context, Scratch};
 use crate::error::{LumaError, Result};
 use crate::reduce::finish_passes;
+use super::structured::emit::Emit;
+use super::structured::strategy::PassMode;
 
 use super::program::{flatten_step, Fused, FusedKey, StateRef, Tail, Traced};
 use super::{launch, ElemTy, Node, Src};
@@ -283,14 +285,14 @@ fn compute_ahead(
 ) -> Result<(Vec<Arc<Storage>>, Buffer)> {
     debug_assert_eq!(from.len(), states);
     if template.inputs.len() + outs.len() <= ctx.jit().max_inputs()
-        && let Ok((next, partial, groups)) = launch::reduce_and_store_fused(ctx, len, with_states(template, from, None), outs, ops, scratch, None, Finish::default(), None)
+        && let Ok((next, partial, groups)) = launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, with_states(template, from, None), outs, ops, scratch, None, Finish::default(), None)
     {
-        let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.stride(), partial, groups, true, None, Finish::default())?;
+        let residual = finish_passes(&mut Emit::now(ctx), PassMode::Auto, scratch, ops, wgsl, ElemTy::F32.stride(), partial, groups, true, None, Finish::default())?;
         return Ok((next.into_iter().map(Arc::new).collect(), residual));
     }
-    let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch, None, Finish::default()).map_err(Failure::into_error)?;
+    let partials = launch::reduce_fused(&mut Emit::now(ctx), PassMode::Auto, len, with_states(template, from, None), ops, scratch, None, Finish::default()).map_err(Failure::into_error)?;
     let [(partial, groups)] = <[_; 1]>::try_from(partials).map_err(|_| LumaError::Gpu("speculated reduction spans segments".into()))?;
-    let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.stride(), partial, groups, true, None, Finish::default())?;
+    let residual = finish_passes(&mut Emit::now(ctx), PassMode::Auto, scratch, ops, wgsl, ElemTy::F32.stride(), partial, groups, true, None, Finish::default())?;
     let next = launch::run_store(ctx, len, with_states(template, from, Some(outs))).map_err(Failure::into_error)?;
     Ok((next.into_iter().map(Arc::new).collect(), residual))
 }

@@ -28,6 +28,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use luma_core::Buffer;
 
+use crate::jit::structured::emit::Emit;
+
 use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
@@ -880,6 +882,8 @@ pub(crate) struct Lines<'a> {
     cores: Vec<(Pass, Arc<KernelCore>)>,
     reduce_cores: Vec<(AxisPass, Arc<KernelCore>)>,
     ty: &'static str,
+    /// Where the passes launch.
+    emit: Emit<'a>,
 }
 
 /// A buffer and the bytes bound of it.
@@ -963,20 +967,26 @@ fn no_operator() -> Operator {
 
 /// Reduces the lines `geom` of the `f32` expression `node` with `op` into `out`: the passes of [`Array::reduce_axis`] of one op,
 /// the first computing the expression where it can.
-pub(crate) fn reduce_axis_node(ctx: &Context, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>) -> Outcome<()> {
+pub(crate) fn reduce_axis_node(emit: &mut Emit<'_>, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>) -> Outcome<()> {
     let operator = no_operator();
-    let mut run = Lines::new(ctx, &operator, "f32");
-    run.reduce(Input::Pending(node), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, ReduceList::new(&[op]), false, &[out])
+    let mut run = Lines::new(emit.ctx(), &operator, "f32");
+    run.emit = emit.clone();
+    let result = run.reduce(Input::Pending(node), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, ReduceList::new(&[op]), false, &[out]);
+    emit.absorb(&run.emit);
+    result
 }
 
 /// Reduces the lines `geom` of the operands of `plan` in the passes of [`Array::reduce_axis`]: op `j` of `ops` reduces its own
 /// operand (see [`jit::AxisPlan::roots`]) into `outs[j]`, every op combining the cells of its lines in the order a reduction
 /// of that operand alone does, so the values are the same bits. One kernel computes the operands together (once what they share).
-pub(crate) fn reduce_axis_planned(ctx: &Context, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>]) -> Outcome<()> {
+pub(crate) fn reduce_axis_planned(emit: &mut Emit<'_>, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>]) -> Outcome<()> {
     let operator = no_operator();
-    let mut run = Lines::new(ctx, &operator, "f32");
+    let mut run = Lines::new(emit.ctx(), &operator, "f32");
+    run.emit = emit.clone();
     let list = ReduceList::merged(ops, plan.roots(), &vec![crate::builtin::Epilogue::default(); ops.len()]);
-    run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs)
+    let result = run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs);
+    emit.absorb(&run.emit);
+    result
 }
 
 /// Chunks a workgroup of [`Pass::ChunkLookback`] reads the status of at a time, one per
@@ -997,7 +1007,7 @@ pub(crate) fn add_operator(ctx: &Context) -> Outcome<Operator> {
 
 impl<'a> Lines<'a> {
     fn new(ctx: &'a Context, op: &'a Operator, ty: &'static str) -> Self {
-        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty }
+        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty, emit: Emit::now(ctx) }
     }
 
     /// The scan kernels of `op`, which must be [`add_operator`] or another operator on `u32`.
@@ -1059,7 +1069,7 @@ impl<'a> Lines<'a> {
         }
         args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
         let (workgroups, size) = self.grid(pass, geometry)?;
-        self.ctx.launch(&core, workgroups, size, &args)
+        self.emit.launch(&core, workgroups, size, &args)
     }
 
     /// Whether a scan with this operator gives the same result however it groups its operands, so
@@ -1106,11 +1116,11 @@ impl<'a> Lines<'a> {
         let input = match input {
             Input::Buffer(input) => input,
             Input::Plan(plan) => {
-                jit::axis_reduce_planned(self.ctx, plan, pass, geometry, workgroups, size, &writes)?;
+                jit::axis_reduce_planned(&mut self.emit, plan, pass, geometry, workgroups, size, &writes)?;
                 return Ok(());
             }
             Input::Pending(node) => {
-                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes, &[])? {
+                if jit::axis_reduce(&mut self.emit, node, pass, geometry, workgroups, size, &writes, &[])? {
                     return Ok(());
                 }
                 let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
@@ -1122,7 +1132,7 @@ impl<'a> Lines<'a> {
         let mut args = writes;
         args.push(RawArg::read(input.buffer, input.bytes));
         args.push(RawArg::Uniform(bytemuck::cast_slice(&geometry)));
-        self.ctx.launch(&core, workgroups, size, &args)?;
+        self.emit.launch(&core, workgroups, size, &args)?;
         Ok(())
     }
 

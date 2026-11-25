@@ -369,6 +369,44 @@ fn a_group_of_reductions_forced_repeatedly_ends_up_in_one_kernel() {
 }
 
 #[test]
+fn a_merged_group_runs_solo_until_its_kernel_is_ready() {
+    use crate::profile::{Decision, DecisionSite, Verdict};
+    use crate::view::concat_slice;
+    let after = 2;
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = after).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let x = f32s(&ctx, &values(100_000, 13, -1.0, 1.0));
+    let count = 6;
+    let run = |scale: f32| -> Vec<Decision> {
+        ctx.record_decisions(true);
+        let sums: Vec<Array<f32>> = (0..count).map(|j| (&x * (j as f32 + scale)).sum().reshape([1])).collect();
+        concat_slice(0, &sums).to_vec().unwrap();
+        let decisions = ctx.take_decisions();
+        ctx.record_decisions(false);
+        decisions.into_iter().filter(|d| d.site == DecisionSite::ReducePlan).collect()
+    };
+    // Not due: the seed asks for the merged kernel, which is not due; it declines, every member is marked solo and runs on its own passes.
+    let first = run(1.5);
+    assert_eq!(first.len(), count, "{first:?}");
+    assert!(first.iter().all(|d| !d.chosen.starts_with("merged")), "{first:?}");
+    assert!(first.iter().filter(|d| d.candidates.contains(&("merged".into(), Verdict::Rejected("declined")))).count() == 1, "{first:?}");
+    // The others were marked solo by that: the merged strategy does not even fit them.
+    assert!(first.iter().filter(|d| d.candidates.contains(&("merged".into(), Verdict::Rejected("shape")))).count() == count - 1, "{first:?}");
+    // Due, then ready: a force records the group in one kernel, and the members take its buffer without a decision of their own.
+    let mut merged = false;
+    for _ in 0..2000 {
+        let decisions = run(1.5);
+        if decisions.len() == 1 && decisions[0].chosen.starts_with("merged") {
+            merged = true;
+            break;
+        }
+        assert!(decisions.iter().all(|d| !d.chosen.starts_with("merged")), "{decisions:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(merged, "the merged strategy was never chosen");
+}
+
+#[test]
 fn consumers_of_pending_reductions_record_them_as_a_group() {
     use crate::view::{concat_slice, stack_slice};
     let ctx = ctx();

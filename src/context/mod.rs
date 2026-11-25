@@ -9,6 +9,8 @@ use crate::numerics::Numerics;
 use crate::error::{LumaError, Result};
 use crate::jit::cost;
 use crate::jit::JitState;
+use crate::jit::structured::select::StrategyOverride;
+use crate::jit::structured::strategy::{FamilyTag, StrategyId};
 use crate::gpu::pager::{Accounted, Pager};
 use crate::gpu::built::BuildCache;
 use crate::gpu::hash::FxMap;
@@ -65,6 +67,8 @@ struct Inner {
     numerics: Numerics,
     /// What the device can do, computed once when the context opens.
     caps: Caps,
+    /// The strategies forced by `LUMA_STRATEGY` (see [`ContextOptions::strategy`]).
+    strategy_override: StrategyOverride,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -237,6 +241,12 @@ pub struct ContextOptions {
     /// rasterizers); `Some(false)` forces the splitting everywhere, `Some(true)` trusts the
     /// caller. `LUMA_DF_FMA=on|off`. The results are the same either way.
     pub df_fma: Option<bool>,
+    /// Forces strategies of the registry: `family:strategy[,family:strategy...]` (`reduce:two-pass`), as `LUMA_STRATEGY` says.
+    /// A strategy that does not fit an operation is not used for it (the default selection runs, and the profile's decisions say
+    /// so); an unknown family or strategy fails [`Context::with_options`] with [`LumaError::InvalidOption`]. For tests and
+    /// investigations: it can change which kernels run, never what a strategy of the same bit class computes.
+    #[doc(hidden)]
+    pub strategy: Option<&'static str>,
 }
 
 /// The value of the removed environment variable `name`, with a warning (once per variable) that
@@ -267,6 +277,7 @@ impl Default for ContextOptions {
             fast_math: false,
             tf32_matmul: true,
             df_fma: None,
+            strategy: None,
         }
     }
 }
@@ -282,6 +293,13 @@ impl ContextOptions {
     /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
     pub fn df_fma(mut self, fused: bool) -> Self {
         self.df_fma = Some(fused);
+        self
+    }
+
+    /// Forces strategies of the registry (see [`ContextOptions::strategy`]).
+    #[doc(hidden)]
+    pub fn strategy(mut self, forced: &'static str) -> Self {
+        self.strategy = Some(forced);
         self
     }
 
@@ -432,8 +450,21 @@ impl ContextOptions {
                 "0" | "off" | "false" => Some(false),
                 _ => None,
             }),
+            strategy: std::env::var("LUMA_STRATEGY").ok().filter(|text| !text.trim().is_empty()).map(intern),
         }
     }
+}
+
+/// `text` as a `&'static str`, leaked once per distinct text (the options are `Copy`).
+fn intern(text: String) -> &'static str {
+    static KNOWN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut known = lock(&KNOWN);
+    if let Some(&found) = known.iter().find(|&&known| known == text) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    known.push(leaked);
+    leaked
 }
 
 /// Which device a [`Context`] runs on, from [`Context::device`].
@@ -625,6 +656,12 @@ impl Context {
         self.inner.caps
     }
 
+    /// The strategy `LUMA_STRATEGY` forces for `family`, if any.
+    #[inline]
+    pub(crate) fn strategy_override(&self, family: FamilyTag) -> Option<StrategyId> {
+        self.inner.strategy_override.of(family)
+    }
+
     /// Whether value-changing algebraic rewrites are allowed.
     pub(crate) fn fast_math(&self) -> bool {
         self.inner.numerics.fast_math()
@@ -692,6 +729,10 @@ impl Context {
         tuning.native_gemm = Tuning::native_gemm_for(backend.native_matmul());
         tune(&mut tuning);
         let caps = Caps::of(info, &*backend, &tuning).without(removed);
+        let strategy_override = match options.strategy {
+            Some(text) => StrategyOverride::parse(text)?,
+            None => StrategyOverride::default(),
+        };
 
         let ctx = Context {
             inner: Arc::new(Inner {
@@ -715,6 +756,7 @@ impl Context {
                 check_finite: options.check_finite,
                 numerics: options.effective_numerics(),
                 caps,
+                strategy_override,
                 pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
@@ -812,6 +854,7 @@ impl Context {
         self.flush()?;
         let waited = self.hal().sync(self.inner.waits.budget())?;
         self.inner.waits.record(waited);
+        self.jit().telemetry.drain_pending(self);
         Ok(())
     }
 

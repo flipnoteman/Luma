@@ -10,6 +10,9 @@ use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList,
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
+use crate::jit::structured::emit::Emit;
+use crate::jit::structured::select;
+use crate::jit::structured::strategy::{Output, PassMode, Subject};
 use crate::jit::structured::{Comp, Family, Meta, OpTag, ReduceOrigin, RunState, Structured};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
@@ -31,6 +34,9 @@ use crate::shape::Shape;
 
 /// Most kernels of reductions whose compile [`Structured::build_ahead`] starts at once.
 const AHEAD_KERNELS: usize = 8;
+
+mod strategies;
+pub(crate) use strategies::REDUCE_STRATEGIES;
 
 /// The lines an axis reduction runs over: `lines` lines of `n` cells, `stride` apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,6 +155,12 @@ impl Structured {
         if !mergeable || !ctx.jit().may_have_partners(self) {
             return Vec::new();
         }
+        self.take_partners(ctx)
+    }
+
+    /// [`Structured::merge_partners`] once its checks hold (the merged strategies' `fits` made them): forces the reductions the
+    /// operand waits for, which is a side effect, hence it runs in `lower` and never in `fits`.
+    pub(crate) fn take_partners(&self, ctx: &Context) -> Vec<Arc<Structured>> {
         let operand = self.operand();
         let Some(leaves) = jit::unresolved_leaves(operand) else { return Vec::new() };
         if !leaves.is_empty() {
@@ -164,13 +176,15 @@ impl Structured {
     }
 
     /// Records the reductions `partners` (see [`Structured::merge_partners`]) and this one in one kernel: this reduction's
-    /// buffer, once the others hold theirs. `None` (nothing recorded) if the program does not fit one kernel.
-    fn record_merged(&self, ctx: &Context, partners: &[Arc<Structured>]) -> Option<Arc<Storage>> {
+    /// buffer, once the others hold theirs. `None` (nothing recorded) if the program does not fit one kernel, or the kernel is
+    /// not due or not ready yet (then every member is marked to run alone).
+    pub(crate) fn record_merged(&self, emit: &mut Emit<'_>, partners: &[Arc<Structured>]) -> Option<Arc<Storage>> {
+        let ctx = emit.ctx();
         let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
         let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), finish: reduced.finish() }).collect();
         let ahead = || self.build_ahead(ctx, partners);
         let deferred = std::cell::Cell::new(false);
-        let pack = match jit::reduce_many(ctx, &members, self.ty(), ctx.tuning().reduce_multi, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
+        let pack = match jit::reduce_many(emit, &members, self.ty(), ctx.tuning().reduce_multi, PassMode::Auto, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
             Ok(Some(pack)) => Arc::new(pack),
             _ => {
                 if deferred.get() {
@@ -225,7 +239,7 @@ impl Structured {
             let members: Vec<jit::Member<'_>> =
                 std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), finish: reduced.finish() }).collect();
             // A program that does not fit is left to the reductions' own turn.
-            let _ = jit::reduce_many(ctx, &members, seed.ty(), ctx.tuning().reduce_multi, jit::ManyMode::BuildOnly);
+            let _ = jit::reduce_many(&mut Emit::now(ctx), &members, seed.ty(), ctx.tuning().reduce_multi, PassMode::Auto, jit::ManyMode::BuildOnly);
         }
     }
 
@@ -252,71 +266,99 @@ impl Structured {
         Some(Ok(T::from_repr(bytemuck::pod_collect_to_vec(words.get(*offset..offset + count)?), count)))
     }
 
-    /// Records the passes into the buffer of a reduction that was not recorded yet: on the host if it can run there, else on
-    /// the GPU together with the reductions that are pending.
+    /// Records the passes into the buffer of a reduction that was not recorded yet: the strategy `select` picks runs (see
+    /// [`strategies`]): on the host if it can run there, else on the GPU together with the reductions that are pending.
     pub(crate) fn record_reduce(&self, ctx: &Context) -> std::result::Result<Arc<Storage>, Arc<LumaError>> {
-        match crate::host::try_eval_reduced(self, ctx) {
-            Some(storage) => Ok(storage),
-            None => {
-                self.forcing.store(true, Ordering::Relaxed);
-                let partners = self.merge_partners(ctx);
-                let result = self.record(ctx, &partners).map_err(Arc::new);
-                self.forcing.store(false, Ordering::Relaxed);
-                result
-            }
-        }
+        self.forcing.store(true, Ordering::Relaxed);
+        let result = select::execute(ctx, &Subject::Reduce(self)).map(Output::into_storage).map_err(|failure| Arc::new(failure.into_error()));
+        self.forcing.store(false, Ordering::Relaxed);
+        result
     }
 
-    #[inline]
-    fn record(&self, ctx: &Context, partners: &[Arc<Structured>]) -> Result<Arc<Storage>> {
-        let comp = self.comp();
-        if let Some(geom) = comp.meta.geom {
-            return self.record_axis(ctx, geom, partners);
-        }
+    /// Records this reduction with the `partners` a read found (non-axis; see [`Structured::read`]): in one kernel with them where
+    /// that works, else alone.
+    fn record_listed(&self, ctx: &Context, partners: &[Arc<Structured>]) -> Result<Arc<Storage>> {
+        let mut emit = Emit::now(ctx);
         if !partners.is_empty()
-            && let Some(storage) = self.record_merged(ctx, partners)
+            && let Some(storage) = self.record_merged(&mut emit, partners)
         {
             return Ok(storage);
         }
+        self.record_alone(&mut emit, PassMode::Auto, self.comp().meta.ty == ElemTy::Bool).map_err(Failure::into_error)
+    }
+
+    /// Records this reduction's own passes into a buffer: `bits` for a packed `bool` value.
+    pub(crate) fn record_alone(&self, emit: &mut Emit<'_>, mode: PassMode, bits: bool) -> std::result::Result<Arc<Storage>, Failure> {
+        let ctx = emit.ctx();
+        let comp = self.comp();
         let RunState::Reduce { wgsl, elem, layout, finish, .. } = &comp.run;
         let count = comp.origin.ops.as_slice().len();
         let storage = Arc::new(Storage::new(ctx, count, *layout));
         let pin = storage.pin(0)?;
         let array = Array::<u32>::from_node(ctx, Shape::from(comp.origin.operand.len()), Arc::clone(&comp.origin.operand));
-        let mut scratch = Scratch::new(ctx);
-        reduce_into(&array, comp.meta.ty == ElemTy::Bool, *elem, wgsl, comp.origin.ops, &mut scratch, Some(pin.buffer()), *finish)?;
+        let mut scratch = emit.scratch();
+        reduce_into(emit, &array, bits, *elem, wgsl, comp.origin.ops, mode, &mut scratch, Some(pin.buffer()), *finish)?;
         Ok(storage)
     }
 
     /// Records this axis reduction into a buffer of one value per line, in one kernel with the axis reductions `partners` of the
-    /// same lines (see [`Structured::merge_partners`]) where the program of their operands fits one: each of them then holds its own buffer.
-    fn record_axis(&self, ctx: &Context, geom: AxisGeom, partners: &[Arc<Structured>]) -> Result<Arc<Storage>> {
+    /// same lines (see [`Structured::merge_partners`]) where the program of their operands fits one: each of them then holds its own
+    /// buffer. `None` (nothing recorded) if there are no partners or the program does not fit.
+    pub(crate) fn record_axis_merged(&self, emit: &mut Emit<'_>, geom: AxisGeom, partners: &[Arc<Structured>]) -> std::result::Result<Option<Arc<Storage>>, Failure> {
+        if partners.is_empty() {
+            return Ok(None);
+        }
+        let ctx = emit.ctx();
         let all: Vec<&Structured> = std::iter::once(self).chain(partners.iter().map(|partner| &**partner)).collect();
+        let operands: Vec<&Arc<Node>> = all.iter().map(|reduced| reduced.operand()).collect();
+        let Some(plan) = jit::axis_plan(ctx, &operands, all.len()) else { return Ok(None) };
         let bytes = geom.lines as u64 * 4;
-        let plan = if all.len() > 1 {
-            let operands: Vec<&Arc<Node>> = all.iter().map(|reduced| reduced.operand()).collect();
-            jit::axis_plan(ctx, &operands, all.len())
-        } else {
-            None
-        };
-        // Without a plan the others are left for their own turn.
-        let all = if plan.is_some() { all } else { vec![self] };
         let storages: Vec<Arc<Storage>> = all.iter().map(|reduced| Arc::new(Storage::new(ctx, geom.lines as usize, reduced.layout()))).collect();
         let pins = storages.iter().map(|storage| storage.pin(0)).collect::<Result<Vec<_>>>()?;
         let outs: Vec<crate::scan::Bound<'_>> = pins.iter().map(|pin| crate::scan::Bound { buffer: pin.buffer(), bytes }).collect();
-        match plan {
-            Some(plan) => {
-                let ops: Vec<ReduceOp> = all.iter().map(|reduced| reduced.ops().as_slice()[0]).collect();
-                crate::scan::reduce_axis_planned(ctx, &plan, geom, &ops, &outs).map_err(Failure::into_error)?;
-                drop(outs);
-                drop(pins);
-                for (reduced, storage) in all.iter().zip(&storages).skip(1) {
-                    reduced.adopt(Arc::clone(storage));
-                }
-            }
-            None => crate::scan::reduce_axis_node(ctx, self.operand(), geom, self.ops().as_slice()[0], outs[0]).map_err(Failure::into_error)?,
+        let ops: Vec<ReduceOp> = all.iter().map(|reduced| reduced.ops().as_slice()[0]).collect();
+        crate::scan::reduce_axis_planned(emit, &plan, geom, &ops, &outs)?;
+        drop(outs);
+        drop(pins);
+        for (reduced, storage) in all.iter().zip(&storages).skip(1) {
+            reduced.adopt(Arc::clone(storage));
         }
-        Ok(Arc::clone(&storages[0]))
+        Ok(Some(Arc::clone(&storages[0])))
+    }
+
+    /// Records this axis reduction alone, into a buffer of one value per line.
+    pub(crate) fn record_axis_lines(&self, emit: &mut Emit<'_>, geom: AxisGeom) -> std::result::Result<Arc<Storage>, Failure> {
+        let ctx = emit.ctx();
+        let storage = Arc::new(Storage::new(ctx, geom.lines as usize, self.layout()));
+        let pin = storage.pin(0)?;
+        let out = crate::scan::Bound { buffer: pin.buffer(), bytes: geom.lines as u64 * 4 };
+        crate::scan::reduce_axis_node(emit, self.operand(), geom, self.ops().as_slice()[0], out)?;
+        drop(pin);
+        Ok(storage)
+    }
+
+    /// The first pass's workgroups, for the label of a Decision.
+    pub(crate) fn first_groups(&self, ctx: &Context) -> u32 {
+        ctx.tuning().reduce_groups(u32::try_from(self.comp().meta.len).unwrap_or(u32::MAX))
+    }
+
+    /// The shape that picks the strategy: the operand's length, or an axis reduction's lines.
+    pub(crate) fn dims(&self) -> [u32; 4] {
+        let comp = self.comp();
+        match comp.meta.geom {
+            Some(geom) => [geom.n, geom.stride, geom.lines, 1],
+            None => [u32::try_from(comp.meta.len).unwrap_or(u32::MAX), 1, 1, 1],
+        }
+    }
+
+    /// What identifies the family's value for the ranking cache: the ops, the element type, packed or not, axis or not.
+    pub(crate) fn signature(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let comp = self.comp();
+        comp.origin.ops.hash(hasher);
+        comp.meta.ty.hash(hasher);
+        comp.meta.tag.hash(hasher);
+        self.layout().is_packed().hash(hasher);
     }
 
     /// The values on the host, without keeping them on the GPU.
@@ -338,7 +380,7 @@ impl Structured {
             let partners = self.merge_partners(ctx);
             if !partners.is_empty() {
                 self.forcing.store(true, Ordering::Relaxed);
-                let result = self.record_with(|| self.record(ctx, &partners).map_err(Arc::new));
+                let result = self.record_with(|| self.record_listed(ctx, &partners).map_err(Arc::new));
                 self.forcing.store(false, Ordering::Relaxed);
                 let storage = result.as_ref().map_err(|error| LumaError::clone(error))?;
                 let values = match self.packed_values::<T>(ctx) {
@@ -447,7 +489,7 @@ impl Array<bool> {
         let storage = Arc::new(Storage::new(ctx, 1, R::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(self, true, R::LAYOUT.stride() as u64, "u32", ReduceList::new(&[op]), &mut scratch, Some(pin.buffer()), Finish::default())?;
+        reduce_into(&mut Emit::now(ctx), self, true, R::LAYOUT.stride() as u64, "u32", ReduceList::new(&[op]), PassMode::Auto, &mut scratch, Some(pin.buffer()), Finish::default())?;
         Ok(Array::from_storage(ctx, Shape::from(1usize), storage))
     }
 
@@ -525,7 +567,7 @@ impl<T: ScalarType> Array<T> {
         let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(self, T::LAYOUT.is_packed(), elem, wgsl, ops, &mut scratch, Some(pin.buffer()), Finish::default())?;
+        reduce_into(&mut Emit::now(ctx), self, T::LAYOUT.is_packed(), elem, wgsl, ops, PassMode::Auto, &mut scratch, Some(pin.buffer()), Finish::default())?;
         Ok(Array::from_storage(ctx, shape, storage))
     }
 
@@ -702,7 +744,7 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         return values;
     }
     let mut scratch = Scratch::new(ctx);
-    let current = reduce_into(array, bits, elem, wgsl, ops, &mut scratch, None, finish)?;
+    let current = reduce_into(&mut Emit::now(ctx), array, bits, elem, wgsl, ops, PassMode::Auto, &mut scratch, None, finish)?;
     let values = T::from_repr(ctx.read::<T::Repr>(&current, elem * count)?, count as usize);
     if values.len() as u64 != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
@@ -719,7 +761,7 @@ fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList,
         && speculate
         && finish.epilogue.is_empty()
         && matches!(wgsl, "f32" | "u32")
-        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(&mut Emit::now(array.context()), array, bits, elem, wgsl, ops, PassMode::Auto, scratch, None, finish))
     {
         return Some(words.map(|words| T::from_repr(bytemuck::cast_slice(&words).to_vec(), count)));
     }
@@ -732,7 +774,8 @@ fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList,
 /// [`Tuning::single_pass_reduce`] (see [`ReduceList::single_pass`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_passes(
-    ctx: &Context,
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
     wgsl: &'static str,
@@ -743,7 +786,7 @@ pub(crate) fn finish_passes(
     target: Option<&luma_core::Buffer>,
     finish: Finish,
 ) -> Result<luma_core::Buffer> {
-    finish_passes_gated(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish, None)
+    finish_passes_gated(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish, None)
 }
 
 /// [`finish_passes`] where the last pass also runs a gate (its id and the arguments of its
@@ -751,7 +794,8 @@ pub(crate) fn finish_passes(
 /// (`per_op`) that are more than one value, so that the last pass is a pass of one group.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_passes_gated(
-    ctx: &Context,
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
     wgsl: &'static str,
@@ -769,7 +813,7 @@ pub(crate) fn finish_passes_gated(
         scalars[used] = word;
         used += 1;
     }
-    passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish.epilogue, &scalars[..used], gate)
+    passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish.epilogue, &scalars[..used], gate)
 }
 
 /// [`finish_passes`] for the partial results of a first pass of a [merged](ReduceList::merged)
@@ -777,7 +821,7 @@ pub(crate) fn finish_passes_gated(
 /// list, the scalars of which are `scalars`, in the order of its uniform fields.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_passes_merged(
-    ctx: &Context,
+    emit: &mut Emit<'_>,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
     wgsl: &'static str,
@@ -787,7 +831,7 @@ pub(crate) fn finish_passes_merged(
     target: &luma_core::Buffer,
     scalars: &[u32],
 ) -> Result<luma_core::Buffer> {
-    passes(ctx, scratch, ops, wgsl, elem, current, n, true, Some(target), Epilogue::default(), scalars, None)
+    passes(emit, PassMode::Auto, scratch, ops, wgsl, elem, current, n, true, Some(target), Epilogue::default(), scalars, None)
 }
 
 /// The passes of [`finish_passes`]: the last one applies `epilogue` (the epilogues of a merged list)
@@ -795,7 +839,8 @@ pub(crate) fn finish_passes_merged(
 /// [`finish_passes_gated`]).
 #[allow(clippy::too_many_arguments)]
 fn passes(
-    ctx: &Context,
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
     wgsl: &'static str,
@@ -809,13 +854,14 @@ fn passes(
     gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
 ) -> Result<luma_core::Buffer> {
     debug_assert!(gate.is_none() || (per_op && n > 1 && ops.as_slice().len() == 1), "a gate runs in a last pass over partial results");
+    let ctx = emit.ctx();
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
         let list = if per_op { ops.rest() } else { ops };
         // The pass with one group is the last: its output is the final value; so is that of a
         // first pass that finishes the reduction itself.
-        let single_pass = !per_op && groups > 1 && ctx.tuning().single_pass_reduce;
+        let single_pass = !per_op && groups > 1 && mode.single(ctx);
         let last = groups == 1 || single_pass;
         let list = if last { list.finished(epilogue) } else { list };
         let list = if single_pass { list.single_pass() } else { list };
@@ -846,7 +892,7 @@ fn passes(
                 Some(target) => target.clone(),
                 None => scratch.take(elem * count)?,
             };
-            ctx.launch(
+            emit.launch(
                 &core,
                 fold_workgroups(ctx, groups)?,
                 [n, 1, 1],
@@ -865,7 +911,7 @@ fn passes(
             raw.extend_from_slice(args);
         }
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&words[..used])));
-        ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+        emit.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
         drop(raw);
         current = out;
         n = groups;
@@ -881,23 +927,24 @@ fn passes(
 /// (see [`Builtin::ReduceBits`]) by the one op of `ops`.
 #[allow(clippy::too_many_arguments)]
 fn reduce_into<T: GpuType>(
+    emit: &mut Emit<'_>,
     array: &Array<T>,
     bits: bool,
     elem: u64,
     wgsl: &'static str,
     ops: ReduceList,
+    mode: PassMode,
     scratch: &mut Scratch<'_>,
     target: Option<&luma_core::Buffer>,
     finish: Finish,
 ) -> Result<luma_core::Buffer> {
-    let ctx = array.context();
     let count = ops.as_slice().len() as u64;
-    let run_passes = |scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
-        finish_passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
+    let run_passes = |emit: &mut Emit<'_>, scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
+        finish_passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
     };
 
     let fused = match array.pending() {
-        Some(node) => jit::reduce_first_pass(node, ops, scratch, target, finish).map_err(Failure::into_error)?,
+        Some(node) => jit::reduce_first_pass(emit, mode, node, ops, scratch, target, finish).map_err(Failure::into_error)?,
         None => None,
     };
     let mut results = Vec::new();
@@ -909,7 +956,7 @@ fn reduce_into<T: GpuType>(
             for (partial, groups) in partials {
                 // A first pass with one segment and one group applied `finish` itself.
                 let rest = if single && groups != 1 { finish } else { Finish::default() };
-                results.push(run_passes(scratch, partial, groups, true, target, rest)?);
+                results.push(run_passes(emit, scratch, partial, groups, true, target, rest)?);
             }
         }
         None => {
@@ -922,10 +969,10 @@ fn reduce_into<T: GpuType>(
                 let pin = storage.pin_read(j)?;
                 let rest = if single { finish } else { Finish::default() };
                 if bits {
-                    let (words, groups) = bits_first_pass(ctx, scratch, ops, pin.buffer(), n, target)?;
-                    results.push(run_passes(scratch, words, groups, true, target, rest)?);
+                    let (words, groups) = bits_first_pass(emit, scratch, ops, pin.buffer(), n, target)?;
+                    results.push(run_passes(emit, scratch, words, groups, true, target, rest)?);
                 } else {
-                    results.push(run_passes(scratch, pin.buffer().clone(), n, false, target, rest)?);
+                    results.push(run_passes(emit, scratch, pin.buffer().clone(), n, false, target, rest)?);
                 }
             }
         }
@@ -938,23 +985,24 @@ fn reduce_into<T: GpuType>(
     let collect = scratch.take(segments * count * elem)?;
     for i in 0..count {
         for (j, partial) in results.iter().enumerate() {
-            ctx.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
+            emit.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
         }
     }
-    run_passes(scratch, collect, len_u32(results.len())?, true, target, finish)
+    run_passes(emit, scratch, collect, len_u32(results.len())?, true, target, finish)
 }
 
 /// The first pass of the reduction `ops` (one op) of the `n` bit-packed elements in `words`: the
 /// buffer holding the partial results and how many there are. With one group they are the final
 /// value, which is written into `target` if it is given.
 fn bits_first_pass(
-    ctx: &Context,
+    emit: &mut Emit<'_>,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
     words: &luma_core::Buffer,
     n: u32,
     target: Option<&luma_core::Buffer>,
 ) -> Result<(luma_core::Buffer, u32)> {
+    let ctx = emit.ctx();
     let count = n.div_ceil(32);
     let groups = ctx.tuning().reduce_groups(count);
     let out = match target {
@@ -963,7 +1011,7 @@ fn bits_first_pass(
     };
     let core = ctx.builtin(Builtin::ReduceBits(ops), "u32")?;
     ctx.jit().note_reduce_pass();
-    ctx.launch(
+    emit.launch(
         &core,
         fold_workgroups(ctx, groups)?,
         [count, 1, 1],

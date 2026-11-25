@@ -145,6 +145,7 @@ impl Context {
             self.hal().notify_released(&released);
         }
         let flushed = self.hal().flush_batch();
+        self.jit().telemetry.drain_pending(self);
         // Everything recorded that uses these buffers is in the batch submitted above.
         drop(released);
         Ok(flushed?)
@@ -174,13 +175,31 @@ impl Context {
         size: [u32; 3],
         args: &[RawArg<'_>],
     ) -> Result<()> {
+        self.launch_timed(kernel, workgroups, size, args, None)
+    }
+
+    /// [`Context::launch`] that asks the backend to time the launch under `tag` (see
+    /// `Backend::time_next_launch`), unless a recording captures it instead.
+    #[inline]
+    pub(crate) fn launch_timed(
+        &self,
+        kernel: &KernelCore,
+        workgroups: [u32; 3],
+        size: [u32; 3],
+        args: &[RawArg<'_>],
+        tag: Option<u64>,
+    ) -> Result<()> {
         check_aliasing(args)?;
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
         if self.capture(kernel, workgroups, size, args) {
             return Ok(());
         }
+        if let Some(tag) = tag {
+            self.hal().time_next_launch(tag);
+        }
         let pending = self.hal().record_launch(kernel, Dispatch::Direct(workgroups), size, args)?;
+        self.jit().telemetry.drain_some(self);
         if pending >= BATCH_LIMIT {
             self.flush_batch()?;
         }

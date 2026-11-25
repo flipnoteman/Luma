@@ -703,17 +703,25 @@ pub(crate) fn try_eval_group(nodes: &[Arc<Node>]) -> bool {
     true
 }
 
-/// The words a reduction leaves (one per op; the bit of a `bool`'s word), epilogue applied.
-pub(crate) fn reduced_words(reduced: &Structured, ctx: &Context) -> Option<Vec<u32>> {
+/// Whether the host may try to evaluate the reduction `reduced`: what `reduced_words` checks before it evaluates anything (the
+/// `fits` of the host reduce strategy).
+pub(crate) fn reduced_fits(reduced: &Structured, ctx: &Context) -> bool {
     let operand = reduced.operand();
     if reduced.is_axis() || !host_ok(ctx) || operand.len() > MAX_HOST_ELEMS || operand.failure().is_some() {
-        return None;
+        return false;
     }
     let ty = reduced.ty();
-    let finish = reduced.finish();
-    if !supported(ty) || (ty != ElemTy::F32 && !finish.epilogue.is_empty()) {
+    supported(ty) && (ty == ElemTy::F32 || reduced.finish().epilogue.is_empty())
+}
+
+/// The words a reduction leaves (one per op; the bit of a `bool`'s word), epilogue applied.
+pub(crate) fn reduced_words(reduced: &Structured, ctx: &Context) -> Option<Vec<u32>> {
+    if !reduced_fits(reduced, ctx) {
         return None;
     }
+    let operand = reduced.operand();
+    let ty = reduced.ty();
+    let finish = reduced.finish();
     let words = Eval::new(ctx).node(operand)?;
     let mut out = Vec::with_capacity(reduced.ops().as_slice().len());
     for &op in reduced.ops().as_slice() {

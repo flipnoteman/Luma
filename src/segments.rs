@@ -319,7 +319,7 @@ impl<T: AtomicElem> Array<T> {
         let pass = AxisPass { pass: Pass::Segments, ops: ReduceList::new(&[op]), partial: false, split: false, line_major: false };
         let groups = fold_workgroups(ctx, tiles)?;
         let fused = match self.pending() {
-            Some(node) => jit::axis_reduce(ctx, node, pass, geometry, groups, [tiles, 1, 1], &writes, &reads)?,
+            Some(node) => jit::axis_reduce(&mut crate::jit::structured::emit::Emit::now(ctx), node, pass, geometry, groups, [tiles, 1, 1], &writes, &reads)?,
             None => false,
         };
         if !fused {

@@ -29,6 +29,15 @@ const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
 const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
 /// `LUMA_MULTI_REDUCE_AFTER=n` overrides [`Tuning::reduce_multi_after`].
 const MULTI_REDUCE_AFTER_ENV: &str = "LUMA_MULTI_REDUCE_AFTER";
+/// `LUMA_TELEMETRY=off|<n>` sets [`Tuning::telemetry_every`]: one execution of a strategy in `n` is timed on the device (`off` or 0
+/// switches the sampling off).
+const TELEMETRY_ENV: &str = "LUMA_TELEMETRY";
+/// `LUMA_TELEMETRY_MIN=<n>` sets [`Tuning::telemetry_min`].
+const TELEMETRY_MIN_ENV: &str = "LUMA_TELEMETRY_MIN";
+/// `LUMA_EXPLORE=<m>` sets [`Tuning::explore_every`] (0 or `off`: never).
+const EXPLORE_ENV: &str = "LUMA_EXPLORE";
+/// `LUMA_VARIANT_BUDGET=<n>` sets [`Tuning::variant_budget`].
+const VARIANT_BUDGET_ENV: &str = "LUMA_VARIANT_BUDGET";
 /// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
@@ -142,6 +151,17 @@ pub(crate) struct Tuning {
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
     /// across workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
     pub(crate) single_pass_reduce: bool,
+    /// One execution of a strategy in this many is timed on the device (`jit::structured::telemetry`); 0: never.
+    /// `LUMA_TELEMETRY` overrides.
+    pub(crate) telemetry_every: u32,
+    /// Samples of a strategy and shape class before their median counts as a measured cost. `LUMA_TELEMETRY_MIN` overrides.
+    pub(crate) telemetry_min: u32,
+    /// One execution in this many runs a rival strategy of the same bit class instead of the chosen one until it has
+    /// `telemetry_min` samples; 0: never. `LUMA_EXPLORE` overrides.
+    pub(crate) explore_every: u32,
+    /// Most kernels of non-baseline strategies a family may build per context (the wgpu pipeline cache is dropped whole above
+    /// its size cap). `LUMA_VARIANT_BUDGET` overrides.
+    pub(crate) variant_budget: u32,
     /// Whether reductions combine within subgroups (the device has `Features::SUBGROUP`).
     pub(crate) subgroups: bool,
     /// Whether every subgroup has exactly 32 invocations (the radix sort ranks keys with ballots
@@ -245,6 +265,10 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        telemetry_every: 32,
+        telemetry_min: 8,
+        explore_every: 0,
+        variant_budget: 48,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -282,6 +306,10 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        telemetry_every: 32,
+        telemetry_min: 8,
+        explore_every: 0,
+        variant_budget: 48,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -321,6 +349,10 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        telemetry_every: 32,
+        telemetry_min: 8,
+        explore_every: 0,
+        variant_budget: 48,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -386,6 +418,18 @@ impl Tuning {
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
         };
+        tuning.telemetry_every = match std::env::var(TELEMETRY_ENV).as_deref().map(str::trim) {
+            Ok("off") => 0,
+            Ok(value) => value.parse::<u32>().unwrap_or(tuning.telemetry_every),
+            Err(_) => tuning.telemetry_every,
+        };
+        for (name, slot) in [(TELEMETRY_MIN_ENV, &mut tuning.telemetry_min), (EXPLORE_ENV, &mut tuning.explore_every), (VARIANT_BUDGET_ENV, &mut tuning.variant_budget)] {
+            match std::env::var(name).as_deref().map(str::trim) {
+                Ok("off") => *slot = 0,
+                Ok(value) => *slot = value.parse::<u32>().unwrap_or(*slot),
+                Err(_) => {}
+            }
+        }
         tuning.reduce_multi = match std::env::var(MULTI_REDUCE_ENV).as_deref().map(str::trim) {
             Ok("off") => 1,
             Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),

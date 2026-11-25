@@ -37,6 +37,9 @@ pub enum LumaError {
     },
     /// A shape or operation argument is invalid (zero-sized dimension, kernel too large, ...).
     InvalidShape(String),
+    /// An option or environment variable of the context names something that does not exist
+    /// (`LUMA_STRATEGY`).
+    InvalidOption(String),
     /// A dimension or the total element count does not fit in `u32`, which the GPU kernels use.
     DimensionTooLarge {
         /// The offending shape.
@@ -175,6 +178,7 @@ impl fmt::Display for LumaError {
                 write!(f, "Length mismatch: array holds {expected} elements, got {actual}")
             }
             LumaError::InvalidShape(msg) => f.write_str(msg),
+            LumaError::InvalidOption(msg) => f.write_str(msg),
             LumaError::DimensionTooLarge { shape } => write!(
                 f,
                 "Shape {shape:?} exceeds u32::MAX in a dimension or in its total element count"

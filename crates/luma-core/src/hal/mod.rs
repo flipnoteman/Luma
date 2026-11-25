@@ -850,6 +850,10 @@ impl RawKernel {
     pub fn is_ready(&self) -> bool {
         self.native.is_ready()
     }
+    /// Whether the compilation has finished with an error (never waits).
+    pub fn failed(&self) -> bool {
+        self.native.is_ready() && self.native.wait().is_err()
+    }
     /// The backend's kernel, once compiled: waits for the compilation, fails with its error, or
     /// with [`BackendError::Unsupported`] if the kernel is not a `T`.
     pub fn resolve<T: 'static>(&self) -> Result<&T, BackendError> {

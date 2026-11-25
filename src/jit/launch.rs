@@ -11,6 +11,8 @@ use crate::gpu_type::ElemLayout;
 use crate::gpu::pager::Pin;
 use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
+use super::structured::emit::Emit;
+use super::structured::strategy::PassMode;
 use crate::error::LumaError;
 use crate::matmul::{MatmulOperand, MatmulTile};
 use crate::solve::SolveSpec;
@@ -1295,6 +1297,8 @@ impl Runs {
 /// finishes the reduction itself (see `ReduceList::single_pass`): the one partial result per op
 /// is then the final value, with `finish` applied, in `target` when it is given.
 pub(crate) fn reduce_first_pass(
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     node: &Arc<Node>,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
@@ -1314,7 +1318,7 @@ pub(crate) fn reduce_first_pass(
     if !fused.key.inlines() && fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
         return Ok(None);
     }
-    reduce_fused(node.context(), node.len(), fused, ops, scratch, target, finish).map(Some)
+    reduce_fused(emit, mode, node.len(), fused, ops, scratch, target, finish).map(Some)
 }
 
 /// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements,
@@ -1322,7 +1326,8 @@ pub(crate) fn reduce_first_pass(
 /// and more than one group, the pass finishes the reduction itself (see
 /// [`ReduceList::single_pass`]) and the one partial result it returns is the final value.
 pub(super) fn reduce_fused(
-    ctx: &crate::context::Context,
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     len: usize,
     fused: Fused,
     ops: ReduceList,
@@ -1330,6 +1335,7 @@ pub(super) fn reduce_fused(
     target: Option<&Buffer>,
     finish: Finish,
 ) -> Result<Vec<(Buffer, u32)>, Failure> {
+    let ctx = emit.ctx();
     fused.mark_fused();
     let Fused { mut key, inputs, mut scalars, .. } = fused;
     // The segments are those an array of this length has: the inputs may be of other lengths.
@@ -1339,7 +1345,7 @@ pub(super) fn reduce_fused(
     let only_groups = if segments == 1 { Some(ctx.tuning().reduce_groups(len_u32(first.range(0).len())?)) } else { None };
     // One segment: a pass of one group, or one that finishes itself, leaves the final values, so
     // the epilogue goes in it.
-    let single_pass = ctx.tuning().single_pass_reduce && only_groups.is_some_and(|groups| groups > 1);
+    let single_pass = mode.single(ctx) && only_groups.is_some_and(|groups| groups > 1);
     let last = !finish.epilogue.is_empty() && only_groups == Some(1);
     if single_pass {
         key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue).single_pass());
@@ -1383,7 +1389,7 @@ pub(super) fn reduce_fused(
             raw.push(RawArg::write(values, cell));
         }
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
-        ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+        emit.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
         drop(raw);
         partials.push(match values {
             Some(values) => (values, 1),
@@ -1404,7 +1410,8 @@ pub(super) fn reduce_fused(
 /// final value, and the pass must be one that leaves it: one group, or a single pass.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reduce_and_store_fused(
-    ctx: &crate::context::Context,
+    emit: &mut Emit<'_>,
+    mode: PassMode,
     len: usize,
     mut fused: Fused,
     store_outs: &[u32],
@@ -1414,6 +1421,7 @@ pub(super) fn reduce_and_store_fused(
     finish: Finish,
     gate: Option<(GateId, &[RawArg<'_>])>,
 ) -> Result<(Vec<Storage>, Buffer, u32), Failure> {
+    let ctx = emit.ctx();
     if store_outs.iter().any(|&at| fused.key.instrs.get(at as usize).is_none_or(|instr| instr.op.out_ty().is_packed())) {
         return Err(LumaError::Chunked("a fused store and reduction on a packed output").into());
     }
@@ -1428,7 +1436,7 @@ pub(super) fn reduce_and_store_fused(
     }
     let n = len_u32(first.range(0).len())?;
     let groups = ctx.tuning().reduce_groups(n);
-    let single_pass = ctx.tuning().single_pass_reduce && groups > 1;
+    let single_pass = mode.single(ctx) && groups > 1;
     let finished = !finish.epilogue.is_empty() && (single_pass || groups == 1);
     if gate.is_some() && !single_pass && groups != 1 {
         return Err(LumaError::Chunked("a gate on a reduction that does not finish in its first pass").into());
@@ -1484,7 +1492,7 @@ pub(super) fn reduce_and_store_fused(
         raw.extend_from_slice(args);
     }
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
-    ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+    emit.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
     drop(raw);
     let stats = &ctx.jit().stats;
     stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
@@ -1524,7 +1532,8 @@ pub(crate) enum ManyMode<'a> {
 ///
 /// `None` (nothing launched) where the program does not fit a single such kernel: sub-programs read
 /// through shifts, arrays split over several buffers, too many bindings.
-pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>], ty: ElemTy, max_accs: usize, mode: ManyMode<'_>) -> Result<Option<Storage>, Failure> {
+pub(crate) fn reduce_many(emit: &mut Emit<'_>, members: &[Member<'_>], ty: ElemTy, max_accs: usize, pass: PassMode, mode: ManyMode<'_>) -> Result<Option<Storage>, Failure> {
+    let ctx = emit.ctx();
     let Some(first) = members.first() else { return Ok(None) };
     let len = first.operand.len();
     let total: usize = members.iter().map(|member| member.ops.as_slice().len()).sum();
@@ -1599,7 +1608,7 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
     }
     let n = len_u32(probe.range(0).len())?;
     let groups = ctx.tuning().reduce_groups(n);
-    let single_pass = ctx.tuning().single_pass_reduce && groups > 1;
+    let single_pass = pass.single(ctx) && groups > 1;
     let last = groups == 1;
     key.tail = Tail::Reduce(match (single_pass, last) {
         (true, _) => first_pass.finished(Default::default()).single_pass(),
@@ -1657,11 +1666,11 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
         raw.push(RawArg::write(target, cell));
     }
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
-    ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+    emit.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
     drop(raw);
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
     if !single_pass && !last {
-        crate::reduce::finish_passes_merged(ctx, &mut scratch, first_pass, ty.wgsl(), elem, out, groups, target, &scalars_of_ops)?;
+        crate::reduce::finish_passes_merged(emit, &mut scratch, first_pass, ty.wgsl(), elem, out, groups, target, &scalars_of_ops)?;
     }
     drop(pack_pin);
     fused.mark_fused();
@@ -1684,7 +1693,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
         let pin = storage.pin_read(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;
         launch_1d(ctx, &core, words, &[RawArg::write(&flags, u64::from(words) * 4), RawArg::read(pin.buffer(), bytes)])?;
-        let result = crate::reduce::finish_passes(ctx, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;
+        let result = crate::reduce::finish_passes(&mut Emit::now(ctx), PassMode::Auto, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;
         if ctx.read::<u32>(&result, 4)?.first().is_some_and(|&flag| flag != 0) {
             return Err(LumaError::NonFinite);
         }
@@ -1902,7 +1911,7 @@ pub(crate) fn matmul(
 /// the pass reads besides the expression's (bound after them, before the uniform).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn axis_reduce(
-    ctx: &crate::context::Context,
+    emit: &mut Emit<'_>,
     node: &Arc<Node>,
     pass: crate::scan::AxisPass,
     geometry: [u32; 5],
@@ -1911,6 +1920,7 @@ pub(crate) fn axis_reduce(
     outs: &[RawArg<'_>],
     reads: &[RawArg<'_>],
 ) -> Result<bool, Failure> {
+    let ctx = emit.ctx();
     let Some(args) = node.operands() else { return Ok(false) };
     let (fused, args) = flatten_bounded(node, args, Tail::AxisReduce(pass))?;
     drop(args);
@@ -1930,7 +1940,7 @@ pub(crate) fn axis_reduce(
     raw.extend(pins.iter().map(InPin::raw));
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
-    ctx.launch(&core, workgroups, size, &raw)?;
+    emit.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
@@ -2014,7 +2024,7 @@ pub(crate) fn axis_plan(ctx: &crate::context::Context, operands: &[&Arc<Node>], 
 /// Runs the reducing pass `pass` (its ops reduce the roots of `plan`, see [`ReduceList::merged`]) over the cells of the
 /// planned program, as [`axis_reduce`] does for one expression.
 pub(crate) fn axis_reduce_planned(
-    ctx: &crate::context::Context,
+    emit: &mut Emit<'_>,
     plan: &AxisPlan,
     pass: crate::scan::AxisPass,
     geometry: [u32; 5],
@@ -2022,6 +2032,7 @@ pub(crate) fn axis_reduce_planned(
     size: [u32; 3],
     outs: &[RawArg<'_>],
 ) -> Result<(), Failure> {
+    let ctx = emit.ctx();
     let Some(fused) = plan.fused.borrow_mut().take() else {
         return Err(Failure::New(LumaError::Gpu("an axis reduction was planned once and launched twice".into())));
     };
@@ -2039,7 +2050,7 @@ pub(crate) fn axis_reduce_planned(
     raw.extend_from_slice(outs);
     raw.extend(pins.iter().map(InPin::raw));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
-    ctx.launch(&core, workgroups, size, &raw)?;
+    emit.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

@@ -13,6 +13,11 @@ use std::panic::Location;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+pub(crate) mod emit;
+pub(crate) mod select;
+pub(crate) mod strategy;
+pub(crate) mod telemetry;
+
 use super::{ElemTy, Node};
 use crate::array::Storage;
 use crate::builtin::{Finish, ReduceList};
@@ -64,7 +69,7 @@ pub(crate) struct Meta {
 }
 
 /// Which operation a value is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum OpTag {
     /// A reduction of the whole array.
     Reduce,

@@ -68,6 +68,7 @@ mod sort;
 mod subgroup_divergence;
 mod sparse;
 mod spill;
+mod strategies;
 mod threads;
 mod transfer;
 mod transfer_lanes;
