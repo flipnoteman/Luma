@@ -3746,6 +3746,8 @@ impl JitState {
     pub(crate) fn set_plan_cache(&self, on: bool) {
         self.plan_cache.store(on, Ordering::Relaxed);
         self.plan_skip.store(0, Ordering::Relaxed);
+        // The tapes of trace following carry the plans they replay: they are stamped with the epoch.
+        self.plan_epoch.fetch_add(1, Ordering::Relaxed);
         lock(&self.plans).clear();
     }
 
