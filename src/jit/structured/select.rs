@@ -40,7 +40,10 @@ impl StrategyOverride {
         let mut forced = StrategyOverride::default();
         for item in text.split(',').map(str::trim).filter(|item| !item.is_empty()) {
             let (family, name) = item.split_once(':').ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: {item:?} is not <family>:<strategy>")))?;
-            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce)", family.trim())))?;
+            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce, sort, scan, scatter)", family.trim())))?;
+            if table(family).is_empty() {
+                return Err(LumaError::InvalidOption(format!("LUMA_STRATEGY: {}: family not ported (it records its Decision only)", family.name())));
+            }
             let id = StrategyId::parse(family, name.trim()).ok_or_else(|| {
                 let known: Vec<&str> = table(family).iter().map(|strategy| strategy.name).collect();
                 LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown {} strategy {:?} (known: {})", family.name(), name.trim(), known.join(", ")))

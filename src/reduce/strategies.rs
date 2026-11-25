@@ -161,7 +161,7 @@ fn fits_single_pass(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Op
 
 fn lower_single_pass(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
     let Some(reduced) = reduced(subject) else { return Ok(Lowered::Declined) };
-    let Params::Reduce(params) = params;
+    let Params::Reduce(params) = params else { unreachable!("a reduce strategy runs with reduce parameters") };
     done(reduced.record_alone(emit, params.pass, false)?)
 }
 
@@ -172,6 +172,6 @@ fn fits_two_pass(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
 
 fn lower_two_pass(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
     let Some(reduced) = reduced(subject) else { return Ok(Lowered::Declined) };
-    let Params::Reduce(params) = params;
+    let Params::Reduce(params) = params else { unreachable!("a reduce strategy runs with reduce parameters") };
     done(reduced.record_alone(emit, params.pass, false)?)
 }

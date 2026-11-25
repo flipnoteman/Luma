@@ -11,6 +11,7 @@ use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::Arc;
 
+use super::boundary::{CompactAttrs, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
 use super::emit::Emit;
 use super::Structured;
 use crate::array::{Failure, Storage};
@@ -24,31 +25,55 @@ use crate::profile::{Decision, DecisionSite, Verdict};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum FamilyTag {
     Reduce,
+    Sort,
+    Scan,
+    Scatter,
+    Search,
+    Compact,
+    Merge,
 }
 
 /// How many families have a table.
-pub(crate) const FAMILY_COUNT: usize = 1;
+pub(crate) const FAMILY_COUNT: usize = 7;
 
 /// Most entries one family's table may have (the ranking cache keeps them in a `u32` mask and an array).
-pub(crate) const MAX_PER_FAMILY: usize = 8;
+pub(crate) const MAX_PER_FAMILY: usize = 12;
 
 impl FamilyTag {
     #[inline(always)]
     pub(crate) const fn index(self) -> usize {
         match self {
             FamilyTag::Reduce => 0,
+            FamilyTag::Sort => 1,
+            FamilyTag::Scan => 2,
+            FamilyTag::Scatter => 3,
+            FamilyTag::Search => 4,
+            FamilyTag::Compact => 5,
+            FamilyTag::Merge => 6,
         }
     }
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
             FamilyTag::Reduce => "reduce",
+            FamilyTag::Sort => "sort",
+            FamilyTag::Scan => "scan",
+            FamilyTag::Scatter => "scatter",
+            FamilyTag::Search => "search",
+            FamilyTag::Compact => "compact",
+            FamilyTag::Merge => "merge",
         }
     }
 
     pub(crate) fn parse(name: &str) -> Option<FamilyTag> {
         match name {
             "reduce" => Some(FamilyTag::Reduce),
+            "sort" => Some(FamilyTag::Sort),
+            "scan" => Some(FamilyTag::Scan),
+            "scatter" => Some(FamilyTag::Scatter),
+            "search" => Some(FamilyTag::Search),
+            "compact" => Some(FamilyTag::Compact),
+            "merge" => Some(FamilyTag::Merge),
             _ => None,
         }
     }
@@ -144,7 +169,9 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 }
 
 /// One table per family; the shared edit of a new family is one line here.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES];
+///
+/// Search, Compact and Merge are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &[], &[], &[], &[], &[], &[]];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
@@ -180,6 +207,12 @@ impl Subject<'_> {
     pub(crate) fn decision_site(&self) -> DecisionSite {
         match self.family() {
             FamilyTag::Reduce => DecisionSite::ReducePlan,
+            FamilyTag::Sort => DecisionSite::SortPlan,
+            FamilyTag::Scan => DecisionSite::ScanPlan,
+            FamilyTag::Scatter => DecisionSite::ScatterPlan,
+            FamilyTag::Search => DecisionSite::SearchPlan,
+            FamilyTag::Compact => DecisionSite::CompactPlan,
+            FamilyTag::Merge => DecisionSite::MergePlan,
         }
     }
 }
@@ -188,6 +221,9 @@ impl Subject<'_> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Params {
     Reduce(ReduceParams),
+    Sort(SortParams),
+    Scan(ScanParams),
+    Scatter(ScatterParams),
 }
 
 impl Params {
@@ -201,6 +237,14 @@ impl Params {
         match self {
             Params::Reduce(params) if params.groups > 1 => Cow::Owned(format!("{name} groups={}", params.groups)),
             Params::Reduce(_) => Cow::Borrowed(name),
+            // The sort's three radix paths keep the labels the log has had since the sort recorded its choice.
+            Params::Sort(_) => Cow::Borrowed(match name {
+                "radix_sweep" => "sweep",
+                "radix_ballots" => "radix ballot",
+                "radix_count_scan" => "radix",
+                other => other,
+            }),
+            Params::Scan(_) | Params::Scatter(_) => Cow::Borrowed(name),
         }
     }
 }
@@ -311,6 +355,12 @@ pub(crate) struct Boundary<'a> {
 #[allow(dead_code)]
 pub(crate) enum BoundaryAttrs {
     None,
+    Sort(SortAttrs),
+    Scan(ScanAttrs),
+    Scatter(ScatterAttrs),
+    /// Light ports: nothing selects on these, they only tell the Decision (and the signature) what the op was.
+    Compact(CompactAttrs),
+    Merge(MergeAttrs),
 }
 
 /// The candidates of a boundary op in table order whose `needs` and numerics hold and whose `fits` returned `Some`, evaluated
