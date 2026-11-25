@@ -1463,6 +1463,243 @@ fn programs() {
     drive("tests/proptest-regressions/fuzz_programs.txt", generator::programs(), describe, |program| run_random(&program));
 }
 
+// -- Traced programs --
+
+/// The element type of the array a top-level statement makes out of nothing (its data is made
+/// outside the traced function and passed in), if it is such a statement.
+fn leaf_ty(stmt: &Stmt) -> Option<Ty> {
+    match stmt {
+        Stmt::Input { ty, .. } | Stmt::Full { ty, .. } | Stmt::Range { ty, .. } => Some(*ty),
+        Stmt::Linspace { .. } => Some(Ty::F32),
+        _ => None,
+    }
+}
+
+/// `program` with other data: every input has another seed (the structure is the same).
+fn with_other_data(program: &Program) -> Program {
+    let mut other = program.clone();
+    for stmt in &mut other.stmts {
+        if let Stmt::Input { seed, .. } = stmt {
+            *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        }
+    }
+    other
+}
+
+fn any_arrays(arrs: &[Arr]) -> Vec<&dyn crate::AnyArray> {
+    arrs.iter().map(|arr| -> &dyn crate::AnyArray { with_arr!(arr, a => a) }).collect()
+}
+
+/// Argument `j` of the traced function as the array a leaf statement made, copied: the function
+/// may write what it made, which it may not do to an argument.
+fn traced_arg(inp: &crate::Inputs<'_>, j: usize, ty: Ty) -> Arr {
+    by_ty!(ty, T => T::wrap(inp.get::<T>(j).copy()))
+}
+
+fn push_output(outputs: crate::Outputs, arr: &Arr) -> crate::Outputs {
+    with_arr!(arr, a => outputs.push(a.clone()))
+}
+
+fn arr_of(item: crate::Dyn) -> Result<Arr, LumaError> {
+    use crate::ElemKind;
+    Ok(match item.elem() {
+        ElemKind::F32 => Arr::F(item.take()?),
+        ElemKind::U32 => Arr::U(item.take()?),
+        ElemKind::I32 => Arr::I(item.take()?),
+        ElemKind::Bool => Arr::B(item.take()?),
+        ElemKind::Df32 => Arr::D(item.take()?),
+        other => panic!("the fuzzer has no arrays of {other}"),
+    })
+}
+
+/// The oracle's run of every statement: the variables and what each statement gave.
+fn host_run(program: &Program) -> (HostEnv, Vec<Result<(), ErrKind>>) {
+    let mut env: HostEnv = Vec::new();
+    let outcomes = program.stmts.iter().map(|stmt| host_stmt(&mut env, stmt, program.math)).collect();
+    (env, outcomes)
+}
+
+/// Compares what a statement gave on the oracle with what it gave on luma.
+fn agree(host: &Result<(), ErrKind>, luma: &Result<(), LumaError>, at: &str) -> Result<(), Fail> {
+    if let Err(e) = luma
+        && matches!(kind_of(e), ErrKind::Chunked | ErrKind::Unsupported)
+    {
+        return Err(Fail::Limit(format!("{at}: {e}")));
+    }
+    match (host, luma) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(h), Err(l)) if kind_of(l) == *h => Ok(()),
+        (Err(h), Err(l)) => Err(Fail::Mismatch(format!("{at}: luma failed with {l}, the oracle with {h:?}"))),
+        (Err(h), Ok(())) => Err(Fail::Mismatch(format!("{at}: luma succeeded where the oracle fails with {h:?}"))),
+        (Ok(()), Err(l)) => Err(Fail::Mismatch(format!("{at}: luma failed where the oracle succeeds: {l}"))),
+    }
+}
+
+/// Compares the outputs of one call (`live[k]` is the variable output `k` holds) with the oracle's variables.
+fn check_outputs(math: bool, live: &[usize], results: crate::Results, host: &HostEnv, call: &str) -> Result<(), Fail> {
+    let items = results.into_vec();
+    if items.len() != live.len() {
+        return Err(Fail::Mismatch(format!("{call}: {} outputs for {} live variables", items.len(), live.len())));
+    }
+    for (&i, item) in live.iter().zip(items) {
+        let arr = arr_of(item).map_err(|e| Fail::Mismatch(format!("{call}: output of variable {i}: {e}")))?;
+        let Some(h) = host.get(i).and_then(Option::as_ref) else {
+            return Err(Fail::Mismatch(format!("{call}: variable {i} is live on luma only")));
+        };
+        let describe = format!("{call}: variable {i} ({:?} {:?})", h.ty, h.dims);
+        if arr.dims() != h.dims || arr.ty() != h.ty {
+            return Err(Fail::Mismatch(format!("{describe}: luma is {:?} {:?}", arr.ty(), arr.dims())));
+        }
+        let got = arr.read().map_err(|e| limit_or_fail(&e, &format!("{describe}: reading")))?;
+        if let Some((k, l, o)) = first_difference(math, h.ty, &got, &h.data()) {
+            return Err(Fail::Mismatch(format!("{describe}: element {k} is {l} on luma, {o} on the oracle")));
+        }
+    }
+    if let Some(i) = (0..host.len()).find(|i| host[*i].is_some() && !live.contains(i)) {
+        return Err(Fail::Mismatch(format!("{call}: variable {i} is live on the oracle only")));
+    }
+    Ok(())
+}
+
+/// What the traced function leaves behind when it runs: the variables it returns and, if a
+/// statement did not do what it did on the oracle, why the rest did not run.
+#[derive(Default)]
+struct Ran {
+    live: Vec<usize>,
+    stopped: Option<Fail>,
+}
+
+/// Runs `program` as a traced function: its inputs (and constants) are the arguments, every
+/// other statement runs inside the function, every live variable is an output. Called twice, on
+/// the data of the program and on other data, and compared with the oracle both times.
+fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
+    // Loops are out of scope for a traced function (`iterate_all` records too).
+    if program.stmts.iter().any(|stmt| matches!(stmt, Stmt::Loop { .. })) {
+        return Err(Fail::Limit("a program with a loop".into()));
+    }
+    let cx = Cx { ctx: ctx.clone(), math: program.math };
+    let other = with_other_data(program);
+    let (host_a, outcomes) = host_run(program);
+    let (host_b, outcomes_b) = host_run(&other);
+    if outcomes.iter().zip(&outcomes_b).any(|(a, b)| a != b) {
+        return Err(Fail::Limit("the other data makes a statement fail differently".into()));
+    }
+    // The arguments: what the statements that make arrays out of nothing make, outside the function.
+    let arguments = |p: &Program| -> Result<Vec<Arr>, Fail> {
+        let mut made: Env = Vec::new();
+        for (k, stmt) in p.stmts.iter().enumerate().filter(|(_, stmt)| leaf_ty(stmt).is_some()) {
+            let before = made.len();
+            let result = luma_stmt(&cx, &mut made, stmt);
+            agree(&outcomes[k], &result, &format!("statement {k}"))?;
+            debug_assert_eq!(made.len() - before, usize::from(result.is_ok()));
+        }
+        Ok(made.into_iter().flatten().collect())
+    };
+    let (args_a, args_b) = (arguments(program)?, arguments(&other)?);
+
+    let ran: std::sync::Arc<std::sync::Mutex<Ran>> = Default::default();
+    let record = std::sync::Arc::clone(&ran);
+    let stmts = program.stmts.clone();
+    let host_outcomes = outcomes.clone();
+    let inside = Cx { ctx: ctx.clone(), math: program.math };
+    let compiled = crate::trace(move |inp| {
+        let mut env: Env = Vec::new();
+        let (mut next, mut stopped) = (0, None);
+        for (k, stmt) in stmts.iter().enumerate() {
+            match leaf_ty(stmt) {
+                // Made outside; a leaf that fails makes nothing, as on the oracle.
+                Some(ty) if host_outcomes[k].is_ok() => {
+                    env.push(Some(traced_arg(inp, next, ty)));
+                    next += 1;
+                }
+                Some(_) => {}
+                None => {
+                    let result = luma_stmt(&inside, &mut env, stmt);
+                    if let Err(fail) = agree(&host_outcomes[k], &result, &format!("statement {k}")) {
+                        stopped = Some(fail);
+                        break;
+                    }
+                }
+            }
+        }
+        let mut outputs = crate::Outputs::new();
+        let mut live = Vec::new();
+        for (i, var) in env.iter().enumerate() {
+            if let Some(arr) = var {
+                outputs = push_output(outputs, arr);
+                live.push(i);
+            }
+        }
+        *record.lock().unwrap_or_else(|e| e.into_inner()) = Ran { live, stopped };
+        outputs
+    });
+
+    let first = match compiled.call(&any_arrays(&args_a)) {
+        Ok(results) => results,
+        Err(error) => {
+            return match error.root() {
+                // What a traced function may not do: the program ends here.
+                LumaError::Trace(_) => Err(Fail::Limit(format!("not traceable: {error}"))),
+                _ => Err(limit_or_fail(&error, "the first call")),
+            };
+        }
+    };
+    let Ran { live, stopped } = std::mem::take(&mut *ran.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(fail) = stopped {
+        return Err(fail);
+    }
+    check_outputs(program.math, &live, first, &host_a, "the first call")?;
+    // Other data through the same variant: nothing is traced again.
+    let second = compiled.call(&any_arrays(&args_b)).map_err(|e| limit_or_fail(&e, "the second call"))?;
+    check_outputs(program.math, &live, second, &host_b, "the second call")?;
+    if compiled.stats().traces != 1 {
+        return Err(Fail::Mismatch(format!("the callable traced {} times for one signature", compiled.stats().traces)));
+    }
+    Ok(())
+}
+
+/// `program` without its loops, where no later statement reads a variable a loop creates (the
+/// loops that cannot go stay: `traced_on` ends those programs early).
+fn without_loops(program: &Program) -> Program {
+    let mut program = program.clone();
+    for k in (0..program.stmts.len()).rev() {
+        if matches!(program.stmts[k], Stmt::Loop { .. })
+            && let Some(stripped) = program.without(k, &created_counts(&program))
+        {
+            program = stripped;
+        }
+    }
+    program
+}
+
+/// [`traced_on`] on a context of `program`'s configuration (without the settings that split arrays
+/// over several buffers or evict them: a callable takes arrays that fit one buffer, and a trace
+/// under memory pressure aborts).
+fn run_traced(program: &Program) -> Result<(), String> {
+    let mut config = program.config.clone();
+    config.chunk_bytes = None;
+    config.memory_budget = None;
+    let Some(ctx) = engine(&config) else { return Ok(()) };
+    match traced_on(&ctx, &without_loops(program)) {
+        Ok(()) => Ok(()),
+        Err(Fail::Limit(what)) => {
+            if std::env::var_os("LUMA_FUZZ_VERBOSE").is_some() {
+                eprintln!("fuzz: traced program ended early: {what}");
+            }
+            ENDED_EARLY.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(Fail::Mismatch(what)) => Err(what),
+    }
+}
+
+/// Random programs wrapped in `luma::trace`, called twice on different data, against the oracle.
+#[test]
+fn traced_programs() {
+    let describe = |program: Program| format!("{}\n{}", run_traced(&program).err().unwrap_or_default(), program.rust());
+    drive("tests/proptest-regressions/fuzz_traced.txt", generator::programs(), describe, |program| run_traced(&program));
+}
+
 /// Runs each of `programs` (under the default engine configuration) on its own thread, all on
 /// `ctx`, and returns the failure of every one that failed (a panic is a failure).
 fn run_concurrently(ctx: &Context, programs: &[Program]) -> Vec<(usize, String)> {

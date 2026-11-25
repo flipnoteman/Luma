@@ -87,6 +87,8 @@ mod guide {
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
     pub mod loops {}
+    #[doc = include_str!("../guide/src/trace.md")]
+    pub mod trace {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
     #[doc = include_str!("../guide/src/complex.md")]

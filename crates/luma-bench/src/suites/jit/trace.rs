@@ -98,6 +98,35 @@ pub fn run(h: &mut Harness) {
             force(&r);
         });
 
+        // The public callable (`luma::trace`): traced once, then a call only encodes the recorded launches. `api_step30`
+        // chains `steps` calls (the launch rate next to `step30_replay`); the `api_call_*` cases are one call each, for
+        // `tools/hosttime` (instructions per call of a 30-launch and of a 3-launch step).
+        let api = trace(|inp| stages(&inp.get::<f32>(0), STAGES).into());
+        let api_small = trace(|inp| stages(&inp.get::<f32>(0), 3).into());
+        api.precompile(&[&u]).unwrap();
+        api_small.precompile(&[&u]).unwrap();
+        {
+            let mut s = u.clone();
+            for _ in 0..3 {
+                s = api.call1::<f32>(&[&s]).unwrap();
+            }
+            let mut want = uh.clone();
+            for _ in 0..3 {
+                want = stages_host(&want, side, side, STAGES);
+            }
+            check("trace/api_step30", &s.to_vec().unwrap(), &want, 1e-3, 1e-4);
+            check("trace/api_call_small", &api_small.call1::<f32>(&[&u]).unwrap().to_vec().unwrap(), &stages_host(&uh, side, side, 3), 1e-3, 1e-4);
+        }
+        h.case("trace/api_step30", &tag(steps), per_sec(steps * STAGES, "launch/s"), &mut || {
+            let mut s = u.clone();
+            for _ in 0..steps {
+                s = api.call1::<f32>(&[&s]).unwrap();
+            }
+            force(&s);
+        });
+        h.case("trace/api_call_step30", &tag(1), per_sec(STAGES, "launch/s"), &mut || force(&api.call1::<f32>(&[&u]).unwrap()));
+        h.case("trace/api_call_small", &format!("3k {side}x{side} x1"), per_sec(3, "launch/s"), &mut || force(&api_small.call1::<f32>(&[&u]).unwrap()));
+
         // 16 independent fields, a stage each: the launches of a step share no buffer, so a graph
         // may run them side by side.
         const WIDE: usize = 16;

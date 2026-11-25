@@ -203,6 +203,23 @@ fn build_steps<const N: usize>(q: &[A; N], muscl: bool, n: usize) {
     }
 }
 
+/// The explicit step as a compiled callable of the `N` fields.
+fn compiled_step<const N: usize>(muscl: bool) -> Compiled {
+    trace(move |inp| {
+        let q: [A; N] = std::array::from_fn(|k| inp.get::<f32>(k));
+        explicit_step(&q, muscl, true).into()
+    })
+}
+
+fn any_refs<const N: usize>(q: &[A; N]) -> Vec<&dyn AnyArray> {
+    q.iter().map(|a| a as &dyn AnyArray).collect()
+}
+
+fn call_step<const N: usize>(step: &Compiled, q: &[A; N]) -> [A; N] {
+    let mut out = step.call(&any_refs(q)).unwrap();
+    std::array::from_fn(|k| out.take::<f32>(k).unwrap())
+}
+
 /// Explicit Euler (first order, or MUSCL for `muscl/..` groups) with the low-i wall: `iterate_all` replay at two sizes and the host loop.
 fn explicit_euler<const N: usize>(h: &mut Harness, z: &Z, group: &str, muscl: bool) {
     let d = N - 2;
@@ -236,6 +253,20 @@ fn explicit_euler<const N: usize>(h: &mut Harness, z: &Z, group: &str, muscl: bo
             }
         };
         h.case(&format!("{group}_per_step"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
+        // The same host loop through a compiled callable: the step is traced once (outside the timed calls), a call only encodes
+        // its launches. The results are the arrays of the next call.
+        let step = compiled_step::<N>(muscl);
+        step.precompile(&any_refs(&q)).unwrap();
+        let mut f = || {
+            let mut cur = call_step(&step, &q);
+            eval_rec(&cur);
+            for _ in 1..n {
+                let next = call_step(&step, &cur);
+                eval_rec(&next);
+                cur = next;
+            }
+        };
+        h.case(&format!("{group}_per_step_compiled"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
         // Host cost of recording a step alone: build the lazy graph of `n` steps off the same state and drop it unevaluated.
         let mut f = || {
             build_steps(&q, muscl, n);

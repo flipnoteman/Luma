@@ -433,7 +433,7 @@ pub struct Compiled {
 ///
 /// let step = trace(|inp| {
 ///     let (x, w) = (inp.get::<f32>(0), inp.get::<f32>(1));
-///     let y = x.matmul(&w).relu();
+///     let y = x.matmul(&w).maximum(0.0);
 ///     (y.sum(), y).into()
 /// });
 /// let x = Array::from_slice(&[1.0f32; 64], [8, 8])?;

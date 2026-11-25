@@ -13,6 +13,7 @@
 - [Interpolation, image transforms and filters](signal.md)
 - [Records](records.md)
 - [Loops](loops.md)
+- [Compiled callables](trace.md)
 - [Precision](precision.md)
 - [Complex numbers](complex.md)
 - [Integer and bit operations](integers.md)

@@ -16,6 +16,11 @@ on the GPU:
 The two `_until` loops evaluate their stop rule on the GPU; `iterate` and `iterate_all` run a
 fixed number of steps. None of them needs you to manage the second buffer a step needs: the previous state and the next are swapped for you.
 
+A function that is not a loop but runs many times (a training step, a solver stage called per
+frame) is recorded once by [`trace`](trace.md), which removes the host work of building the
+graph from every call; a [`Compiled`](trace.md) can be the stage a chunked loop runs between its
+chunks. It cannot be called inside the step of one of these loops.
+
 ## Stencils: `iterate`
 
 ```rust
