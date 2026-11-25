@@ -294,6 +294,37 @@ impl Rig {
     }
 }
 
+/// The device runs the arithmetic kernel for at least [`WARM_MIN`] and until two rounds in a row
+/// agree within [`WARM_AGREE`] (at most [`WARM_MAX`]) before anything is timed: a GPU that was
+/// idle runs at a fraction of its clock and takes tens of milliseconds to ramp up (an RTX 3080
+/// Laptop idles at 210 MHz of 2100), so a measurement taken at the start of the ramp is a different
+/// number from one taken after it, and the cost model would depend on which a run caught.
+fn warm_up(ctx: &Context, source: String, n: u32, k: u32) -> Result<()> {
+    let rig = Rig::new(ctx, source, "CostWarm", n, n)?;
+    let start = Instant::now();
+    let mut last = f64::INFINITY;
+    let result = loop {
+        let ns = match rig.time_best_of(ctx, k, 0, REPS, 1) {
+            Ok(ns) => ns,
+            Err(err) => break Err(err),
+        };
+        let elapsed = start.elapsed();
+        let steady = (ns - last).abs() <= WARM_AGREE * last;
+        if elapsed >= WARM_MAX || (elapsed >= WARM_MIN && steady) {
+            break Ok(());
+        }
+        last = ns;
+    };
+    rig.release(ctx);
+    result
+}
+
+/// How long, at least and at most, the device is warmed before calibration, and how closely two
+/// rounds must agree for it to count as warm.
+const WARM_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const WARM_MAX: std::time::Duration = std::time::Duration::from_millis(150);
+const WARM_AGREE: f64 = 0.02;
+
 /// Best wall-clock nanoseconds per launch of a kernel over `n` elements with uniform `{k, 0}`
 /// (see [`Rig::time`]); the input and output are `n` elements.
 fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
@@ -503,13 +534,17 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<(CostModel, Option<MemoryModel>
 
     // One buffer must hold a whole calibration array: stay within what the device can bind.
     let cap = u32::try_from(ctx.max_buffer_bytes() / 4).unwrap_or(u32::MAX);
+    let n_alu: u32 = if cpu { 1 << 16 } else { 1 << 20 }.min(cap);
+    let (k_alu, k_df, k_f64) = (512u32, 64u32, 128u32);
+    let alu = kernel_source("", "f32", "in0[i]", "x = x * 1.0001 + 0.5;", "x");
+    if !cpu {
+        warm_up(ctx, alu.clone(), n_alu, k_alu)?;
+    }
+
     let n_copy: u32 = if cpu { 1 << 20 } else { 1 << 24 }.min(cap);
     let t_copy = time_kernel(ctx, copy(), "CostCopy", n_copy, 0, REPS)?;
     let bandwidth_gbs = 8.0 * f64::from(n_copy) / t_copy;
 
-    let n_alu: u32 = if cpu { 1 << 16 } else { 1 << 20 }.min(cap);
-    let (k_alu, k_df, k_f64) = (512u32, 64u32, 128u32);
-    let alu = kernel_source("", "f32", "in0[i]", "x = x * 1.0001 + 0.5;", "x");
     let t_alu = time_kernel(ctx, alu, "CostAlu", n_alu, k_alu, REPS)?;
     let f32_ops_per_ns = 2.0 * f64::from(k_alu) * f64::from(n_alu) / t_alu;
     let per_op_f32 = t_alu / (2.0 * f64::from(k_alu) * f64::from(n_alu));
