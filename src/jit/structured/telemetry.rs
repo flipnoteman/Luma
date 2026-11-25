@@ -381,6 +381,42 @@ mod tests {
         assert!(ctx.jit().telemetry.measured(&cell, 1).is_some_and(|ns| ns > 0.0));
     }
 
+    /// Host time of a launch that is armed for timing against one that is not: `cargo test --release --lib
+    /// host_cost_of_an_armed_launch -- --ignored --nocapture`, on the backend `LUMA_BACKEND` names.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn host_cost_of_an_armed_launch() {
+        let ctx = default_backend();
+        if !ctx.caps().contains(Caps::TELEMETRY) {
+            println!("SKIPPED: {} cannot time launches", ctx.device_name());
+            return;
+        }
+        let core = ctx.builtin(Builtin::Fill, "u32").unwrap();
+        let buffer = ctx.alloc_buffer(256, crate::context::STORAGE_USAGE).unwrap();
+        let args = [RawArg::write(&buffer, 256), RawArg::Uniform(bytemuck::bytes_of(&7u32))];
+        let rounds = 400;
+        let mut measure = |armed: bool| {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                ctx.sync().unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    let mut emit = if armed { Emit::sampled(&ctx, SampleTag(1 << 8)) } else { Emit::now(&ctx) };
+                    for _ in 0..8 {
+                        emit.launch(&core, [1, 1, 1], [64, 1, 1], &args).unwrap();
+                    }
+                    ctx.flush().unwrap();
+                }
+                best = best.min(start.elapsed().as_secs_f64() * 1e9 / f64::from(rounds * 8));
+                ctx.sync().unwrap();
+            }
+            best
+        };
+        let (plain, armed) = (measure(false), measure(true));
+        println!("{}: {plain:.0} ns per launch, {armed:.0} ns armed: +{:.0} ns ({:.2} us once in 32 launches)", ctx.device_name(), armed - plain, (armed - plain) / 32.0 / 1e3);
+        ctx.recycle(buffer);
+    }
+
     #[test]
     fn more_than_eight_launches_discard_the_sample() {
         let ctx = cpu(1);
