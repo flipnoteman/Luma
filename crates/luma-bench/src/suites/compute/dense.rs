@@ -147,8 +147,67 @@ fn general(h: &mut Harness) {
     }
 }
 
+/// Launches per factorisation (W2-U3b): what a call costs in kernel launches and in host time per launch, at every size from 64 to
+/// 4096. `LUMA_BENCH_KERNELS=1` lists the launches per kernel label of each case (the class breakdown). The launches come from the
+/// profiler, which the CPU backend does not have: there the cases only time the call.
+fn launches(h: &mut Harness) {
+    let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[64, 128], &[64, 128, 256]) } else { pick(h, &[64, 256, 1024], &[64, 128, 256, 512, 1024, 2048, 4096]) };
+    for &n in sizes {
+        let a = dd_spd(n, 700 + n as u64);
+        let al = upload(h, &a, [n, n]);
+        let bl = upload(h, &values(n, 701, -1.0, 1.0), [1, n]);
+        let tag = format!("n={n}");
+        h.case("dense/launches_lu", &tag, Work::None, &mut || al.lu().lu.eval().unwrap());
+        h.case("dense/launches_cholesky", &tag, Work::None, &mut || al.cholesky().eval().unwrap());
+        h.case("dense/launches_qr", &tag, Work::None, &mut || {
+            let f = al.qr();
+            f.qr.eval().unwrap();
+            f.t.eval().unwrap();
+        });
+        h.case("dense/launches_solve", &tag, Work::None, &mut || al.solve(&bl).eval().unwrap());
+        h.case("dense/launches_solve_spd", &tag, Work::None, &mut || al.solve_spd(&bl).eval().unwrap());
+        h.case("dense/launches_inverse", &tag, Work::None, &mut || al.inverse().eval().unwrap());
+    }
+}
+
+/// `solve_refined` against `solve` of the same system (one right-hand side, `kappa` of a few), the ratio the spec gates at 1.3, and a
+/// batch of small systems, which is launch bound and only reported.
+fn refined(h: &mut Harness) {
+    let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[128], &[128, 256]) } else { pick(h, &[1024], &[1024, 2048, 4096]) };
+    for &n in sizes {
+        let a = gen_mat(n, 800 + n as u64);
+        let al = upload(h, &a, [n, n]);
+        let b = values(n, 801, -1.0, 1.0);
+        let bl = upload(h, &b, [1, n]);
+        let refined = al.solve_refined(&bl);
+        assert!(refined.converged, "solve_refined {n}: not converged ({})", refined.achieved_rel_err);
+        let x = host(&refined.x);
+        let r = solve_error(&a, n, &x, &b);
+        assert!(r < 1e-6, "solve_refined {n}: backward error {r}");
+        let nf = n as f64;
+        h.case("dense/solve_plain", &format!("{n}x{n}, 1 rhs"), Work::Flops(2.0 / 3.0 * nf * nf * nf), &mut || al.solve(&bl).eval().unwrap());
+        h.case("dense/solve_refined", &format!("{n}x{n}, 1 rhs"), Work::Flops(2.0 / 3.0 * nf * nf * nf), &mut || {
+            al.solve_refined(&bl).x.eval().unwrap();
+        });
+    }
+    let (n, batch) = (64usize, 1000usize);
+    let mut data = Vec::with_capacity(batch * n * n);
+    for m in 0..batch {
+        data.extend(gen_mat(n, 900 + m as u64));
+    }
+    let al = upload(h, &data, [n, n, batch]);
+    let bl = upload(h, &values(n * batch, 902, -1.0, 1.0), [1, n, batch]);
+    assert!(al.solve_refined(&bl).converged, "solve_refined batch");
+    h.case("dense/solve_plain_batch", &format!("{n}x{n} x{batch}"), Work::None, &mut || al.solve(&bl).eval().unwrap());
+    h.case("dense/solve_refined_batch", &format!("{n}x{n} x{batch}"), Work::None, &mut || {
+        al.solve_refined(&bl).x.eval().unwrap();
+    });
+}
+
 pub fn run(h: &mut Harness) {
     h.guarded("dense", general);
+    h.guarded("dense", launches);
+    h.guarded("dense", refined);
     h.guarded("dense", |h| {
         let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[128, 256], &[256, 512, 1024]) } else { pick(h, &[256, 1024], &[256, 1024, 4096]) };
         for &n in sizes {

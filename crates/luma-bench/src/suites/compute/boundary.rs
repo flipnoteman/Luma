@@ -63,6 +63,20 @@ pub fn run(h: &mut Harness) {
             let _ = x.filter(&mask).unwrap();
         });
 
+        // W2-U3b: the dense and line-solve boundaries. Matrices of 16 and lines of 64, so the host dominates.
+        let m = 16usize;
+        let spd: Vec<f32> = (0..m * m).map(|i| if i % (m + 1) == 0 { m as f32 } else { ((i * 31) % 7) as f32 * 0.01 }).collect();
+        let a = upload(h, &spd, [m, m]);
+        let rhs = upload(h, &values(m, 63, -1.0, 1.0), [1, m]);
+        let tag = format!("n={m}");
+        h.case("boundary/lu_small", &tag, Work::None, &mut || a.lu().lu.eval().unwrap());
+        h.case("boundary/chol_small", &tag, Work::None, &mut || a.cholesky().eval().unwrap());
+        h.case("boundary/tri_small", &tag, Work::None, &mut || a.solve_triangular(&rhs, Triangle::Lower, false, false).eval().unwrap());
+        let lines = 64usize;
+        let coef = |v: f32| upload(h, &vec![v; lines * 64], [64, lines]);
+        let (lo, diag, up, line_rhs) = (coef(-1.0), coef(4.0), coef(-1.0), coef(1.0));
+        h.case("boundary/solve_tridiag_small", "64 lines of 64", Work::None, &mut || solve_tridiagonal(0, &lo, &diag, &up, &line_rhs).eval().unwrap());
+
         let a = Array::<u32>::from_slice_on(&h.ctx, &(0..512u32).map(|i| i * 2).collect::<Vec<_>>(), 512usize).unwrap();
         let b = Array::<u32>::from_slice_on(&h.ctx, &(0..512u32).map(|i| i * 3).collect::<Vec<_>>(), 512usize).unwrap();
         let mut want: Vec<u32> = (0..512u32).map(|i| i * 2).chain((0..512u32).map(|i| i * 3)).collect();

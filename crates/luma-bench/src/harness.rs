@@ -47,6 +47,8 @@ pub struct Record {
     pub unit: &'static str,
     pub gpu_ms: Option<f64>,
     pub launches: Option<u32>,
+    /// The wall time of the call before the harness syncs (the host time of recording and submitting it), over its launches.
+    pub host_ms_per_launch: Option<f64>,
     /// Device memory the context holds after the case (resident plus pooled), MiB.
     pub mem_mib: f64,
 }
@@ -213,12 +215,15 @@ impl Harness {
         }
         self.header();
         let ctx = self.ctx.clone();
-        let run = |f: &mut dyn FnMut()| {
+        // (the call and its sync, the call alone: what the host spent recording and submitting)
+        let run_both = |f: &mut dyn FnMut()| {
             let t = Instant::now();
             f();
+            let host = t.elapsed().as_secs_f64() * 1e3;
             ctx.sync().expect("sync");
-            t.elapsed().as_secs_f64() * 1e3
+            (t.elapsed().as_secs_f64() * 1e3, host)
         };
+        let run = |f: &mut dyn FnMut()| run_both(f).0;
         let started = Instant::now();
         let first = run(f);
         if let Some(n) = self.iters {
@@ -254,9 +259,13 @@ impl Harness {
         } else {
             9
         };
-        let mut times: Vec<f64> = (0..reps).map(|_| run(f)).collect();
+        let both: Vec<(f64, f64)> = (0..reps).map(|_| run_both(f)).collect();
+        let mut times: Vec<f64> = both.iter().map(|t| t.0).collect();
+        let mut hosts: Vec<f64> = both.iter().map(|t| t.1).collect();
         times.sort_by(f64::total_cmp);
+        hosts.sort_by(f64::total_cmp);
         let (median, min) = (times[times.len() / 2], times[0]);
+        let host_median = hosts[hosts.len() / 2];
         let (rate, unit) = match work {
             Work::Bytes(b) => (Some(b / (median * 1e-3) / 1e9), "GB/s"),
             Work::Flops(n) => (Some(n / (median * 1e-3) / 1e9), "GFLOP/s"),
@@ -289,6 +298,7 @@ impl Harness {
         }
         let stats = self.ctx.memory_stats();
         let mem_mib = (stats.resident_bytes + stats.pooled_bytes) as f64 / (1 << 20) as f64;
+        let host_ms_per_launch = launches.filter(|&l| l > 0).map(|l| host_median / f64::from(l));
         let rec = Record {
             suite: self.suite.clone(),
             case: case.to_string(),
@@ -301,6 +311,7 @@ impl Harness {
             unit,
             gpu_ms,
             launches,
+            host_ms_per_launch,
             mem_mib,
         };
         let fmt = |v: Option<f64>| v.map_or("-".to_string(), |v| if v < 10.0 { format!("{v:.3}") } else { format!("{v:.1}") });
@@ -335,7 +346,7 @@ impl Record {
         let num = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.6}"));
         let _ = write!(
             s,
-            "\"suite\":\"{}\",\"case\":\"{}\",\"size\":\"{}\",\"backend\":\"{:?}\",\"device\":\"{}\",\"first_ms\":{:.6},\"median_ms\":{:.6},\"min_ms\":{:.6},\"reps\":{},\"rate\":{},\"unit\":\"{}\",\"gpu_ms\":{},\"launches\":{},\"mem_mib\":{:.3},\"ref\":\"{}\"",
+            "\"suite\":\"{}\",\"case\":\"{}\",\"size\":\"{}\",\"backend\":\"{:?}\",\"device\":\"{}\",\"first_ms\":{:.6},\"median_ms\":{:.6},\"min_ms\":{:.6},\"reps\":{},\"rate\":{},\"unit\":\"{}\",\"gpu_ms\":{},\"launches\":{},\"host_ms_per_launch\":{},\"mem_mib\":{:.3},\"ref\":\"{}\"",
             esc(&self.suite),
             esc(&self.case),
             esc(&self.size),
@@ -349,6 +360,7 @@ impl Record {
             self.unit,
             num(self.gpu_ms),
             self.launches.map_or("null".to_string(), |l| l.to_string()),
+            num(self.host_ms_per_launch),
             self.mem_mib,
             esc(&std::env::var("LUMA_BENCH_REF").unwrap_or_default())
         );

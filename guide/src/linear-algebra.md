@@ -93,6 +93,44 @@ assert!((back.to_vec()?[0] - 0.25).abs() < 1e-5);
   on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of `U` (the
   solve then gives `Inf`/`NaN`, the determinant 0). Shape errors poison the result as usual.
 
+## Refined solves
+
+`solve` and `solve_spd` factor in `f32` and give a solution whose relative error is about the
+condition number of the matrix times `2^-24`. `Array::solve_refined(&b)` (and `solve_spd_refined`,
+`solve_refined_to(&b, target)`, `solve_spd_refined_to`) takes the same factorisation and refines the
+solution: the residual `b - A x` is accumulated in compensated arithmetic (Dot2: a dot product as if
+in twice the working precision, in one launch that reads `A` once for up to eight right-hand sides),
+the solution is kept as a pair of `f32` (`Df32`), and each correction is a solve with the factors
+already computed. For a matrix with condition number up to about `1e6` the result is the correctly
+rounded `f32` solution after two to four corrections, at the price of one residual launch and one
+solve per correction.
+
+```rust
+use luma::*;
+# let ctx = Context::new()?;
+let a = Array::from_slice(&[4.0f32, 1.0, 1.0, 3.0], [2, 2])?;
+let b = Array::from_slice(&[1.0f32, 2.0], [1, 2])?;
+let solved = a.solve_refined(&b);
+assert!(solved.converged);                       // every column met the target
+assert!(solved.achieved_rel_err <= 6.0e-8);      // estimated from the last correction
+let x = solved.x.to_vec()?;
+# Ok::<(), luma::LumaError>(())
+```
+
+It returns a `Refined { x, achieved_rel_err, converged }`. `achieved_rel_err` is the size of the last
+correction relative to the solution, which estimates the error of the result when the corrections
+contract by half or better; `converged` is false when they stop contracting (a condition number
+of `1e7` and up for an `f32` factorisation: the factorisation is then too poor to refine with),
+after six corrections, or on a non-finite iterate. A system that does not converge returns the iterate
+with the smallest residual it saw, never worse than `solve`, and the decision log (`FactorPlan`)
+says `factor::refine_stalled`. A singular matrix gives the `NaN` and `Inf` entries `solve` gives.
+
+What it does not promise: the error is an estimate, not a bound; the matrix is the `f32` matrix as
+stored; the target cannot go below `2^-24` (the result is an `f32`); and it is an explicit request,
+so nothing makes `solve` refine and its bits do not change. The call synchronises (one readback after
+the second correction, one after each further one), so it is not for a recorded step: inside `iterate`,
+a trace or a graph capture the result is poisoned with `LumaError::Unsupported`.
+
 ## SVD, pseudo-inverse, rank and the symmetric eigenproblem
 
 ```rust
