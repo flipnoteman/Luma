@@ -28,7 +28,9 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use luma_core::Buffer;
 
+use crate::jit::structured::boundary::ScanAttrs;
 use crate::jit::structured::emit::Emit;
+use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 
 use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
@@ -52,7 +54,7 @@ pub(crate) const WORKGROUP: u32 = 128;
 /// Contiguous cells every invocation of a chunk scan folds (a chunk is `WORKGROUP * PER_THREAD`).
 const PER_THREAD: u32 = 8;
 /// Cells of a contiguous line one workgroup scans.
-const SCAN_CHUNK: u32 = WORKGROUP * PER_THREAD;
+pub(crate) const SCAN_CHUNK: u32 = WORKGROUP * PER_THREAD;
 /// Contiguous cells every invocation of a [`Pass::ChunkLookback`] chunk folds. A look-back walks
 /// over the chunks that started while it waited and have no inclusive prefix yet, a window of
 /// [`WORKGROUP`] chunks at a time, and takes longer the more of them there are. At the bandwidth
@@ -63,13 +65,13 @@ const SCAN_CHUNK: u32 = WORKGROUP * PER_THREAD;
 /// [`chunk_source`]).
 const LOOKBACK_PER_THREAD: u32 = 32;
 /// Cells of a contiguous line one workgroup of [`Pass::ChunkLookback`] scans.
-const LOOKBACK_CHUNK: u32 = WORKGROUP * LOOKBACK_PER_THREAD;
+pub(crate) const LOOKBACK_CHUNK: u32 = WORKGROUP * LOOKBACK_PER_THREAD;
 /// Cells of a contiguous line one workgroup reduces (its invocations stride over them).
 pub(crate) const REDUCE_CHUNK: u32 = 16384;
 /// Contiguous lines up to this many cells are handled a group of lines per workgroup. One
 /// workgroup per line (128 invocations for 33 cells) was 6 ms for 2^26 cells, a group of lines
 /// 0.4 ms; from 256 cells on a workgroup per line is as fast.
-const SHORT_LINE: u32 = 255;
+pub(crate) const SHORT_LINE: u32 = 255;
 /// Cells of workgroup memory a group of short lines is staged in (16 KiB, the smallest limit
 /// WebGPU guarantees).
 pub(crate) const ROWS_TILE: u32 = 4096;
@@ -88,7 +90,7 @@ const WARP_AHEAD: u32 = 1;
 /// 0.210 / 0.271 for the other passes, 256 lines 0.184 against 0.204 / 0.263, 64 lines 0.33
 /// against 0.214 / 0.255; on an RTX 3080 Laptop (48 multiprocessors) 128 lines already run at
 /// the bandwidth of a copy and 64 lines beat the other passes too.
-const WARP_MIN_LINES: u32 = 128;
+pub(crate) const WARP_MIN_LINES: u32 = 128;
 /// Strided lines up to this many cells are walked by one invocation each.
 const SHORT_STRIDED: u32 = 256;
 /// A strided pass with this many lines or more has enough invocations without blocks.
@@ -101,7 +103,7 @@ const THREADS_PER_UNIT: u64 = 1536;
 /// pass to read back: a strided sum, product or mean of 4096 x 4096 over axis 1 takes 0.101 ms on an
 /// RTX 3090 with a million invocations, 0.094 ms with 262144 (ArrayFire 0.096), and on an RTX 3080
 /// Laptop 0.221 ms with a million, 0.195 ms with 65536 (ArrayFire 0.203).
-fn target_threads(tuning: &crate::tuning::Tuning) -> u64 {
+pub(crate) fn target_threads(tuning: &crate::tuning::Tuning) -> u64 {
     u64::from(tuning.compute_units.max(1)) * THREADS_PER_UNIT
 }
 /// Fewest cells of a line one invocation of a blocked strided pass walks.
@@ -915,7 +917,7 @@ enum Input<'b> {
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
 /// are short or numerous enough for one invocation each.
-fn strided_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
+pub(crate) fn strided_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
     if lines >= WIDE_LINES || n <= SHORT_STRIDED {
         return None;
     }
@@ -1141,45 +1143,44 @@ impl<'a> Lines<'a> {
         Ok((self.scratch.take(bytes)?, bytes))
     }
 
-    /// The inclusive scan of every line of `input` into `out`.
+    /// The inclusive scan of every line of `input` into `out`. The strategy comes from the registry (`families::scan`): the
+    /// order of its table is the order of the conditions this function had.
+    #[track_caller]
     pub(crate) fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
-        let seq = [n, stride, lines, 1, n];
-        if stride == 1 {
-            if n <= SHORT_LINE {
-                return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None);
+        let boundary = Boundary::new(FamilyTag::Scan, "scan", Location::caller(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: self.grouping_free(), by_key: false }));
+        let (id, params) = candidates(self.ctx, &boundary).next().expect("a scan strategy always fits");
+        note(self.ctx, &boundary, id, &params, &[]);
+        let Params::Scan(params) = params else { unreachable!("a scan strategy runs with scan parameters") };
+        match id {
+            StrategyId::SCAN_ROWS => self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None),
+            StrategyId::SCAN_WARP => self.launch(Pass::Warp { vec: params.vec }, [n, 1, lines, 1, n], out, input, None),
+            StrategyId::SCAN_LOOKBACK => self.lookback(n, lines, out, input),
+            StrategyId::SCAN_CHUNK_SINGLE => self.launch(Pass::ChunkScan { seeded: false }, [n, 1, lines, 1, SCAN_CHUNK], out, input, None),
+            StrategyId::SCAN_CHUNK_THREE_PASS => {
+                let nb = params.nb;
+                let geometry = [n, 1, lines, nb, SCAN_CHUNK];
+                let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
+                let totals = Bound { buffer: &totals, bytes };
+                self.launch(Pass::ChunkFold, geometry, totals, input, None)?;
+                let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
+                let prefix = Bound { buffer: &prefix, bytes };
+                self.scan(totals, nb, 1, lines, prefix)?;
+                self.launch(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix))
             }
-            if lines >= self.ctx.tuning().scaled(WARP_MIN_LINES) && self.ctx.tuning().subgroup32 {
-                let vec = if n.is_multiple_of(4) { 4 } else if n.is_multiple_of(2) { 2 } else { 1 };
-                return self.launch(Pass::Warp { vec }, [n, 1, lines, 1, n], out, input, None);
+            StrategyId::SCAN_SEQ => self.launch(Pass::Seq, [n, stride, lines, 1, n], out, input, None),
+            StrategyId::SCAN_FOLD_WALK => {
+                let (nb, k) = (params.nb, params.k);
+                let geometry = [n, stride, lines, nb, k];
+                let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
+                let totals = Bound { buffer: &totals, bytes };
+                self.launch(Pass::Fold, geometry, totals, input, None)?;
+                let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
+                let prefix = Bound { buffer: &prefix, bytes };
+                self.scan(totals, nb, lines, lines, prefix)?;
+                self.launch(Pass::Walk, geometry, out, input, Some(prefix))
             }
-            if self.ctx.tuning().lookback_scan && n > LOOKBACK_CHUNK && self.grouping_free() {
-                return self.lookback(n, lines, out, input);
-            }
-            let nb = n.div_ceil(SCAN_CHUNK);
-            let geometry = [n, 1, lines, nb, SCAN_CHUNK];
-            if nb == 1 {
-                return self.launch(Pass::ChunkScan { seeded: false }, geometry, out, input, None);
-            }
-            let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
-            let totals = Bound { buffer: &totals, bytes };
-            self.launch(Pass::ChunkFold, geometry, totals, input, None)?;
-            let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
-            let prefix = Bound { buffer: &prefix, bytes };
-            self.scan(totals, nb, 1, lines, prefix)?;
-            return self.launch(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix));
+            other => unreachable!("{other:?} is not a strategy of a scan along an axis"),
         }
-        let Some(k) = strided_block(n, lines, target_threads(self.ctx.tuning())) else {
-            return self.launch(Pass::Seq, seq, out, input, None);
-        };
-        let nb = n.div_ceil(k);
-        let geometry = [n, stride, lines, nb, k];
-        let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
-        let totals = Bound { buffer: &totals, bytes };
-        self.launch(Pass::Fold, geometry, totals, input, None)?;
-        let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
-        let prefix = Bound { buffer: &prefix, bytes };
-        self.scan(totals, nb, lines, lines, prefix)?;
-        self.launch(Pass::Walk, geometry, out, input, Some(prefix))
     }
 
     /// The reductions `ops` of every line of `input` into `outs` (see [`Lines::launch_reduce`]);

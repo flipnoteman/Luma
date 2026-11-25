@@ -109,6 +109,17 @@ pub(crate) enum ScatterOp {
     Max,
 }
 
+impl ScatterOp {
+    pub(crate) fn of(atomic: Option<crate::jit::AtomicOp>) -> ScatterOp {
+        match atomic {
+            None => ScatterOp::None,
+            Some(crate::jit::AtomicOp::Add) => ScatterOp::Add,
+            Some(crate::jit::AtomicOp::Min) => ScatterOp::Min,
+            Some(crate::jit::AtomicOp::Max) => ScatterOp::Max,
+        }
+    }
+}
+
 /// What a scatter boundary reads; `dims` is `[base_len, count, 0, 0]` (saturated).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ScatterAttrs {

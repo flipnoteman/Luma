@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(crate) mod boundary;
 pub(crate) mod emit;
+pub(crate) mod families;
 pub(crate) mod select;
 pub(crate) mod strategy;
 pub(crate) mod telemetry;

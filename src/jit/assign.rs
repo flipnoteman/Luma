@@ -29,6 +29,8 @@ use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
 
 use super::program::{flatten, AtomicOp, Tail};
+use super::structured::boundary::{dim, ScatterAttrs, ScatterOp};
+use super::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use super::{launch, lock, Args, Edge, ElemTy, Held, Node, Op, OpKind, ShiftKind, Src, ViewMap};
 
 /// One region of an array that `assign` overwrites.
@@ -500,9 +502,9 @@ pub(crate) fn assign(
 
 /// Targets of at most this many elements are accumulated in workgroup memory by an atomic scatter
 /// with enough elements (see [`PRIVATE_RATIO`]).
-const PRIVATE_BINS: usize = 4096;
+pub(crate) const PRIVATE_BINS: usize = 4096;
 /// An atomic scatter accumulates privately when it has at least this many elements per target element.
-const PRIVATE_RATIO: usize = 16;
+pub(crate) const PRIVATE_RATIO: usize = 16;
 
 /// `base[indices[i]] = values[i]` for `count` elements, skipping indices outside `base`, in one
 /// kernel. Duplicate indices: one of them wins. With `atomic`, the value is instead combined
@@ -544,9 +546,20 @@ pub(crate) fn scatter(
         store.fused.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let len = u32::try_from(base.len()).map_err(|_| LumaError::DimensionTooLarge { shape: [base.len(), 1, 1, 1] })?;
-    let tail = match atomic {
-        None => Tail::Scatter { len },
-        Some(op) => Tail::ScatterAdd { len, op, private: base.len() <= PRIVATE_BINS && count / PRIVATE_RATIO >= base.len(), len_slot: None },
+    let boundary = Boundary::new(
+        FamilyTag::Scatter,
+        name,
+        location,
+        [dim(base.len()), dim(count), 0, 0],
+        BoundaryAttrs::Scatter(ScatterAttrs { atomic: ScatterOp::of(atomic), base_len: base.len() as u64, count: count as u64, base_is_view: false, base_is_read_view: false, host_site: false }),
+    );
+    let (chosen, params) = candidates(ctx, &boundary).next().expect("a scatter strategy always fits");
+    note(ctx, &boundary, chosen, &params, &[]);
+    let tail = match (chosen, atomic) {
+        (StrategyId::SCATTER_PLAIN, _) => Tail::Scatter { len },
+        (StrategyId::SCATTER_ATOMIC_PRIVATE, Some(op)) => Tail::ScatterAdd { len, op, private: true, len_slot: None },
+        (_, Some(op)) => Tail::ScatterAdd { len, op, private: false, len_slot: None },
+        (_, None) => unreachable!("only the plain scatter takes no operator"),
     };
     let bases = [Arc::clone(base)];
 
