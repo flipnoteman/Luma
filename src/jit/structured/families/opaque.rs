@@ -29,8 +29,9 @@ pub(crate) const EMPTY_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(1).0
 pub(crate) const SCATTER_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(1).1.split_at(1).0;
 pub(crate) const NATIVE_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(2).1;
 
-fn attrs(subject: &Subject<'_>) -> OpaqueAttrs {
-    match boundary(subject).attrs {
+#[inline(always)]
+fn attrs<'a>(subject: &'a Subject<'_>) -> &'a OpaqueAttrs {
+    match &boundary(subject).attrs {
         BoundaryAttrs::Opaque(attrs) => attrs,
         _ => unreachable!("an opaque boundary carries OpaqueAttrs"),
     }

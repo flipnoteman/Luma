@@ -497,7 +497,7 @@ pub(crate) fn first_candidate(ctx: &Context, boundary: &Boundary<'_>) -> Option<
 
 /// [`first_candidate`] over the entries of one stage of a family whose table serves several (`Factor`: the LU leaves, the QR panels,
 /// the triangular solves, ... and the stages of conv, window and the sparse products); the forced strategy of `LUMA_STRATEGY` counts where it is one of `entries`.
-#[inline]
+#[inline(always)]
 pub(crate) fn first_candidate_in(entries: &'static [Strategy], ctx: &Context, boundary: &Boundary<'_>) -> Option<(StrategyId, Params)> {
     if ctx.strategy_override(boundary.family).is_some() {
         return candidates_in(entries, ctx, boundary).next();

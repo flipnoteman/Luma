@@ -39,8 +39,9 @@ pub(crate) const DIRECT_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(2).0;
 pub(crate) const FFT_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(2).1.split_at(2).0;
 pub(crate) const FIR_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(4).1;
 
-fn attrs(subject: &Subject<'_>) -> ConvAttrs {
-    match boundary(subject).attrs {
+#[inline(always)]
+fn attrs<'a>(subject: &'a Subject<'_>) -> &'a ConvAttrs {
+    match &boundary(subject).attrs {
         BoundaryAttrs::Conv(attrs) => attrs,
         _ => unreachable!("a conv boundary carries ConvAttrs"),
     }

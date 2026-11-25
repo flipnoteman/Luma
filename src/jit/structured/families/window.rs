@@ -30,8 +30,9 @@ pub(crate) static WINDOW_STRATEGIES: [Strategy; 4] = [
 pub(crate) const ENTRY_STRATEGIES: &[Strategy] = WINDOW_STRATEGIES.split_at(1).0;
 pub(crate) const PLAN_STRATEGIES: &[Strategy] = WINDOW_STRATEGIES.split_at(1).1;
 
-fn attrs(subject: &Subject<'_>) -> WindowAttrs {
-    match boundary(subject).attrs {
+#[inline(always)]
+fn attrs<'a>(subject: &'a Subject<'_>) -> &'a WindowAttrs {
+    match &boundary(subject).attrs {
         BoundaryAttrs::Window(attrs) => attrs,
         _ => unreachable!("a window boundary carries WindowAttrs"),
     }
