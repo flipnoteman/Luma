@@ -35,7 +35,7 @@ static ANNOUNCED: [AtomicBool; 4] = [AtomicBool::new(false), AtomicBool::new(fal
 
 /// A context of `kind`, or `None` (announced, once per process) if the host has no such device.
 fn open(kind: BackendKind) -> Option<Context> {
-    let result = Context::with_options(ContextOptions::from_env().backend(kind).calibrate(false));
+    let result = Context::with_options(ContextOptions::default().backend(kind).calibrate(false));
     let slot = ALL.iter().position(|&k| k == kind).expect("a concrete backend kind");
     let first = !ANNOUNCED[slot].swap(true, Ordering::Relaxed);
     match result {
@@ -150,7 +150,7 @@ fn constructors_open_their_backend_or_report_it_unavailable() {
 #[test]
 fn a_cpu_device_is_the_cpu_backend_and_gpu_backends_refuse_it() {
     for kind in [BackendKind::Metal, BackendKind::Cuda, BackendKind::Wgpu] {
-        let options = ContextOptions::from_env().backend(kind).device(DeviceKind::Cpu).calibrate(false);
+        let options = ContextOptions::default().backend(kind).device(DeviceKind::Cpu).calibrate(false);
         match Context::with_options(options) {
             Err(LumaError::NoDevice(message)) => {
                 assert!(message.contains("cpu") || message.contains("built without"), "{}: {message}", label(kind));
@@ -158,13 +158,13 @@ fn a_cpu_device_is_the_cpu_backend_and_gpu_backends_refuse_it() {
             other => panic!("{} on a CPU device must be refused with NoDevice, got {other:?}", label(kind)),
         }
     }
-    match Context::with_options(ContextOptions::from_env().backend(BackendKind::Cpu).device(DeviceKind::Gpu).calibrate(false)) {
+    match Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).device(DeviceKind::Gpu).calibrate(false)) {
         Err(LumaError::NoDevice(_)) => {}
         other => panic!("the cpu backend on a GPU device must be refused with NoDevice, got {other:?}"),
     }
     for ctx in [
-        Context::with_options(ContextOptions::from_env().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false)),
-        Context::with_options(ContextOptions::from_env().backend(BackendKind::Auto).device(DeviceKind::Cpu).calibrate(false)),
+        Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false)),
+        Context::with_options(ContextOptions::default().backend(BackendKind::Auto).device(DeviceKind::Cpu).calibrate(false)),
         Context::cpu(),
     ] {
         match ctx {
@@ -191,7 +191,7 @@ fn the_device_summary_names_the_device() {
         assert_eq!(ctx.device_name(), device.name);
     }
     // A GPU host: the default device is not a software one.
-    let gpu = ContextOptions::from_env().device(DeviceKind::Gpu).calibrate(false);
+    let gpu = ContextOptions::default().device(DeviceKind::Gpu).calibrate(false);
     if let Ok(ctx) = Context::with_options(gpu) {
         let device = ctx.device();
         assert!(!device.software, "{device:?}");
@@ -205,7 +205,7 @@ fn the_device_summary_names_the_device() {
 #[test]
 fn auto_takes_the_first_available_of_cuda_metal_wgpu() {
     let expected = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu, BackendKind::Cpu].into_iter().find(|&kind| open(kind).is_some());
-    let result = Context::with_options(ContextOptions::from_env().backend(BackendKind::Auto).calibrate(false));
+    let result = Context::with_options(ContextOptions::default().backend(BackendKind::Auto).calibrate(false));
     match (result, expected) {
         (Ok(ctx), Some(kind)) => assert_eq!(ctx.backend(), kind, "auto must prefer cuda, then metal, then wgpu"),
         (Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)), None) => {}
