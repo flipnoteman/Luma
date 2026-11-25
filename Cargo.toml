@@ -21,6 +21,7 @@ members = [
     "crates/luma-cuda",
     "crates/luma-cpu",
     "crates/luma-bench",
+    "crates/luma-io",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ luma-wgpu = { package = "luma-hal-wgpu", path = "crates/luma-wgpu", version = "0
 luma-metal = { package = "luma-hal-metal", path = "crates/luma-metal", version = "0.5.2" }
 luma-cuda = { package = "luma-hal-cuda", path = "crates/luma-cuda", version = "0.5.2" }
 luma-cpu = { package = "luma-hal-cpu", path = "crates/luma-cpu", version = "0.5.2" }
+luma-io = { path = "crates/luma-io", version = "0.5.2" }
 cranelift-codegen = { version = "0.137.2", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = "0.137.2"
 cranelift-native = "0.137.2"
@@ -72,12 +74,14 @@ luma-wgpu = { workspace = true, optional = true }
 luma-metal = { workspace = true, optional = true }
 luma-cuda = { workspace = true, optional = true }
 luma-cpu.workspace = true
+luma-io.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 log.workspace = true
 encase.workspace = true
 smallvec = "1.15"
 [dev-dependencies]
+luma-io = { workspace = true, features = ["testing"] }
 criterion = "0.8"
 ml-kem = "0.3.4"
 proptest = "1"

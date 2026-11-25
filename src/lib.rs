@@ -151,6 +151,7 @@ mod fields_macro;
 mod fuzz;
 mod fft;
 mod factorize;
+mod file;
 mod filter;
 mod generate;
 mod gpu;
@@ -213,6 +214,7 @@ pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, 
 pub use luma_core::hal::HostBytes;
 pub use error::{LumaError, Result};
 pub use fields::Fields;
+pub use file::FileOptions;
 pub use complex::C32;
 pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};

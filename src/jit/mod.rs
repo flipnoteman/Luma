@@ -2158,7 +2158,18 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 /// real parts, and none of the three has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
-fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
+fn check_supported(ctx: &Context, op: &Op, name: &str, len: usize, args: &Args) -> std::result::Result<(), LumaError> {
+    // Past 2^32 elements (a file array, see `Array::open`) only the operations that reach nothing but their own element run: a shift (a view reads another element than its own) or a generator needs a 32-bit index, of the result or of what it reads.
+    if matches!(op.kind, OpKind::Shift(_) | OpKind::Generate(_)) {
+        let read = match &args[0] {
+            Src::Buffer(storage) => storage.len(),
+            Src::Node(node) => node.len(),
+            Src::Scalar(_) => 0,
+        };
+        if len.max(read) > u32::MAX as usize {
+            return Err(LumaError::DimensionTooLarge { shape: [len.max(read), 1, 1, 1] });
+        }
+    }
     let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32 | ElemTy::C32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
@@ -2269,7 +2280,7 @@ fn create_with(
         }
     }
     let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
-    check_supported(ctx, op, name).map_err(Failure::New)?;
+    check_supported(ctx, op, name, len, &args).map_err(Failure::New)?;
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));

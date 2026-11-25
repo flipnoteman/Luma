@@ -954,9 +954,14 @@ pub(super) fn store_args<'a>(
     let range = first.range(j);
     let n = len_u32(range.len())?;
     let ids = segment_ids(shifted, j)?;
+    // An output that is not an in-place input is overwritten whole: a file-backed segment is not read first.
     let outs = outputs
         .iter()
-        .map(|out| out.pin(j).map(|pin| (pin, out.segment_byte_len(j))))
+        .enumerate()
+        .map(|(o, out)| {
+            let pin = if key.in_place.iter().any(|&(_, output)| output as usize == o) { out.pin(j) } else { out.pin_overwrite(j) };
+            pin.map(|pin| (pin, out.segment_byte_len(j)))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let ins = pin_inputs(key, inputs, ids, j, n)?;
     let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), None, scalars)?;
@@ -1055,6 +1060,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
             Arc::strong_count(input) == 1
                 && !input.is_alias()
                 && !input.is_window()
+                && !input.is_homed()
                 && in_place_eligible(&key, k as u32)
         });
         if let Some(k) = candidate {

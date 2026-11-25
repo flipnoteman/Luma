@@ -59,6 +59,25 @@ impl Shape {
     }
 }
 
+impl Shape {
+    /// [`Shape::validate`] for a shape that may hold more than `u32::MAX` elements: every extent
+    /// is non-zero and fits `u32`, and the element count is at most 2⁴⁸. Only a file array may have
+    /// such a shape (see [`Array::open`](crate::Array::open)); every other constructor and
+    /// operation keeps `validate`. Returns the element count.
+    pub(crate) fn validate_wide(&self) -> Result<usize> {
+        let too_large = || LumaError::DimensionTooLarge { shape: self.0 };
+        let mut len = 1u64;
+        for &extent in &self.0 {
+            if extent == 0 {
+                return Err(LumaError::InvalidShape(format!("Shape {:?} has a zero-sized dimension", self.0)));
+            }
+            u32::try_from(extent).map_err(|_| too_large())?;
+            len = len.checked_mul(extent as u64).filter(|&len| len <= 1 << 48).ok_or_else(too_large)?;
+        }
+        usize::try_from(len).map_err(|_| too_large())
+    }
+}
+
 impl fmt::Display for Shape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.0)

@@ -528,6 +528,9 @@ impl Array<bool> {
     }
 
     fn count_at(&self, name: &'static str, location: &'static Location<'static>) -> Array<u32> {
+        if self.is_wide() {
+            return Array::resolve(self.context(), Shape::from(1usize), Err(self.too_wide().into()), name, location);
+        }
         if self.pending().is_some() {
             return self.cast_at::<u32>(location).reduce_at([Reduction::Sum], name, location);
         }
@@ -574,6 +577,19 @@ impl Array<bool> {
     }
 }
 
+impl<T: GpuType> Array<T> {
+    /// Whether the array has more than `u32::MAX` elements (only a file array can: see
+    /// [`Array::open`]); the operations that need 32-bit counts or indices refuse it.
+    pub(crate) fn is_wide(&self) -> bool {
+        self.len() > u32::MAX as usize
+    }
+
+    /// The error of an operation that does not run on a wide array.
+    pub(crate) fn too_wide(&self) -> LumaError {
+        LumaError::DimensionTooLarge { shape: self.shape().dims() }
+    }
+}
+
 impl<T: ScalarType> Array<T> {
     pub(crate) fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
         const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
@@ -590,6 +606,10 @@ impl<T: ScalarType> Array<T> {
 
     fn run_reduce(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
+        // A file array of more than 2^32 elements: only the whole-array reductions that need no count or index.
+        if self.is_wide() && !matches!(name, "sum" | "prod" | "product" | "min" | "max" | "any" | "all") {
+            return Err(self.too_wide().into());
+        }
         let shape = Shape::from(tag.op_count());
         let elem = T::LAYOUT.stride() as u64;
         let wgsl = T::reduce_type();
@@ -738,6 +758,9 @@ impl Array<f32> {
     /// division happens in the last pass of the reduction.
     #[track_caller]
     pub fn mean(&self) -> Array<f32> {
+        if self.is_wide() {
+            return Array::resolve(self.context(), Shape::from(1usize), Err(self.too_wide().into()), "mean", Location::caller());
+        }
         &self.sum() / (self.len() as f32)
     }
 

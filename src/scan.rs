@@ -1410,6 +1410,9 @@ impl<T: ScalarType> Array<T> {
     /// inside the first pass unless it cannot be (see [`jit::axis_reduce`]).
     pub(crate) fn run_axis_reduce(&self, axis: usize, ops: ReduceList) -> Outcome<Vec<Array<T>>> {
         let ctx = self.context();
+        if self.is_wide() {
+            return Err(self.too_wide().into());
+        }
         let ty = ElemTy::of::<T>()?;
         if ty.layout() != ElemLayout::plain(4) {
             return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ty.display())).into());
@@ -1489,6 +1492,7 @@ impl<T: ScalarType> Array<T> {
     fn arg_lines(&self, axis: Option<usize>, op: ReduceOp, name: &'static str, location: &'static Location<'static>) -> Array<u32> {
         let mut dims = self.shape().dims();
         let result = match axis {
+            Some(_) if self.is_wide() => Err(self.too_wide().into()),
             Some(axis) if axis >= 4 => Err(LumaError::InvalidShape(format!("axis {axis} of shape {}", self.shape())).into()),
             Some(axis) => {
                 dims[axis] = 1;
@@ -1521,6 +1525,7 @@ impl<T: ScalarType> Array<T> {
         // one after another are recorded in one kernel when they are used (see `jit::multireduce`).
         if (1..=MAX_REDUCTIONS).contains(&N)
             && axis < 4
+            && !self.is_wide()
             && !self.is_empty()
             && let Ok((n, stride, lines)) = self.line_geometry(axis)
             && let Some(arrays) = self.defer_axis(&ops.map(Reduction::op), crate::reduce::AxisGeom { n, stride, lines }, shape, name, location)

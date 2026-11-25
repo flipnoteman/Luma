@@ -347,8 +347,8 @@ impl<T: ScalarType> Array<T> {
     ) -> Outcome<()> {
         let ctx = self.context();
         let storage = Arc::clone(self.storage()?);
-        if storage.is_alias() {
-            return Err(LumaError::ReadOnly("the state passed to an iteration step").into());
+        if storage.is_read_only() {
+            return Err(crate::file::read_only(&storage).into());
         }
         let other = match rhs {
             Rhs::Array(other) => {
@@ -2244,6 +2244,9 @@ impl Array<C32> {
     #[track_caller]
     pub fn mean(&self) -> Array<C32> {
         let location = Location::caller();
+        if self.is_wide() {
+            return Array::resolve(self.context(), Shape::from(1usize), Err(self.too_wide().into()), "mean", location);
+        }
         self.sum().with_real(self.len() as f32, BinOp::Div, false, location)
     }
 

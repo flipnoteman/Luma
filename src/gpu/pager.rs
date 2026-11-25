@@ -16,6 +16,7 @@ use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
 use luma_core::Buffer;
 
 use crate::array::Storage;
+use crate::file::FileStore;
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::{FxMap, FxSet};
@@ -41,6 +42,21 @@ enum State {
     /// Not in memory: the contents are what the segment's lineage computes (see
     /// [`crate::jit::lineage`]), run again at the next pin. The lineage holds the inputs.
     Lineage,
+    /// The bytes exist only at the segment's home, a range of a file (see [`Home`]); read at the
+    /// next pin.
+    Away,
+}
+
+/// The byte range of a file that holds a segment's data: where the data comes from when the
+/// segment is first used, and where it goes when it is evicted dirty or flushed.
+#[derive(Debug)]
+pub(crate) struct Home {
+    pub(crate) store: Arc<FileStore>,
+    /// Byte offset of the segment's data in the file.
+    pub(crate) offset: u64,
+    /// Bytes of the file the segment covers: at most the segment's bytes; the rest (the tail of
+    /// a packed segment that does not fill its last word) is zero and never written.
+    pub(crate) file_bytes: u64,
 }
 
 /// Where a windowed segment's data is: `bytes` bytes of the one buffer of `pack`, from `offset`.
@@ -88,6 +104,14 @@ pub(crate) struct Segment {
     epoch: AtomicU64,
     /// Value of the pager's clock at the last pin.
     stamp: AtomicU64,
+    /// Where the data lives in a file, if the segment is file-backed.
+    home: Option<Home>,
+    /// Whether the home holds the current bytes (the segment is "clean"): true while `Away`,
+    /// false from every may-write pin until the next write-back.
+    home_valid: AtomicBool,
+    /// Set when a may-write pin was taken of a segment whose file is read-only: the segment is
+    /// anonymous from then on (copy on write), so that the file is never written.
+    detached: AtomicBool,
     /// The texture of this segment's data made last (see [`crate::texture`]).
     texture: Mutex<Option<crate::texture::Cached>>,
 }
@@ -206,7 +230,8 @@ pub(crate) fn take_dead_buffers(pins: &mut Vec<Pin>, fresh: &FxSet<u64>) -> Vec<
     for pin in pins.iter() {
         let segment = &pin.segment;
         let key = Arc::as_ptr(segment);
-        if dead.contains(&key) || Arc::strong_count(segment) != held[&key] {
+        // A file-backed segment is never dismantled here: its data may be dirty, and dropping the segment writes it back.
+        if dead.contains(&key) || Arc::strong_count(segment) != held[&key] || segment.home.is_some() {
             continue;
         }
         let mut state = lock(&segment.state);
@@ -267,6 +292,20 @@ pub(crate) struct Pager {
     /// arrays are too small for recomputing to beat a transfer).
     #[cfg(test)]
     force_lineage: AtomicBool,
+    /// Bytes of host memory the CPU backend may use for file-backed data (a CPU context has no
+    /// device budget; anonymous arrays are not bounded).
+    home_budget: u64,
+    /// Sum of the sizes of the buffers of file-backed segments on the device.
+    resident_homed_bytes: AtomicU64,
+    /// Bytes read from files into segments.
+    io_read_bytes: AtomicU64,
+    /// Bytes written back to files.
+    io_written_bytes: AtomicU64,
+    /// Evictions of file-backed segments (and detachments from read-only files): the buffer is
+    /// dropped, the file is the copy.
+    home_drops: AtomicU64,
+    /// Write-backs of dirty file-backed segments.
+    home_writebacks: AtomicU64,
     /// Whether the over-budget warning has been printed.
     host_warned: AtomicBool,
     /// Windows given a buffer of their own, a copy of their range (see [`Segment::windowed`]).
@@ -338,6 +377,12 @@ impl Pager {
             lineage_pinned_bytes: AtomicU64::new(0),
             #[cfg(test)]
             force_lineage: AtomicBool::new(false),
+            home_budget: host_budget,
+            resident_homed_bytes: AtomicU64::new(0),
+            io_read_bytes: AtomicU64::new(0),
+            io_written_bytes: AtomicU64::new(0),
+            home_drops: AtomicU64::new(0),
+            home_writebacks: AtomicU64::new(0),
             host_warned: AtomicBool::new(false),
             window_copies: AtomicU64::new(0),
             warned: AtomicBool::new(false),
@@ -358,6 +403,9 @@ impl Pager {
     /// Records that `segment` now holds a device buffer of `size` bytes.
     fn register(&self, segment: &Arc<Segment>, size: u64) {
         self.resident_bytes.fetch_add(size, Ordering::Relaxed);
+        if segment.home.is_some() {
+            self.resident_homed_bytes.fetch_add(size, Ordering::Relaxed);
+        }
         segment.stamp.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         let mut resident = lock(&self.resident);
         resident.list.push(Arc::downgrade(segment));
@@ -390,8 +438,62 @@ impl Segment {
             write_pins: AtomicU32::new(0),
             epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
+            home: None,
+            home_valid: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
             texture: Mutex::new(None),
         })
+    }
+
+    /// A segment of `bytes` bytes whose data is at `home`, not in memory yet: the file is read
+    /// when the segment is first pinned.
+    pub(crate) fn homed(ctx: &Context, bytes: u64, home: Home) -> Arc<Segment> {
+        let mut segment = Segment {
+            ctx: ctx.clone(),
+            bytes,
+            state: Mutex::new(State::Away),
+            host_copy: Mutex::new(None),
+            has_copy: AtomicBool::new(false),
+            lineage: Mutex::new(None),
+            has_lineage: AtomicBool::new(false),
+            dependents: Mutex::new(Dependents::default()),
+            has_dependents: AtomicBool::new(false),
+            pins: AtomicU32::new(0),
+            write_pins: AtomicU32::new(0),
+            epoch: AtomicU64::new(0),
+            stamp: AtomicU64::new(0),
+            home: None,
+            home_valid: AtomicBool::new(true),
+            detached: AtomicBool::new(false),
+            texture: Mutex::new(None),
+        };
+        segment.home = Some(home);
+        Arc::new(segment)
+    }
+
+    /// The home of the segment while it is file-backed: `None` for an anonymous segment and for
+    /// one detached from a read-only file.
+    pub(crate) fn home(&self) -> Option<&Home> {
+        self.home.as_ref().filter(|_| !self.detached.load(Ordering::Acquire))
+    }
+
+    /// Stops counting a device buffer of `size` bytes of this segment as resident.
+    fn uncount(&self, size: u64) {
+        let pager = self.ctx.pager();
+        pager.resident_bytes.fetch_sub(size, Ordering::Relaxed);
+        if self.home.is_some() {
+            pager.resident_homed_bytes.fetch_sub(size, Ordering::Relaxed);
+        }
+    }
+
+    /// Notes a write to a homed segment: the home no longer holds the data, and a read-only
+    /// file's segment lets go of it.
+    fn home_written(&self) {
+        let Some(home) = &self.home else { return };
+        self.home_valid.store(false, Ordering::Release);
+        if !home.store.writable() && !self.detached.swap(true, Ordering::AcqRel) {
+            self.ctx.pager().home_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A segment of `bytes` bytes without a buffer; it gets one at its first pin.
@@ -418,10 +520,13 @@ impl Segment {
 
     /// Whether the segment is a window or a device buffer no command being recorded holds.
     pub(crate) fn can_adopt(&self) -> bool {
+        if self.home.is_some() {
+            return false;
+        }
         match &*lock(&self.state) {
             State::Device(_) => self.pins.load(Ordering::Acquire) == 0,
             State::Window(_) => true,
-            State::Empty | State::Host(_) | State::Lineage => false,
+            State::Empty | State::Host(_) | State::Lineage | State::Away => false,
         }
     }
 
@@ -464,21 +569,29 @@ impl Segment {
     /// The pin may be used to write: the host copy of the data, if the segment keeps one, is
     /// dropped. [`Segment::pin_read`] keeps it.
     pub(crate) fn pin(self: &Arc<Self>) -> Result<Pin> {
-        let pin = self.pin_unrecorded(true)?;
+        let pin = self.pin_unrecorded(true, false)?;
+        self.ctx.keep_pin(&pin);
+        Ok(pin)
+    }
+
+    /// [`Segment::pin`] for a command that overwrites every byte of the data: a file-backed
+    /// segment that is not in memory is given a buffer without reading its file.
+    pub(crate) fn pin_overwrite(self: &Arc<Self>) -> Result<Pin> {
+        let pin = self.pin_unrecorded(true, true)?;
         self.ctx.keep_pin(&pin);
         Ok(pin)
     }
 
     /// [`Segment::pin`] for a command that only reads the buffer: a host copy stays valid.
     pub(crate) fn pin_read(self: &Arc<Self>) -> Result<Pin> {
-        let pin = self.pin_unrecorded(false)?;
+        let pin = self.pin_unrecorded(false, false)?;
         self.ctx.keep_pin(&pin);
         Ok(pin)
     }
 
     /// [`Segment::pin`] without keeping the pin for the recording (see `keep_pin`).
     pub(crate) fn pin_quiet(self: &Arc<Self>) -> Result<Pin> {
-        self.pin_unrecorded(true)
+        self.pin_unrecorded(true, false)
     }
 
     /// Drops the kept host copy: the device buffer is about to be, or was, written.
@@ -492,12 +605,15 @@ impl Segment {
         }
     }
 
-    fn pin_unrecorded(self: &Arc<Self>, write: bool) -> Result<Pin> {
+    fn pin_unrecorded(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
         if !write {
-            return self.pin_device(false);
+            return self.pin_device(false, false);
         }
         self.note_write()?;
-        let pin = self.pin_device(true)?;
+        let pin = self.pin_device(true, overwrite)?;
+        if self.home.is_some() {
+            self.home_written();
+        }
         if self.has_lineage.load(Ordering::Acquire) {
             // The data is about to change: the pin keeps the segment resident, so it is not evicted by lineage meanwhile.
             self.clear_lineage();
@@ -558,7 +674,7 @@ impl Segment {
     fn give_up_lineage(self: &Arc<Self>) -> Result<()> {
         loop {
             // Pinned, the recomputed segment cannot be evicted by lineage again before its lineage is gone.
-            let _pin = if matches!(&*lock(&self.state), State::Lineage) { Some(self.pin_device(false)?) } else { None };
+            let _pin = if matches!(&*lock(&self.state), State::Lineage) { Some(self.pin_device(false, false)?) } else { None };
             if self.drop_lineage() {
                 return Ok(());
             }
@@ -658,7 +774,7 @@ impl Segment {
 
     /// The device buffer of the segment, in place for a resident one; the segment is allocated,
     /// brought back from host memory, copied out of its pack or recomputed otherwise.
-    fn pin_device(self: &Arc<Self>, write: bool) -> Result<Pin> {
+    fn pin_device(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
         let pager = self.ctx.pager();
         loop {
             if let State::Device(buffer) = &*lock(&self.state) {
@@ -675,8 +791,11 @@ impl Segment {
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write: counted });
             }
             let evicted_by_lineage = matches!(&*lock(&self.state), State::Lineage);
+            let away = matches!(&*lock(&self.state), State::Away);
             if evicted_by_lineage {
                 self.ctx.abort_recording_for("recompute of an evicted segment")?;
+            } else if away {
+                self.ctx.abort_recording_for("file segment upload")?;
             } else if matches!(&*lock(&self.state), State::Host(_)) {
                 self.ctx.abort_recording_for("host segment upload")?;
             }
@@ -693,6 +812,9 @@ impl Segment {
             } else {
                 None
             };
+            if away && self.ctx.is_cpu() && pager.budget.is_none() {
+                self.ctx.make_room_homed(self.bytes)?;
+            }
             let buffer = match self.ctx.take_recorded(self.bytes, STORAGE_USAGE) {
                 Some(buffer) => buffer,
                 None => {
@@ -700,6 +822,17 @@ impl Segment {
                     self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?
                 }
             };
+            if away && self.home().is_none() {
+                self.ctx.recycle(buffer);
+                return Err(LumaError::Gpu("a segment without a home lost its data".into()));
+            }
+            if away && let Some(home) = self.home() {
+                // Nothing reads the file when the caller overwrites every byte of a writable file (the bytes of a read-only one are kept for the copy a write detaches).
+                if !(overwrite && home.store.writable()) && let Err(e) = self.fill_from_home(home, &buffer) {
+                    self.ctx.recycle(buffer);
+                    return Err(e);
+                }
+            }
             if let Some((pack, offset)) = window {
                 // The copy runs after the launch that wrote the pack and before any later one.
                 let source = pack.pin_read(0)?;
@@ -753,9 +886,76 @@ impl Segment {
         }
     }
 
+    /// Fills `buffer` (idle, at least `self.bytes` bytes) with the data at `home`: read straight
+    /// into it where the host can write the buffer (the CPU backend), through a host buffer
+    /// and an upload elsewhere. The bytes past the file's are zero.
+    fn fill_from_home(&self, home: &Home, buffer: &Buffer) -> Result<()> {
+        let file_bytes = home.file_bytes as usize;
+        let total = self.bytes as usize;
+        if self.ctx.is_cpu()
+            && !self.ctx.recording_here()
+            && let Some(ptr) = self.ctx.host_ptr(buffer, self.bytes)
+        {
+            // SAFETY: `host_ptr` vouches for `self.bytes` bytes no command touches, and the buffer is not shared with anything yet.
+            let dst = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), total) };
+            let (data, tail) = dst.split_at_mut(file_bytes);
+            home.store.read(home.offset, data)?;
+            tail.fill(MaybeUninit::new(0));
+        } else {
+            let mut data = HostBytes::zeroed(total);
+            // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the read only writes initialized bytes.
+            let dst = unsafe { std::slice::from_raw_parts_mut(data.as_mut_slice().as_mut_ptr().cast::<MaybeUninit<u8>>(), file_bytes) };
+            home.store.read(home.offset, dst)?;
+            self.ctx.upload(buffer, data.as_slice())?;
+        }
+        self.ctx.pager().io_read_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Writes the data in `buffer` to the segment's home. The caller has waited for every
+    /// command that writes the buffer (see [`Context::read_spill`]).
+    fn write_home(&self, home: &Home, data: &HostBytes) -> Result<()> {
+        home.store.write(home.offset, &data.as_slice()[..home.file_bytes as usize])?;
+        let pager = self.ctx.pager();
+        pager.io_written_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);
+        pager.home_writebacks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Writes the data of a segment that is on the device and dirty to its (writable) home and
+    /// marks it clean; the buffer stays. Does nothing for a clean segment or one that is not on
+    /// the device.
+    pub(crate) fn write_back(&self) -> Result<()> {
+        let Some(home) = self.home() else { return Ok(()) };
+        if self.home_valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Before the state lock: aborting a recording can pin this segment.
+        self.ctx.abort_recording()?;
+        let state = lock(&self.state);
+        let State::Device(buffer) = &*state else { return Ok(()) };
+        if self.home_valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let data = self.ctx.read_spill(buffer, self.bytes)?;
+        self.write_home(home, &data)?;
+        self.home_valid.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Copies the segment's data into `dst` (`dst.len()` bytes), after everything recorded so
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
+        if matches!(&*lock(&self.state), State::Away)
+            && let Some(home) = self.home()
+        {
+            // Read from the file: no buffer, no device round trip.
+            let (data, tail) = dst.split_at_mut(dst.len().min(home.file_bytes as usize));
+            home.store.read(home.offset, data)?;
+            tail.fill(MaybeUninit::new(0));
+            self.ctx.pager().io_read_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            return Ok(());
+        }
         // On the CPU backend the segment is in the same memory as `dst`: a copy between host buffers, bound by the host's memory.
         let copy = if self.ctx.is_cpu() { copy_parallel_host } else { copy_parallel };
         if self.with_host_bytes(|data| copy(&data[..dst.len()], dst)).is_some() {
@@ -777,7 +977,7 @@ impl Segment {
                 // SAFETY: `host_ptr` vouches for `self.bytes` readable bytes no GPU command writes, and the state lock keeps the buffer from being evicted.
                 f(unsafe { std::slice::from_raw_parts(ptr, self.bytes as usize) })
             }),
-            State::Device(_) | State::Empty | State::Window(_) | State::Lineage => None,
+            State::Device(_) | State::Empty | State::Window(_) | State::Lineage | State::Away => None,
         }
     }
 
@@ -798,10 +998,11 @@ impl Segment {
             State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
                 self.invalidate_host_copy();
                 self.clear_lineage();
+                self.home_written();
                 // SAFETY: as in `with_host_bytes`; the state lock and the absent pins make this the only access.
                 f(unsafe { std::slice::from_raw_parts_mut(ptr, self.bytes as usize) })
             }),
-            State::Device(_) | State::Empty | State::Window(_) | State::Lineage => None,
+            State::Device(_) | State::Empty | State::Window(_) | State::Lineage | State::Away => None,
         }
     }
 }
@@ -817,13 +1018,27 @@ impl Drop for Segment {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         match std::mem::replace(state, State::Empty) {
             State::Device(buffer) => {
-                self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+                if let Some(home) = self.home.as_ref().filter(|_| !self.detached.load(Ordering::Acquire))
+                    && !self.home_valid.load(Ordering::Acquire)
+                {
+                    // The last dirty copy of the data: it goes to the file before the buffer is recycled.
+                    let written = self.ctx.read_spill(&buffer, self.bytes).and_then(|data| self.write_home(home, &data));
+                    if let Err(error) = written {
+                        home.store.failed_with(&error);
+                        log::error!("luma: could not write back a dropped file segment: {error}");
+                    }
+                }
+                let pager = self.ctx.pager();
+                pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+                if self.home.is_some() {
+                    pager.resident_homed_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+                }
                 self.ctx.recycle(buffer);
             }
             State::Host(data) => {
                 self.ctx.pager().host_state_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
             }
-            State::Empty | State::Window(_) | State::Lineage => {}
+            State::Empty | State::Window(_) | State::Lineage | State::Away => {}
         }
     }
 }
@@ -857,9 +1072,30 @@ impl Context {
         Ok(())
     }
 
+    /// On the CPU backend, evicts file-backed segments (least recently pinned first) until
+    /// `bytes` more of them fit in the host budget for file data. Anonymous arrays are not
+    /// bounded there.
+    pub(crate) fn make_room_homed(&self, bytes: u64) -> Result<()> {
+        let pager = self.pager();
+        let class = size_class(bytes, self.max_buffer_bytes()).unwrap_or(bytes);
+        while pager.resident_homed_bytes.load(Ordering::Relaxed) + class > pager.home_budget && self.evict_one_homed()? {
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
     /// Moves the least recently pinned unpinned segment to host memory. `Ok(false)`: nothing to
     /// move. `Ok(true)`: a segment moved, or the choice raced with a pin; the caller retries.
     pub(crate) fn evict_one(&self) -> Result<bool> {
+        self.evict_one_in(false)
+    }
+
+    /// [`Context::evict_one`] for file-backed segments only.
+    fn evict_one_homed(&self) -> Result<bool> {
+        self.evict_one_in(true)
+    }
+
+    fn evict_one_in(&self, homed_only: bool) -> Result<bool> {
         if EVICTING.with(Cell::get) {
             return Ok(false);
         }
@@ -883,7 +1119,7 @@ impl Context {
                 .list
                 .iter()
                 .filter_map(Weak::upgrade)
-                .filter(|segment| segment.pins.load(Ordering::Acquire) == 0)
+                .filter(|segment| segment.pins.load(Ordering::Acquire) == 0 && (!homed_only || segment.home().is_some()))
                 .min_by_key(|segment| segment.stamp.load(Ordering::Relaxed))
         };
         let Some(victim) = victim else { return Ok(false) };
@@ -898,6 +1134,37 @@ impl Context {
             return Ok(true);
         }
         let buffer = buffer.clone();
+        if let Some(home) = victim.home() {
+            // The file is the copy: a clean segment is dropped, a dirty one is written back first.
+            if victim.home_valid.load(Ordering::Acquire) {
+                #[cfg(debug_assertions)]
+                if pager.clean_evictions.load(Ordering::Relaxed).is_multiple_of(16) {
+                    let real = self.read_spill(&buffer, victim.bytes)?;
+                    let mut file = vec![std::mem::MaybeUninit::<u8>::uninit(); home.file_bytes as usize];
+                    home.store.read(home.offset, &mut file)?;
+                    // SAFETY: `read` initialized every byte.
+                    let file: &[u8] = unsafe { std::slice::from_raw_parts(file.as_ptr().cast::<u8>(), file.len()) };
+                    assert!(file == &real.as_slice()[..file.len()], "a clean file segment differs from its file: a write did not mark it dirty");
+                }
+                pager.clean_evictions.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Flushes and waits, so every recorded use of the buffer has run.
+                let data = self.read_spill(&buffer, victim.bytes)?;
+                victim.write_home(home, &data)?;
+                victim.home_valid.store(true, Ordering::Release);
+            }
+            if home.store.drop_cache() {
+                home.store.advise_drop(home.offset, home.file_bytes);
+            }
+            pager.home_drops.fetch_add(1, Ordering::Relaxed);
+            *state = State::Away;
+            lock(&victim.texture).take();
+            victim.uncount(buffer.size());
+            lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
+            self.recycle(buffer);
+            drop(state);
+            return Ok(true);
+        }
         let kept = if victim.has_copy.load(Ordering::Acquire) { lock(&victim.host_copy).take() } else { None };
         if kept.is_none()
             && let Some(inputs) = candidate
@@ -908,7 +1175,7 @@ impl Context {
             pager.recompute_evictions.fetch_add(1, Ordering::Relaxed);
             *state = State::Lineage;
             lock(&victim.texture).take();
-            pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+            victim.uncount(buffer.size());
             lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
             self.recycle(buffer);
             drop(state);
@@ -938,7 +1205,7 @@ impl Context {
         *state = State::Host(data);
         // The texture holds the buffer the data just left.
         lock(&victim.texture).take();
-        pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+        victim.uncount(buffer.size());
         pager.spilled_bytes.fetch_add(victim.bytes, Ordering::Relaxed);
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
         self.recycle(buffer);
@@ -1009,6 +1276,11 @@ impl Context {
             readback_evictions: pager.readback_evictions.load(Ordering::Relaxed),
             recompute_evictions: pager.recompute_evictions.load(Ordering::Relaxed),
             lineage_pinned_bytes: pager.lineage_pinned_bytes.load(Ordering::Relaxed),
+            io_read_bytes: pager.io_read_bytes.load(Ordering::Relaxed),
+            io_written_bytes: pager.io_written_bytes.load(Ordering::Relaxed),
+            home_drops: pager.home_drops.load(Ordering::Relaxed),
+            home_writebacks: pager.home_writebacks.load(Ordering::Relaxed),
+            file_resident_bytes: pager.resident_homed_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -1063,6 +1335,18 @@ pub struct PagingStats {
     /// once per holder, so an input shared by several of them is counted several times). Not
     /// part of the memory budget; a value that stays high is a leak to look at.
     pub lineage_pinned_bytes: u64,
+    /// Bytes read from files into segments of file-backed arrays (see [`Array::open`](crate::Array::open)).
+    pub io_read_bytes: u64,
+    /// Bytes written back to files, at eviction, `flush` and drop.
+    pub io_written_bytes: u64,
+    /// Buffers of file-backed segments dropped because the file holds their data: evictions of
+    /// clean and of written-back segments, and segments of a read-only file that a write made
+    /// anonymous (copy on write).
+    pub home_drops: u64,
+    /// Write-backs of dirty file-backed segments to their files.
+    pub home_writebacks: u64,
+    /// Bytes of device buffers that file-backed segments hold now.
+    pub file_resident_bytes: u64,
 }
 
 /// The default host budget: half of the available host memory, capped by the cgroup limit; 0

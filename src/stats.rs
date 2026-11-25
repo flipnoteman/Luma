@@ -191,6 +191,10 @@ macro_rules! float_stats {
             /// The mean and variance over the whole array or along `axis`, weighted or not.
             fn meanvar_at(&self, axis: Option<usize>, weights: Option<&Array<$t>>, bias: Bias, name: &'static str, location: &'static Location<'static>) -> (Array<$t>, Array<$t>) {
                 let shape = reduced_shape(self.shape(), axis);
+                if self.is_wide() {
+                    let bad = Array::resolve(self.context(), shape, Err(self.too_wide().into()), name, location);
+                    return (bad.clone(), bad);
+                }
                 let ddof = bias.ddof() as $t;
                 let (shift, shifted) = self.shifted(axis);
                 match weights {
@@ -267,6 +271,9 @@ macro_rules! float_stats {
             }
 
             fn weighted_mean_at(&self, axis: Option<usize>, weights: &Array<$t>, name: &'static str, location: &'static Location<'static>) -> Array<$t> {
+                if self.is_wide() {
+                    return Array::resolve(self.context(), reduced_shape(self.shape(), axis), Err(self.too_wide().into()), name, location);
+                }
                 if weights.shape().dims().iter().zip(self.shape().dims()).any(|(&w, x)| w != x && w != 1) {
                     return mismatch(self, weights, reduced_shape(self.shape(), axis), name, location);
                 }
@@ -297,6 +304,9 @@ macro_rules! float_stats {
             }
 
             fn cross_at(&self, axis: Option<usize>, y: &Array<$t>, bias: Bias, correlation: bool, name: &'static str, location: &'static Location<'static>) -> Array<$t> {
+                if self.is_wide() {
+                    return Array::resolve(self.context(), reduced_shape(self.shape(), axis), Err(self.too_wide().into()), name, location);
+                }
                 if self.shape() != y.shape() {
                     return mismatch(self, y, reduced_shape(self.shape(), axis), name, location);
                 }
@@ -427,6 +437,9 @@ impl Array<f64> {
     /// [`Array<f32>::mean`](Array::mean)).
     #[track_caller]
     pub fn mean(&self) -> Array<f64> {
+        if self.is_wide() {
+            return Array::resolve(self.context(), Shape::from(1usize), Err(self.too_wide().into()), "mean", Location::caller());
+        }
         &self.sum() / (self.len() as f64)
     }
 }

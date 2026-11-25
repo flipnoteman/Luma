@@ -188,6 +188,25 @@ pub enum LumaError {
     Map(String),
     /// Accessing the mapped readback buffer failed.
     MapRange(String),
+    /// Reading or writing a file of a file-backed array failed (see [`Array::open`](crate::Array::open)).
+    Io {
+        /// What was being done (`"open"`, `"read"`, `"write"`, `"lock"`, ...).
+        op: &'static str,
+        /// The file.
+        path: Arc<std::path::Path>,
+        /// The byte offset in the file, where the operation has one.
+        offset: Option<u64>,
+        /// The operating system's error.
+        source: Arc<std::io::Error>,
+    },
+    /// A file is not in the format it was opened as, or does not hold the array it was opened
+    /// as (see [`Array::open`](crate::Array::open)).
+    FileFormat {
+        /// The file.
+        path: Arc<std::path::Path>,
+        /// What is wrong with it.
+        message: String,
+    },
 }
 
 impl fmt::Display for LumaError {
@@ -284,6 +303,14 @@ impl fmt::Display for LumaError {
             LumaError::Poll(e) => write!(f, "GPU poll failed: {e}"),
             LumaError::Map(e) => write!(f, "Failed to read data back from GPU: {e}"),
             LumaError::MapRange(e) => write!(f, "Failed to map staging buffer: {e}"),
+            LumaError::Io { op, path, offset, source } => {
+                write!(f, "{op} of {}", path.display())?;
+                if let Some(offset) = offset {
+                    write!(f, " at byte {offset}")?;
+                }
+                write!(f, " failed: {source}")
+            }
+            LumaError::FileFormat { path, message } => write!(f, "{}: {message}", path.display()),
         }
     }
 }
@@ -292,6 +319,7 @@ impl Error for LumaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LumaError::Op { source, .. } => Some(&**source),
+            LumaError::Io { source, .. } => Some(&**source),
             _ => None,
         }
     }
@@ -321,6 +349,11 @@ impl From<luma_core::BackendError> for LumaError {
 }
 
 impl LumaError {
+    /// An I/O error of `op` on `path` (at byte `offset`, if known).
+    pub(crate) fn io(op: &'static str, path: &Arc<std::path::Path>, offset: Option<u64>, source: std::io::Error) -> LumaError {
+        LumaError::Io { op, path: Arc::clone(path), offset, source: Arc::new(source) }
+    }
+
     /// The error underneath any [`LumaError::Op`] wrappers: what actually went wrong.
     pub fn root(&self) -> &LumaError {
         let mut error = self;

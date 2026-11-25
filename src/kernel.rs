@@ -407,15 +407,15 @@ fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg
     }
     if writable
         && let Ok(storage) = array.storage()
-        && storage.is_alias()
+        && storage.is_read_only()
     {
-        return KernelArg { repr: ArgRepr::Poisoned(Arc::new(LumaError::ReadOnly("the state passed to an iteration step"))) };
+        return KernelArg { repr: ArgRepr::Poisoned(Arc::new(crate::file::read_only(storage))) };
     }
     if writable {
         // Lazy operations recorded earlier still read the contents the kernel is about to change.
         array.flush_readers();
     }
-    let repr = match array.ready() {
+    let repr = match if writable { array.ready() } else { array.ready_read() } {
         Ok((pin, bytes)) => ArgRepr::Storage {
             ctx: array.context(),
             pin,

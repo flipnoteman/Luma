@@ -38,6 +38,7 @@ mod ext_reach;
 mod euler_residual;
 mod factor_env;
 mod factorize;
+mod file;
 mod fields_generic;
 mod fft;
 mod filter;

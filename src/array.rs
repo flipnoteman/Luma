@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::context::{default_context, Context};
-use crate::gpu::pager::{Pin, Segment};
+use crate::file::FileStore;
+use crate::gpu::pager::{Home, Pin, Segment};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType};
 use crate::builtin::UnOp;
@@ -76,6 +77,9 @@ pub(crate) struct Storage {
     /// Id of the lazy node this is the result of, `u64::MAX` if none; finds the state of a loop
     /// whose node was dropped (see `jit::looped`).
     producer: AtomicU64,
+    /// The file the segments live in, for a storage opened or created as a file array (see
+    /// [`Array::open`]).
+    file: Option<Arc<FileStore>>,
 }
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -186,7 +190,50 @@ impl Storage {
             materialized: AtomicBool::new(false),
             readers: Readers::default(),
             producer: AtomicU64::new(u64::MAX),
+            file: None,
         }
+    }
+
+    /// A storage of `len` elements of `layout` whose segments live in `store` from byte
+    /// `data_offset` on (`elem_bytes` per element in the file): every segment starts without a
+    /// buffer and its first pin reads its range of the file.
+    pub(crate) fn homed(ctx: &Context, len: usize, layout: ElemLayout, store: &Arc<FileStore>, data_offset: u64, elem_bytes: u64) -> Self {
+        let c = segment_len(ctx, layout);
+        let data_end = data_offset + len as u64 * elem_bytes;
+        let segments = (0..len.div_ceil(c))
+            .map(|j| {
+                let range = j * c..len.min((j + 1) * c);
+                let bytes = layout.bytes(range.len());
+                let offset = data_offset + range.start as u64 * elem_bytes;
+                let file_bytes = bytes.min(data_end - offset);
+                Segment::homed(ctx, bytes, Home { store: Arc::clone(store), offset, file_bytes })
+            })
+            .collect();
+        let mut storage = Self::with_segments(ctx, len, layout, segments, None);
+        storage.file = Some(Arc::clone(store));
+        storage
+    }
+
+    /// Whether the segments live in a file.
+    pub(crate) fn is_homed(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// The file of a file-backed storage.
+    pub(crate) fn file(&self) -> Option<&Arc<FileStore>> {
+        self.file.as_ref()
+    }
+
+    /// Whether nothing may write the storage: it borrows the buffers of another one, or it is a
+    /// file opened without `writable()`.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.is_alias() || self.file.as_ref().is_some_and(|file| !file.writable())
+    }
+
+    /// [`Storage::pin`] for a command that overwrites every byte of segment `j`: a file-backed
+    /// segment that is not in memory is not read from its file first.
+    pub(crate) fn pin_overwrite(&self, j: usize) -> Result<Pin> {
+        self.segment(j).pin_overwrite()
     }
 
     /// Unique per storage; identifies it as an input of a fused kernel.
@@ -641,6 +688,11 @@ impl<T: GpuType> Array<T> {
         Ok((self.storage()?.pin_single()?, self.byte_len()))
     }
 
+    /// [`Array::ready`] for a reader: the pin does not announce a write.
+    pub(crate) fn ready_read(&self) -> std::result::Result<(Pin, u64), Failure> {
+        Ok((self.storage()?.pin_single_read()?, self.byte_len()))
+    }
+
     /// This array as an operand of a lazy operation, without evaluating it: its buffer, or the
     /// pending expression that produces it.
     pub(crate) fn src(&self) -> std::result::Result<Src, Failure> {
@@ -742,7 +794,8 @@ impl<T: GpuType> Array<T> {
             },
             _ => return false,
         };
-        Arc::strong_count(storage) == 1 && !storage.is_alias() && !storage.is_window()
+        // A file array is written through its buffers: compound assignment is an explicit write, never a new expression.
+        Arc::strong_count(storage) == 1 && !storage.is_alias() && !storage.is_window() && !storage.is_homed()
     }
 
     /// Evaluates every pending lazy operation that reads this array's buffer. Must run before
@@ -859,8 +912,8 @@ impl<T: GpuType> Array<T> {
             ));
         }
         let storage = self.storage().map_err(Failure::into_error)?;
-        if storage.is_alias() {
-            return Err(LumaError::ReadOnly("the state passed to an iteration step"));
+        if storage.is_read_only() {
+            return Err(crate::file::read_only(storage));
         }
         if data.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: data.len() });
@@ -869,7 +922,8 @@ impl<T: GpuType> Array<T> {
         self.flush_readers();
         let words = T::to_repr(data);
         for j in 0..storage.segments() {
-            let pin = storage.pin(j)?;
+            // Every byte of the segment is overwritten: a file segment is not read first.
+            let pin = storage.pin_overwrite(j)?;
             self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.words(j)]))?;
         }
         Ok(())

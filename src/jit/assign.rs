@@ -443,8 +443,8 @@ pub(crate) fn assign(
         if region.base.segments() != 1 {
             return Err(LumaError::Chunked("assigning into an array split over several buffers").into());
         }
-        if region.base.is_alias() {
-            return Err(LumaError::ReadOnly("the state passed to an iteration step").into());
+        if region.base.is_read_only() {
+            return Err(crate::file::read_only(&region.base).into());
         }
         if !region.map.is_injective() {
             return Err(LumaError::InvalidShape("assign needs a slice, flip or transpose view".into()).into());
@@ -525,8 +525,8 @@ pub(crate) fn scatter(
     if base.segments() != 1 {
         return Err(LumaError::Chunked("assigning into an array split over several buffers").into());
     }
-    if base.is_alias() {
-        return Err(LumaError::ReadOnly("the state passed to an iteration step").into());
+    if base.is_read_only() {
+        return Err(crate::file::read_only(base).into());
     }
     // Whatever was recorded against the old contents runs before the write.
     base.readers.flush();

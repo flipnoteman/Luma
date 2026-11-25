@@ -1357,8 +1357,8 @@ impl<'a, T: ScalarType> ViewMut<'a, Array<T>> {
         let ctx = self.inner.context();
         let storage = view.storage(ctx)?;
         if writable {
-            if storage.is_alias() {
-                return Err(LumaError::ReadOnly("the state passed to an iteration step").into());
+            if storage.is_read_only() {
+                return Err(crate::file::read_only(&storage).into());
             }
             storage.readers.flush();
             ctx.jit().note_write();
