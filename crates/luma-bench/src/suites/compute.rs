@@ -24,6 +24,7 @@
 
 mod bandwidth;
 mod boundary;
+mod boundary_conv;
 mod imageops;
 mod visionops;
 mod crypto;
@@ -108,6 +109,7 @@ pub fn run(h: &mut Harness) {
     linalg::run(h);
     scans::run(h);
     boundary::run(h);
+    boundary_conv::run(h);
     physics::run(h);
     signal::run(h);
     imageops::run(h);
