@@ -550,6 +550,10 @@ fn execute_ranked(entries: &'static [Strategy], ctx: &Context, subject: &Subject
                 Lowered::Declined => {
                     declined[declined_len] = Some(id);
                     declined_len += 1;
+                    // A non-baseline strategy that declined because its kernel failed to compile is not tried again in this context.
+                    if !strategy.baseline && (strategy.warm)(subject, &params, ctx).is_ok_and(|warm| warm.failed()) {
+                        ctx.jit().variants.mark_failed(id);
+                    }
                     if forced == Some(id) {
                         // The override declined: the default selection takes over.
                         forced = None;
