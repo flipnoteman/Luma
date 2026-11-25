@@ -196,8 +196,9 @@ pub enum LumaError {
         path: Arc<std::path::Path>,
         /// The byte offset in the file, where the operation has one.
         offset: Option<u64>,
-        /// The operating system's error.
-        source: Arc<std::io::Error>,
+        /// The operating system's error. (Wrapped so that `LumaError` stays `UnwindSafe`, which
+        /// `std::io::Error` is not; it dereferences to the `io::Error`.)
+        source: Arc<std::panic::AssertUnwindSafe<std::io::Error>>,
     },
     /// A file is not in the format it was opened as, or does not hold the array it was opened
     /// as (see [`Array::open`](crate::Array::open)).
@@ -308,7 +309,7 @@ impl fmt::Display for LumaError {
                 if let Some(offset) = offset {
                     write!(f, " at byte {offset}")?;
                 }
-                write!(f, " failed: {source}")
+                write!(f, " failed: {}", source.0)
             }
             LumaError::FileFormat { path, message } => write!(f, "{}: {message}", path.display()),
         }
@@ -319,7 +320,7 @@ impl Error for LumaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LumaError::Op { source, .. } => Some(&**source),
-            LumaError::Io { source, .. } => Some(&**source),
+            LumaError::Io { source, .. } => Some(&source.0),
             _ => None,
         }
     }
@@ -351,7 +352,7 @@ impl From<luma_core::BackendError> for LumaError {
 impl LumaError {
     /// An I/O error of `op` on `path` (at byte `offset`, if known).
     pub(crate) fn io(op: &'static str, path: &Arc<std::path::Path>, offset: Option<u64>, source: std::io::Error) -> LumaError {
-        LumaError::Io { op, path: Arc::clone(path), offset, source: Arc::new(source) }
+        LumaError::Io { op, path: Arc::clone(path), offset, source: Arc::new(std::panic::AssertUnwindSafe(source)) }
     }
 
     /// The error underneath any [`LumaError::Op`] wrappers: what actually went wrong.
