@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::Arc;
 
-use super::boundary::{CompactAttrs, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
+use super::boundary::{CompactAttrs, FactorAttrs, FactorParams, LineSolveAttrs, LineSolveParams, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
 use super::emit::Emit;
 use super::contraction::{ContractionParams, ContractionView};
 use super::Structured;
@@ -33,10 +33,12 @@ pub(crate) enum FamilyTag {
     Compact,
     Merge,
     Contraction,
+    LineSolve,
+    Factor,
 }
 
 /// How many families have a table.
-pub(crate) const FAMILY_COUNT: usize = 8;
+pub(crate) const FAMILY_COUNT: usize = 10;
 
 /// Most entries one family's table may have (the ranking cache keeps them in a `u32` mask and an array).
 pub(crate) const MAX_PER_FAMILY: usize = 12;
@@ -53,6 +55,8 @@ impl FamilyTag {
             FamilyTag::Compact => 5,
             FamilyTag::Merge => 6,
             FamilyTag::Contraction => 7,
+            FamilyTag::LineSolve => 8,
+            FamilyTag::Factor => 9,
         }
     }
 
@@ -66,6 +70,8 @@ impl FamilyTag {
             FamilyTag::Compact => "compact",
             FamilyTag::Merge => "merge",
             FamilyTag::Contraction => "contraction",
+            FamilyTag::LineSolve => "line_solve",
+            FamilyTag::Factor => "factor",
         }
     }
 
@@ -79,6 +85,8 @@ impl FamilyTag {
             "compact" => Some(FamilyTag::Compact),
             "merge" => Some(FamilyTag::Merge),
             "contraction" => Some(FamilyTag::Contraction),
+            "line_solve" => Some(FamilyTag::LineSolve),
+            "factor" => Some(FamilyTag::Factor),
             _ => None,
         }
     }
@@ -176,7 +184,7 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 /// One table per family; the shared edit of a new family is one line here.
 ///
 /// Search, Compact and Merge are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES];
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES, &super::families::line_solve::LINE_SOLVE_STRATEGIES, &super::families::factor::FACTOR_STRATEGIES];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
@@ -223,6 +231,8 @@ impl Subject<'_> {
             FamilyTag::Compact => DecisionSite::CompactPlan,
             FamilyTag::Merge => DecisionSite::MergePlan,
             FamilyTag::Contraction => DecisionSite::MatmulPlan,
+            FamilyTag::LineSolve => DecisionSite::LineSolvePlan,
+            FamilyTag::Factor => DecisionSite::FactorPlan,
         }
     }
 
@@ -240,6 +250,8 @@ pub(crate) enum Params {
     Scan(ScanParams),
     Scatter(ScatterParams),
     Contraction(ContractionParams),
+    LineSolve(LineSolveParams),
+    Factor(FactorParams),
 }
 
 impl Params {
@@ -261,8 +273,11 @@ impl Params {
                 other => other,
             }),
             Params::Scan(params) if params.fused => Cow::Owned(format!("{name} prologue=fused")),
-            Params::Scan(_) | Params::Scatter(_) => Cow::Borrowed(name),
+            Params::Scan(_) | Params::Scatter(_) | Params::Factor(_) => Cow::Borrowed(name),
             Params::Contraction(params) => Cow::Owned(super::contraction::label(params, subject, ctx)),
+            // The line solver's log has said `cyclic ...` or `thomas ...` since it recorded its choice: the strategies that are
+            // not cyclic reduction (the native and the stacked ones included) are all the Thomas algorithm there.
+            Params::LineSolve(params) => Cow::Owned(params.legacy_label(name)),
         }
     }
 }
@@ -383,6 +398,8 @@ pub(crate) enum BoundaryAttrs {
     /// Light ports: nothing selects on these, they only tell the Decision (and the signature) what the op was.
     Compact(CompactAttrs),
     Merge(MergeAttrs),
+    LineSolve(LineSolveAttrs),
+    Factor(FactorAttrs),
 }
 
 /// The candidates of a boundary op in table order whose `needs` and numerics hold and whose `fits` returned `Some`, evaluated
@@ -445,22 +462,41 @@ pub(crate) fn first_candidate(ctx: &Context, boundary: &Boundary<'_>) -> Option<
     table(boundary.family).iter().find_map(|strategy| super::select::admit(strategy, &subject, ctx, &Residencies::DEVICE).ok().map(|params| (strategy.id, params)))
 }
 
+/// [`first_candidate`] over the entries of one stage of a family whose table serves several (`Factor`: the LU leaves, the QR panels,
+/// the triangular solves, ...); the forced strategy of `LUMA_STRATEGY` counts where it is one of `entries`.
+#[inline]
+pub(crate) fn first_candidate_in(entries: &'static [Strategy], ctx: &Context, boundary: &Boundary<'_>) -> Option<(StrategyId, Params)> {
+    if ctx.strategy_override(boundary.family).is_some() {
+        return candidates_in(entries, ctx, boundary).next();
+    }
+    let subject = Subject::Boundary(boundary);
+    entries.iter().find_map(|strategy| super::select::admit(strategy, &subject, ctx, &Residencies::DEVICE).ok().map(|params| (strategy.id, params)))
+}
+
 /// Records the Decision of a boundary op that chose `chosen` (with `params`) after `declined` ones gave up, while decisions are
 /// recorded (profiling or `Context::record_decisions`): one relaxed load otherwise.
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn note(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
     if ctx.jit().recording_decisions() {
-        note_recorded(ctx, boundary, chosen, params, declined);
+        note_recorded(ctx, boundary, table(boundary.family), chosen, params, declined);
+    }
+}
+
+/// [`note`] listing as alternatives only the `entries` of the stage that chose.
+#[inline(always)]
+pub(crate) fn note_in(ctx: &Context, boundary: &Boundary<'_>, entries: &'static [Strategy], chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
+    if ctx.jit().recording_decisions() {
+        note_recorded(ctx, boundary, entries, chosen, params, declined);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn note_recorded(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
+fn note_recorded(ctx: &Context, boundary: &Boundary<'_>, entries: &'static [Strategy], chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
     let subject = Subject::Boundary(boundary);
     let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen, &subject, ctx));
-    for strategy in table(boundary.family) {
+    for strategy in entries {
         if strategy.id == chosen {
             continue;
         }

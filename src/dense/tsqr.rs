@@ -49,10 +49,8 @@ pub(crate) struct Plan {
     pub k: usize,
 }
 
-/// Whether and how a `m x w` single panel can be factored by [`panel`] on `ctx` (`op` and `loc`
-/// name the factorisation for the decision log).
-pub(crate) fn plan(ctx: &crate::Context, m: usize, w: usize, op: &'static str, loc: &'static std::panic::Location<'static>) -> Option<Plan> {
-    let found = choose(ctx, m, w);
+/// Records which panel a factorisation chose (the `QrPanel` decision: `found` is the plan of the TSQR panel, `None` the generic one).
+pub(crate) fn note(ctx: &crate::Context, found: Option<Plan>, op: &'static str, loc: &'static std::panic::Location<'static>) {
     if ctx.jit().recording_decisions() {
         let decision = match &found {
             Some(plan) => crate::profile::Decision::new(op, loc, crate::profile::DecisionSite::QrPanel, format!("tsqr groups={} bs={} k={}", plan.groups, plan.bs, plan.k)),
@@ -60,10 +58,11 @@ pub(crate) fn plan(ctx: &crate::Context, m: usize, w: usize, op: &'static str, l
         };
         ctx.jit().note_decision(decision);
     }
-    found
 }
 
-fn choose(ctx: &crate::Context, m: usize, w: usize) -> Option<Plan> {
+/// Whether and how a `m x w` single panel can be factored by [`panel`] on `ctx`: `None` for `LUMA_QR_TSQR=0`, a panel wider than 32
+/// columns, a device with fewer than two warps per workgroup or fewer than 12 storage buffers.
+pub(crate) fn choose(ctx: &crate::Context, m: usize, w: usize) -> Option<Plan> {
     if matches!(std::env::var("LUMA_QR_TSQR").as_deref(), Ok("0")) || w == 0 || w > 32 || m < w {
         return None;
     }

@@ -20,10 +20,10 @@
 use std::panic::Location;
 use std::sync::Arc;
 
-use crate::profile::{Decision, DecisionSite};
 use crate::array::{Array, Failure};
-use crate::builtin::{thomas_plan, thomas_scratch_floats, thomas_workgroups, Builtin, UNROLLED_BLOCK};
-use crate::cyclic;
+use crate::builtin::{thomas_scratch_floats, thomas_workgroups, Builtin};
+use crate::jit::structured::boundary::LineSolveAttrs;
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::PartSide;
@@ -31,6 +31,15 @@ use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 use crate::solve::{Algo, Io, SolveSpec};
 use crate::tuning::Tuning;
+
+/// The tuning a line solve selects with: the context's (a test forces one for the thread, to pick an algorithm or a budget).
+pub(crate) fn tuning_of(ctx: &crate::context::Context) -> Tuning {
+    #[cfg(test)]
+    if let Some(forced) = tests::FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    *ctx.tuning()
+}
 
 /// Solves `lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]` along `axis` for every line of
 /// the four arrays, which share one shape. `lo` at the first and `up` at the last cell of a line
@@ -61,9 +70,9 @@ pub fn solve_tridiagonal(
     let location = Location::caller();
     let arrays = [lo, diag, up, rhs];
     let result = if arrays.iter().any(|a| a.pending().is_some()) {
-        run_parts(None, 1, 1, axis, &arrays, None, location).map(|mut solved| solved.remove(0))
+        run_parts(1, 1, axis, &arrays, None, location).map(|mut solved| solved.remove(0))
     } else {
-        run(None, None, axis, arrays, None, location)
+        run(None, axis, arrays, None, location)
     };
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
@@ -83,9 +92,9 @@ pub fn solve_tridiagonal_from(
     let location = Location::caller();
     let arrays = [lo, diag, up, rhs];
     let result = if arrays.iter().any(|a| a.pending().is_some()) {
-        run_parts(None, 1, 1, axis, &arrays, Some(start), location).map(|mut solved| solved.remove(0))
+        run_parts(1, 1, axis, &arrays, Some(start), location).map(|mut solved| solved.remove(0))
     } else {
-        run(None, None, axis, arrays, Some(start), location)
+        run(None, axis, arrays, Some(start), location)
     };
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
@@ -115,7 +124,7 @@ pub fn solve_block_tridiagonal(
     rhs: &Array<f32>,
 ) -> Array<f32> {
     let location = Location::caller();
-    let result = run(None, Some(block), axis, [lo, diag, up, rhs], None, location);
+    let result = run(Some(block), axis, [lo, diag, up, rhs], None, location);
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_block_tridiagonal", location)
 }
 
@@ -132,7 +141,7 @@ pub fn solve_block_tridiagonal_from(
     start: &Array<u32>,
 ) -> Array<f32> {
     let location = Location::caller();
-    let result = run(None, Some(block), axis, [lo, diag, up, rhs], Some(start), location);
+    let result = run(Some(block), axis, [lo, diag, up, rhs], Some(start), location);
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_block_tridiagonal", location)
 }
 
@@ -201,7 +210,7 @@ pub fn solve_block_tridiagonal_parts<const B2: usize, const B: usize>(
     const { assert!(B >= 1 && B <= 8 && B2 == B * B, "block parts: 1 <= B <= 8 and B2 == B * B") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = lo.into_iter().chain(diag).chain(up).chain(rhs).collect();
-    let result = run_parts(None, B, 1, axis, &parts, None, location);
+    let result = run_parts(B, 1, axis, &parts, None, location);
     resolve_parts(rhs[0], result, "solve_block_tridiagonal_parts", location)
 }
 
@@ -219,7 +228,7 @@ pub fn solve_block_tridiagonal_parts_from<const B2: usize, const B: usize>(
     const { assert!(B >= 1 && B <= 8 && B2 == B * B, "block parts: 1 <= B <= 8 and B2 == B * B") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = lo.into_iter().chain(diag).chain(up).chain(rhs).collect();
-    let result = run_parts(None, B, 1, axis, &parts, Some(start), location);
+    let result = run_parts(B, 1, axis, &parts, Some(start), location);
     resolve_parts(rhs[0], result, "solve_block_tridiagonal_parts_from", location)
 }
 
@@ -256,7 +265,7 @@ pub fn solve_tridiagonal_parts<const N: usize>(
     const { assert!(N >= 1 && N <= 64, "tridiagonal systems: 1 <= N <= 64") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = systems.iter().flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs]).collect();
-    let result = run_parts(None, 1, N, axis, &parts, None, location);
+    let result = run_parts(1, N, axis, &parts, None, location);
     resolve_parts(systems[0].3, result, "solve_tridiagonal_parts", location)
 }
 
@@ -272,7 +281,7 @@ pub fn solve_tridiagonal_parts_from<const N: usize>(
     const { assert!(N >= 1 && N <= 64, "tridiagonal systems: 1 <= N <= 64") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = systems.iter().flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs]).collect();
-    let result = run_parts(None, 1, N, axis, &parts, Some(start), location);
+    let result = run_parts(1, N, axis, &parts, Some(start), location);
     resolve_parts(systems[0].3, result, "solve_tridiagonal_parts_from", location)
 }
 
@@ -302,10 +311,8 @@ fn invalid(message: String) -> Failure {
     LumaError::InvalidShape(message).into()
 }
 
-/// `block == None`: the scalar form. `arrays` = `[lo, diag, up, rhs]`. `tuning` replaces the
-/// context's (tests force an algorithm and the workgroup memory budget).
+/// `block == None`: the scalar form. `arrays` = `[lo, diag, up, rhs]`.
 fn run(
-    tuning: Option<Tuning>,
     block: Option<usize>,
     axis: usize,
     arrays: [&Array<f32>; 4],
@@ -370,32 +377,33 @@ fn run(
     let out_pin = out_storage.pin_single()?;
     let mut scratch = Scratch::new(ctx);
     let params = [n, stride, lines32];
-    let tuning = tuning.unwrap_or(*ctx.tuning());
-    let line_plan = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, false, ctx.max_buffer_bytes());
-    ctx.jit().note_with(|loc| {
-        let chosen = match &line_plan {
-            Some(plan) => format!("cyclic block={b} workgroup={} shift={}", plan.workgroup, plan.shift),
-            None => format!("thomas block={b}"),
-        };
-        Decision::new("tridiagonal", loc, DecisionSite::LineSolvePlan, chosen)
-    });
-    let (core, groups, scratch_bytes) = if let Some(plan) = line_plan {
+    let boundary = Boundary::new(
+        FamilyTag::LineSolve,
+        "tridiagonal",
+        Location::caller(),
+        [n, stride, lines32, 1],
+        BoundaryAttrs::LineSolve(LineSolveAttrs {
+            block: b as u8,
+            parts: false,
+            fused: false,
+            starts: start.is_some(),
+            len: cells as u64,
+            max_scratch: ctx.max_buffer_bytes(),
+        }),
+    );
+    let (chosen, params_of) = first_candidate(ctx, &boundary).expect("a stacked line solve always fits");
+    note(ctx, &boundary, chosen, &params_of, &[]);
+    let Params::LineSolve(plan) = params_of else { unreachable!("a line-solve strategy runs with line-solve parameters") };
+    let (core, groups, scratch_bytes) = if chosen == StrategyId::LINE_SOLVE_CYCLIC {
         let core = ctx.builtin(
-            Builtin::CyclicTridiagonal {
-                block: b as u8,
-                starts: start.is_some(),
-                workgroup: plan.workgroup,
-                shift: plan.shift,
-                shared_rows: plan.shared_rows,
-            },
+            Builtin::CyclicTridiagonal { block: b as u8, starts: start.is_some(), workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows },
             "f32",
         )?;
-        (core, fold_workgroups(ctx, lines32)?, plan.scratch_bytes(b as u32, n, lines32))
+        (core, fold_workgroups(ctx, lines32)?, plan.scratch_bytes)
     } else {
-        let plan = thomas_plan(&tuning, b as u32, lines32, stride, false);
-        let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup: plan.workgroup, twisted: plan.twisted }, "f32")?;
-        let groups = fold_workgroups(ctx, thomas_workgroups(lines32, plan.workgroup, plan.twisted))?;
-        (core, groups, cells as u64 * (b * b) as u64 * 4)
+        let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup: plan.workgroup as u8, twisted: plan.twisted }, "f32")?;
+        let groups = fold_workgroups(ctx, thomas_workgroups(lines32, plan.workgroup as u8, plan.twisted))?;
+        (core, groups, plan.scratch_bytes)
     };
     let scratch_buffer = if scratch_bytes > 0 { Some(scratch.take(scratch_bytes)?) } else { None };
     let mut args = vec![RawArg::write(out_pin.buffer(), rhs_bytes)];
@@ -437,9 +445,8 @@ fn part_side(ctx: &crate::context::Context, array: &Array<f32>) -> Outcome<PartS
 
 /// The solve on parts: `systems` systems of `block`-blocks whose parts are `parts`, `systems` runs
 /// of `3 block^2 + block` (`lo`, `diag`, `up`, `rhs`); the result is the `block` components of the
-/// solution of every system. `tuning` replaces the context's (tests force an algorithm).
+/// solution of every system.
 fn run_parts(
-    tuning: Option<Tuning>,
     block: usize,
     systems: usize,
     axis: usize,
@@ -476,28 +483,30 @@ fn run_parts(
     let to_u32 = |v: usize| u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }));
     let (n32, stride32, lines32) = (to_u32(n)?, to_u32(stride)?, to_u32(lines)?);
     let total = to_u32(lines * systems)?;
-    let tuning = tuning.unwrap_or(*ctx.tuning());
-    let b32 = block as u32;
     let fused = sides.iter().any(|s| matches!(s, PartSide::Pending(_)));
-    let line_plan = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes());
-    ctx.jit().note_with(|loc| {
-        let chosen = match &line_plan {
-            Some(plan) => format!("cyclic parts block={block} workgroup={} shift={}", plan.workgroup, plan.shift),
-            None => format!("thomas parts block={block}"),
-        };
-        Decision::new("tridiagonal", loc, DecisionSite::LineSolvePlan, chosen)
-    });
-    let algo = if let Some(plan) = line_plan {
-        Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
-    } else if (block <= UNROLLED_BLOCK as usize || tuning.native_solve)
-        && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
-        && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
-    {
-        Some((Algo::Thomas { workgroup: thomas.workgroup, tiled: thomas.tiled, twisted: thomas.twisted }, bytes))
-    } else {
-        None
+    let boundary = Boundary::new(
+        FamilyTag::LineSolve,
+        "tridiagonal",
+        Location::caller(),
+        [n32, stride32, total, systems as u32],
+        BoundaryAttrs::LineSolve(LineSolveAttrs {
+            block: block as u8,
+            parts: true,
+            fused,
+            starts: start.is_some(),
+            len: parts[0].len() as u64,
+            max_scratch: ctx.max_buffer_bytes(),
+        }),
+    );
+    let (id, params) = first_candidate(ctx, &boundary).expect("a parts solve always fits (stacked_from_parts at the latest)");
+    note(ctx, &boundary, id, &params, &[]);
+    let Params::LineSolve(plan) = params else { unreachable!("a line-solve strategy runs with line-solve parameters") };
+    let algo = match id {
+        StrategyId::LINE_SOLVE_CYCLIC => Some(Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }),
+        StrategyId::LINE_SOLVE_NATIVE | StrategyId::LINE_SOLVE_THOMAS => Some(Algo::Thomas { workgroup: plan.workgroup as u8, tiled: plan.tiled, twisted: plan.twisted }),
+        _ => None,
     };
-    if fused && tuning.native_solve && matches!(algo, Some((Algo::Thomas { .. }, _))) {
+    if id == StrategyId::LINE_SOLVE_NATIVE && fused {
         // The native solve reads buffers: the parts that are expressions are computed first, all
         // together (one kernel with an output each, sharing what they read).
         for (array, side) in parts.iter().zip(&sides) {
@@ -513,20 +522,21 @@ fn run_parts(
             }
         }
     }
-    if let Some((algo, scratch_bytes)) = algo {
+    if let Some(algo) = algo {
         let spec = SolveSpec { algo, block: block as u8, systems: systems as u8, starts: start.is_some(), fused: [0; 4] };
-        if let Some(solved) = launch_parts(ctx, sides, spec, shape, [n32, stride32, lines32], scratch_bytes, start_ready)? {
+        // A launch that declines (the kernel cannot read the parts, see `jit::solve`) leaves the composition: `stacked_from_parts`.
+        if let Some(solved) = launch_parts(ctx, sides, spec, shape, [n32, stride32, lines32], plan.scratch_bytes, start_ready)? {
             return Ok(solved);
         }
     }
-    solve_stacked(tuning, block, systems, axis, parts, start, location)
+    solve_stacked(block, systems, axis, parts, start, location)
 }
 
 /// The scratch bytes of the Thomas solve of `systems` systems of `block x block` blocks over
 /// `len` cells (the modified upper blocks of every system, `tiled` as in
 /// [`thomas_plan`](crate::builtin::thomas_plan)), or `None` if they exceed `max_buffer` (the
 /// solve then falls back to the stacked one, whose scratch is one system's).
-fn thomas_parts_scratch(len: usize, block: usize, systems: usize, tiled: bool, max_buffer: u64) -> Option<u64> {
+pub(crate) fn thomas_parts_scratch(len: usize, block: usize, systems: usize, tiled: bool, max_buffer: u64) -> Option<u64> {
     let bytes = thomas_scratch_floats(len as u64, block as u32, tiled)?.checked_mul(4 * systems as u64)?;
     (bytes <= max_buffer).then_some(bytes)
 }
@@ -573,7 +583,6 @@ fn launch_parts(
 /// arrays of [`solve_block_tridiagonal`] (or are the four arrays of [`solve_tridiagonal`]), and
 /// the components of the solution are slices of its result.
 fn solve_stacked(
-    tuning: Tuning,
     block: usize,
     systems: usize,
     axis: usize,
@@ -587,12 +596,12 @@ fn solve_stacked(
     let mut solutions = Vec::with_capacity(systems * block);
     for system in parts.chunks(per) {
         if block == 1 {
-            solutions.push(run(Some(tuning), None, axis, [system[0], system[1], system[2], system[3]], start, location)?);
+            solutions.push(run(None, axis, [system[0], system[1], system[2], system[3]], start, location)?);
             continue;
         }
         let stack = |parts: &[&Array<f32>]| crate::view::stack_of(0, parts, location);
         let (lo, diag, up, rhs) = (stack(&system[..bb]), stack(&system[bb..2 * bb]), stack(&system[2 * bb..3 * bb]), stack(&system[3 * bb..]));
-        let x = run(Some(tuning), Some(block), axis + 1, [&lo, &diag, &up, &rhs], start, location)?;
+        let x = run(Some(block), axis + 1, [&lo, &diag, &up, &rhs], start, location)?;
         solutions.extend((0..block).map(|c| x.slice(0, c..c + 1).reshape(shape)));
     }
     Ok(solutions)
@@ -602,11 +611,31 @@ fn solve_stacked(
 mod tests {
     use std::panic::Location;
 
+    use std::cell::Cell;
+
     use super::{run, run_parts, thomas_parts_scratch};
     use crate::array::Array;
     use crate::builtin::{thomas_plan, ThomasPlan};
     use crate::context::Context;
     use crate::tuning::{LineSolver, Tuning, TuningProfile};
+
+    thread_local! {
+        /// The tuning `tuning_of` gives on this thread while a test forces one.
+        pub(super) static FORCED: Cell<Option<Tuning>> = const { Cell::new(None) };
+    }
+
+    /// Runs `f` with line solves selecting under `tuning` instead of the context's.
+    pub(super) fn forced<R>(tuning: Tuning, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCED.with(|forced| forced.set(None));
+            }
+        }
+        FORCED.with(|forced| forced.set(Some(tuning)));
+        let _reset = Reset;
+        f()
+    }
 
     /// Deterministic values in `[-0.5, 0.5)`.
     struct Lcg(u64);
@@ -722,14 +751,9 @@ mod tests {
         let (lo_a, diag_a, up_a, rhs_a) = (make(&lo, bs * bs), make(&diag, bs * bs), make(&up, bs * bs), make(&rhs, bs));
         let start_a = Array::from_slice_on(ctx, &start, lines).unwrap();
         let location = Location::caller();
-        let result = run(
-            Some(tuning),
-            (b > 0).then_some(b),
-            if b == 0 { axis } else { axis + 1 },
-            [&lo_a, &diag_a, &up_a, &rhs_a],
-            starts.then_some(&start_a),
-            location,
-        );
+        let result = forced(tuning, || {
+            run((b > 0).then_some(b), if b == 0 { axis } else { axis + 1 }, [&lo_a, &diag_a, &up_a, &rhs_a], starts.then_some(&start_a), location)
+        });
         let got = Array::resolve(ctx, rhs_a.shape(), result, "solve", location).to_vec().unwrap();
 
         let stride = if axis == 0 { 1 } else { lines };
@@ -794,7 +818,7 @@ mod tests {
         let location = Location::caller();
         let (solved, profile) = ctx
             .profile(|| {
-                let solved = run_parts(Some(tuning), b, systems, axis, &refs, starts.then_some(&start_a), location);
+                let solved = forced(tuning, || run_parts(b, systems, axis, &refs, starts.then_some(&start_a), location));
                 ctx.sync().unwrap();
                 solved
             })
@@ -1129,7 +1153,7 @@ mod tests {
                     let make = |d: &[f32]| Array::from_slice_on(&ctx, d, grid).unwrap();
                     let (lo_a, diag_a, up_a, rhs_a) = (make(&lo), make(&diag), make(&up), make(&rhs));
                     let location = Location::caller();
-                    let got = Array::resolve(&ctx, rhs_a.shape(), run(Some(tuning), None, axis, [&lo_a, &diag_a, &up_a, &rhs_a], None, location), "solve", location).to_vec().unwrap();
+                    let got = Array::resolve(&ctx, rhs_a.shape(), forced(tuning, || run(None, axis, [&lo_a, &diag_a, &up_a, &rhs_a], None, location)), "solve", location).to_vec().unwrap();
                     // Element `[j, ..]` of the batch is the solve of its own coefficients alone.
                     for j in 0..2 {
                         let pick = |d: &[f32]| -> Vec<f32> { d.iter().skip(j).step_by(2).copied().collect() };
@@ -1137,7 +1161,7 @@ mod tests {
                         let sub = if axis == 1 { sub } else { [lines, n] };
                         let alone = |d: &[f32]| Array::from_slice_on(&ctx, &pick(d), sub).unwrap();
                         let (a, b, c, d) = (alone(&lo), alone(&diag), alone(&up), alone(&rhs));
-                        let one = Array::resolve(&ctx, d.shape(), run(Some(tuning), None, axis - 1, [&a, &b, &c, &d], None, location), "solve", location).to_vec().unwrap();
+                        let one = Array::resolve(&ctx, d.shape(), forced(tuning, || run(None, axis - 1, [&a, &b, &c, &d], None, location)), "solve", location).to_vec().unwrap();
                         for (k, want) in one.iter().enumerate() {
                             let have = got[2 * k + j];
                             assert!((have - want).abs() <= 2e-4 * (1.0 + want.abs()), "n={n} axis={axis} batch {j} cell {k}: {have} vs {want}");

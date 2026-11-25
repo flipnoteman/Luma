@@ -351,16 +351,20 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     )
 }
 
+/// The columns of the right-hand sides a workgroup takes and whether the diagonal blocks are inverted, for `n` rows and `k` columns:
+/// `inverse` asks for the inverted blocks, which the kernel takes from `LUMA_TRSV_INV_MIN` rows on (768; the inverse of the first block is
+/// on the chain whatever the size, 10 us or so a launch: substitution is faster below a few blocks).
+pub(crate) fn plan(n: usize, k: usize, inverse: bool) -> (usize, bool) {
+    let inverse = inverse && n >= std::env::var("LUMA_TRSV_INV_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(768);
+    (group_columns(k.next_power_of_two()), inverse)
+}
+
 /// `L X = B` for one `[n, n]` lower triangle and `[k, n]` right-hand sides, `k <= KMAX`; see the module doc.
-pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, kc: usize, inverse: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let ctx = l.context();
     let n = l.shape().dims()[1];
     let k = b.shape().dims()[0];
-    // The inverse of the first block is on the chain whatever the size, 10 us or so a launch: substitution is faster
-    // below a few blocks (`LUMA_TRSV_INV_MIN` rows, 768).
-    let inverse = inverse && n >= std::env::var("LUMA_TRSV_INV_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(768);
     let nblocks = n.div_ceil(NB);
-    let kc = group_columns(k.next_power_of_two());
     let ncg = k.div_ceil(kc);
     let setup = (Array::<f32>::alloc(ctx, b.shape()), Array::<u32>::zeros_on(ctx, 1 + ncg * n * kc));
     let (mut out, mut st) = match setup {

@@ -423,6 +423,8 @@ pub enum DecisionSite {
     CompactPlan,
     /// Merge strategy (merge of sorted arrays; `factorize`).
     MergePlan,
+    /// Dense factorisation strategy (the leaf and recursion of LU, Cholesky, QR, triangular solves, SVD, eigh; refined solves).
+    FactorPlan,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }

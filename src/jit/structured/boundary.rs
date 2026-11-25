@@ -189,3 +189,106 @@ pub(crate) fn note_light(ctx: &Context, family: FamilyTag, op: &'static str, loc
 pub(crate) fn note_chosen(ctx: &Context, boundary: &Boundary<'_>, id: StrategyId, params: &Params, declined: &[StrategyId]) {
     note(ctx, boundary, id, params, declined);
 }
+
+// -- LineSolve --
+
+/// What a line-solve boundary reads (`linalg::run`, `run_parts`); `dims` is `[n, stride, lines (systems folded), systems]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct LineSolveAttrs {
+    pub(crate) block: u8,
+    /// Coefficients given as parts (computed in the kernel by `luma_cell`), else stacked buffers.
+    pub(crate) parts: bool,
+    /// Some part is a pending expression.
+    pub(crate) fused: bool,
+    pub(crate) starts: bool,
+    /// Cells of one part (`n * lines`), which sizes the Thomas scratch of a parts solve.
+    pub(crate) len: u64,
+    /// The largest buffer the device binds (`ctx.max_buffer_bytes()`).
+    pub(crate) max_scratch: u64,
+}
+
+/// What a line solve runs with: the cyclic plan or the Thomas plan, and the scratch it needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct LineSolveParams {
+    pub(crate) block: u8,
+    pub(crate) parts: bool,
+    pub(crate) workgroup: u16,
+    /// Cyclic reduction: rows folded away before the shared-memory levels, and rows of a line kept in workgroup memory.
+    pub(crate) shift: u8,
+    pub(crate) shared_rows: u32,
+    /// Thomas: tiled scratch, two invocations per line.
+    pub(crate) tiled: bool,
+    pub(crate) twisted: bool,
+    pub(crate) scratch_bytes: u64,
+}
+
+impl LineSolveParams {
+    /// The text of the `LineSolvePlan` decisions since the line solver first recorded its choice: cyclic reduction, or the Thomas
+    /// algorithm for every strategy that is not cyclic reduction.
+    pub(crate) fn legacy_label(&self, name: &str) -> String {
+        let parts = if self.parts { " parts" } else { "" };
+        if name == "cyclic" {
+            format!("cyclic{parts} block={} workgroup={} shift={}", self.block, self.workgroup, self.shift)
+        } else {
+            format!("thomas{parts} block={}", self.block)
+        }
+    }
+}
+
+// -- Factor --
+
+/// What a factorisation boundary stands for; each strategy of the family applies at one or two of them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum FactorKind {
+    Lu,
+    Cholesky,
+    Qr,
+    Svd,
+    Eigh,
+    SolveTriangular,
+    SolveRefined,
+    SolveSpdRefined,
+}
+
+/// What a factorisation boundary reads; `dims` is `[rows, cols, batch, rhs]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct FactorAttrs {
+    pub(crate) kind: FactorKind,
+    /// Triangular solves: the diagonal blocks may be taken as explicit inverses (`LUMA_TRSV_INV=1`, or the solves of a factorisation).
+    pub(crate) inverse: bool,
+    /// SVD: no rank tolerance (a precondition by QR may apply).
+    pub(crate) exact: bool,
+    /// SVD and eigh: the vectors are computed too.
+    pub(crate) vectors: bool,
+}
+
+/// What a factorisation strategy runs with (the fields a kind does not use are 0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FactorParams {
+    /// LU panel invocations; Cholesky leaf rows.
+    pub(crate) threads: u32,
+    /// CALU: chunks of rows, rows of a chunk, workgroup rows of the chunk kernels and of the final one, panel columns rounded to 8.
+    pub(crate) chunks: u32,
+    pub(crate) chunk_rows: u32,
+    pub(crate) rows: u32,
+    pub(crate) rows2: u32,
+    pub(crate) wp: u32,
+    /// Cholesky and triangular solves: the block of columns (`nb`) and the columns of an outer step (`wide`).
+    pub(crate) nb: u32,
+    pub(crate) wide: u32,
+    /// Triangular solve: columns per workgroup of the look-back kernel, padded columns of the blocked one, inverted diagonal blocks.
+    pub(crate) kc: u32,
+    pub(crate) kp: u32,
+    pub(crate) inverse: bool,
+    /// TSQR: groups of 32 rows, rows of a block, blocks.
+    pub(crate) groups: u32,
+    pub(crate) bs: u32,
+    pub(crate) k: u32,
+    /// SVD and eigh of the workgroup-memory kernel.
+    pub(crate) svd: Option<crate::dense::svd::Plan>,
+}
+
+impl FactorParams {
+    pub(crate) const NONE: FactorParams =
+        FactorParams { threads: 0, chunks: 0, chunk_rows: 0, rows: 0, rows2: 0, wp: 0, nb: 0, wide: 0, kc: 0, kp: 0, inverse: false, groups: 0, bs: 0, k: 0, svd: None };
+}

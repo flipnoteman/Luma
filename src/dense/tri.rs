@@ -14,6 +14,9 @@ use std::panic::Location;
 use super::{fail, grid, launch, launch_unchecked, nth, product, stack_batch, Dims, Triangle};
 use crate::array::Array;
 use crate::error::LumaError;
+use crate::jit::structured::boundary::FactorKind;
+use crate::jit::structured::families::factor::{boundary_flags, tri_stage};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, Params as Chosen, StrategyId};
 use crate::kernel::{uniform, view, KernelArg};
 use crate::shape::Shape;
 
@@ -122,11 +125,15 @@ fn lower_left_with(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bool, op
         (Err(e), _) | (_, Err(e)) => return fail(ctx, shape, e, op, loc),
     };
     let (ld, bd) = dims;
-    if ld.rows <= BASE {
+    let boundary = boundary_flags(FactorKind::SolveTriangular, op, loc, ld, bd.cols, inverse, false, false);
+    let (id, params) = first_candidate_in(tri_stage(), ctx, &boundary).expect("a triangular solve always fits");
+    note_in(ctx, &boundary, tri_stage(), id, &params, &[]);
+    if id == StrategyId::TRI_SUBSTITUTE {
         return substitute(l, b, ld, bd, unit, op, loc);
     }
-    if super::trsv::applies(ctx, ld.rows, bd.cols, ld.batch) {
-        return super::trsv::lower_left(l, b, unit, inverse, op, loc);
+    if id == StrategyId::TRI_TRSV {
+        let Chosen::Factor(params) = params else { unreachable!("a factor strategy runs with factor parameters") };
+        return super::trsv::lower_left(l, b, unit, params.kc as usize, params.inverse, op, loc);
     }
     if ld.batch > 1 {
         let parts: Vec<Array<f32>> = (0..ld.batch).map(|i| blocked(&nth(l, i), &nth(b, i), unit, op, loc)).collect();

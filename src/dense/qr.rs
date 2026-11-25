@@ -19,6 +19,9 @@ use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::bmm::matmul_batched;
 use crate::error::LumaError;
+use crate::jit::structured::boundary::{FactorKind, FactorParams};
+use crate::jit::structured::families::factor::{boundary_of, qr_stage};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, Params as Chosen, StrategyId};
 use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
@@ -26,7 +29,7 @@ use crate::shape::Shape;
 use crate::view::concat_slice;
 
 /// Columns of a panel one workgroup factors.
-const PANEL: usize = 32;
+pub(crate) const PANEL: usize = 32;
 
 /// A packed QR factorisation, see [`Array::qr`].
 #[derive(Clone, Debug)]
@@ -366,16 +369,35 @@ struct TParams {
     n1: u32,
 }
 
+/// The strategy of [`qr_stage`] that factors the `d` matrices of `a`, and the TSQR plan if that is the panel. The `QrPanel` decision
+/// stays where it was made: a single matrix of at most [`PANEL`] columns says which panel it took.
+fn pick(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> (StrategyId, FactorParams) {
+    let ctx = a.context();
+    let boundary = boundary_of(FactorKind::Qr, op, loc, d, 0);
+    let (id, params) = first_candidate_in(qr_stage(), ctx, &boundary).expect("a QR always fits (the recursion at the latest)");
+    note_in(ctx, &boundary, qr_stage(), id, &params, &[]);
+    let Chosen::Factor(params) = params else { unreachable!("a factor strategy runs with factor parameters") };
+    if d.batch == 1 && d.cols <= PANEL {
+        let found = (id == StrategyId::QR_TSQR_PANEL).then_some(super::tsqr::Plan { groups: params.groups as usize, bs: params.bs as usize, k: params.k as usize });
+        super::tsqr::note(ctx, found, op, loc);
+    }
+    (id, params)
+}
+
+fn tsqr_plan(params: FactorParams) -> super::tsqr::Plan {
+    super::tsqr::Plan { groups: params.groups as usize, bs: params.bs as usize, k: params.k as usize }
+}
+
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Node {
     let [w, m, ..] = a.shape().dims();
-    if w <= PANEL
-        && let Some(plan) = super::tsqr::plan(a.context(), m, w, op, loc)
-    {
-        return tsqr_panel(a, plan, op, loc);
+    let d = Dims { rows: m, cols: w, batch: 1 };
+    let (id, params) = pick(a, d, op, loc);
+    if id == StrategyId::QR_TSQR_PANEL {
+        return tsqr_panel(a, tsqr_plan(params), op, loc);
     }
-    if w <= if m <= 64 { PANEL } else { super::panel_width() } {
-        return Node::of(leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc));
+    if id == StrategyId::QR_LEAF {
+        return Node::of(leaf(a, d, op, loc));
     }
     let n1 = super::split_cols(w);
     let n2 = w - n1;
@@ -404,13 +426,11 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
-    if d.batch == 1
-        && d.cols <= PANEL
-        && let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols, op, loc)
-    {
-        return tsqr_panel(a, plan, op, loc).into_qr();
+    let (id, params) = pick(a, d, op, loc);
+    if id == StrategyId::QR_TSQR_PANEL {
+        return tsqr_panel(a, tsqr_plan(params), op, loc).into_qr();
     }
-    if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
+    if id == StrategyId::QR_LEAF {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {

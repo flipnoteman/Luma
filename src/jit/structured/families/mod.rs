@@ -2,6 +2,8 @@
 //! the op that selects loops over [`candidates`](super::strategy::candidates) and runs the body of today's function for the id it
 //! gets (a `match` on a constant: the existing generic code stays monomorphic, so `lower` is `None`).
 
+pub(crate) mod factor;
+pub(crate) mod line_solve;
 pub(crate) mod scan;
 pub(crate) mod scatter;
 pub(crate) mod sort;

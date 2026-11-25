@@ -13,12 +13,15 @@ use super::tri::{block_size, lower_left_factor, rhs_matrix};
 use super::{block, fail, launch, launch_unchecked, nth, product, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
+use crate::jit::structured::boundary::FactorKind;
+use crate::jit::structured::families::factor::{boundary_of, chol_stage};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
 use crate::kernel::{uniform, view, KernelArg};
 use crate::shape::Shape;
 
 /// Rows of the matrix a workgroup factors in workgroup memory, at most: 64 where the device has the
 /// 16.5 KiB that takes, else 48.
-fn leaf(ctx: &Context) -> usize {
+pub(crate) fn leaf(ctx: &Context) -> usize {
     if ctx.info().limits.max_workgroup_storage_bytes >= 64 * 65 * 4 + 64 * 4 { 64 } else { 48 }
 }
 
@@ -560,7 +563,11 @@ pub(crate) fn lower(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f3
         Ok(d) => d,
         Err(e) => return fail(a.context(), a.shape(), e, "cholesky", loc),
     };
-    if d.rows <= leaf(a.context()) {
+    let ctx = a.context();
+    let boundary = boundary_of(FactorKind::Cholesky, "cholesky", loc, d, 0);
+    let (id, params) = first_candidate_in(chol_stage(), ctx, &boundary).expect("a Cholesky always fits");
+    note_in(ctx, &boundary, chol_stage(), id, &params, &[]);
+    if id == StrategyId::CHOL_SMALL {
         return small(a, d, loc);
     }
     if d.batch > 1 {
@@ -635,7 +642,7 @@ impl Array<f32> {
     }
 }
 
-fn cholesky_solve(l: &Array<f32>, b: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
+pub(crate) fn cholesky_solve(l: &Array<f32>, b: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let (rhs, vector) = rhs_matrix(l, b);
     let y = lower_left_factor(l, &rhs, false, "cholesky_solve", loc);
     // Lᵀ X = Y: the transpose is upper, solved on its flip.

@@ -39,6 +39,9 @@ use super::{fail, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::{Array, Failure};
 use crate::context::Context;
 use crate::error::LumaError;
+use crate::jit::structured::boundary::{FactorKind, FactorParams};
+use crate::jit::structured::families::factor::{boundary_flags, eigh_stage, svd_stage};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, Params as Chosen, StrategyId};
 use crate::kernel::{uniform, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
@@ -86,8 +89,8 @@ struct SmallParams {
 }
 
 /// The shape of a workgroup-memory kernel: the largest matrix it takes and its thread layout.
-#[derive(Clone, Copy, Debug)]
-struct Plan {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
     kind: Kind,
     vectors: bool,
     /// Rows and columns of the largest matrix the compiled kernel takes (`rmax >= cmax`).
@@ -114,7 +117,7 @@ fn bucket(n: usize) -> usize {
 }
 
 /// The workgroup-memory kernel for `r x c` matrices (`r >= c`), if the device has room.
-fn plan(ctx: &Context, kind: Kind, vectors: bool, r: usize, c: usize) -> Option<Plan> {
+pub(crate) fn plan(ctx: &Context, kind: Kind, vectors: bool, r: usize, c: usize) -> Option<Plan> {
     if c > 96 {
         return None;
     }
@@ -755,13 +758,13 @@ const NEXT_CHUNK: u32 = 2;
 
 /// Columns from which a matrix is decomposed by block Jacobi ([`block`]) instead of rotating one pair of
 /// columns per workgroup.
-const BLOCK_MIN: usize = 128;
+pub(crate) const BLOCK_MIN: usize = 128;
 
 /// Whether a big matrix of `cc` columns (the smaller side) is decomposed through the QR factorisation of its tall form
 /// (see [`preconditioned`]): from 1024 columns on (a tall one of 512 columns and 16384 rows was
 /// slower through it: the QR panels of so many rows cost more than the sweeps save).
 /// `LUMA_SVD_PRECOND=off` turns it off, a number changes the 1024.
-fn precondition(cc: usize) -> bool {
+pub(crate) fn precondition(cc: usize) -> bool {
     let setting = std::env::var("LUMA_SVD_PRECOND").ok();
     if setting.as_deref() == Some("off") {
         return false;
@@ -770,9 +773,8 @@ fn precondition(cc: usize) -> bool {
 }
 
 /// Decomposes one matrix (`[cols, rows]`) in global memory.
-fn big(a: &Array<f32>, kind: Kind, vectors: bool, tol: f32) -> Result<Outputs, LumaError> {
-    let [cols, rows, ..] = a.shape().dims();
-    if kind == Kind::Svd && tol == 0.0 && precondition(rows.min(cols)) {
+fn big(a: &Array<f32>, id: StrategyId, kind: Kind, vectors: bool, tol: f32) -> Result<Outputs, LumaError> {
+    if id == StrategyId::SVD_PRECONDITIONED {
         preconditioned(a, vectors)
     } else {
         plain(a, kind, vectors, tol)
@@ -962,12 +964,16 @@ pub(crate) fn decompose_ranking(a: &Array<f32>, kind: Kind, vectors: bool, tol: 
         Err(e) => return poisoned(a.shape(), e),
     };
     let (rr, cc) = if d.rows >= d.cols { (d.rows, d.cols) } else { (d.cols, d.rows) };
-    let result = if let Some(plan) = plan(ctx, kind, vectors, rr, cc) {
+    let stage = if kind == Kind::Svd { svd_stage() } else { eigh_stage() };
+    let boundary = boundary_flags(if kind == Kind::Svd { FactorKind::Svd } else { FactorKind::Eigh }, op, loc, Dims { rows: rr, cols: cc, batch: d.batch }, 0, false, tol == 0.0, vectors);
+    let (id, params) = first_candidate_in(stage, ctx, &boundary).expect("a decomposition always fits");
+    note_in(ctx, &boundary, stage, id, &params, &[]);
+    let result = if let Chosen::Factor(FactorParams { svd: Some(plan), .. }) = params {
         small(a, d, plan)
     } else if d.batch == 1 {
-        big(a, kind, vectors, tol)
+        big(a, id, kind, vectors, tol)
     } else {
-        (0..d.batch).map(|i| big(&nth(a, i), kind, vectors, tol)).collect::<Result<Vec<_>, _>>().map(|parts| {
+        (0..d.batch).map(|i| big(&nth(a, i), id, kind, vectors, tol)).collect::<Result<Vec<_>, _>>().map(|parts| {
             let join = |f: &dyn Fn(&Outputs) -> Option<Array<f32>>| -> Option<Array<f32>> {
                 let arrays: Vec<Array<f32>> = parts.iter().filter_map(f).collect();
                 (!arrays.is_empty()).then(|| stack_batch(&arrays))
