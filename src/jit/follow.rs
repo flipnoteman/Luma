@@ -446,6 +446,8 @@ struct Tape {
 /// A step being recorded.
 struct Rec {
     jit: u64,
+    /// The kind of step this is (see [`Kind`]).
+    kind: u64,
     stamp: u64,
     pending_start: i64,
     write_epoch: u64,
@@ -479,6 +481,8 @@ impl Drop for Rec {
 
 /// A step being followed.
 struct Fol {
+    /// The kind of step this is (see [`Kind`]).
+    kind: u64,
     tape: Rc<Tape>,
     pos: usize,
     leaves: Vec<Weak<Storage>>,
@@ -509,19 +513,39 @@ enum Phase {
     Fol(Box<Fol>),
 }
 
+/// What the follower knows of one kind of step: the steps that begin with the same call. A loop
+/// of several steps (an `eval` inside what the program calls a step, a `cache`, a read) is
+/// several kinds, each with a tape of its own and a backoff of its own, so a kind that cannot be
+/// followed costs the others nothing.
+struct StepKind {
+    key: u64,
+    /// The tape of the last step of this kind that was recorded to its end.
+    tape: Option<Rc<Tape>>,
+    /// Steps of this kind that were recorded or followed in vain, in a row.
+    fails: u32,
+    /// Steps of this kind still to leave alone.
+    cooldown: u32,
+    used: u64,
+}
+
+/// Kinds of steps a thread keeps (the one longest unused goes first). A kind without a tape is
+/// a few words: what it remembers is that it did not work.
+const MAX_KINDS: usize = 64;
+
+/// Tapes a thread keeps (the one longest unused goes first).
+const MAX_TAPES: usize = 8;
+
 struct State {
     jit: u64,
     /// The counters of that context.
     stats: Option<Arc<Stats>>,
-    tape: Option<Rc<Tape>>,
+    kinds: Vec<StepKind>,
+    clock: u64,
     phase: Phase,
-    /// Steps still to leave alone after steps that left no tape.
-    cooldown: u32,
-    fails: u32,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, tape: None, phase: Phase::Idle, cooldown: 0, fails: 0 }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, phase: Phase::Idle }) };
     /// Whether the calls of this thread need to be looked at: false while the step is neither
     /// recorded nor followed, which is all a call costs then.
     static GATE: Cell<bool> = const { Cell::new(true) };
@@ -533,31 +557,74 @@ pub(super) fn gate() -> bool {
     GATE.with(Cell::get)
 }
 
+/// What kind of step begins with this call: the operation, the length and what the operands are.
+fn step_key(op: &Op, len: usize, args: &Args, arity: usize) -> u64 {
+    let mut key = op.fingerprint ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for arg in args.iter().take(arity) {
+        key = key.rotate_left(5)
+            ^ match arg {
+                Src::Node(_) => 1,
+                Src::Buffer(_) => 2,
+                Src::Scalar(_) => 3,
+            };
+    }
+    key
+}
+
 impl State {
     fn set(&mut self, phase: Phase) {
         GATE.with(|gate| gate.set(!matches!(phase, Phase::Skip)));
         self.phase = phase;
     }
 
-    /// The step ends without a tape being made of it (or one in use failing): the next steps
-    /// are left alone for a while if this keeps happening.
-    fn failed(&mut self) {
-        self.tape = None;
-        self.fails = (self.fails + 1).min(6);
-        self.cooldown = if self.fails >= 2 { (1u32 << (self.fails - 1)).min(64) } else { 0 };
+    /// The record of kind `key` (made if there is none).
+    fn kind(&mut self, key: u64) -> &mut StepKind {
+        self.clock += 1;
+        let clock = self.clock;
+        let at = match self.kinds.iter().position(|kind| kind.key == key) {
+            Some(at) => at,
+            None => {
+                if self.kinds.len() >= MAX_KINDS {
+                    let oldest = (0..self.kinds.len()).min_by_key(|&at| self.kinds[at].used).unwrap_or(0);
+                    self.kinds.swap_remove(oldest);
+                }
+                self.kinds.push(StepKind { key, tape: None, fails: 0, cooldown: 0, used: 0 });
+                self.kinds.len() - 1
+            }
+        };
+        let kind = &mut self.kinds[at];
+        kind.used = clock;
+        kind
     }
 
-    /// A step that was recorded left no tape: the tape there is stays (steps of another kind may
-    /// come between the steps it is for).
-    fn recording_failed(&mut self) {
-        let tape = self.tape.take();
-        self.failed();
-        self.tape = tape;
+    /// Makes `tape` the tape of kind `key`, dropping the one longest unused if there are too many.
+    fn keep(&mut self, key: u64, tape: Rc<Tape>) {
+        if self.kinds.iter().filter(|kind| kind.tape.is_some() && kind.key != key).count() >= MAX_TAPES
+            && let Some(oldest) = self.kinds.iter_mut().filter(|kind| kind.tape.is_some() && kind.key != key).min_by_key(|kind| kind.used)
+        {
+            oldest.tape = None;
+        }
+        self.kind(key).tape = Some(tape);
     }
 
-    fn succeeded(&mut self) {
-        self.fails = 0;
-        self.cooldown = 0;
+    /// A step of kind `key` was recorded or followed in vain: the next ones of its kind are left
+    /// alone for a while if this keeps happening (a step that cannot be followed then costs a
+    /// recording one time in 65). A tape that did not hold goes unless `keep_tape`.
+    fn failed(&mut self, key: u64, keep_tape: bool) {
+        let kind = self.kind(key);
+        if !keep_tape {
+            kind.tape = None;
+        }
+        kind.fails = (kind.fails + 1).min(7);
+        kind.cooldown = if kind.fails >= 2 { (1u32 << (kind.fails - 1)).min(64) } else { 0 };
+    }
+
+    /// A step of kind `key` was replayed: only that earns the kind its trust back (a tape that is
+    /// made and never followed does not).
+    fn replayed(&mut self, key: u64) {
+        let kind = self.kind(key);
+        kind.fails = 0;
+        kind.cooldown = 0;
     }
 }
 
@@ -626,7 +693,7 @@ impl State {
         let jit = ctx.jit();
         if self.jit != jit.id {
             self.set(Phase::Idle);
-            self.tape = None;
+            self.kinds.clear();
             self.jit = jit.id;
             self.stats = Some(Arc::clone(&jit.follow.stats));
         }
@@ -651,20 +718,19 @@ impl State {
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
-        if self.cooldown > 0 {
-            self.cooldown -= 1;
+        let key = step_key(op, len, args, arity);
+        let kind = self.kind(key);
+        if kind.cooldown > 0 {
+            kind.cooldown -= 1;
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
         let stamp = plancache::stamp(jit, ctx);
         let pending = jit.pending_nodes.load(Ordering::Relaxed);
-        if let Some(tape) = &self.tape
-            && tape.jit == jit.id
-            && tape.stamp == stamp
-            && tape.pending_start == pending
-        {
+        if let Some(tape) = kind.tape.as_ref().filter(|tape| tape.jit == jit.id && tape.stamp == stamp && tape.pending_start == pending) {
             let tape = Rc::clone(tape);
             let fol = Fol {
+                kind: key,
                 pos: 0,
                 leaves: Vec::with_capacity(tape.leaves.len()),
                 classes: Vec::with_capacity(tape.classes.len()),
@@ -683,6 +749,7 @@ impl State {
         plancache::tape_begin();
         let rec = Rec {
             jit: jit.id,
+            kind: key,
             stamp,
             pending_start: pending,
             write_epoch: jit.write_epoch.load(Ordering::Relaxed),
@@ -719,13 +786,13 @@ impl State {
                 if let Some(stats) = &self.stats {
                     stats.diverged.fetch_add(1, Ordering::Relaxed);
                 }
-                self.failed();
+                self.failed(fol.kind, false);
             }
-            Phase::Rec(_) => {
+            Phase::Rec(rec) => {
                 if let Some(stats) = &self.stats {
                     stats.abandoned.fetch_add(1, Ordering::Relaxed);
                 }
-                self.recording_failed();
+                self.failed(rec.kind, true);
             }
             _ => {}
         }
@@ -741,6 +808,9 @@ impl State {
         let verdict = (|| {
             let Some(e) = tape.entries.get(fol.pos) else { return Err("the step is longer than the tape") };
             if e.len != len || e.arity as usize != arity || e.op != *op {
+                if tracing() {
+                    note(&format!("entry {} of {}: len {} vs {len}, arity {} vs {arity}, op {:?} vs {:?}", fol.pos, tape.entries.len(), e.len, e.arity, e.op.kind, op.kind));
+                }
                 return Err("a call that is not the next entry");
             }
             for i in 0..arity {
@@ -1354,6 +1424,7 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     };
     let ctx = pending[0].context().clone();
     let tape = Rc::clone(&fol.tape);
+    let kind = fol.kind;
     let usable = plancache::usable(jit, &ctx) && jit.plan_skip.load(Ordering::Relaxed) == 0;
     let roots_match = pending.len() == tape.roots.len()
         && pending.iter().zip(&tape.roots).all(|(root, &j)| fol.nodes.get(j as usize).is_some_and(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(root))));
@@ -1390,7 +1461,7 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
         fol.register_all();
         jit.follow.stats.diverged.fetch_add(1, Ordering::Relaxed);
         STATE.with_borrow_mut(|state| {
-            state.failed();
+            state.failed(kind, false);
             state.set(Phase::Idle);
         });
         return Eval::Normal(None);
@@ -1416,9 +1487,9 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     STATE.with_borrow_mut(|state| {
         state.set(Phase::Idle);
         if replayed.is_ok() {
-            state.succeeded();
+            state.replayed(kind);
         } else {
-            state.recording_failed();
+            state.failed(kind, true);
         }
     });
     match replayed {
@@ -1434,9 +1505,10 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
 impl State {
     /// The evaluation of a recorded step begins.
     fn record_end(&mut self, jit: &JitState, rec: Box<Rec>, pending: &[Arc<Node>]) -> Eval {
-        let abandon = |state: &mut State, jit: &JitState| {
+        let kind = rec.kind;
+        let abandon = move |state: &mut State, jit: &JitState| {
             jit.follow.stats.abandoned.fetch_add(1, Ordering::Relaxed);
-            state.recording_failed();
+            state.failed(kind, true);
             state.set(Phase::Idle);
             Eval::Normal(None)
         };
@@ -1485,7 +1557,7 @@ pub(super) fn eval_end(jit: &JitState, recording: Option<Box<Recording>>) {
             other => {
                 note(&format!("the recording left no plan: {}", other.and_then(Result::err).unwrap_or("none")));
                 jit.follow.stats.abandoned.fetch_add(1, Ordering::Relaxed);
-                state.failed();
+                state.failed(rec.kind, false);
                 return;
             }
         };
@@ -1517,7 +1589,7 @@ pub(super) fn eval_end(jit: &JitState, recording: Option<Box<Recording>>) {
                 (leaf, holders)
             })
             .collect();
-        state.tape = Some(Rc::new(Tape {
+        let tape = Rc::new(Tape {
             jit: rec.jit,
             stamp: rec.stamp,
             pending_start: rec.pending_start,
@@ -1533,20 +1605,21 @@ pub(super) fn eval_end(jit: &JitState, recording: Option<Box<Recording>>) {
             key: recording.key,
             watch,
             boundary: RefCell::new(boundary),
-        }));
+        });
+        state.keep(rec.kind, tape);
         jit.follow.stats.recorded.fetch_add(1, Ordering::Relaxed);
-        state.succeeded();
     });
 }
 
 impl Drop for Recording {
     /// A recording whose evaluation did not end makes no tape.
     fn drop(&mut self) {
-        if self.rec.is_some() {
+        if let Some(rec) = &self.rec {
+            let kind = rec.kind;
             plancache::tape_abort();
             let _ = STATE.try_with(|state| {
                 if let Ok(mut state) = state.try_borrow_mut() {
-                    state.recording_failed();
+                    state.failed(kind, true);
                     state.set(Phase::Idle);
                 }
             });
@@ -1593,8 +1666,10 @@ pub(super) fn escape(node: &Arc<Node>) -> bool {
             }
             match &state.phase {
                 Phase::Fol(_) => true,
-                Phase::Rec(_) => {
+                Phase::Rec(rec) => {
+                    let kind = rec.kind;
                     jit.follow.stats.abandoned.fetch_add(1, Ordering::Relaxed);
+                    state.failed(kind, true);
                     state.set(Phase::Idle);
                     false
                 }
