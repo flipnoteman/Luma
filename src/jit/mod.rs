@@ -2181,7 +2181,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
 
 /// Turns the operands among the first `arity` that were evaluated since they were created into
 /// plain buffers; an operand that failed makes the operation fail the same way.
-#[inline(always)]
+#[inline]
 fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), Failure> {
     for i in 0..arity {
         let evaluated = match args.get(i) {
@@ -2841,6 +2841,7 @@ impl ConsTable {
     /// Records `node` for `hash`, in place of what the hash had, in a free entry, or in one whose
     /// node is dead; if every entry of the set is alive the table grows (or, at its limit, the
     /// hash picks the entry that gives way).
+    #[inline(always)]
     fn store(&mut self, hash: u64, node: Weak<Node>) {
         if self.sets.is_empty() {
             self.sets.resize_with(CONS_SETS_MIN, ConsSet::default);
@@ -3543,11 +3544,13 @@ impl JitState {
     }
 
     /// Runs `f` on the calling thread's [`ConsTable`] of this context.
+    #[inline(always)]
     fn with_cons<R>(&self, f: impl FnOnce(&mut ConsTable) -> R) -> R {
         CONS.with_borrow_mut(|slots| f(slots.of(self)))
     }
 
     /// Runs `f` on the calling thread's list of live nodes of this context.
+    #[inline(always)]
     fn with_live<R>(&self, f: impl FnOnce(&mut readers::ReaderList) -> R) -> R {
         LIVE.with_borrow_mut(|slots| f(slots.of(self)))
     }

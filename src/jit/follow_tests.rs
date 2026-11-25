@@ -637,3 +637,58 @@ fn host_data_made_inside_a_step_is_a_leaf_of_it() {
         assert!(stats.replayed >= 10, "{stats:?}");
     }
 }
+
+fn other_chain(x: &A, k: usize, salt: usize) -> A {
+    // Begins with another operation than `chain`: another kind of step.
+    let mut y = x.abs();
+    for i in 0..k {
+        let c = scalar(i, salt);
+        y = if i % 2 == 0 { &y + c * 1e-3 } else { &y * c };
+    }
+    y
+}
+
+#[test]
+fn steps_of_different_kinds_that_alternate_each_keep_a_tape() {
+    let stats = both(|ctx| {
+        let x = A::from_slice_on(ctx, &data(1), N).unwrap();
+        let z = A::from_slice_on(ctx, &data(2), N).unwrap();
+        let mut out = Vec::new();
+        for salt in 0..20 {
+            let y = chain(&x, 10, salt);
+            y.eval().unwrap();
+            out.extend(bits(&y.to_vec().unwrap()));
+            let w = other_chain(&z, 7, salt);
+            w.eval().unwrap();
+            out.extend(bits(&w.to_vec().unwrap()));
+        }
+        out
+    });
+    if on_cpu() {
+        assert_eq!(stats.recorded, 2, "{stats:?}");
+        assert!(stats.replayed >= 34, "{stats:?}");
+        assert_eq!(stats.diverged, 0, "{stats:?}");
+    }
+}
+
+#[test]
+fn a_step_that_cannot_be_followed_is_recorded_ever_less_often() {
+    let stats = both(|ctx| {
+        let x = A::from_slice_on(ctx, &data(1), N).unwrap();
+        let mut out = Vec::new();
+        for salt in 0..160 {
+            // A read in the middle of the step ends it: the first half is never a step that evaluates, the second one is.
+            let mid = chain(&x, 6, salt);
+            out.extend(bits(&mid.to_vec().unwrap()));
+            let y = &mid + scalar(0, salt);
+            y.eval().unwrap();
+            out.extend(bits(&y.to_vec().unwrap()));
+        }
+        out
+    });
+    if on_cpu() {
+        // The kind of the first half backs off (1, 1, 2, 4 ... steps skipped between attempts); the second half follows.
+        assert!(stats.abandoned <= 12, "{stats:?}");
+        assert!(stats.replayed >= 100, "{stats:?}");
+    }
+}

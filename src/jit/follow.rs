@@ -25,6 +25,13 @@
 //! The tape holds descriptors and the plan, never nodes or buffers (see the keccak entry of the
 //! changelog); the step being followed holds weak references.
 //!
+//! A thread has a *kind* ([`StepKind`]) for each first call a step was seen to begin with: the
+//! loop of a program may be several steps (an `eval` inside what the program calls a step, a
+//! `cache`, a read of an intermediate end one), and each kind has a tape of its own and a backoff
+//! of its own. A kind that is recorded or followed in vain is left alone for 0, 0, 2, 4, ... 64
+//! of its steps (until one replays), so a step that cannot be followed costs one recording in 65
+//! and never makes another kind of step lose its tape.
+//!
 //! One thread follows per context: a write by another thread would have to flush the phantoms,
 //! which are on no list ([`Shared::shared`]).
 

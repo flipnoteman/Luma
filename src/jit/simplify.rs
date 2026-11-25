@@ -16,7 +16,7 @@
 use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
-#[inline(always)]
+#[inline]
 pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
     exact(op, args).or_else(|| if fast { self::fast(op, args) } else { None })
 }
@@ -117,6 +117,7 @@ fn binary(kind: BinOp, ty: ElemTy, x: &Src, y: Src) -> Option<(Op, Args)> {
 }
 
 /// The rewrites that keep every result bit.
+#[inline(always)]
 fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, c] = args;
     let ty = op.ty;
