@@ -36,6 +36,14 @@ impl Failure {
             Failure::Inherited(error) => LumaError::clone(&error),
         }
     }
+
+    /// The error, shared (an inherited one is not cloned).
+    pub(crate) fn into_shared(self) -> Arc<LumaError> {
+        match self {
+            Failure::New(error) => Arc::new(error),
+            Failure::Inherited(error) => error,
+        }
+    }
 }
 
 /// The data of an array: one or several segments, each a device buffer for a contiguous element

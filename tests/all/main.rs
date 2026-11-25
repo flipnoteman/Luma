@@ -27,6 +27,7 @@ mod complex;
 mod cpu;
 mod df32_library;
 mod elementwise_math;
+mod erased;
 mod errors;
 mod euler_residual;
 mod factorize;

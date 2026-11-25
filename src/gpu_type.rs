@@ -64,6 +64,10 @@ pub trait GpuType: Zeroable + Copy + Send + Sync + std::fmt::Debug + sealed::Sea
     /// The GPU word of a one-element array holding this value.
     #[doc(hidden)]
     fn into_repr(self) -> Self::Repr;
+
+    /// Which element type this is, for the arrays that forget their type (see [`crate::AnyArray`]).
+    #[doc(hidden)]
+    const ELEM_KIND: crate::ElemKind;
 }
 
 /// How the elements of a type sit in a device buffer.
@@ -150,9 +154,11 @@ pub trait ScalarType: GpuType {
 
 /// `GpuType` for types that are their own GPU representation.
 macro_rules! plain_gpu_type {
-    ($($ty:ty),*) => {$(
+    ($($ty:ty => $kind:ident),*) => {$(
         impl GpuType for $ty {
             type Repr = $ty;
+
+            const ELEM_KIND: crate::ElemKind = crate::ElemKind::$kind;
 
             fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
                 std::borrow::Cow::Borrowed(host)
@@ -173,12 +179,17 @@ macro_rules! plain_gpu_type {
     )*};
 }
 
-plain_gpu_type!(u32, i32, f32, f64, Df32, crate::complex::C32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]);
+plain_gpu_type!(
+    u32 => U32, i32 => I32, f32 => F32, f64 => F64, Df32 => Df32, crate::complex::C32 => C32, [f32; 2] => F32x2, [f32; 4] => F32x4, [u32; 2] => U32x2,
+    [u32; 4] => U32x4
+);
 
 impl GpuType for bool {
     type Repr = u32;
 
     const LAYOUT: ElemLayout = ElemLayout::PACKED;
+
+    const ELEM_KIND: crate::ElemKind = crate::ElemKind::Bool;
 
     fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
         std::borrow::Cow::Owned(
@@ -212,11 +223,13 @@ impl GpuType for bool {
 /// host values go to the device as they are (a copy of the bytes, padded to a whole word, no
 /// widening) and come back the same way.
 macro_rules! small_gpu_type {
-    ($($ty:ty => $layout:ident, $bits:ty),*) => {$(
+    ($($ty:ty => $layout:ident, $bits:ty, $kind:ident),*) => {$(
         impl GpuType for $ty {
             type Repr = u32;
 
             const LAYOUT: ElemLayout = ElemLayout::$layout;
+
+            const ELEM_KIND: crate::ElemKind = crate::ElemKind::$kind;
 
             fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
                 let bytes: &[u8] = bytemuck::cast_slice(host);
@@ -251,7 +264,9 @@ macro_rules! small_gpu_type {
     )*};
 }
 
-small_gpu_type!(u8 => BYTE, u8, i8 => BYTE, u8, u16 => HALF, u16, i16 => HALF, u16, half::f16 => HALF, u16, half::bf16 => HALF, u16);
+small_gpu_type!(
+    u8 => BYTE, u8, U8, i8 => BYTE, u8, I8, u16 => HALF, u16, U16, i16 => HALF, u16, I16, half::f16 => HALF, u16, F16, half::bf16 => HALF, u16, Bf16
+);
 
 /// The element types of arithmetic: `u32`, `i32`, `f32`, `f64` and [`Df32`]. Sums, running sums,
 /// products and the generic reductions exist for these; `bool` has its own counting versions
