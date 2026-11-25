@@ -395,7 +395,7 @@ mod tests {
         let buffer = ctx.alloc_buffer(256, crate::context::STORAGE_USAGE).unwrap();
         let args = [RawArg::write(&buffer, 256), RawArg::Uniform(bytemuck::bytes_of(&7u32))];
         let rounds = 400;
-        let mut measure = |armed: bool| {
+        let measure = |armed: bool| {
             let mut best = f64::MAX;
             for _ in 0..7 {
                 ctx.sync().unwrap();
