@@ -105,7 +105,5 @@ fn fits_thomas(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<
 /// Parts that neither of the above takes: the parts are stacked and the solve selects again on the stacked buffers.
 fn fits_stacked_from_parts(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<Params> {
     let (_, a) = shape(subject);
-    a.parts.then(|| {
-        Params::LineSolve(LineSolveParams { block: a.block, parts: true, workgroup: 0, shift: 0, shared_rows: 0, tiled: false, twisted: false, scratch_bytes: 0 })
-    })
+    a.parts.then_some(Params::LineSolve(LineSolveParams { block: a.block, parts: true, workgroup: 0, shift: 0, shared_rows: 0, tiled: false, twisted: false, scratch_bytes: 0 }))
 }

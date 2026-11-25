@@ -25,9 +25,11 @@ use crate::shape::Shape;
 
 pub(crate) mod chol;
 pub(crate) mod eigh;
+pub(crate) mod graph;
 pub(crate) mod lu;
 pub(crate) mod svd;
 pub(crate) mod qr;
+pub(crate) mod refine;
 pub(crate) mod tri;
 pub(crate) mod trsv;
 pub(crate) mod tsqr;

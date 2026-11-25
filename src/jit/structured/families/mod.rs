@@ -62,4 +62,6 @@ pub(super) const fn id(family: FamilyTag, at: u8) -> StrategyId {
 }
 
 #[cfg(test)]
+mod dense_tests;
+#[cfg(test)]
 mod tests;

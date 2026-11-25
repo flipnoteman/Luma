@@ -231,6 +231,7 @@ pub use dense::lu::Lu;
 pub use dense::eigh::Eigh;
 pub use dense::svd::Svd;
 pub use dense::qr::Qr;
+pub use dense::refine::Refined;
 pub use dense::Triangle;
 pub use matmul::{dot, matmul, matmul_f32, matmul_nt, matmul_tf32, matmul_tn, matmul_tt};
 pub use jit::fusion_limit;

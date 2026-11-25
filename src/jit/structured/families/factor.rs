@@ -170,12 +170,17 @@ fn fits_lu_recursive(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Opt
 fn fits_chol_small(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let (rows, _, _, _, a) = shape(subject);
     let leaf = chol::leaf(ctx);
-    (a.kind == FactorKind::Cholesky && rows <= leaf).then(|| Params::Factor(FactorParams { threads: leaf as u32, ..FactorParams::NONE }))
+    (a.kind == FactorKind::Cholesky && rows <= leaf).then_some(Params::Factor(FactorParams { threads: leaf as u32, ..FactorParams::NONE }))
 }
 
+/// `rows > chol::leaf(ctx)`; the block of columns (`LUMA_CHOL_NB`) and the columns of an outer step (`LUMA_CHOL_WIDE`) are parameters.
 fn fits_chol_blocked(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let (rows, _, _, _, a) = shape(subject);
-    (a.kind == FactorKind::Cholesky && rows > chol::leaf(ctx)).then_some(Params::Factor(FactorParams::NONE))
+    if a.kind != FactorKind::Cholesky || rows <= chol::leaf(ctx) {
+        return None;
+    }
+    let nb = tri::block_size(ctx);
+    some(FactorParams { nb: nb as u32, wide: chol::wide(nb) as u32, ..FactorParams::NONE })
 }
 
 // -- QR --
@@ -219,9 +224,13 @@ fn fits_tri_trsv(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
     some(FactorParams { kc: kc as u32, inverse, ..FactorParams::NONE })
 }
 
-fn fits_tri_blocked(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<Params> {
-    let (_, _, _, _, a) = shape(subject);
-    (a.kind == FactorKind::SolveTriangular).then_some(Params::Factor(FactorParams::NONE))
+/// The block of rows (`LUMA_CHOL_NB`) and the right-hand-side columns padded to four where there are few.
+fn fits_tri_blocked(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let (_, _, _, k, a) = shape(subject);
+    if a.kind != FactorKind::SolveTriangular {
+        return None;
+    }
+    some(FactorParams { nb: tri::block_size(ctx) as u32, kp: if k < 32 { k.next_multiple_of(4) as u32 } else { k as u32 }, ..FactorParams::NONE })
 }
 
 // -- SVD and eigh --
@@ -251,7 +260,7 @@ fn big(subject: &Subject<'_>, ctx: &Context, kind: FactorKind) -> Option<(usize,
         return None;
     }
     let preconditioned = kind == FactorKind::Svd && a.exact && svd::precondition(cols);
-    Some((cols, preconditioned)).filter(|_| rows >= cols)
+    (rows >= cols).then_some((cols, preconditioned))
 }
 
 fn fits_svd_jacobi(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {

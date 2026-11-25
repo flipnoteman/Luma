@@ -248,6 +248,12 @@ pub(crate) enum FactorKind {
     SolveTriangular,
     SolveRefined,
     SolveSpdRefined,
+    /// Compositions: they select nothing themselves (their stages are those of the factorisation and the triangular solves they call),
+    /// but a captured launch list of one is keyed apart from its factorisation's.
+    Solve,
+    SolveSpd,
+    Inverse,
+    Lstsq,
 }
 
 /// What a factorisation boundary reads; `dims` is `[rows, cols, batch, rhs]`.

@@ -492,6 +492,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+/// The columns an outer step of [`blocked`] brings up to date together (`LUMA_CHOL_WIDE`: a multiple of `nb`; default `4 * nb`).
+pub(crate) fn wide(nb: usize) -> usize {
+    std::env::var("LUMA_CHOL_WIDE").ok().and_then(|v| v.parse().ok()).filter(|w: &usize| w.is_multiple_of(nb) && *w >= nb).unwrap_or(4 * nb)
+}
+
 /// The lower Cholesky factor of one `[n, n]` matrix, left-looking in blocks of `nb` columns. Per
 /// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one `matmul_f32` over everything finished so far, the
 /// only big flops: `n³/3` in all, in `n / nb` products), the diagonal block `A_kk - T` factored by
@@ -503,7 +508,7 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let nb = block_size(ctx);
     // The columns an outer step brings up to date together with one product: a product of 128 columns
     // only fills a fifth of the multiprocessors, one of 512 runs about twice as fast.
-    let wide = std::env::var("LUMA_CHOL_WIDE").ok().and_then(|v| v.parse().ok()).filter(|w: &usize| w.is_multiple_of(nb) && *w >= nb).unwrap_or(4 * nb);
+    let wide = wide(nb);
     let shape = Shape::from([n, n]);
     let setup = (Array::<f32>::zeros_on(ctx, shape), Array::<f32>::alloc(ctx, Shape::from([nb, nb])), Array::<f32>::alloc(ctx, Shape::from(1)));
     let (mut out, mut dk, dummy) = match setup {

@@ -273,6 +273,7 @@ impl Params {
                 other => other,
             }),
             Params::Scan(params) if params.fused => Cow::Owned(format!("{name} prologue=fused")),
+            Params::Factor(params) if params.nb > 0 => Cow::Owned(format!("{name} nb={}", params.nb)),
             Params::Scan(_) | Params::Scatter(_) | Params::Factor(_) => Cow::Borrowed(name),
             Params::Contraction(params) => Cow::Owned(super::contraction::label(params, subject, ctx)),
             // The line solver's log has said `cyclic ...` or `thomas ...` since it recorded its choice: the strategies that are

@@ -14,6 +14,11 @@ pub(crate) struct Caps(u32);
 
 #[allow(dead_code)]
 impl Caps {
+    /// The capability bits (for keys).
+    pub(crate) const fn bits(self) -> u32 {
+        self.0
+    }
+
     /// Subgroup operations.
     pub(crate) const SUBGROUP: Self = Self(1 << 0);
     /// Subgroups of exactly 32 lanes.
