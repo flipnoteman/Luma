@@ -675,8 +675,10 @@ impl Segment {
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write: counted });
             }
             let evicted_by_lineage = matches!(&*lock(&self.state), State::Lineage);
-            if evicted_by_lineage || matches!(&*lock(&self.state), State::Host(_)) {
-                self.ctx.abort_recording()?;
+            if evicted_by_lineage {
+                self.ctx.abort_recording_for("recompute of an evicted segment")?;
+            } else if matches!(&*lock(&self.state), State::Host(_)) {
+                self.ctx.abort_recording_for("host segment upload")?;
             }
             let window = match &*lock(&self.state) {
                 State::Window(window) => Some((Arc::clone(&window.pack), window.offset)),
@@ -862,7 +864,7 @@ impl Context {
             return Ok(false);
         }
         // Before any lock: aborting a recording can pin (and so lock) the victim's segment.
-        self.abort_recording()?;
+        self.abort_recording_for("eviction under memory pressure")?;
         let before = self.pager().resident_bytes.load(Ordering::Relaxed);
         self.jit().drop_speculated();
         if self.pager().resident_bytes.load(Ordering::Relaxed) < before {

@@ -69,6 +69,7 @@ mod subgroup_divergence;
 mod sparse;
 mod spill;
 mod threads;
+mod trace;
 mod transfer;
 mod transfer_lanes;
 mod tridiagonal;

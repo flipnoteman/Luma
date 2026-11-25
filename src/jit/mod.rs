@@ -216,8 +216,8 @@ pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, c
 pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
-pub(crate) use rerun::{Attempt, Site};
-pub(crate) use replay::{force, force_stepped, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
+pub(crate) use rerun::{stamp, Attempt, Mix, Site};
+pub(crate) use replay::{force, force_stepped, force_traced, Forced, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
 pub(crate) use stencil::plan as stencil_plan;
 pub(crate) use until::{force_with_record, next_block, run_until, FoldGate, FIRST_BLOCK};
 #[cfg(test)]
@@ -3702,6 +3702,11 @@ impl JitState {
     /// needs that (see `Trace::start`): a lazy array it reads would be evaluated by the recording.
     pub(crate) fn evaluate_held(&self) {
         self.evaluate_swept(true);
+    }
+
+    /// How many kernels this context has generated and compiled so far (cache hits are not counted).
+    pub(crate) fn kernels_built(&self) -> u64 {
+        self.stats.built.load(Ordering::Relaxed)
     }
 
     /// The sweep of [`JitState::evaluate_live`]; `held` also computes the arrays that were

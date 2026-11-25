@@ -10,6 +10,7 @@ use luma_core::{Buffer, Dispatch, ExecGraph, GraphLaunch};
 use crate::array::{Array, Failure, Storage};
 use crate::context::{Cmd, CmdArg, Context, RawArg, Recording};
 use crate::error::Result;
+use crate::erased::Erased;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
 use crate::gpu::pager::{Accounted, Pin};
@@ -62,7 +63,6 @@ impl Plan {
     }
 
     /// Bytes of the buffers the plan made up for its intermediates.
-    #[cfg(test)]
     pub(crate) fn transient_bytes(&self) -> u64 {
         self.transient.iter().map(Buffer::size).sum()
     }
@@ -77,6 +77,23 @@ impl Plan {
     /// Number of recorded launches.
     pub(crate) fn launches(&self) -> usize {
         self.cmds.len()
+    }
+
+    /// The recorded commands, in order.
+    pub(crate) fn commands(&self) -> &[Cmd] {
+        &self.cmds
+    }
+
+    /// Whether `buffer` is one the plan made up for its intermediates (see `Recording::share_transients`).
+    pub(crate) fn is_transient(&self, buffer: &Buffer) -> bool {
+        self.transient.contains(buffer)
+    }
+
+    /// Bytes of the distinct buffers the plan keeps resident by pins: the arrays its commands
+    /// read or write that existed before the trace.
+    pub(crate) fn pinned_bytes(&self) -> u64 {
+        let mut seen = std::collections::HashSet::new();
+        self.pins.iter().filter(|pin| seen.insert(pin.buffer().id())).map(|pin| pin.buffer().size()).sum()
     }
 
     /// The nanoseconds the cost model gives the plan's launches, as `(launching, moving)`: a
@@ -130,7 +147,7 @@ impl Plan {
     /// `from` alive here: their pins and the seeds (used only by [`Plan::run_once`], which a plan
     /// that is replayed with swaps never needs). For a stepper's probes, which every replay swaps
     /// for the real state: placeholders take their names and their memory can go.
-    fn forget_probes(&mut self, from: &[Buffer], to: &[Buffer]) {
+    pub(crate) fn forget_probes(&mut self, from: &[Buffer], to: &[Buffer]) {
         for cmd in &mut self.cmds {
             for arg in &mut cmd.args {
                 if let CmdArg::Storage { buffer, .. } = arg
@@ -647,6 +664,14 @@ impl Trace {
         Ok((trace, probes))
     }
 
+    /// Starts recording on `probes`, the placeholders of a compiled callable's arguments (see
+    /// `crate::trace`), without a seed: nothing is copied into them, because the plan is only
+    /// replayed with them swapped for real arrays. `None` (nothing started) if this thread has a
+    /// recording on the context already.
+    pub(crate) fn start_unseeded(ctx: &Context, probes: Vec<Arc<Storage>>) -> Option<Trace> {
+        ctx.begin_recording(Vec::new()).then(|| Trace { ctx: ctx.clone(), init: Vec::new(), probe_storages: probes, recording: true })
+    }
+
     /// [`Trace::start`] without starting the recording: the caller may launch for real first
     /// (see `jit::Attempt`) and then [`Trace::begin`] it.
     pub(crate) fn prepare<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
@@ -787,5 +812,39 @@ pub(crate) fn force_stepped<T: GpuType>(arrays: &[&Array<T>], probes: &[Arc<Stor
         .zip(probes)
         .zip(&passing)
         .map(|((array, probe), &passes)| if passes { Ok(Arc::clone(probe)) } else { array.storage().map(Arc::clone) })
+        .collect()
+}
+
+/// What [`force_traced`] made of one array.
+pub(crate) enum Forced {
+    /// The array is the probe `i` handed back unchanged (see [`Array::passes_through`]); nothing was evaluated for it.
+    Probe(usize),
+    /// The array's storage, evaluated.
+    Storage(Arc<Storage>),
+}
+
+/// [`force_stepped`] for the outputs of a callable traced on `probes`: arrays of any element type,
+/// each of which may be any one of the probes handed back unchanged. The rest are evaluated
+/// together, pending expressions of one length in one fused kernel, as [`force`] does.
+pub(crate) fn force_traced(arrays: &[&Erased], probes: &[Arc<Storage>]) -> std::result::Result<Vec<Forced>, Failure> {
+    let passing: Vec<Option<usize>> = arrays.iter().map(|array| probes.iter().position(|probe| array.passes_through(probe))).collect();
+    let mut groups: Vec<(usize, Vec<Arc<Node>>)> = Vec::new();
+    for node in arrays.iter().zip(&passing).filter(|&(_, passes)| passes.is_none()).filter_map(|(array, _)| array.pending()) {
+        match groups.iter_mut().find(|(len, _)| *len == node.len()) {
+            Some((_, nodes)) if nodes.iter().any(|known| Arc::ptr_eq(known, node)) => {}
+            Some((_, nodes)) => nodes.push(Arc::clone(node)),
+            None => groups.push((node.len(), vec![Arc::clone(node)])),
+        }
+    }
+    for (_, nodes) in &groups {
+        super::evaluate_group(nodes);
+    }
+    arrays
+        .iter()
+        .zip(&passing)
+        .map(|(array, passes)| match passes {
+            Some(i) => Ok(Forced::Probe(*i)),
+            None => array.storage().map(|storage| Forced::Storage(Arc::clone(storage))),
+        })
         .collect()
 }

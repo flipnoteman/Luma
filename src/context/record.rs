@@ -115,8 +115,8 @@ pub(crate) struct Recording {
 #[derive(Debug)]
 enum RecState {
     Active(Box<Recording>),
-    /// The recording was aborted; `end_recording` removes it.
-    Aborted,
+    /// The recording was aborted, for the reason given; `end_recording` removes it.
+    Aborted(&'static str),
 }
 
 /// The numbers that tell contexts apart in [`RECORDINGS`] (the address of a dropped context can come back).
@@ -183,7 +183,7 @@ impl Context {
     fn with_recording<R>(&self, f: impl FnOnce(&mut Recording) -> R) -> Option<R> {
         self.with_entry(|state| match state {
             RecState::Active(recording) => Some(f(recording)),
-            RecState::Aborted => None,
+            RecState::Aborted(_) => None,
         })
         .flatten()
     }
@@ -191,6 +191,27 @@ impl Context {
     /// Whether this thread has an active recording.
     pub(crate) fn recording_here(&self) -> bool {
         self.with_recording(|_| ()).is_some()
+    }
+
+    /// Whether this thread has a recording on the context, active or aborted (see
+    /// [`Context::begin_recording`], which refuses to start another one then).
+    pub(crate) fn recording_open(&self) -> bool {
+        self.with_entry(|_| ()).is_some()
+    }
+
+    /// Why this thread's recording was aborted, if it was (`abort_recording_for` gave the reason).
+    pub(crate) fn abort_reason(&self) -> Option<&'static str> {
+        self.with_entry(|state| match state {
+            RecState::Aborted(reason) => Some(*reason),
+            RecState::Active(_) => None,
+        })
+        .flatten()
+    }
+
+    /// Whether `buffer` was handed out by `alloc_buffer` while this thread's recording ran (so
+    /// the recording's plan owns its contents), as opposed to one that existed before it.
+    pub(crate) fn recording_made(&self, buffer: &Buffer) -> bool {
+        self.with_recording(|recording| recording.fresh.contains(&buffer.id())).unwrap_or(false)
     }
 
     /// Commands captured so far by this thread's recording (0 if none).
@@ -297,14 +318,21 @@ impl Context {
     }
 
     /// Ends the recording of this thread, if any, as if it had never been held back: the seeds
-    /// are copied and the captured commands encoded, in order.
-    pub(crate) fn abort_recording(&self) -> Result<()> {
+    /// are copied and the captured commands encoded, in order. `reason` (what the traced code
+    /// did that a recording cannot hold) is kept for [`Context::abort_reason`]; an aborted
+    /// recording keeps the first.
+    pub(crate) fn abort_recording_for(&self, reason: &'static str) -> Result<()> {
         // Taken out (and left aborted) before anything is encoded: the commands must not be captured again.
-        let Some(recording) = self.with_entry(|state| match std::mem::replace(state, RecState::Aborted) {
-            RecState::Active(recording) => Some(recording),
-            RecState::Aborted => None,
-        })
-        .flatten() else {
+        let Some(recording) = self
+            .with_entry(|state| match state {
+                RecState::Active(_) => match std::mem::replace(state, RecState::Aborted(reason)) {
+                    RecState::Active(recording) => Some(recording),
+                    RecState::Aborted(_) => None,
+                },
+                RecState::Aborted(_) => None,
+            })
+            .flatten()
+        else {
             return Ok(());
         };
         self.encode_recording(*recording)

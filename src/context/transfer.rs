@@ -98,7 +98,7 @@ impl Context {
     /// batch that copies out of one is submitted it is mapped again, and the next upload of its
     /// size class writes straight into it.
     pub(crate) fn upload(&self, dst: &Buffer, data: &[u8]) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("upload")?;
         let bytes = data.len() as u64;
         let max = self.max_buffer_bytes();
         size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
@@ -208,7 +208,7 @@ impl Context {
     /// each its own submission, so copying one piece out of its staging buffer overlaps the
     /// transfer of the next.
     pub(crate) fn read_into(&self, buffer: &Buffer, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("readback")?;
         self.notify_released();
         let waited = self.hal().read_into(buffer, dst, false, self.inner.waits.budget())?;
         self.inner.waits.record(waited);
@@ -219,7 +219,7 @@ impl Context {
     /// buffer of a bounded size and without noting the waits in [`WaitHistory`].
     /// For readbacks made while the device is full.
     pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<HostBytes> {
-        self.abort_recording()?;
+        self.abort_recording_for("readback")?;
         let len = usize::try_from(bytes).map_err(|_| LumaError::InvalidShape(format!("{bytes} bytes do not fit in host memory")))?;
         HostBytes::filled_by::<LumaError>(len, |dst| {
             self.notify_released();

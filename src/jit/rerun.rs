@@ -39,9 +39,9 @@ use super::{launch, Args, Node, Op, Src};
 /// Hashes the nodes of a trace into 128 bits: two multiply-xorshift streams, each a bijection of
 /// its state for any word, so traces that differ in one word never meet again.
 #[derive(Clone, Copy)]
-pub(super) struct Mix {
-    pub(super) a: u64,
-    pub(super) b: u64,
+pub(crate) struct Mix {
+    pub(crate) a: u64,
+    pub(crate) b: u64,
 }
 
 impl Default for Mix {
@@ -54,14 +54,14 @@ impl Mix {
     const A: u64 = 0x517c_c1b7_2722_0a95;
     const B: u64 = 0x9e37_79b9_7f4a_7c15;
 
-    pub(super) fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         let mut mix = Mix { a: 0x243f_6a88_85a3_08d3, b: 0x1319_8a2e_0370_7344 };
         mix.word(seed);
         mix
     }
 
     #[inline]
-    pub(super) fn word(&mut self, w: u64) {
+    pub(crate) fn word(&mut self, w: u64) {
         self.a = (self.a.rotate_left(5) ^ w).wrapping_mul(Self::A);
         self.b = (self.b ^ w.rotate_left(17)).wrapping_mul(Self::B);
         self.b ^= self.b >> 29;
@@ -365,7 +365,7 @@ struct Speculation {
 }
 
 /// What of the environment changes the program a trace flattens to.
-fn stamp(ctx: &Context) -> u64 {
+pub(crate) fn stamp(ctx: &Context) -> u64 {
     let jit = ctx.jit();
     let mut mix = Mix::new(jit.max_nodes() as u64);
     mix.word(jit.max_inputs() as u64);

@@ -808,7 +808,7 @@ impl Context {
     /// Submits everything recorded so far and waits until the GPU has executed it. Reports the
     /// first error the GPU raised while running luma's commands.
     pub fn sync(&self) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("sync")?;
         self.flush()?;
         let waited = self.hal().sync(self.inner.waits.budget())?;
         self.inner.waits.record(waited);
@@ -1218,7 +1218,7 @@ impl Context {
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
     #[allow(deprecated)]
     pub fn finish_profiling(&self) -> Result<Profile> {
-        self.abort_recording()?;
+        self.abort_recording_for("sync")?;
         if !self.hal().is_profiling()? {
             return Err(LumaError::Profiling("profiling is not enabled".into()));
         }

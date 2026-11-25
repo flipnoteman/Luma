@@ -152,14 +152,14 @@ impl Context {
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
     pub(crate) fn clear(&self, buffer: &Buffer, bytes: u64) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("clear")?;
         Ok(self.hal().record_clear(buffer, bytes)?)
     }
 
     /// Records copying `bytes` bytes from `src` at `src_offset` to `dst` at `dst_offset`, for
     /// gathering the partial results of several segments into one buffer.
     pub(crate) fn copy(&self, src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, bytes: u64) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("copy")?;
         Ok(self.hal().record_copy(src, src_offset, dst, dst_offset, bytes)?)
     }
 
@@ -200,7 +200,7 @@ impl Context {
         raw: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(raw)?;
-        self.abort_recording()?;
+        self.abort_recording_for("indirect launch")?;
         kernel.check_count(raw.len())?;
         kernel.check_kinds(raw)?;
 
@@ -221,7 +221,7 @@ impl Context {
 
     /// Records a replay of a captured `graph` counting as `dispatches` dispatches.
     pub(crate) fn launch_graph(&self, graph: &dyn ExecGraph, dispatches: u32) -> Result<()> {
-        self.abort_recording()?;
+        self.abort_recording_for("graph launch")?;
         let pending = self.hal().record_graph(graph, dispatches)?;
         if pending >= BATCH_LIMIT {
             self.flush_batch()?;
