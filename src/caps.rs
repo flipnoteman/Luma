@@ -43,6 +43,8 @@ impl Caps {
     /// The static part of the host-path condition: a GPU backend on unified memory, where host
     /// execution of small work beats a launch. Not `Context::can_run_on_host`, which is dynamic.
     pub(crate) const HOST_PATH: Self = Self(1 << 13);
+    /// The backend can time single launches without profiling mode (`Backend::can_time_launches`).
+    pub(crate) const TELEMETRY: Self = Self(1 << 14);
 
     /// Whether every capability of `other` is set.
     pub(crate) const fn contains(self, other: Self) -> bool {
@@ -83,6 +85,7 @@ impl Caps {
         set(!backend.gemm_tiles(false).is_empty(), Caps::TF32);
         set(info.zero_copy, Caps::UNIFIED_MEMORY);
         set(!info.cpu && info.zero_copy, Caps::HOST_PATH);
+        set(backend.can_time_launches(), Caps::TELEMETRY);
         caps
     }
 }

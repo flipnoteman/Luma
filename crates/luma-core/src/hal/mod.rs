@@ -411,6 +411,8 @@ pub enum DecisionSite {
     LineSolvePlan,
     /// QR panel strategy.
     QrPanel,
+    /// Reduction strategy (host, merged, bits, single or two passes, axis lines).
+    ReducePlan,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }
@@ -1389,6 +1391,25 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError>;
     /// Whether profiling is enabled.
     fn is_profiling(&self) -> Result<bool, BackendError>;
+    /// Whether the backend can time single launches outside profiling mode (see
+    /// [`Backend::time_next_launch`]). The library samples one launch in a few dozen to learn what a
+    /// strategy costs; a backend that cannot leaves the default and is never asked.
+    fn can_time_launches(&self) -> bool {
+        false
+    }
+    /// Asks for the next [`Backend::record_launch`] of the calling thread to be timed and reported
+    /// under `tag` by [`Backend::drain_launch_times`]. A backend that cannot time launches ignores
+    /// it. A tag that is armed and not consumed by a launch (the batch is flushed first, or the
+    /// launch is captured into a graph instead) is dropped, never carried over to an unrelated launch.
+    fn time_next_launch(&self, tag: u64) {
+        let _ = tag;
+    }
+    /// Appends the timings of the armed launches that have finished to `out`, as `(tag, GPU time)`.
+    /// Never waits for unfinished work and never synchronizes: a launch that is still running is
+    /// reported by a later call.
+    fn drain_launch_times(&self, out: &mut Vec<(u64, Duration)>) {
+        let _ = out;
+    }
     /// Captures launches into a replayable graph, `None` when unsupported.
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>>;
     /// Whether [`Backend::compile_line_solve`] can run the line solves of luma: the library then
