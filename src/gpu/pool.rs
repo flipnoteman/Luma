@@ -26,6 +26,7 @@ impl BufferPool {
     /// two, the size a power-of-two rule would have given the request), if one exists. A request
     /// then reuses everything the old rule would have, at most as wasteful, so finer classes
     /// cannot leave more idle buffers behind.
+    #[inline]
     pub(crate) fn take(&mut self, class: u64, usage: BufferUsage) -> Option<Buffer> {
         let octave = class.next_power_of_two();
         let mut at = class;
@@ -42,6 +43,7 @@ impl BufferPool {
     /// pool holds more than its cap; those are returned. A buffer larger than the
     /// limit is still kept as long as nothing else is pooled. The buffer must not be mapped.
     /// Its contents are left as they are: whoever takes it next must overwrite what it reads.
+    #[inline]
     pub(crate) fn put(&mut self, buffer: Buffer) -> Vec<Buffer> {
         let class = buffer.size();
         self.clock += 1;
