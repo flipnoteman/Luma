@@ -1265,6 +1265,7 @@ impl Context {
         if !self.hal().is_profiling()? {
             return Err(LumaError::Profiling("profiling is not enabled".into()));
         }
+        self.jit().follow_report();
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();

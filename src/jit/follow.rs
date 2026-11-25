@@ -125,6 +125,23 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    /// Prints the counters (`LUMA_TRACE_FOLLOW=+stats`, one line per call).
+    pub(super) fn report(&self) {
+        if env_words().iter().any(|word| word == "stats") {
+            let s = &self.stats;
+            eprintln!(
+                "luma trace following: stats recorded {} replayed {} diverged {} abandoned {} cuts {}",
+                s.recorded.load(Ordering::Relaxed),
+                s.replayed.load(Ordering::Relaxed),
+                s.diverged.load(Ordering::Relaxed),
+                s.abandoned.load(Ordering::Relaxed),
+                s.cuts.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+impl Shared {
     pub(super) fn new() -> Shared {
         Shared { on: AtomicBool::new(default_on()), owner: AtomicU64::new(0), shared: AtomicBool::new(false), stats: Arc::new(Stats::default()) }
     }
@@ -184,9 +201,6 @@ fn thread_ordinal() -> u64 {
 
 /// Called when `jit` is written to: a write by a thread that does not follow ends following.
 pub(super) fn note_write(jit: &JitState) {
-    if tracing() {
-        note(&format!("a write: {}", std::backtrace::Backtrace::force_capture()));
-    }
     let owner = jit.follow.owner.load(Ordering::Relaxed);
     if owner != 0 && owner != thread_ordinal() {
         jit.follow.shared.store(true, Ordering::Relaxed);

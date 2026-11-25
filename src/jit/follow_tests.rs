@@ -618,3 +618,22 @@ fn an_intermediate_sent_to_another_thread_and_written_mid_step() {
     let (on, off) = (ctx(true), ctx(false));
     assert_eq!(run(&on), run(&off));
 }
+
+#[test]
+fn host_data_made_inside_a_step_is_a_leaf_of_it() {
+    let stats = both(|ctx| {
+        let x = A::from_slice_on(ctx, &data(1), N).unwrap();
+        let mut out = Vec::new();
+        for salt in 0..14 {
+            let fresh = A::from_slice_on(ctx, &data(10 + salt as u32), N).unwrap();
+            let y = &chain(&fresh, 20, salt) + &x;
+            y.eval().unwrap();
+            out.extend(bits(&y.to_vec().unwrap()));
+        }
+        out
+    });
+    eprintln!("host data in a step: {stats:?}");
+    if on_cpu() {
+        assert!(stats.replayed >= 10, "{stats:?}");
+    }
+}

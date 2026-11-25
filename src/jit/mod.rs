@@ -3753,6 +3753,11 @@ impl JitState {
         }
     }
 
+    /// Prints what trace following did so far (`LUMA_TRACE_FOLLOW=+stats`).
+    pub(crate) fn follow_report(&self) {
+        self.follow.report();
+    }
+
     /// Whether trace following is on for this context (`LUMA_TRACE_FOLLOW`).
     #[inline(always)]
     fn follow_on(&self) -> bool {
