@@ -290,11 +290,9 @@ pub(crate) struct FactorParams {
     pub(crate) groups: u32,
     pub(crate) bs: u32,
     pub(crate) k: u32,
-    /// SVD and eigh of the workgroup-memory kernel.
-    pub(crate) svd: Option<crate::dense::svd::Plan>,
 }
 
 impl FactorParams {
     pub(crate) const NONE: FactorParams =
-        FactorParams { threads: 0, chunks: 0, chunk_rows: 0, rows: 0, rows2: 0, wp: 0, nb: 0, wide: 0, kc: 0, kp: 0, inverse: false, groups: 0, bs: 0, k: 0, svd: None };
+        FactorParams { threads: 0, chunks: 0, chunk_rows: 0, rows: 0, rows2: 0, wp: 0, nb: 0, wide: 0, kc: 0, kp: 0, inverse: false, groups: 0, bs: 0, k: 0 };
 }

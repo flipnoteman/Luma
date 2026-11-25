@@ -33,12 +33,13 @@ use crate::solve::{Algo, Io, SolveSpec};
 use crate::tuning::Tuning;
 
 /// The tuning a line solve selects with: the context's (a test forces one for the thread, to pick an algorithm or a budget).
-pub(crate) fn tuning_of(ctx: &crate::context::Context) -> Tuning {
+#[inline]
+pub(crate) fn tuning_of(ctx: &crate::context::Context) -> std::borrow::Cow<'_, Tuning> {
     #[cfg(test)]
     if let Some(forced) = tests::FORCED.with(std::cell::Cell::get) {
-        return forced;
+        return std::borrow::Cow::Owned(forced);
     }
-    *ctx.tuning()
+    std::borrow::Cow::Borrowed(ctx.tuning())
 }
 
 /// Solves `lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]` along `axis` for every line of

@@ -15,9 +15,9 @@ use crate::jit::structured::boundary::{dim, FactorAttrs, FactorKind, FactorParam
 use crate::jit::structured::strategy::{Boundary, BoundaryAttrs, FamilyTag, Params, Residencies, Strategy, StrategyId, Subject};
 
 impl StrategyId {
-    pub(crate) const LU_CALU_SINGLE: StrategyId = id(FamilyTag::Factor, 0);
-    pub(crate) const LU_CALU_TOURNAMENT: StrategyId = id(FamilyTag::Factor, 1);
-    pub(crate) const LU_SMALL: StrategyId = id(FamilyTag::Factor, 2);
+    pub(crate) const LU_SMALL: StrategyId = id(FamilyTag::Factor, 0);
+    pub(crate) const LU_CALU_SINGLE: StrategyId = id(FamilyTag::Factor, 1);
+    pub(crate) const LU_CALU_TOURNAMENT: StrategyId = id(FamilyTag::Factor, 2);
     pub(crate) const LU_PANEL: StrategyId = id(FamilyTag::Factor, 3);
     pub(crate) const LU_RECURSIVE: StrategyId = id(FamilyTag::Factor, 4);
     pub(crate) const CHOL_SMALL: StrategyId = id(FamilyTag::Factor, 5);
@@ -40,9 +40,9 @@ impl StrategyId {
 }
 
 pub(crate) static FACTOR_STRATEGIES: [Strategy; 22] = [
+    entry(StrategyId::LU_SMALL, "lu_small", Caps::empty(), split_global, fits_lu_small),
     entry(StrategyId::LU_CALU_SINGLE, "lu_calu_single", Caps::empty(), split_global, fits_lu_calu_single),
     entry(StrategyId::LU_CALU_TOURNAMENT, "lu_calu_tournament", Caps::empty(), split_global, fits_lu_calu_tournament),
-    entry(StrategyId::LU_SMALL, "lu_small", Caps::empty(), split_global, fits_lu_small),
     entry(StrategyId::LU_PANEL, "lu_panel", Caps::empty(), split_global, fits_lu_panel),
     entry(StrategyId::LU_RECURSIVE, "lu_recursive", Caps::empty(), split_global, fits_lu_recursive),
     entry(StrategyId::CHOL_SMALL, "chol_small", Caps::empty(), split_global, fits_chol_small),
@@ -64,7 +64,9 @@ pub(crate) static FACTOR_STRATEGIES: [Strategy; 22] = [
     entry(StrategyId::CHOL_REFINED_F32, "chol_refined_f32", Caps::empty(), split_global, fits_chol_refined_f32),
 ];
 
-/// The entries an LU selects over: the leaves in the order `leaf` tried them (tournament, workgroup memory, panel), then the recursion.
+/// The entries an LU selects over: the leaves, then the recursion. `leaf` tried the tournament first, then the workgroup-memory kernel;
+/// their conditions exclude each other (more than 64 rows against at most 64), so the cheap one goes first: the matrices that are small
+/// are the ones whose host time matters.
 pub(crate) fn lu_stage() -> &'static [Strategy] {
     &FACTOR_STRATEGIES[0..5]
 }
@@ -242,7 +244,8 @@ fn small(subject: &Subject<'_>, ctx: &Context, kind: FactorKind) -> Option<Param
         return None;
     }
     let plan = svd::plan(ctx, if kind == FactorKind::Svd { Kind::Svd } else { Kind::Eigh }, a.vectors, rows, cols)?;
-    some(FactorParams { svd: Some(plan), ..FactorParams::NONE })
+    let _ = plan;
+    some(FactorParams::NONE)
 }
 
 fn fits_svd_small(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {

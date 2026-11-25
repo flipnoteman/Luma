@@ -34,9 +34,16 @@ fn shape(subject: &Subject<'_>) -> ([u32; 4], LineSolveAttrs) {
     }
 }
 
-fn thomas_params(a: &LineSolveAttrs, tuning: &Tuning, dims: [u32; 4], scratch_bytes: u64) -> Params {
+/// The Thomas plan and its scratch: a parts solve keeps the modified upper blocks of every system (`None` where they exceed a buffer),
+/// a stacked one those of its cells.
+fn thomas(a: &LineSolveAttrs, tuning: &Tuning, dims: [u32; 4]) -> Option<Params> {
     let plan = thomas_plan(tuning, u32::from(a.block), dims[2], dims[1], a.parts);
-    Params::LineSolve(LineSolveParams {
+    let scratch_bytes = if a.parts {
+        thomas_parts_scratch(a.len as usize, usize::from(a.block), dims[3] as usize, plan.tiled, a.max_scratch)?
+    } else {
+        a.len * u64::from(a.block) * u64::from(a.block) * 4
+    };
+    Some(Params::LineSolve(LineSolveParams {
         block: a.block,
         parts: a.parts,
         workgroup: u16::from(plan.workgroup),
@@ -45,29 +52,20 @@ fn thomas_params(a: &LineSolveAttrs, tuning: &Tuning, dims: [u32; 4], scratch_by
         tiled: plan.tiled,
         twisted: plan.twisted,
         scratch_bytes,
-    })
-}
-
-/// The scratch bytes of the Thomas solve: a parts solve keeps the modified upper blocks of every system (`None` where they exceed a
-/// buffer), a stacked one those of its cells.
-fn thomas_scratch(a: &LineSolveAttrs, tuning: &Tuning, dims: [u32; 4]) -> Option<u64> {
-    if a.parts {
-        let tiled = thomas_plan(tuning, u32::from(a.block), dims[2], dims[1], true).tiled;
-        thomas_parts_scratch(a.len as usize, usize::from(a.block), dims[3] as usize, tiled, a.max_scratch)
-    } else {
-        Some(a.len * u64::from(a.block) * u64::from(a.block) * 4)
-    }
+    }))
 }
 
 /// `cyclic::plan(..)` is `Some`; `LUMA_STRATEGY=line_solve:cyclic` forces it like `LUMA_TRIDIAGONAL=cyclic`.
 fn fits_cyclic(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let (dims, a) = shape(subject);
-    let mut tuning = tuning_of(ctx);
-    if ctx.strategy_override(FamilyTag::LineSolve) == Some(StrategyId::LINE_SOLVE_CYCLIC) {
-        tuning.line_solver = LineSolver::Cyclic;
-    }
+    let tuning = tuning_of(ctx);
+    let forced = ctx.strategy_override(FamilyTag::LineSolve) == Some(StrategyId::LINE_SOLVE_CYCLIC);
     let block = u32::from(a.block);
-    let plan = crate::cyclic::plan(&tuning, block, dims[0], dims[2], dims[1], a.parts, a.fused, a.max_scratch)?;
+    let plan = if forced {
+        crate::cyclic::plan(&Tuning { line_solver: LineSolver::Cyclic, ..*tuning }, block, dims[0], dims[2], dims[1], a.parts, a.fused, a.max_scratch)
+    } else {
+        crate::cyclic::plan(&tuning, block, dims[0], dims[2], dims[1], a.parts, a.fused, a.max_scratch)
+    }?;
     Some(Params::LineSolve(LineSolveParams {
         block: a.block,
         parts: a.parts,
@@ -87,8 +85,7 @@ fn fits_native(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<
     if !tuning.native_solve {
         return None;
     }
-    let scratch = thomas_scratch(&a, &tuning, dims)?;
-    Some(thomas_params(&a, &tuning, dims, scratch))
+    thomas(&a, &tuning, dims)
 }
 
 /// Not native; a parts solve needs `block <= UNROLLED_BLOCK` and a scratch that fits a buffer.
@@ -98,8 +95,7 @@ fn fits_thomas(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<
     if tuning.native_solve || (a.parts && u32::from(a.block) > UNROLLED_BLOCK) {
         return None;
     }
-    let scratch = thomas_scratch(&a, &tuning, dims)?;
-    Some(thomas_params(&a, &tuning, dims, scratch))
+    thomas(&a, &tuning, dims)
 }
 
 /// Parts that neither of the above takes: the parts are stacked and the solve selects again on the stacked buffers.

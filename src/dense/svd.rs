@@ -39,9 +39,9 @@ use super::{fail, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::{Array, Failure};
 use crate::context::Context;
 use crate::error::LumaError;
-use crate::jit::structured::boundary::{FactorKind, FactorParams};
+use crate::jit::structured::boundary::FactorKind;
 use crate::jit::structured::families::factor::{boundary_flags, eigh_stage, svd_stage};
-use crate::jit::structured::strategy::{first_candidate_in, note_in, Params as Chosen, StrategyId};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
 use crate::kernel::{uniform, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
@@ -968,7 +968,7 @@ pub(crate) fn decompose_ranking(a: &Array<f32>, kind: Kind, vectors: bool, tol: 
     let boundary = boundary_flags(if kind == Kind::Svd { FactorKind::Svd } else { FactorKind::Eigh }, op, loc, Dims { rows: rr, cols: cc, batch: d.batch }, 0, false, tol == 0.0, vectors);
     let (id, params) = first_candidate_in(stage, ctx, &boundary).expect("a decomposition always fits");
     note_in(ctx, &boundary, stage, id, &params, &[]);
-    let result = if let Chosen::Factor(FactorParams { svd: Some(plan), .. }) = params {
+    let result = if let Some(plan) = (id == StrategyId::SVD_SMALL || id == StrategyId::EIGH_SMALL).then(|| plan(ctx, kind, vectors, rr, cc)).flatten() {
         small(a, d, plan)
     } else if d.batch == 1 {
         big(a, id, kind, vectors, tol)
