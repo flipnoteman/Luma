@@ -136,17 +136,17 @@ impl Harness {
     /// Whether `case` (of the current suite) is selected by `--only`.
     pub fn want(&self, case: &str) -> bool {
         let full = self.full(case);
-        self.only.as_deref().is_none_or(|f| full.contains(f))
+        self.only.as_deref().is_none_or(|f| f.split(',').any(|f| full.contains(f)))
     }
 
     /// Runs `f` (which verifies and times one or more cases) if `group` is selected; a panic is
     /// reported as a `SKIPPED` line and the run goes on. Case names inside a group should start
     /// with the group name (`"attention/forward"` in group `"attention"`), so that `--only`
-    /// picks a group by `suite/group` or one case by its full name.
+    /// picks a group by `suite/group` or one case by its full name; `--only a,b` takes several.
     pub fn guarded(&mut self, group: &str, f: impl FnOnce(&mut Harness)) {
         if let Some(only) = self.only.as_deref() {
             let full = self.full(group);
-            if !full.contains(only) && !only.starts_with(&full) {
+            if !only.split(',').any(|only| full.contains(only) || only.starts_with(&full)) {
                 return;
             }
         }
