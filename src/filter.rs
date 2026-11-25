@@ -24,6 +24,8 @@ use std::fmt::Write;
 use std::panic::Location;
 use std::sync::Arc;
 
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg};
@@ -294,6 +296,7 @@ impl<T: ScalarType> Array<T> {
         let ctx = self.context();
         let words = words_of::<T>(self.len())?;
         let src = Arc::clone(self.storage()?);
+        note_light(ctx, FamilyTag::Compact, "filter", Location::caller(), "compact::count_scatter");
         let tiles = count_tiles(ctx, self.shape(), mask)?;
         let selected = tiles.selected()?;
         if selected == 0 {
@@ -325,6 +328,7 @@ impl<T: ScalarType> Array<T> {
         let ctx = self.context();
         let words = words_of::<T>(self.len())?;
         let src = Arc::clone(self.storage()?);
+        note_light(ctx, FamilyTag::Compact, "filter_padded", Location::caller(), "compact::count_scatter_padded");
         let tiles = count_tiles(ctx, self.shape(), mask)?;
         let out = Array::<T>::full_on(ctx, self.shape(), fill)?;
         tiles.scatter(ctx, Some(&src), words, out.storage()?)?;
@@ -374,6 +378,7 @@ nonzero!(u32, "non-zero");
 fn nonzero_of(cond: &impl Condition) -> Outcome<Option<Array<u32>>> {
     let mask = bits_of(cond);
     let ctx = mask.context();
+    note_light(ctx, FamilyTag::Compact, "nonzero", Location::caller(), "compact::count_scatter");
     let tiles = count_tiles(ctx, mask.shape(), &mask)?;
     let selected = tiles.selected()?;
     if selected == 0 {
@@ -387,6 +392,7 @@ fn nonzero_of(cond: &impl Condition) -> Outcome<Option<Array<u32>>> {
 fn nonzero_padded_of(cond: &impl Condition, fill: u32) -> Outcome<(Array<u32>, Array<u32>)> {
     let mask = bits_of(cond);
     let ctx = mask.context();
+    note_light(ctx, FamilyTag::Compact, "nonzero_padded", Location::caller(), "compact::count_scatter_padded");
     let tiles = count_tiles(ctx, mask.shape(), &mask)?;
     let out = Array::<u32>::full_on(ctx, mask.shape(), fill)?;
     tiles.scatter(ctx, None, 1, out.storage()?)?;
