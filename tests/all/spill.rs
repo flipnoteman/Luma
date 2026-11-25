@@ -13,6 +13,16 @@ fn values(len: usize, salt: usize) -> Vec<f32> {
     (0..len).map(|i| ((i * 7 + salt * 131) % 1021) as f32).collect()
 }
 
+/// Options with the cost model fixed to the profile's numbers. Which way a segment leaves the device
+/// (a kept host copy, a readback, or lineage: rerunning its kernel) is a decision of that model (see
+/// `jit::lineage`), and the numbers calibration measures (and `LUMA_CACHE_DIR` keeps) follow the load of
+/// the machine they were measured on: on the CPU backend a megabyte stops being cheaper to recompute than
+/// to move once the measured bandwidth falls below 18 GB/s, which a busy machine does. The tests below
+/// assert which way segments leave, so they must not depend on it.
+fn pinned() -> ContextOptions {
+    ContextOptions::from_env().calibrate(false)
+}
+
 #[test]
 fn arrays_larger_than_the_budget_compute_correctly() {
     let ctx = small_budget();
@@ -137,7 +147,7 @@ fn readbacks_in_a_loop_under_a_budget_do_not_deadlock() {
 
 /// `ctx` with 64 KiB segments, a 1 MiB device budget and `host` bytes of host budget.
 fn with_host_budget(host: u64) -> Context {
-    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(1 << 20).host_budget(Some(host))).unwrap()
+    Context::with_options(pinned().chunk_bytes(1 << 16).memory_budget(1 << 20).host_budget(Some(host))).unwrap()
 }
 
 /// Reads every array through a kernel (which only reads it), so a spilled one comes back.
@@ -218,7 +228,7 @@ const MEGABYTE: usize = 1 << 18;
 
 /// A context whose segments hold a megabyte and whose budget holds six of them.
 fn lineage_context() -> Context {
-    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 20).memory_budget(6 << 20)).unwrap()
+    Context::with_options(pinned().chunk_bytes(1 << 20).memory_budget(6 << 20)).unwrap()
 }
 
 fn megabyte(salt: usize) -> Vec<f32> {
