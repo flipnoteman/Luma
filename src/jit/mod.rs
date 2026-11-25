@@ -162,6 +162,7 @@ mod inline;
 mod kirgen;
 mod launch;
 pub(crate) mod lineage;
+mod follow;
 mod looped;
 mod operator;
 mod multireduce;
@@ -190,9 +191,11 @@ pub(crate) mod transpose;
 mod tests;
 #[cfg(test)]
 mod plancache_tests;
+#[cfg(test)]
+mod follow_tests;
 
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
@@ -919,19 +922,11 @@ pub(crate) struct Node {
     /// Number of elements of the result (and of every array operand).
     len: usize,
     below_len: usize,
-    /// The id that bit 0 of the first word stands for (a multiple of 64).
-    below_base: u64,
     /// The operations of the expression in f32-operation units (see [`Node::weight`]).
     weight: f64,
-    /// The ids of the distinct nodes in the expression below this one (`below_len` of them) as a
-    /// bit set over `below_base..` (`below_words` words), or sorted `(word, bits)` pairs (bit
-    /// `id & 63` of the entry for word `id >> 6`) if they are spread too widely for that
-    /// (`below_sparse`, `below_words` numbers); followed by the ids of the distinct buffers the
-    /// expression reads, sorted. Upper bounds once parts of the expression have been evaluated
-    /// (`create` counts the buffers exactly by walking the expression whenever the bound is over
-    /// the device's limit). One allocation for both.
-    ids: Box<[u64]>,
-    below_words: u32,
+    /// What the node knows of the nodes and buffers below it, see [`Ids`]. A node made by trace
+    /// following (see [`follow`]) has none until something asks for it ([`SPECIAL_LAZY`]).
+    ids: IdsCell,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
     /// How many array handles ([`Held`]) are on this node. A held node is never handed out again
@@ -946,7 +941,9 @@ pub(crate) struct Node {
     /// Levels of shifted lazy expressions nested in the expression (0: none; see
     /// [`recompute_shifted`]).
     shift_depth: u8,
-    below_sparse: bool,
+    /// What is unusual about the node, see [`SPECIAL_LOOPED`], [`SPECIAL_LAZY`], [`SPECIAL_UNREGISTERED`].
+    /// Read first by every accessor of `ids`, in the place of the check of `looped` it had before.
+    special: AtomicU8,
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
     /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
     fused: AtomicBool,
@@ -975,6 +972,52 @@ pub(crate) struct Node {
     /// The trace the node was created in and its number there (0: none; see [`rerun`]).
     trace: u64,
 }
+
+/// The ids of the distinct nodes in the expression below a node (`below_len` of them) as a bit set
+/// over `base..` (`words` words), or sorted `(word, bits)` pairs (bit `id & 63` of the entry for
+/// word `id >> 6`) if they are spread too widely for that (`sparse`, `words` numbers); followed by
+/// the ids of the distinct buffers the expression reads, sorted. Upper bounds once parts of the
+/// expression have been evaluated (`create` counts the buffers exactly by walking the expression
+/// whenever the bound is over the device's limit). One allocation for both.
+struct Ids {
+    ids: Box<[u64]>,
+    /// The id that bit 0 of the first word stands for (a multiple of 64).
+    base: u64,
+    words: u32,
+    sparse: bool,
+}
+
+impl From<Measure> for Ids {
+    fn from(measured: Measure) -> Ids {
+        Ids { ids: measured.ids, base: measured.base, words: measured.words, sparse: measured.sparse }
+    }
+}
+
+/// The [`Ids`] of a node: written once more by [`follow`] for a node that was made without them,
+/// before [`SPECIAL_LAZY`] is cleared (with release ordering) under the lock of that module. The
+/// accessors of [`Node`] never read it while the flag is set.
+struct IdsCell(std::cell::UnsafeCell<Ids>);
+
+// SAFETY: see above: the cell is written only while `SPECIAL_LAZY` is set, by whoever holds the
+// lock of `follow`, and read only after the flag was seen cleared.
+unsafe impl Sync for IdsCell {}
+
+impl IdsCell {
+    fn new(ids: Ids) -> IdsCell {
+        IdsCell(std::cell::UnsafeCell::new(ids))
+    }
+}
+
+/// `Node::special`: the node is a state of a repeating step (`looped` is set).
+const SPECIAL_LOOPED: u8 = 1;
+/// `Node::special`: the ids were not made when the node was (see [`follow`]).
+const SPECIAL_LAZY: u8 = 2;
+/// `Node::special`: the node was made by [`follow`] and is not registered (with the readers of its
+/// operands, the live list or the consumer counts) yet.
+const SPECIAL_UNREGISTERED: u8 = 4;
+/// `Node::special`: the node is on the readers of the buffers it reads (so that a write flushes
+/// it) though it is not registered otherwise (see [`follow`]).
+const SPECIAL_GUARDED: u8 = 8;
 
 thread_local! {
     static THREAD: std::thread::ThreadId = std::thread::current().id();
@@ -1093,40 +1136,73 @@ impl Node {
         if self.looped.get().is_some() { 0 } else { self.below_len }
     }
 
+    /// What the node knows of what is below it, made first if the node was made without it (see
+    /// [`follow`]).
+    #[inline]
+    fn ids(&self) -> &Ids {
+        if self.special.load(Ordering::Acquire) & SPECIAL_LAZY != 0 {
+            follow::make_ids(self);
+        }
+        self.ids_made()
+    }
+
+    /// [`Node::ids`] for a caller that found the flag cleared (or made them) a moment ago.
+    #[inline(always)]
+    fn ids_made(&self) -> &Ids {
+        debug_assert!(self.special.load(Ordering::Relaxed) & SPECIAL_LAZY == 0, "the ids of a node were read before they were made");
+        // SAFETY: the cell is written only while `SPECIAL_LAZY` is set (see `IdsCell`).
+        unsafe { &*self.ids.0.get() }
+    }
+
     /// The part of `ids` that holds the nodes below this one.
+    #[inline]
     fn below_part(&self) -> &[u64] {
-        if self.looped.get().is_some() {
+        if self.special.load(Ordering::Acquire) & (SPECIAL_LOOPED | SPECIAL_LAZY) != 0 {
+            return self.below_part_special();
+        }
+        let ids = self.ids_made();
+        ids.ids.get(..ids.words as usize).unwrap_or(&[])
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn below_part_special(&self) -> &[u64] {
+        let ids = self.ids();
+        if self.special.load(Ordering::Acquire) & SPECIAL_LOOPED != 0 {
             return &[];
         }
-        self.ids.get(..self.below_words as usize).unwrap_or(&[])
+        ids.ids.get(..ids.words as usize).unwrap_or(&[])
     }
 
     /// The first and last id that can be below this node (a superset), if there are any.
     fn below_span(&self) -> Option<(u64, u64)> {
         let part = self.below_part();
-        if self.below_sparse {
+        let ids = self.ids_made();
+        if ids.sparse {
             return Some((*part.first()? * 64, *part.get(part.len().checked_sub(2)?)? * 64 + 63));
         }
-        (!part.is_empty()).then(|| (self.below_base, self.below_base + 64 * part.len() as u64 - 1))
+        (!part.is_empty()).then(|| (ids.base, ids.base + 64 * part.len() as u64 - 1))
     }
 
     /// Whether node `id` is below this one.
     pub(crate) fn below_contains(&self, id: u64) -> bool {
         let part = self.below_part();
-        if self.below_sparse {
+        let ids = self.ids_made();
+        if ids.sparse {
             let word = id >> 6;
             let pairs = part.as_chunks::<2>().0;
             let at = pairs.partition_point(|&[w, _]| w < word);
             return pairs.get(at).is_some_and(|&[w, bits]| w == word && bits >> (id & 63) & 1 == 1);
         }
-        let Some(offset) = id.checked_sub(self.below_base) else { return false };
+        let Some(offset) = id.checked_sub(ids.base) else { return false };
         part.get((offset >> 6) as usize).is_some_and(|word| word >> (offset & 63) & 1 == 1)
     }
 
     /// Calls `f` with the ids of the distinct nodes below this one, ascending, until it says yes.
     fn below_any(&self, mut f: impl FnMut(u64) -> bool) -> bool {
         let part = self.below_part();
-        if self.below_sparse {
+        let ids = self.ids_made();
+        if ids.sparse {
             for &[word, mut bits] in part.as_chunks::<2>().0 {
                 while bits != 0 {
                     if f(word * 64 + u64::from(bits.trailing_zeros())) {
@@ -1138,7 +1214,7 @@ impl Node {
             return false;
         }
         for (k, &word) in part.iter().enumerate() {
-            let (mut bits, first) = (word, self.below_base + 64 * k as u64);
+            let (mut bits, first) = (word, ids.base + 64 * k as u64);
             while bits != 0 {
                 if f(first + u64::from(bits.trailing_zeros())) {
                     return true;
@@ -1153,7 +1229,8 @@ impl Node {
     /// below this one, ascending.
     fn for_each_below_word(&self, mut f: impl FnMut(u64, u64)) {
         let part = self.below_part();
-        if self.below_sparse {
+        let ids = self.ids_made();
+        if ids.sparse {
             for &[word, bits] in part.as_chunks::<2>().0 {
                 if bits != 0 {
                     f(word, bits);
@@ -1163,7 +1240,7 @@ impl Node {
         }
         for (k, &bits) in part.iter().enumerate() {
             if bits != 0 {
-                f((self.below_base >> 6) + k as u64, bits);
+                f((ids.base >> 6) + k as u64, bits);
             }
         }
     }
@@ -1181,7 +1258,8 @@ impl Node {
     /// Adds the nodes below this one to `set`, whose bit 0 stands for id `base`.
     fn mark_below(&self, set: &mut [u64], base: u64) {
         let part = self.below_part();
-        if self.below_sparse {
+        let ids = self.ids_made();
+        if ids.sparse {
             for &[word, bits] in part.as_chunks::<2>().0 {
                 if let Some(slot) = set.get_mut((word - (base >> 6)) as usize) {
                     *slot |= bits;
@@ -1193,15 +1271,29 @@ impl Node {
         if part.is_empty() {
             return;
         }
-        let at = ((self.below_base - base) >> 6) as usize;
+        let at = ((ids.base - base) >> 6) as usize;
         bits::or_into(set.get_mut(at..).unwrap_or(&mut []), part);
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
+    #[inline]
     fn inputs(&self) -> &[u64] {
+        if self.special.load(Ordering::Acquire) & (SPECIAL_LOOPED | SPECIAL_LAZY) != 0 {
+            return self.inputs_special();
+        }
+        let ids = self.ids_made();
+        ids.ids.get(ids.words as usize..).unwrap_or(&[])
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn inputs_special(&self) -> &[u64] {
         match self.looped.get() {
             Some((plan, _)) => &plan.input_ids,
-            None => self.ids.get(self.below_words as usize..).unwrap_or(&[]),
+            None => {
+                let ids = self.ids();
+                ids.ids.get(ids.words as usize..).unwrap_or(&[])
+            }
         }
     }
 
@@ -1257,7 +1349,10 @@ impl Node {
     /// the buffer it writes. Does not wait for the GPU.
     pub(crate) fn force(self: &Arc<Self>) -> &NodeResult {
         if self.result.get().is_none() {
-            crate::host::try_eval_node(self);
+            // A step that follows a tape ends here if this is all it computes (see [`follow`]).
+            if !(self.ctx.jit().follow_on() && follow::escape(self)) {
+                crate::host::try_eval_node(self);
+            }
         }
         let mut ran = false;
         let result = self.result.get_or_init(|| {
@@ -1792,7 +1887,7 @@ fn measure_nodes(args: &[Src]) -> Option<Measure> {
         return None;
     }
     let [Some(first), second] = nodes else { return None };
-    if first.below_sparse || second.is_some_and(|node| node.below_sparse) {
+    if first.ids().sparse || second.is_some_and(|node| node.ids().sparse) {
         return None;
     }
     // The buffers: the operand's own, or the union of both operands'.
@@ -1829,6 +1924,12 @@ fn measure_nodes(args: &[Src]) -> Option<Measure> {
 
 /// [`measure`] for any operands.
 fn measure_any(args: &[Src]) -> Measure {
+    // Nodes made without their ids make them by measuring, which needs the working memory below.
+    for arg in args {
+        if let Src::Node(node) = arg {
+            let _ = node.ids();
+        }
+    }
     MEASURED.with_borrow_mut(|m| {
         let Measured { inputs, below, decoded, tmp } = m;
         inputs.clear();
@@ -1855,7 +1956,7 @@ fn measure_any(args: &[Src]) -> Measure {
         let (mut lo, mut hi, mut upper, mut used) = (u64::MAX, 0u64, 0usize, 0usize);
         for node in operands() {
             (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
-            used += 1 + if node.below_sparse { node.below_part().len() / 2 } else { node.below_part().len() };
+            used += 1 + if node.ids().sparse { node.below_part().len() / 2 } else { node.below_part().len() };
             if let Some((first, last)) = node.below_span() {
                 (lo, hi) = (lo.min(first), hi.max(last));
             }
@@ -1884,14 +1985,14 @@ fn measure_any(args: &[Src]) -> Measure {
         below.clear();
         for node in operands() {
             let part = node.below_part();
-            if node.below_sparse || part.is_empty() {
+            if node.ids().sparse || part.is_empty() {
                 merge_sets(below, tmp, part);
             } else {
                 // A bit set: its words that are not empty, as pairs.
                 decoded.clear();
                 for (k, &word) in part.iter().enumerate() {
                     if word != 0 {
-                        decoded.extend([(node.below_base >> 6) + k as u64, word]);
+                        decoded.extend([(node.ids().base >> 6) + k as u64, word]);
                     }
                 }
                 merge_sets(below, tmp, decoded);
@@ -2080,6 +2181,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
 
 /// Turns the operands among the first `arity` that were evaluated since they were created into
 /// plain buffers; an operand that failed makes the operation fail the same way.
+#[inline(always)]
 fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), Failure> {
     for i in 0..arity {
         let evaluated = match args.get(i) {
@@ -2128,11 +2230,20 @@ fn create_with(
     // Operands evaluated since they were created become plain buffers.
     convert_evaluated(&mut args, arity)?;
 
+    // A tape of the step before may make this call, or the step is being recorded (see [`follow`]).
+    let mut go = follow::Go::Off;
+    if jit.follow_on() && follow::gate() {
+        match follow::begin(ctx, len, first_op, &mut args, arity, name, location) {
+            follow::Begun::Done(node) => return Ok(node),
+            follow::Begun::Go(how) => go = how,
+        }
+    }
+
     // Algebraic simplification (see [`simplify`]); the operands a rewrite takes from a pending
     // operand may have been evaluated since it was created.
     let mut rewritten_op: Option<Op> = None;
+    let mut rounds = 0;
     if jit.simplify_enabled() {
-        let mut rounds = 0;
         while rounds < 4
             && let Some((rewritten, operands)) = simplify::rewrite(rewritten_op.as_ref().unwrap_or(first_op), &args, ctx.fast_math())
         {
@@ -2158,6 +2269,9 @@ fn create_with(
         && let Some(found) = jit.cons_lookup(hash, op, len, &args)
     {
         rerun::reused(&found);
+        if !matches!(go, follow::Go::Off) {
+            follow::finish_hit(go, rounds, &found);
+        }
         return Ok(found);
     }
 
@@ -2198,9 +2312,27 @@ fn create_with(
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
     let trace = rerun::created(op, len, &args, arity);
-    // The distinct operands the node registers with once it exists. The node owns `args` from
-    // then on, which keeps them alive, so only their addresses are noted here (an `Arc` cloned
-    // for every operand costs an atomic operation to take and another to give back).
+    // The distinct operands the node registers with once it exists (see [`registered_of`]).
+    let (registered, known) = registered_of(&args, arity);
+    // What the table is told: a cut changed the operands, so the hash is made again.
+    let table_hash = cons_key.map(|hash| if cut { cons_hash(op, len, &args) } else { hash });
+    let node = new_node(ctx, len, op, args, name, location, trace, measured.below, Ids::from(measured), 0, shift_depth, depth, weight);
+    let weak = Arc::downgrade(&node);
+    register_node(jit, &weak, &registered[..known]);
+    if let Some(hash) = table_hash {
+        jit.cons_insert(hash, weak);
+    }
+    if !matches!(go, follow::Go::Off) {
+        follow::finish_created(go, rounds, cut, &node);
+    }
+    Ok(node)
+}
+
+/// The distinct operands a new node registers with once it exists, and how many there are. The
+/// node owns `args` from then on, which keeps them alive, so only their addresses are noted (an
+/// `Arc` cloned for every operand costs an atomic operation to take and another to give back).
+#[inline(always)]
+fn registered_of(args: &Args, arity: usize) -> ([Registered; 3], usize) {
     let mut registered = [Registered::None; 3];
     let mut known = 0;
     for (i, arg) in args.iter().enumerate().take(arity) {
@@ -2222,50 +2354,68 @@ fn create_with(
             known += 1;
         }
     }
-    // What the table is told: a cut changed the operands, so the hash is made again.
-    let table_hash = cons_key.map(|hash| if cut { cons_hash(op, len, &args) } else { hash });
-    // Built where it lives: the node is bigger than what a move of it copies cheaply.
-    let node = {
-        let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
-        // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, whose fields are
-        // all written (one by one: a struct literal would be built on the stack and copied) before
-        // the `Arc` is made again.
-        unsafe {
-            std::ptr::addr_of_mut!((*ptr).trace).write(trace);
-            std::ptr::addr_of_mut!((*ptr).thread).write(current_thread());
-            std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
-            std::ptr::addr_of_mut!((*ptr).op).write(*op);
-            std::ptr::addr_of_mut!((*ptr).len).write(len);
-            std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args)));
-            std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
-            std::ptr::addr_of_mut!((*ptr).name).write(name);
-            std::ptr::addr_of_mut!((*ptr).location).write(location);
-            std::ptr::addr_of_mut!((*ptr).id).write(NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed));
-            std::ptr::addr_of_mut!((*ptr).ids).write(measured.ids);
-            std::ptr::addr_of_mut!((*ptr).below_len).write(measured.below);
-            std::ptr::addr_of_mut!((*ptr).below_base).write(measured.base);
-            std::ptr::addr_of_mut!((*ptr).below_words).write(measured.words);
-            std::ptr::addr_of_mut!((*ptr).below_sparse).write(measured.sparse);
-            std::ptr::addr_of_mut!((*ptr).consumers).write(AtomicU32::new(0));
-            std::ptr::addr_of_mut!((*ptr).fused).write(AtomicBool::new(false));
-            std::ptr::addr_of_mut!((*ptr).shift_depth).write(shift_depth);
-            std::ptr::addr_of_mut!((*ptr).depth).write(depth);
-            std::ptr::addr_of_mut!((*ptr).weight).write(weight);
-            std::ptr::addr_of_mut!((*ptr).shifted_reads).write(AtomicU32::new(0));
-            std::ptr::addr_of_mut!((*ptr).readers).write(Readers::default());
-            std::ptr::addr_of_mut!((*ptr).requested).write(AtomicBool::new(false));
-            std::ptr::addr_of_mut!((*ptr).leaf_free).write(AtomicBool::new(false));
-            std::ptr::addr_of_mut!((*ptr).looped).write(OnceLock::new());
-            std::ptr::addr_of_mut!((*ptr).deferred).write(OnceLock::new());
-            std::ptr::addr_of_mut!((*ptr).handles).write(AtomicU32::new(0));
-            Arc::from_raw(ptr)
-        }
-    };
+    (registered, known)
+}
 
-    let weak = Arc::downgrade(&node);
-    for entry in &registered[..known] {
-        // SAFETY: the operand is held by `node.args`, which nothing has touched since the node
-        // was made (it is not shared yet).
+/// A node, built where it lives: the node is bigger than what a move of it copies cheaply.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn new_node(
+    ctx: &Context,
+    len: usize,
+    op: &Op,
+    args: Args,
+    name: &'static str,
+    location: &'static Location<'static>,
+    trace: u64,
+    below_len: usize,
+    ids: Ids,
+    special: u8,
+    shift_depth: u8,
+    depth: u16,
+    weight: f64,
+) -> Arc<Node> {
+    let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
+    // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, whose fields are
+    // all written (one by one: a struct literal would be built on the stack and copied) before
+    // the `Arc` is made again.
+    unsafe {
+        std::ptr::addr_of_mut!((*ptr).trace).write(trace);
+        std::ptr::addr_of_mut!((*ptr).thread).write(current_thread());
+        std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
+        std::ptr::addr_of_mut!((*ptr).op).write(*op);
+        std::ptr::addr_of_mut!((*ptr).len).write(len);
+        std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args)));
+        std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
+        std::ptr::addr_of_mut!((*ptr).name).write(name);
+        std::ptr::addr_of_mut!((*ptr).location).write(location);
+        std::ptr::addr_of_mut!((*ptr).id).write(NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed));
+        std::ptr::addr_of_mut!((*ptr).below_len).write(below_len);
+        std::ptr::addr_of_mut!((*ptr).ids).write(IdsCell::new(ids));
+        std::ptr::addr_of_mut!((*ptr).special).write(AtomicU8::new(special));
+        std::ptr::addr_of_mut!((*ptr).consumers).write(AtomicU32::new(0));
+        std::ptr::addr_of_mut!((*ptr).fused).write(AtomicBool::new(false));
+        std::ptr::addr_of_mut!((*ptr).shift_depth).write(shift_depth);
+        std::ptr::addr_of_mut!((*ptr).depth).write(depth);
+        std::ptr::addr_of_mut!((*ptr).weight).write(weight);
+        std::ptr::addr_of_mut!((*ptr).shifted_reads).write(AtomicU32::new(0));
+        std::ptr::addr_of_mut!((*ptr).readers).write(Readers::default());
+        std::ptr::addr_of_mut!((*ptr).requested).write(AtomicBool::new(false));
+        std::ptr::addr_of_mut!((*ptr).leaf_free).write(AtomicBool::new(false));
+        std::ptr::addr_of_mut!((*ptr).looped).write(OnceLock::new());
+        std::ptr::addr_of_mut!((*ptr).deferred).write(OnceLock::new());
+        std::ptr::addr_of_mut!((*ptr).handles).write(AtomicU32::new(0));
+        Arc::from_raw(ptr)
+    }
+}
+
+/// Tells the operands (the readers of a buffer or of a pending node, the consumer count of a
+/// node) and the context (live nodes, pending count) of a node that was just made.
+#[inline(always)]
+fn register_node(jit: &JitState, weak: &Weak<Node>, registered: &[Registered]) {
+    for entry in registered {
+        // SAFETY: the operand is held by the node's `args` (which only this thread has touched
+        // since the node was made).
         unsafe {
             match *entry {
                 Registered::Buffer(storage) => (*storage).readers.add_weak(weak.clone()),
@@ -2279,10 +2429,6 @@ fn create_with(
     }
     jit.with_live(|live| live.add_weak(weak.clone()));
     jit.pending_nodes.fetch_add(1, Ordering::Relaxed);
-    if let Some(hash) = table_hash {
-        jit.cons_insert(hash, weak);
-    }
-    Ok(node)
 }
 
 /// An operand a new node registers with (see [`create_with`]).
@@ -2310,6 +2456,8 @@ fn settle(
     max_inputs: usize,
 ) -> std::result::Result<(Measure, bool, Option<Option<u16>>), Failure> {
     let jit = ctx.jit();
+    // What this evaluates is part of the call, not the end of a step (see [`follow::escape`]).
+    let _settling = follow::Settling::enter();
     // The first time the expression is over a limit, its biggest operand is evaluated together
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
@@ -2374,6 +2522,9 @@ fn settle(
                 SplitReason::Depth { limit: usize::from(MAX_DEPTH) }
             };
             jit.note_cut(name, location, reason);
+            if jit.follow_on() {
+                follow::cut_reason(reason);
+            }
         }
         if !too_big {
             // Only the nesting: evaluating the deepest operand cuts the chain.
@@ -2444,6 +2595,7 @@ fn settle(
 /// recorded when something that needs the value is, after the arrays it shares work with. It has
 /// no operands: expressions that read it find it evaluated first, like a loop leaf.
 pub(crate) fn deferred_value(ctx: &Context, len: usize, ty: ElemTy, value: Arc<structured::Structured>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
+    follow::interrupt(ctx.jit());
     let measured = measure(&[]);
     let node = Arc::new(Node {
         trace: 0,
@@ -2456,11 +2608,9 @@ pub(crate) fn deferred_value(ctx: &Context, len: usize, ty: ElemTy, value: Arc<s
         name,
         location,
         id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-        ids: measured.ids,
         below_len: measured.below,
-        below_base: measured.base,
-        below_words: measured.words,
-        below_sparse: measured.sparse,
+        ids: IdsCell::new(Ids::from(measured)),
+        special: AtomicU8::new(0),
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
         shift_depth: 0,
@@ -3038,6 +3188,8 @@ pub(crate) struct JitState {
     /// [`JitState::plans`].
     plan_epoch: AtomicU64,
     plan_stats: plancache::Stats,
+    /// What this context knows of trace following (see [`follow`]).
+    follow: follow::Shared,
     /// Evaluations the plan cache still sits out (see [`plancache`]).
     plan_skip: AtomicU32,
     /// Whether [`JitState::decisions`] is recording (kept apart so that looking is a load).
@@ -3156,6 +3308,7 @@ impl JitState {
             plan_cache: AtomicBool::new(plancache::enabled_by(std::env::var(plancache::ENV).ok().as_deref())),
             plan_epoch: AtomicU64::new(0),
             plan_stats: plancache::Stats::default(),
+            follow: follow::Shared::new(),
             plan_skip: AtomicU32::new(0),
             decisions_on: AtomicBool::new(env_records_decisions()),
             pending_nodes: std::sync::atomic::AtomicI64::new(0),
@@ -3311,6 +3464,9 @@ impl JitState {
     /// Records that a buffer's contents are about to change (or did): operations written before
     /// are not the same values as identical ones written after.
     pub(crate) fn note_write(&self) {
+        if self.follow_on() {
+            follow::note_write(self);
+        }
         self.write_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3590,6 +3746,31 @@ impl JitState {
         lock(&self.plans).clear();
     }
 
+    /// The evaluation `eval` asked for was postponed (see [`follow`]).
+    pub(crate) fn follow_postponed(&self) {
+        if self.follow_on() {
+            follow::postponed(self);
+        }
+    }
+
+    /// Whether trace following is on for this context (`LUMA_TRACE_FOLLOW`).
+    #[inline(always)]
+    fn follow_on(&self) -> bool {
+        self.follow.on()
+    }
+
+    /// Switches trace following on or off for this context (tests).
+    #[cfg(test)]
+    pub(crate) fn set_follow(&self, on: bool) {
+        self.follow.set(on);
+    }
+
+    /// What trace following did so far.
+    #[cfg(test)]
+    pub(crate) fn follow_stats(&self) -> follow::StatsSnapshot {
+        self.follow.snapshot()
+    }
+
     /// What the plan cache did so far.
     pub(crate) fn plan_stats(&self) -> plancache::StatsSnapshot {
         self.plan_stats.snapshot()
@@ -3721,6 +3902,8 @@ impl JitState {
     /// The sweep of [`JitState::evaluate_live`]; `held` also computes the arrays that were
     /// fused into the kernel of another one.
     fn evaluate_swept(&self, held: bool) {
+        // The live list is what this reads: a step that follows a tape ends here.
+        follow::interrupt(self);
         let me = current_thread();
         let nodes = self.with_live(|live| live.take_if(|node| node.thread == me));
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();

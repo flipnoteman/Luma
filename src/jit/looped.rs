@@ -215,6 +215,7 @@ impl Node {
             if args.is_none() || self.looped.set((Arc::clone(plan), j)).is_err() {
                 return;
             }
+            self.special.fetch_or(super::SPECIAL_LOOPED, std::sync::atomic::Ordering::Release);
             *args = None;
         }
         plan.register(self);
@@ -229,7 +230,7 @@ impl Drop for Node {
         if self.result.get().is_none() {
             self.settled();
         }
-        super::bits::recycle(std::mem::take(&mut self.ids));
+        super::bits::recycle(std::mem::take(&mut self.ids.0.get_mut().ids));
     }
 }
 
@@ -357,6 +358,17 @@ impl JitState {
             return;
         }
         let prev: Vec<(Option<Arc<Node>>, u64)> = tracker.prev.iter().map(|(weak, id)| (weak.upgrade(), *id)).collect();
+        // A step that follows its tape and relates to the arrays before as the step that taught the
+        // tape did ends as that one did: no loop (see [`super::follow`]).
+        if self.follow_on()
+            && let Some(exit) = super::follow::boundary_exit(self, &prev)
+        {
+            match exit {
+                super::follow::Exit::Remember => tracker.remember(nodes, Some(shape)),
+                super::follow::Exit::Reset => tracker.reset(nodes, Some(shape)),
+            }
+            return;
+        }
         let mut states = Vec::with_capacity(prev.len());
         for (node, id) in &prev {
             let state = match node {
@@ -373,12 +385,18 @@ impl JitState {
             let Some(state) = state else {
                 // The array is gone and its buffer is not read: nothing to trace now, but the
                 // step seen before still counts.
+                if self.follow_on() {
+                    super::follow::note_boundary(self, &prev, super::follow::Exit::Remember);
+                }
                 tracker.remember(nodes, Some(shape));
                 return;
             };
             states.push(state);
         }
         let Some(mut traced) = flatten_step(nodes, &states, Tail::Store) else {
+            if self.follow_on() {
+                super::follow::note_boundary(self, &prev, super::follow::Exit::Reset);
+            }
             tracker.reset(nodes, Some(shape));
             return;
         };

@@ -34,6 +34,7 @@ use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
 use crate::profile::{Decision, DecisionSite};
 
+use super::follow;
 use super::launch;
 use super::program::{Fused, FusedKey};
 use super::rerun::Mix;
@@ -153,7 +154,7 @@ impl Table {
 
 /// Where an input of a recorded launch comes from.
 #[derive(Clone, Copy, Debug)]
-enum Input {
+pub(super) enum Input {
     /// A buffer the walk found, by its position in [`Walk::leaves`].
     Leaf(u32),
     /// Output `out` of an earlier launch of the plan.
@@ -162,10 +163,10 @@ enum Input {
 
 /// One recorded `run_store`.
 #[derive(Debug)]
-struct Step {
+pub(super) struct Step {
     key: FusedKey,
     len: usize,
-    inputs: Vec<Input>,
+    pub(super) inputs: Vec<Input>,
     /// The words `run_store` got, with those that come from scalars of the graph at 0.
     scalars: Vec<u32>,
     /// (slot, class): the slots to fill with the value of scalar class `class` of the walk.
@@ -174,7 +175,7 @@ struct Step {
     fused: Vec<u32>,
     /// (output, node): the nodes the launch's outputs became the results of, in the order the
     /// evaluation finished them.
-    done: Vec<(u32, u32)>,
+    pub(super) done: Vec<(u32, u32)>,
 }
 
 /// What an evaluation of one structure did.
@@ -183,7 +184,7 @@ pub(super) struct Plan {
     nodes: usize,
     leaves: usize,
     classes: usize,
-    steps: Vec<Step>,
+    pub(super) steps: Vec<Step>,
 }
 
 /// A scalar the walk met: its type and bits.
@@ -395,7 +396,7 @@ impl Walk {
 
 /// What of the environment decides how a graph is planned (see [`JitState::plan_epoch`] for the
 /// settings that only tests change).
-fn stamp(jit: &JitState, ctx: &Context) -> u64 {
+pub(super) fn stamp(jit: &JitState, ctx: &Context) -> u64 {
     let mut mix = Mix::new(jit.plan_epoch.load(Ordering::Relaxed));
     mix.word(jit.max_nodes() as u64);
     mix.word(jit.max_inputs() as u64);
@@ -413,9 +414,9 @@ fn stamp(jit: &JitState, ctx: &Context) -> u64 {
 
 /// Whether evaluations of `ctx` may use the cache now (the cheapest checks first: this runs for
 /// every `eval`).
-fn usable(jit: &JitState, ctx: &Context) -> bool {
+pub(super) fn usable(jit: &JitState, ctx: &Context) -> bool {
     jit.plan_cache.load(Ordering::Relaxed)
-        && !ACTIVE.with(Cell::get)
+        && !recording_has(WALKING)
         && !ctx.check_finite()
         && !ctx.recording_here()
         && !ctx.is_profiling()
@@ -423,21 +424,52 @@ fn usable(jit: &JitState, ctx: &Context) -> bool {
 }
 
 thread_local! {
-    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Which recordings this thread has under way: [`WALKING`] and [`TAPING`].
+    static RECORDING: Cell<u8> = const { Cell::new(0) };
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    /// The recording of a whole step that trace following is making (see [`super::follow`]): the
+    /// launches of its creates and of its evaluation, by position in the tape.
+    static TAPE: RefCell<Option<Recorder>> = const { RefCell::new(None) };
     static SCRATCH: RefCell<Walk> = RefCell::new(Walk::default());
 }
 
-/// Whether this thread's evaluation is being recorded.
-pub(super) fn recording() -> bool {
-    ACTIVE.with(Cell::get)
+/// `RECORDING`: the plan cache is recording an evaluation (see [`Watching`]).
+const WALKING: u8 = 1;
+/// `RECORDING`: trace following is recording a step.
+const TAPING: u8 = 2;
+
+fn recording_has(flag: u8) -> bool {
+    RECORDING.with(Cell::get) & flag != 0
 }
 
-/// Marks the recording (if any) as one that cannot become a plan, because something happens that
+fn recording_set(flag: u8, on: bool) {
+    RECORDING.with(|recording| recording.set(if on { recording.get() | flag } else { recording.get() & !flag }));
+}
+
+/// Whether this thread's launches are being recorded, by the plan cache or by a tape.
+pub(super) fn recording() -> bool {
+    RECORDING.with(Cell::get) != 0
+}
+
+/// Marks the recordings (if any) as ones that cannot become a plan, because something happens that
 /// a replay would not reproduce.
 pub(super) fn taint(why: &'static str) {
-    if recording() {
+    if recording_has(WALKING) {
         RECORDER.with_borrow_mut(|recorder| {
+            if let Some(recorder) = recorder
+                && recorder.tainted.is_none()
+            {
+                recorder.tainted = Some(why);
+            }
+        });
+    }
+    taint_tape(why);
+}
+
+/// [`taint`] for the tape's recording alone.
+pub(super) fn taint_tape(why: &'static str) {
+    if recording_has(TAPING) {
+        TAPE.with_borrow_mut(|recorder| {
             if let Some(recorder) = recorder
                 && recorder.tainted.is_none()
             {
@@ -447,8 +479,45 @@ pub(super) fn taint(why: &'static str) {
     }
 }
 
+/// What `run_store` hands back to [`end_store`]: the step each recorder made of the launch.
+#[derive(Clone, Copy)]
+pub(super) struct StoreToken {
+    walk: Option<usize>,
+    tape: Option<usize>,
+}
+
+/// Starts the recording of a step for trace following.
+pub(super) fn tape_begin() {
+    TAPE.with_borrow_mut(|slot| *slot = Some(Recorder::open()));
+    recording_set(TAPING, true);
+}
+
+/// Ends the recording of a step: the recorder, if there was one.
+pub(super) fn tape_end() -> Option<Recorder> {
+    recording_set(TAPING, false);
+    TAPE.with_borrow_mut(Option::take)
+}
+
+/// Ends the recording of a step without making anything of it.
+pub(super) fn tape_abort() {
+    let _ = RECORDING.try_with(|recording| recording.set(recording.get() & !TAPING));
+    let _ = TAPE.try_with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            slot.take();
+        }
+    });
+}
+
+/// Runs `f` on the tape's recorder, if one is recording.
+pub(super) fn with_tape<R>(f: impl FnOnce(&mut Recorder) -> R) -> Option<R> {
+    if !recording_has(TAPING) {
+        return None;
+    }
+    TAPE.with_borrow_mut(|recorder| recorder.as_mut().map(f))
+}
+
 /// Watches an evaluation that no plan covers, to make one.
-struct Recorder {
+pub(super) struct Recorder {
     nodes: Vec<Weak<Node>>,
     node_at: FxMap<u64, u32>,
     leaf_at: FxMap<u64, u32>,
@@ -460,11 +529,97 @@ struct Recorder {
     produced: FxMap<u64, (u32, u32)>,
     done: Vec<bool>,
     fused_marks: Vec<bool>,
+    /// Nodes a replay of the plan cache marked fused before the launch that is about to be made.
+    pending_fused: Vec<u32>,
     leaves: usize,
     tainted: Option<&'static str>,
 }
 
 impl Recorder {
+    /// A recorder for a whole step of trace following: nodes, buffers and scalars are told to it as
+    /// the step makes them, in the order of the tape.
+    fn open() -> Recorder {
+        Recorder {
+            nodes: Vec::new(),
+            node_at: FxMap::default(),
+            leaf_at: FxMap::default(),
+            classes: Vec::new(),
+            lens: Vec::new(),
+            fused_before: Vec::new(),
+            steps: Vec::new(),
+            produced: FxMap::default(),
+            done: Vec::new(),
+            fused_marks: Vec::new(),
+            pending_fused: Vec::new(),
+            leaves: 0,
+            tainted: None,
+        }
+    }
+
+    /// The step (the launches so far) a node, buffer or scalar is told in.
+    pub(super) fn steps_len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Notes the node the entry that comes next made.
+    pub(super) fn note_node(&mut self, node: &Arc<Node>) -> u32 {
+        let at = self.nodes.len() as u32;
+        self.nodes.push(Arc::downgrade(node));
+        self.node_at.insert(node.id, at);
+        self.fused_before.push(node.fused.load(Ordering::Relaxed));
+        self.done.push(false);
+        self.fused_marks.push(false);
+        let len = node.len as u64;
+        if let Err(place) = self.lens.binary_search(&len) {
+            self.lens.insert(place, len);
+        }
+        at
+    }
+
+    /// Notes an entry that made no node (hash-consing handed one out).
+    pub(super) fn note_no_node(&mut self) {
+        self.nodes.push(Weak::new());
+        self.fused_before.push(false);
+        self.done.push(false);
+        self.fused_marks.push(false);
+    }
+
+    /// The entry that made the node with this id.
+    pub(super) fn node_index(&self, id: u64) -> Option<u32> {
+        self.node_at.get(&id).copied()
+    }
+
+    /// The leaf with the buffer with this id, and the output of a step it is, if it was made by one.
+    pub(super) fn leaf_index(&self, id: u64) -> Option<u32> {
+        self.leaf_at.get(&id).copied()
+    }
+
+    pub(super) fn produced_by(&self, id: u64) -> Option<(u32, u32)> {
+        self.produced.get(&id).copied()
+    }
+
+    pub(super) fn note_leaf(&mut self, id: u64) -> u32 {
+        let at = self.leaves as u32;
+        self.leaf_at.insert(id, at);
+        self.leaves += 1;
+        at
+    }
+
+    pub(super) fn note_class(&mut self, class: Class) -> u32 {
+        self.classes.push(class);
+        self.classes.len() as u32 - 1
+    }
+
+    /// How many references each node noted so far holds (0 for a call that made none).
+    pub(super) fn strong_counts(&self) -> Vec<u32> {
+        self.nodes.iter().map(|node| node.strong_count() as u32).collect()
+    }
+
+    /// The plan of a recorded step, if it can be one (see [`Recorder::finish`]).
+    pub(super) fn into_plan(self) -> Result<Plan, &'static str> {
+        self.finish()
+    }
+
     fn new(walk: &Walk) -> Recorder {
         let mut lens: Vec<u64> = walk.nodes.iter().map(|node| node.len as u64).collect();
         lens.sort_unstable();
@@ -480,6 +635,7 @@ impl Recorder {
             produced: FxMap::default(),
             done: vec![false; walk.nodes.len()],
             fused_marks: vec![false; walk.nodes.len()],
+            pending_fused: Vec::new(),
             leaves: walk.leaves.len(),
             tainted: None,
         }
@@ -548,86 +704,134 @@ impl Recorder {
 }
 
 /// Called by `run_store` before it runs `fused` (while recording): the step it will be.
-pub(super) fn begin_store(len: usize, fused: &Fused) -> Option<usize> {
-    RECORDER.with_borrow_mut(|recorder| {
-        let recorder = recorder.as_mut()?;
-        if recorder.tainted.is_some() {
-            return None;
-        }
-        match recorder.step(len, fused) {
-            Ok(step) => {
-                for &at in &step.fused {
-                    recorder.fused_marks[at as usize] = true;
+pub(super) fn begin_store(len: usize, fused: &Fused) -> StoreToken {
+    fn note(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, len: usize, fused: &Fused) -> Option<usize> {
+        slot.with_borrow_mut(|recorder| {
+            let recorder = recorder.as_mut()?;
+            if recorder.tainted.is_some() {
+                return None;
+            }
+            match recorder.step(len, fused) {
+                Ok(mut step) => {
+                    step.fused.append(&mut recorder.pending_fused);
+                    for &at in &step.fused {
+                        recorder.fused_marks[at as usize] = true;
+                    }
+                    recorder.steps.push(step);
+                    Some(recorder.steps.len() - 1)
                 }
-                recorder.steps.push(step);
-                Some(recorder.steps.len() - 1)
+                Err(why) => {
+                    recorder.tainted = Some(why);
+                    None
+                }
             }
-            Err(why) => {
-                recorder.tainted = Some(why);
-                None
-            }
-        }
-    })
+        })
+    }
+    StoreToken {
+        walk: if recording_has(WALKING) { note(&RECORDER, len, fused) } else { None },
+        tape: if recording_has(TAPING) { note(&TAPE, len, fused) } else { None },
+    }
 }
 
 /// Called by `run_store` when it returns while recording: what the step wrote.
-pub(super) fn end_store<E>(step: Option<usize>, outputs: &Result<Vec<Storage>, E>) {
-    let Some(step) = step else { return };
-    RECORDER.with_borrow_mut(|recorder| {
-        let Some(recorder) = recorder.as_mut() else { return };
-        match outputs {
-            Ok(outputs) => {
-                for (out, storage) in outputs.iter().enumerate() {
-                    recorder.produced.insert(storage.id(), (step as u32, out as u32));
+pub(super) fn end_store<E>(token: StoreToken, outputs: &Result<Vec<Storage>, E>) {
+    fn note<E>(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, step: Option<usize>, outputs: &Result<Vec<Storage>, E>) {
+        let Some(step) = step else { return };
+        slot.with_borrow_mut(|recorder| {
+            let Some(recorder) = recorder.as_mut() else { return };
+            match outputs {
+                Ok(outputs) => {
+                    for (out, storage) in outputs.iter().enumerate() {
+                        recorder.produced.insert(storage.id(), (step as u32, out as u32));
+                    }
+                    // The number of outputs a plan expects is that of the program.
+                    if outputs.len() != recorder.steps[step].key.outputs.len() && recorder.tainted.is_none() {
+                        recorder.tainted = Some("a launch with other outputs than its program");
+                    }
                 }
-                // The number of outputs a plan expects is that of the program.
-                if outputs.len() != recorder.steps[step].key.outputs.len() && recorder.tainted.is_none() {
-                    recorder.tainted = Some("a launch with other outputs than its program");
+                Err(_) => {
+                    if recorder.tainted.is_none() {
+                        recorder.tainted = Some("a launch failed");
+                    }
                 }
             }
-            Err(_) => {
-                if recorder.tainted.is_none() {
-                    recorder.tainted = Some("a launch failed");
-                }
-            }
-        }
-    });
+        });
+    }
+    note(&RECORDER, token.walk, outputs);
+    note(&TAPE, token.tape, outputs);
 }
 
 /// Called when `node` got `storage` as its result while recording.
+#[inline(always)]
 pub(super) fn finished(node: &Node, storage: &Storage) {
-    if !recording() {
-        return;
+    if RECORDING.with(Cell::get) != 0 {
+        finished_recording(node, storage);
     }
-    RECORDER.with_borrow_mut(|recorder| {
-        let Some(recorder) = recorder.as_mut() else { return };
-        if recorder.tainted.is_some() {
-            return;
-        }
-        let (Some(&(step, out)), Some(&at)) = (recorder.produced.get(&storage.id()), recorder.node_at.get(&node.id)) else {
-            recorder.tainted = Some("a node finished with a buffer that no recorded launch wrote, or a node outside the graph");
-            return;
-        };
-        if recorder.done[at as usize] {
-            recorder.tainted = Some("a node finished twice");
-            return;
-        }
-        recorder.done[at as usize] = true;
-        recorder.steps[step as usize].done.push((out, at));
-    });
+}
+
+#[cold]
+#[inline(never)]
+fn finished_recording(node: &Node, storage: &Storage) {
+    fn note(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, node: &Node, storage: &Storage) {
+        slot.with_borrow_mut(|recorder| {
+            let Some(recorder) = recorder.as_mut() else { return };
+            if recorder.tainted.is_some() {
+                return;
+            }
+            let (Some(&(step, out)), Some(&at)) = (recorder.produced.get(&storage.id()), recorder.node_at.get(&node.id)) else {
+                recorder.tainted = Some("a node finished with a buffer that no recorded launch wrote, or a node outside the graph");
+                return;
+            };
+            if recorder.done[at as usize] {
+                recorder.tainted = Some("a node finished twice");
+                return;
+            }
+            recorder.done[at as usize] = true;
+            recorder.steps[step as usize].done.push((out, at));
+        });
+    }
+    let recording = RECORDING.with(Cell::get);
+    if recording & WALKING != 0 {
+        note(&RECORDER, node, storage);
+    }
+    if recording & TAPING != 0 {
+        note(&TAPE, node, storage);
+    }
 }
 
 /// Evaluates `pending` (the nodes `eval` asked for that are still pending, all of this thread's)
 /// with `run`, which plans and launches, or from the plan an earlier evaluation of the same
 /// structure left.
 pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Vec<Arc<Node>>)) {
+    // A step that follows its tape replays without making a plan; one that was recorded is
+    // complete when its evaluation is.
+    let mut recording = None;
+    if jit.follow_on() {
+        match follow::eval_begin(jit, &pending) {
+            follow::Eval::Replayed => return,
+            follow::Eval::Failed => return run(pending.into_iter().filter(|node| node.is_pending()).collect()),
+            follow::Eval::Normal(made) => recording = made,
+        }
+    }
+    evaluate_planned(jit, pending, run);
+    if recording.is_some() {
+        follow::eval_end(jit, recording);
+    }
+}
+
+/// [`evaluate`] with the plan cache.
+#[inline(always)]
+fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Vec<Arc<Node>>)) {
     let Some(first) = pending.first() else { return run(pending) };
+    // A tape is made of an evaluation the plan cache could have cached, and of no other.
     let skip = jit.plan_skip.load(Ordering::Relaxed);
     if skip > 0 {
         jit.plan_skip.store(skip - 1, Ordering::Relaxed);
+        taint_tape("the plan cache sits out evaluations");
         return run(pending);
     }
     if !usable(jit, first.context()) {
+        taint_tape("the plan cache cannot be used");
         return run(pending);
     }
     let ctx = first.context().clone();
@@ -636,6 +840,7 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
     let most: i64 = pending.iter().map(|root| 1 + root.below_len() as i64).sum();
     if jit.pending_nodes.load(Ordering::Relaxed) > most {
         note_miss(jit);
+        taint_tape("other arrays are pending");
         return run(pending);
     }
     let mut walk = SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()));
@@ -644,6 +849,7 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
         // Not a graph the cache can handle: nothing is remembered.
         None => {
             note_miss(jit);
+            taint_tape("the graph is not one the plan cache can walk");
             walk.clear();
             run(pending);
         }
@@ -666,6 +872,7 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
             if replayed.is_ok() {
                 jit.plan_stats.hits.fetch_add(1, Ordering::Relaxed);
             } else {
+                taint_tape("the plan cache's replay failed");
                 // Whatever the plan finished is finished; the rest is evaluated as ever.
                 walk.clear();
                 run(pending.into_iter().filter(|node| node.is_pending()).collect());
@@ -674,6 +881,7 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
         // A structure that cannot be replayed (or a key that matched a plan of another shape).
         Some((_, Some(_))) => {
             note_miss(jit);
+            taint_tape("the structure is one the plan cache cannot replay");
             walk.clear();
             run(pending);
         }
@@ -713,19 +921,19 @@ struct Watching;
 impl Watching {
     fn begin(recorder: Recorder) -> Watching {
         RECORDER.with_borrow_mut(|slot| *slot = Some(recorder));
-        ACTIVE.with(|active| active.set(true));
+        recording_set(WALKING, true);
         Watching
     }
 
     fn end(self) -> Option<Recorder> {
-        ACTIVE.with(|active| active.set(false));
+        recording_set(WALKING, false);
         RECORDER.with_borrow_mut(Option::take)
     }
 }
 
 impl Drop for Watching {
     fn drop(&mut self) {
-        ACTIVE.with(|active| active.set(false));
+        recording_set(WALKING, false);
         RECORDER.with_borrow_mut(|slot| slot.take());
     }
 }
@@ -750,6 +958,7 @@ fn note_miss(jit: &JitState) {
 fn replay(ctx: &Context, plan: &Plan, walk: &Walk) -> Result<(), ()> {
     let class_words: Vec<u32> = walk.classes.iter().map(|&(_, bits)| bits as u32).collect();
     let mut outs: Vec<Vec<Arc<Storage>>> = Vec::with_capacity(plan.steps.len());
+    let taping = recording_has(TAPING);
     for step in &plan.steps {
         let inputs: Vec<Arc<Storage>> = step
             .inputs
@@ -764,7 +973,12 @@ fn replay(ctx: &Context, plan: &Plan, walk: &Walk) -> Result<(), ()> {
             scalars[slot as usize] = class_words[class as usize];
         }
         for &at in &step.fused {
-            walk.nodes[at as usize].fused.store(true, Ordering::Relaxed);
+            let node = &walk.nodes[at as usize];
+            node.fused.store(true, Ordering::Relaxed);
+            if taping {
+                // A tape that is being recorded learns which nodes the launch computed inside itself.
+                with_tape(|recorder| recorder.pending_fused.extend(recorder.node_at.get(&node.id).copied()));
+            }
         }
         let fused = Fused { key: step.key.clone(), inputs, scalars, fused_nodes: Vec::new(), instr_nodes: Vec::new(), sub_roots: Vec::new() };
         let outputs = launch::run_store(ctx, step.len, fused).map_err(|_| ())?;
@@ -775,4 +989,75 @@ fn replay(ctx: &Context, plan: &Plan, walk: &Walk) -> Result<(), ()> {
         outs.push(outputs);
     }
     Ok(())
+}
+
+/// What replaying a step of a tape rebinds: the buffers, scalar words and nodes of the step being
+/// followed, by position in the tape (see [`super::follow`]).
+pub(super) trait Rebind {
+    fn leaf(&self, at: u32) -> Option<Arc<Storage>>;
+    fn word(&self, class: u32) -> u32;
+    /// The node of an entry that is still alive.
+    fn node(&self, at: u32) -> Option<Arc<Node>>;
+}
+
+impl Plan {
+    /// The leaves a launch could take over the buffer of if nothing else held it (see
+    /// `launch::run_store`): inputs of launches with one output that the program can overwrite.
+    pub(super) fn takeover_leaves(&self) -> Vec<u32> {
+        let mut leaves = Vec::new();
+        for step in &self.steps {
+            if step.key.outputs.len() != 1 {
+                continue;
+            }
+            for (k, input) in step.inputs.iter().enumerate() {
+                if let Input::Leaf(at) = *input
+                    && launch::in_place_eligible(&step.key, k as u32)
+                    && !leaves.contains(&at)
+                {
+                    leaves.push(at);
+                }
+            }
+        }
+        leaves
+    }
+}
+
+/// Replays `step` over what `with` rebinds. `outs` holds the outputs of the steps before it (and
+/// gets its own).
+pub(super) fn run_step(ctx: &Context, step: &Step, outs: &mut Vec<Vec<Arc<Storage>>>, with: &dyn Rebind) -> Result<(), ()> {
+    let mut inputs: Vec<Arc<Storage>> = Vec::with_capacity(step.inputs.len());
+    for input in &step.inputs {
+        inputs.push(match *input {
+            Input::Leaf(at) => with.leaf(at).ok_or(())?,
+            Input::Out { step, out } => Arc::clone(outs.get(step as usize).and_then(|outputs| outputs.get(out as usize)).ok_or(())?),
+        });
+    }
+    let mut scalars = step.scalars.clone();
+    for &(slot, class) in &step.patches {
+        scalars[slot as usize] = with.word(class);
+    }
+    for &at in &step.fused {
+        if let Some(node) = with.node(at) {
+            node.fused.store(true, Ordering::Relaxed);
+        }
+    }
+    let fused = Fused { key: step.key.clone(), inputs, scalars, fused_nodes: Vec::new(), instr_nodes: Vec::new(), sub_roots: Vec::new() };
+    let outputs = launch::run_store(ctx, step.len, fused).map_err(|_| ())?;
+    let outputs: Vec<Arc<Storage>> = outputs.into_iter().map(Arc::new).collect();
+    for &(out, at) in &step.done {
+        if let Some(node) = with.node(at) {
+            node.finish_shared(Arc::clone(&outputs[out as usize]));
+        }
+    }
+    outs.push(outputs);
+    Ok(())
+}
+
+/// The key a walk of `pending` makes (what `follow` checks its tapes against, see `LUMA_TRACE_FOLLOW=verify`).
+pub(super) fn walk_key(jit: &JitState, ctx: &Context, pending: &[Arc<Node>]) -> Option<[u64; 2]> {
+    let mut walk = SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()));
+    let key = walk.run(jit, ctx, pending);
+    walk.clear();
+    SCRATCH.with(|scratch| *scratch.borrow_mut() = walk);
+    key
 }

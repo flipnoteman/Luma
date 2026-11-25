@@ -115,6 +115,7 @@ impl Context {
         if postpone(self.gpu_busy(), self.hal().pending_dispatches(), self.pager().under_pressure())
             && !self.jit().requested_stencil_chain()
         {
+            self.jit().follow_postponed();
             return Ok(());
         }
         self.jit().evaluate_requested();

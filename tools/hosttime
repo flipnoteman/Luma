@@ -5,6 +5,7 @@
                  [--binary PATH] [--plan-cache on|off] [--out FILE.json] [--top N]
   tools/hosttime --compare BASE.json NEW.json [--max-regression PCT]
 
+Each case is matched exactly (`--only CASE$`, luma-bench's exact match), so `jit/hoststep/chain10` does not also run `chain100`.
 Runs each case of the release `luma-bench` binary under `valgrind --tool=callgrind` twice, with
 `--iters A` and `--iters B` timed calls, and prints (Ir_B - Ir_A) / (B - A): the instructions of one
 iteration, so start-up, calibration probes and the case's one-off verification cancel. Reported per case:
@@ -85,7 +86,7 @@ def run_once(binary, backend, case, iters, plan_cache, workdir):
         env["LUMA_PLAN_CACHE"] = "off"
     else:
         env.pop("LUMA_PLAN_CACHE", None)
-    cmd = ["valgrind", "--tool=callgrind", f"--callgrind-out-file={out}", binary, "--only", case, "--iters", str(iters)]
+    cmd = ["valgrind", "--tool=callgrind", f"--callgrind-out-file={out}", binary, "--only", case.rstrip("$") + "$", "--iters", str(iters)]
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0 or case.split("/", 1)[-1] not in r.stdout:
         sys.stderr.write(r.stdout[-2000:] + r.stderr[-2000:])

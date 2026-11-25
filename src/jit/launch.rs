@@ -519,7 +519,7 @@ pub(crate) fn force_group(nodes: &[Arc<Node>]) -> Result<(), Failure> {
 /// before it is overwritten, by the invocation that overwrites it. That fails when the program
 /// has several outputs or types differ, and when `k` is read at another element: through a shift
 /// or inside a sub-program.
-fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
+pub(super) fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
     let Some(&input_ty) = key.input_tys.get(k as usize) else { return false };
     let out_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map(|instr| instr.op.out_ty());
     key.tail == Tail::Store

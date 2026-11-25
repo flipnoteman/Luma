@@ -16,6 +16,7 @@
 use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
+#[inline(always)]
 pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
     exact(op, args).or_else(|| if fast { self::fast(op, args) } else { None })
 }
@@ -36,6 +37,18 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
         ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => u64::from(value as u32),
         ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => u64::from(value as i32 as u32),
     }
+}
+
+/// Whether a scalar operand of type `ty` with these bits can make a rule of [`exact`] fire (every
+/// rule that looks at the *value* of a scalar looks for one of these). A step that makes the same
+/// operations on scalars that are not sensitive gets the same rewrites (none, or those the
+/// operands decide), which is what trace following relies on to skip [`rewrite`] (see
+/// `LUMA_TRACE_FOLLOW`). The fast rules read any value: they are not covered, following always runs
+/// [`rewrite`] under fast math.
+pub(super) fn sensitive(ty: ElemTy, bits: u64) -> bool {
+    let bits = bits & 0xffff_ffff;
+    let shifts = matches!(ty, ElemTy::U32 | ElemTy::I32 | ElemTy::U8 | ElemTy::U16 | ElemTy::I8 | ElemTy::I16) && bits & 31 == 0;
+    shifts || [0.0, 1.0, -1.0, -0.0, f64::from(u32::MAX)].into_iter().any(|value| bits == const_bits(ty, value) & 0xffff_ffff)
 }
 
 /// Whether `s` is the constant `value` of type `ty`, by bit pattern (so `-0.0` is not `0.0`).

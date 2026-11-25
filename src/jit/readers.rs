@@ -182,6 +182,8 @@ impl Readers {
     /// Evaluates every pending node registered here that `keep` rejects. The kept ones stay
     /// registered (and pending).
     pub(crate) fn flush_where(&self, keep: impl Fn(&Node) -> bool) {
+        // Nodes made by trace following are on no list yet: a write ends such a step.
+        super::follow::interrupt_thread();
         self.generation.fetch_add(1, Ordering::Relaxed);
         let mut to_force = Vec::new();
         {

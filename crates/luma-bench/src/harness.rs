@@ -133,10 +133,16 @@ impl Harness {
         format!("{}/{}", self.suite, case)
     }
 
-    /// Whether `case` (of the current suite) is selected by `--only`.
+    /// Whether `case` (of the current suite) is selected by `--only`: a substring match, or an exact
+    /// match of the full name when the filter ends in `$` (what `tools/hosttime` passes).
     pub fn want(&self, case: &str) -> bool {
         let full = self.full(case);
-        self.only.as_deref().is_none_or(|f| f.split(',').any(|f| full.contains(f)))
+        self.only.as_deref().is_none_or(|f| {
+            f.split(',').any(|f| match f.strip_suffix('$') {
+                Some(exact) => full == exact,
+                None => full.contains(f),
+            })
+        })
     }
 
     /// Runs `f` (which verifies and times one or more cases) if `group` is selected; a panic is
@@ -146,7 +152,7 @@ impl Harness {
     pub fn guarded(&mut self, group: &str, f: impl FnOnce(&mut Harness)) {
         if let Some(only) = self.only.as_deref() {
             let full = self.full(group);
-            if !only.split(',').any(|only| full.contains(only) || only.starts_with(&full)) {
+            if !only.split(',').any(|only| full.contains(only.trim_end_matches('$')) || only.starts_with(&full)) {
                 return;
             }
         }

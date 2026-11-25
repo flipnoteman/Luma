@@ -1,7 +1,7 @@
 //! `luma-bench`: workload benchmark suites for Luma.
 //!
 //! ```text
-//! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>] [--json out.jsonl] [--iters N]
+//! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>|<case>$] [--json out.jsonl] [--iters N]
 //! ```
 //!
 //! `--iters N` times every selected case with exactly N calls (no calibration, no profile run); it is for

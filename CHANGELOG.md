@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Trace following (on by default; `LUMA_TRACE_FOLLOW=off` is a dev switch that turns it off): a loop that builds the same graph step after step (`x = step(&x); x.eval()`) records the step once (the calls of `create`, the cuts inside it, and the launches of its evaluation) and later steps replay it: matching calls make nodes without `measure`, `settle`, the hash-consing table, reader registration or ids (made on demand), and the evaluation replays the recorded launches over the step's new buffers and scalars without walking the graph. Anything that does not match (another operation, operand pattern, rewrite, a write, an extra pending array, a read of an intermediate, another thread) registers the nodes and goes on as before. Host instructions per step on the CPU backend (`tools/hosttime`, `luma_self`, plan cache on): `hoststep/chain10` 1.55x fewer, `chain100` 2.19x, `wide100` 2.18x, `chain1000` 2.75x (cut at the depth limit, now followable), `cfd/euler/2d` 1.57x, `euler/3d` 1.53x, `muscl/2d` 1.74x, `muscl/3d` 1.71x. With the switch off the build costs 0.8-1.6% more host instructions than before. `tools/hosttime` and `luma-bench --only` now match one case exactly (`--only CASE$`).
+
 ### Deprecated
 
 Each of these is kept working until 0.6, which removes it; the replacement is in place now.
