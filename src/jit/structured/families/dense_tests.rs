@@ -13,7 +13,7 @@ use crate::dense::svd::{self, Kind};
 use crate::dense::{chol, qr, trsv, tsqr, tri, Dims};
 use crate::jit::structured::boundary::{dim, FactorKind, LineSolveAttrs};
 use crate::jit::structured::families::factor::{boundary_flags, boundary_of, chol_stage, eigh_stage, lu_stage, qr_stage, svd_stage, tri_stage};
-use crate::jit::structured::strategy::{candidates, first_candidate_in, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
+use crate::jit::structured::strategy::{candidates, first_candidate_in, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use crate::linalg::thomas_parts_scratch;
 use crate::tuning::{LineSolver, Tuning, TuningProfile};
 
@@ -341,10 +341,10 @@ fn cholesky_qr_and_triangular_solves_fit_on_both_sides_of_their_thresholds() {
     assert_eq!(qr_pick(65, 33, 2), StrategyId::QR_RECURSIVE);
     let gmax = (ctx.info().limits.max_workgroup_invocations.min(ctx.info().limits.max_workgroup_size[0]) as usize / 32).min(16);
     for rows in [gmax * 32, gmax * 32 + 1] {
+        // A tall panel is cut in one level up to `gmax * 32` rows, in several above.
         let found = tsqr::choose(&ctx, rows, 8).expect("a tall panel is cut");
-        let params = candidates(&ctx, &boundary_of(FactorKind::Qr, "qr", here(), dims(rows, 8, 1), 0)).next().unwrap().1;
-        assert_eq!(params, Params::Factor(crate::jit::structured::boundary::FactorParams { groups: found.groups as u32, bs: found.bs as u32, k: found.k as u32, ..crate::jit::structured::boundary::FactorParams::NONE }));
-        assert_eq!(found.k == 1, rows <= gmax * 32);
+        assert_eq!(found.k == 1, rows <= gmax * 32, "{rows} rows");
+        assert_eq!(qr_pick(rows, 8, 1), StrategyId::QR_TSQR_PANEL);
     }
 
     // Triangular solves: 64 / 65 rows, 32 / 33 columns of the look-back kernel, a batch.
@@ -358,9 +358,8 @@ fn cholesky_qr_and_triangular_solves_fit_on_both_sides_of_their_thresholds() {
     let no_lookback = cpu_with("", |t| t.lookback_scan = false);
     assert_eq!(tri_pick(65, 8, 1, &no_lookback), StrategyId::TRI_BLOCKED);
     for (rows, inverted) in [(767usize, false), (768, true)] {
-        let boundary = boundary_flags(FactorKind::SolveTriangular, "solve_triangular", here(), dims(rows, rows, 1), 1, true, false, false);
-        let Params::Factor(params) = candidates(&ctx, &boundary).next().unwrap().1 else { unreachable!() };
-        assert_eq!(params.inverse, inverted, "{rows} rows");
+        assert_eq!(trsv::plan(rows, 1, true).1, inverted, "{rows} rows");
+        assert!(!trsv::plan(rows, 1, false).1, "{rows} rows, not asked");
     }
 
     // SVD: 96 / 97 columns around the workgroup-memory kernel (given room), 127 / 128 around block Jacobi, 1023 / 1024 around the QR route.

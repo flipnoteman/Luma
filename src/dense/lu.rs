@@ -24,9 +24,9 @@ use super::tri::{lower_left_factor, rhs_matrix};
 use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::error::LumaError;
-use crate::jit::structured::boundary::{FactorKind, FactorParams};
+use crate::jit::structured::boundary::FactorKind;
 use crate::jit::structured::families::factor::{boundary_of, lu_stage};
-use crate::jit::structured::strategy::{first_candidate_in, note_in, Params as Chosen, StrategyId};
+use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
 use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
@@ -697,9 +697,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+/// How [`calu_run`] cuts a panel: chunks of rows and rows of a chunk, the rows the workgroups of the chunk and of the final kernel hold
+/// (powers of two), and the panel's columns rounded up to 8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaluPlan {
+    pub(crate) chunks: usize,
+    pub(crate) chunk_rows: usize,
+    pub(crate) rows: usize,
+    pub(crate) rows2: usize,
+    pub(crate) wp: usize,
+}
+
 /// How [`calu_run`] cuts a `w`-column panel of `m` rows, or `None` where a tournament does not apply (the device cannot hold a chunk,
 /// or a chunk would hold fewer than `w` rows). A pure function of the shape and the device: the `fits` of the CALU strategies.
-pub(crate) fn calu_plan(ctx: &crate::Context, m: usize, w: usize) -> Option<FactorParams> {
+pub(crate) fn calu_plan(ctx: &crate::Context, m: usize, w: usize) -> Option<CaluPlan> {
     let (rows, rows2) = calu_rows(ctx);
     if w > CALU_W || rows < 64 || rows2 < 2 * w || m < w {
         return None;
@@ -715,7 +726,7 @@ pub(crate) fn calu_plan(ctx: &crate::Context, m: usize, w: usize) -> Option<Fact
     }
     // Workgroups as small as the rows they factor: a pivot costs a pass of the invocations.
     let (rows, rows2) = (chunk_rows.next_power_of_two().clamp(64, rows), (chunks * w).next_power_of_two().clamp(64, rows2));
-    Some(FactorParams { chunks: chunks as u32, chunk_rows: chunk_rows as u32, rows: rows as u32, rows2: rows2 as u32, wp: w.next_multiple_of(8) as u32, ..FactorParams::NONE })
+    Some(CaluPlan { chunks, chunk_rows, rows, rows2, wp: w.next_multiple_of(8) })
 }
 
 /// Factors one `[w, m]` panel (`w <= 32`, `m >= w`) by a tournament: [`calu_chunks_source`]
@@ -724,11 +735,11 @@ pub(crate) fn calu_plan(ctx: &crate::Context, m: usize, w: usize) -> Option<Fact
 /// of every row in parallel. Three launches whose workgroups all work, where the panel kernel has
 /// one workgroup stream the whole panel for every column. [`calu_plan`] says where the device can
 /// hold a chunk and how the rows are cut.
-fn calu_run(a: &Array<f32>, d: Dims, plan: FactorParams, op: &'static str, loc: &'static Location<'static>) -> Lu {
+fn calu_run(a: &Array<f32>, d: Dims, plan: CaluPlan, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let ctx = a.context();
     let perm_shape = Shape::from([d.rows, 1, 1]);
     let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
-    let (chunks, chunk_rows, rows, rows2, wp) = (plan.chunks as usize, plan.chunk_rows as usize, plan.rows as usize, plan.rows2 as usize, plan.wp as usize);
+    let CaluPlan { chunks, chunk_rows, rows, rows2, wp } = plan;
     let params = CaluParams { m: d.rows as u32, w: d.cols as u32, g: chunks as u32, rc: chunk_rows as u32 };
     let (mut win, mut f, mut perm) = match (Array::<u32>::alloc(ctx, Shape::from([chunks * d.cols])), Array::<f32>::alloc(ctx, a.shape()), Array::<u32>::alloc(ctx, perm_shape)) {
         (Ok(w), Ok(f), Ok(p)) => (w, f, p),
@@ -939,9 +950,10 @@ pub(crate) fn leaf_width(m: usize, batch: usize) -> usize {
 }
 
 /// Factors every `[w, m, batch]` matrix of `a` (`m >= w`) with the leaf strategy `id` chose.
-fn leaf(id: StrategyId, plan: FactorParams, a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Lu {
+fn leaf(id: StrategyId, a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let ctx = a.context();
     if id == StrategyId::LU_CALU_SINGLE || id == StrategyId::LU_CALU_TOURNAMENT {
+        let plan = calu_plan(ctx, d.rows, d.cols).expect("the tournament fit this panel");
         return calu_run(a, d, plan, op, loc);
     }
     let perm_shape = Shape::from([d.rows, 1, d.batch]);
@@ -955,7 +967,7 @@ fn leaf(id: StrategyId, plan: FactorParams, a: &Array<f32>, d: Dims, op: &'stati
     let result = if id == StrategyId::LU_SMALL {
         launch(ctx, "lu_small", "lu_small", small_source, per_matrix(ctx, d.batch), &args)
     } else {
-        let threads = plan.threads as usize;
+        let threads = panel_threads(ctx, d.rows);
         launch(ctx, &format!("lu_panel/{threads}/{}", fence(ctx).len()), "lu_panel", || panel_source(fence(ctx), threads), per_matrix(ctx, d.batch), &args)
     };
     match result {
@@ -969,11 +981,10 @@ fn leaf(id: StrategyId, plan: FactorParams, a: &Array<f32>, d: Dims, op: &'stati
 fn node(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let ctx = a.context();
     let boundary = boundary_of(FactorKind::Lu, op, loc, d, 0);
-    let (id, plan) = first_candidate_in(lu_stage(), ctx, &boundary).expect("an LU always fits (the recursion at the latest)");
-    note_in(ctx, &boundary, lu_stage(), id, &plan, &[]);
-    let Chosen::Factor(plan) = plan else { unreachable!("a factor strategy runs with factor parameters") };
+    let (id, params) = first_candidate_in(lu_stage(), ctx, &boundary).expect("an LU always fits (the recursion at the latest)");
+    note_in(ctx, &boundary, lu_stage(), id, &params, &[]);
     if id != StrategyId::LU_RECURSIVE {
-        return leaf(id, plan, a, d, op, loc);
+        return leaf(id, a, d, op, loc);
     }
     if d.batch > 1 {
         let parts: Vec<Lu> = (0..d.batch).map(|i| node(&nth(a, i), Dims { batch: 1, ..d }, op, loc)).collect();

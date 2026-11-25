@@ -268,31 +268,15 @@ pub(crate) struct FactorAttrs {
     pub(crate) vectors: bool,
 }
 
-/// What a factorisation strategy runs with (the fields a kind does not use are 0).
+/// What a factorisation strategy runs with: what the Decision label shows. The geometry (the tournament's chunks, the TSQR blocks, the
+/// look-back kernel's columns) is recomputed by the op from the same pure functions `fits` used, so that a selection copies two bytes
+/// where the small paths (one workgroup per matrix) are measured in a few thousand host instructions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct FactorParams {
-    /// LU panel invocations; Cholesky leaf rows.
-    pub(crate) threads: u32,
-    /// CALU: chunks of rows, rows of a chunk, workgroup rows of the chunk kernels and of the final one, panel columns rounded to 8.
-    pub(crate) chunks: u32,
-    pub(crate) chunk_rows: u32,
-    pub(crate) rows: u32,
-    pub(crate) rows2: u32,
-    pub(crate) wp: u32,
-    /// Cholesky and triangular solves: the block of columns (`nb`) and the columns of an outer step (`wide`).
-    pub(crate) nb: u32,
-    pub(crate) wide: u32,
-    /// Triangular solve: columns per workgroup of the look-back kernel, padded columns of the blocked one, inverted diagonal blocks.
-    pub(crate) kc: u32,
-    pub(crate) kp: u32,
-    pub(crate) inverse: bool,
-    /// TSQR: groups of 32 rows, rows of a block, blocks.
-    pub(crate) groups: u32,
-    pub(crate) bs: u32,
-    pub(crate) k: u32,
+    /// The block of columns of the blocked Cholesky and triangular solves (`LUMA_CHOL_NB`); 0 for every other strategy.
+    pub(crate) nb: u16,
 }
 
 impl FactorParams {
-    pub(crate) const NONE: FactorParams =
-        FactorParams { threads: 0, chunks: 0, chunk_rows: 0, rows: 0, rows2: 0, wp: 0, nb: 0, wide: 0, kc: 0, kp: 0, inverse: false, groups: 0, bs: 0, k: 0 };
+    pub(crate) const NONE: FactorParams = FactorParams { nb: 0 };
 }

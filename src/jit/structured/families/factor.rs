@@ -125,14 +125,15 @@ fn shape(subject: &Subject<'_>) -> (usize, usize, usize, usize, FactorAttrs) {
     }
 }
 
+#[inline]
 fn some(params: FactorParams) -> Option<Params> {
     Some(Params::Factor(params))
 }
 
 // -- LU --
 
-/// The tournament panel of `leaf`: one matrix of more than 64 rows whose columns fit a leaf and a tournament, in one chunk.
-fn calu(subject: &Subject<'_>, ctx: &Context) -> Option<FactorParams> {
+/// The tournament panel of `leaf`: one matrix of more than 64 rows whose columns fit a leaf and a tournament.
+fn calu(subject: &Subject<'_>, ctx: &Context) -> Option<lu::CaluPlan> {
     let (rows, cols, batch, _, a) = shape(subject);
     if a.kind != FactorKind::Lu || batch != 1 || rows <= lu::SMALL || cols > lu::leaf_width(rows, batch) {
         return None;
@@ -140,12 +141,14 @@ fn calu(subject: &Subject<'_>, ctx: &Context) -> Option<FactorParams> {
     lu::calu_plan(ctx, rows, cols)
 }
 
+/// One chunk of rows: pivoted exactly as partial pivoting does.
 fn fits_lu_calu_single(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
-    calu(subject, ctx).filter(|plan| plan.chunks == 1).and_then(some)
+    calu(subject, ctx).filter(|plan| plan.chunks == 1).map(|_| Params::Factor(FactorParams::NONE))
 }
 
+/// Several chunks, which play off their winners.
 fn fits_lu_calu_tournament(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
-    calu(subject, ctx).filter(|plan| plan.chunks > 1).and_then(some)
+    calu(subject, ctx).filter(|plan| plan.chunks > 1).map(|_| Params::Factor(FactorParams::NONE))
 }
 
 /// `rows <= 64` and the columns fit a leaf.
@@ -155,9 +158,9 @@ fn fits_lu_small(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<
 }
 
 /// `rows > 64`, the columns fit a leaf (the tournament is tried first, by table order).
-fn fits_lu_panel(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+fn fits_lu_panel(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<Params> {
     let (rows, cols, batch, _, a) = shape(subject);
-    (a.kind == FactorKind::Lu && rows > lu::SMALL && cols <= lu::leaf_width(rows, batch)).then(|| Params::Factor(FactorParams { threads: lu::panel_threads(ctx, rows) as u32, ..FactorParams::NONE }))
+    (a.kind == FactorKind::Lu && rows > lu::SMALL && cols <= lu::leaf_width(rows, batch)).then_some(Params::Factor(FactorParams::NONE))
 }
 
 /// More columns than a leaf takes.
@@ -171,8 +174,7 @@ fn fits_lu_recursive(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Opt
 /// `rows <= chol::leaf(ctx)`.
 fn fits_chol_small(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let (rows, _, _, _, a) = shape(subject);
-    let leaf = chol::leaf(ctx);
-    (a.kind == FactorKind::Cholesky && rows <= leaf).then_some(Params::Factor(FactorParams { threads: leaf as u32, ..FactorParams::NONE }))
+    (a.kind == FactorKind::Cholesky && rows <= chol::leaf(ctx)).then_some(Params::Factor(FactorParams::NONE))
 }
 
 /// `rows > chol::leaf(ctx)`; the block of columns (`LUMA_CHOL_NB`) and the columns of an outer step (`LUMA_CHOL_WIDE`) are parameters.
@@ -181,8 +183,7 @@ fn fits_chol_blocked(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> O
     if a.kind != FactorKind::Cholesky || rows <= chol::leaf(ctx) {
         return None;
     }
-    let nb = tri::block_size(ctx);
-    some(FactorParams { nb: nb as u32, wide: chol::wide(nb) as u32, ..FactorParams::NONE })
+    some(FactorParams { nb: tri::block_size(ctx) as u16 })
 }
 
 // -- QR --
@@ -193,8 +194,7 @@ fn fits_qr_tsqr_panel(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> 
     if a.kind != FactorKind::Qr || batch != 1 || cols > crate::dense::qr::PANEL {
         return None;
     }
-    let plan = tsqr::choose(ctx, rows, cols)?;
-    some(FactorParams { groups: plan.groups as u32, bs: plan.bs as u32, k: plan.k as u32, ..FactorParams::NONE })
+    tsqr::choose(ctx, rows, cols).map(|_| Params::Factor(FactorParams::NONE))
 }
 
 /// `cols <= (batch > 1 || rows <= 64 ? 32 : panel_width())`.
@@ -222,17 +222,16 @@ fn fits_tri_trsv(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
     if a.kind != FactorKind::SolveTriangular || !trsv::applies(ctx, rows, k, batch) {
         return None;
     }
-    let (kc, inverse) = trsv::plan(rows, k, a.inverse);
-    some(FactorParams { kc: kc as u32, inverse, ..FactorParams::NONE })
+    Some(Params::Factor(FactorParams::NONE))
 }
 
-/// The block of rows (`LUMA_CHOL_NB`) and the right-hand-side columns padded to four where there are few.
+/// The block of rows (`LUMA_CHOL_NB`).
 fn fits_tri_blocked(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
-    let (_, _, _, k, a) = shape(subject);
+    let (_, _, _, _, a) = shape(subject);
     if a.kind != FactorKind::SolveTriangular {
         return None;
     }
-    some(FactorParams { nb: tri::block_size(ctx) as u32, kp: if k < 32 { k.next_multiple_of(4) as u32 } else { k as u32 }, ..FactorParams::NONE })
+    some(FactorParams { nb: tri::block_size(ctx) as u16 })
 }
 
 // -- SVD and eigh --
@@ -243,9 +242,7 @@ fn small(subject: &Subject<'_>, ctx: &Context, kind: FactorKind) -> Option<Param
     if a.kind != kind {
         return None;
     }
-    let plan = svd::plan(ctx, if kind == FactorKind::Svd { Kind::Svd } else { Kind::Eigh }, a.vectors, rows, cols)?;
-    let _ = plan;
-    some(FactorParams::NONE)
+    svd::plan(ctx, if kind == FactorKind::Svd { Kind::Svd } else { Kind::Eigh }, a.vectors, rows, cols).map(|_| Params::Factor(FactorParams::NONE))
 }
 
 fn fits_svd_small(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
