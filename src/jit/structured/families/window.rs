@@ -58,19 +58,19 @@ fn fits_separable_extremum(subject: &Subject<'_>, _: &Context, _: &Residencies) 
 /// A median of at most `MEDIAN_REGISTERS` cells: the unrolled insertion selection.
 fn fits_median_registers(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let a = attrs(subject);
-    if a.stage != WindowStage::Plan || a.op != Op::Median || cells(&a) > MEDIAN_REGISTERS {
+    if a.stage != WindowStage::Plan || a.op != Op::Median || cells(a) > MEDIAN_REGISTERS {
         return None;
     }
-    plan(&a, ctx)
+    plan(a, ctx)
 }
 
 /// A median of more cells: bit by bit from workgroup memory.
 fn fits_median_bitwise(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let a = attrs(subject);
-    if a.stage != WindowStage::Plan || a.op != Op::Median || cells(&a) <= MEDIAN_REGISTERS {
+    if a.stage != WindowStage::Plan || a.op != Op::Median || cells(a) <= MEDIAN_REGISTERS {
         return None;
     }
-    plan(&a, ctx)
+    plan(a, ctx)
 }
 
 /// Every window kernel, unless no candidate fits workgroup memory (`Unsupported`, as before).
@@ -79,5 +79,5 @@ fn fits_tiled(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<P
     if a.stage != WindowStage::Plan {
         return None;
     }
-    plan(&a, ctx)
+    plan(a, ctx)
 }

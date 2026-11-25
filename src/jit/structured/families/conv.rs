@@ -79,7 +79,7 @@ fn fits_fft_single(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Optio
     if a.stage != ConvStage::Fft {
         return None;
     }
-    let (log_n, blocks) = overlap(&a);
+    let (log_n, blocks) = overlap(a);
     blocks.is_none().then_some(Params::Conv(ConvParams { log_n, ..ConvParams::NONE }))
 }
 
@@ -89,7 +89,7 @@ fn fits_fft_blocked(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Opti
     if a.stage != ConvStage::Fft {
         return None;
     }
-    let (log_n, blocks) = overlap(&a);
+    let (log_n, blocks) = overlap(a);
     blocks.map(|log_b| Params::Conv(ConvParams { log_n, log_b, ..ConvParams::NONE }))
 }
 
