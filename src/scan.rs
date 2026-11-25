@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use luma_core::Buffer;
 
-use crate::jit::structured::boundary::ScanAttrs;
+use crate::jit::structured::boundary::{ScanAttrs, ScanOperand};
 use crate::jit::structured::emit::Emit;
 use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 
@@ -183,7 +183,7 @@ impl Pass {
         matches!(self, Pass::Rows { .. } | Pass::Warp { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments)
     }
 
-    fn seeded(self) -> bool {
+    pub(crate) fn seeded(self) -> bool {
         matches!(self, Pass::Walk | Pass::ChunkScan { seeded: true })
     }
 }
@@ -206,6 +206,9 @@ pub(crate) struct AxisPass {
     /// instead of `out[b * lines + l]`, so that the next pass is a contiguous reduction of
     /// lines of `nb` cells (see [`line_major`]).
     pub(crate) line_major: bool,
+    /// A scan, not a reduction: `pass` is one of the scan passes of [`Lines::scan`], reading its operand through `load` (the fused
+    /// first read of a `cumsum`, see [`scan_body`]); `ops` is then the one sum that stands for the operator.
+    pub(crate) scan: bool,
 }
 
 /// Whether the `Fold` of `nb` blocks per line writes line-major partial results: when one
@@ -220,6 +223,9 @@ pub(crate) const AXIS_PARAMS: &str = "n: u32, stride: u32, lines: u32, nb: u32, 
 impl AxisPass {
     /// The profile label of the kernel.
     pub(crate) fn label(self) -> &'static str {
+        if self.scan {
+            return self.pass.label();
+        }
         let arg = self.ops.as_slice().first().is_some_and(|op| op.is_arg());
         match (self.pass, arg) {
             (Pass::Fold, false) => "ReduceFold",
@@ -240,6 +246,11 @@ impl AxisPass {
     pub(crate) fn output_bindings(self, ty: &str) -> String {
         if self.pass == Pass::Segments {
             return crate::segments::tile_outputs(ty);
+        }
+        if let (true, Pass::Warp { vec }) = (self.scan, self.pass)
+            && vec > 1
+        {
+            return format!("@group(1) @binding(0) var<storage, read_write> out: array<vec{vec}<{ty}>>;\n");
         }
         let ty = if self.ops.as_slice().first().is_some_and(|op| op.is_arg()) { "u32" } else { ty };
         let mut src = String::new();
@@ -271,6 +282,9 @@ fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
 /// array reductions (`ReduceElem::combine`), so a NaN is handled as `Array::min` and `max` do;
 /// `SumSquares` squares the cells it reads.
 pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) -> String {
+    if pass.scan {
+        return fused_scan_body(pass.pass, ty, load, workgroup);
+    }
     if pass.pass == Pass::Segments {
         return crate::segments::tile_body(ty, pass.ops.as_slice()[0], load);
     }
@@ -451,6 +465,22 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
     src
 }
 
+/// The kernel of a scan `pass` of `+` whose operand is computed in it: `load(q)` is cell `q` (see [`reduce_body`], whose fused
+/// kernels this is one of). A warp pass of vectors loads `vec` consecutive cells.
+fn fused_scan_body(pass: Pass, ty: &str, load: &str, workgroup: u32) -> String {
+    let mut src = String::new();
+    let mut load = load.to_owned();
+    if let Pass::Warp { vec } = pass
+        && vec > 1
+    {
+        let cells: Vec<String> = (0..vec).map(|c| format!("{load}(q * {vec}u + {c}u)")).collect();
+        let _ = writeln!(src, "fn luma_scan_vec(q: u32) -> vec{vec}<{ty}> {{ return vec{vec}<{ty}>({}); }}", cells.join(", "));
+        load = "luma_scan_vec".to_owned();
+    }
+    src.push_str(&scan_body(pass, ty, &format!("fn op(x0: {ty}, x1: {ty}) -> {ty} {{ return x0 + x1; }}\n"), &load, workgroup));
+    src
+}
+
 fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
     let mut src = String::from("struct Params { n: u32, stride: u32, lines: u32, nb: u32, k: u32, ");
     for (k, scalar) in op.scalar_tys.iter().enumerate() {
@@ -473,14 +503,24 @@ fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
         2
     };
     let _ = writeln!(src, "@group(1) @binding({uniform}) var<uniform> p: Params;");
-    src.push_str(&op.source);
+    let _ = writeln!(src, "fn lda(q: u32) -> {elem} {{ return a[q]; }}");
+    src.push_str(&scan_body(pass, ty, &op.source, "lda", workgroup));
+    src
+}
+
+/// The operator `op`, `line_base` and the entry point of a scan `pass`, with the cells of the operand from `{load}(q)` (a vector of
+/// `vec` cells for [`Pass::Warp`]). Needs `Params` (see [`AXIS_PARAMS`]) as `p`, the output `out` (an array of vectors for a warp
+/// pass of `vec > 1`), and `pre` (seeded passes) or `st` (the look-back) as the kernel's reads. The buffer kernels
+/// of [`Lines`] and the fused ones of `jit` (a pending operand of a `cumsum`, `Tail::AxisReduce` with `scan` set) both generate with it.
+pub(crate) fn scan_body(pass: Pass, ty: &str, op_source: &str, load: &str, workgroup: u32) -> String {
+    let mut src = String::from(op_source);
     src.push_str("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
     if let Pass::Warp { vec } = pass {
-        src.push_str(&warp_source(vec, ty));
+        src.push_str(&warp_source(vec, ty, load));
         return src;
     }
     if pass.per_workgroup() {
-        src.push_str(&chunk_source(pass, ty));
+        src.push_str(&chunk_source(pass, ty, load));
         return src;
     }
     let _ = writeln!(
@@ -493,11 +533,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         Pass::Seq => {
             "    if (i >= p.lines) { return; }
     let base = line_base(i);
-    var acc = a[base];
+    var acc = __LOAD__(base);
     out[base] = acc;
     for (var s = 1u; s < p.n; s++) {
         let q = base + s * p.stride;
-        acc = op(acc, a[q]);
+        acc = op(acc, __LOAD__(q));
         out[q] = acc;
     }
 }
@@ -510,8 +550,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let base = line_base(l);
     let s0 = b * p.k;
     let s1 = min(p.n, s0 + p.k);
-    var acc = a[base + s0 * p.stride];
-    for (var s = s0 + 1u; s < s1; s++) { acc = op(acc, a[base + s * p.stride]); }
+    var acc = __LOAD__(base + s0 * p.stride);
+    for (var s = s0 + 1u; s < s1; s++) { acc = op(acc, __LOAD__(base + s * p.stride)); }
     out[i] = acc;
 }
 "
@@ -528,7 +568,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (b > 0u) { acc = pre[i - p.lines]; have = true; }
     for (var s = s0; s < s1; s++) {
         let q = base + s * p.stride;
-        let v = a[q];
+        let v = __LOAD__(q);
         if (have) { acc = op(acc, v); } else { acc = v; have = true; }
         out[q] = acc;
     }
@@ -537,7 +577,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         Pass::Rows { .. } | Pass::Warp { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments => unreachable!("workgroup passes return above"),
     };
-    src.push_str(&main.replace("__T__", ty));
+    src.push_str(&main.replace("__T__", ty).replace("__LOAD__", load));
     src
 }
 
@@ -549,12 +589,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// (`carry`, which the first step of a line does not have: its first invocation has no prefix).
 /// Lanes past the end of the line load zeros and write nothing: they only sit above the lanes
 /// that matter, which no lane reads.
-fn warp_source(vec: u32, ty: &str) -> String {
+fn warp_source(vec: u32, ty: &str, load: &str) -> String {
     let vt = if vec > 1 { format!("vec{vec}<{ty}>") } else { ty.to_owned() };
     let comps: Vec<String> = if vec > 1 { ["x", "y", "z", "w"][..vec as usize].iter().map(|c| format!("v.{c}")).collect() } else { vec!["v".to_owned()] };
     let last = vec as usize - 1;
     let mut src = String::new();
-    let _ = writeln!(src, "fn ld(vbase: u32, nv: u32, lane: u32, s: u32) -> {vt} {{ let q = s * 32u + lane; if (q < nv) {{ return a[vbase + q]; }} return {vt}(); }}");
+    let _ = writeln!(src, "fn ld(vbase: u32, nv: u32, lane: u32, s: u32) -> {vt} {{ let q = s * 32u + lane; if (q < nv) {{ return {load}(vbase + q); }} return {vt}(); }}");
     // One step: `step` is the expression of its number, `cur` the vector the invocation loaded.
     let process = |step: &str, cur: &str| -> String {
         let mut s = String::new();
@@ -627,7 +667,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 /// inclusive prefix themselves (the bits of the element) are words `1 + lines * nb + ticket` and
 /// `1 + 2 * lines * nb + ticket`. A value is stored, fenced (`storageBarrier`) and only then the
 /// status; a reader loads the status, fences and only then the value.
-fn chunk_source(pass: Pass, ty: &str) -> String {
+fn chunk_source(pass: Pass, ty: &str, load: &str) -> String {
     let w = WORKGROUP;
     let mut src = String::new();
     let head = "@compute @workgroup_size(__W__)
@@ -652,7 +692,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
     let cells = cnt * p.n;
     for (var j = t; j < cells; j += {r}u) {{
         let r = j / p.n;
-        tile[r * ld + (j - r * p.n)] = a[base + j];
+        tile[r * ld + (j - r * p.n)] = {load}(base + j);
     }}
     workgroupBarrier();
     var acc: {ty};
@@ -702,10 +742,10 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         // The loads of an invocation do not depend on one another: all of them are issued before
         // the first is waited for.
         for i in 0..k {
-            let _ = writeln!(src, "    {{ let j = {}u + t; if (j < len) {{ tile[ix(j)] = a[base + s0 + j]; }} }}", i * w);
+            let _ = writeln!(src, "    {{ let j = {}u + t; if (j < len) {{ tile[ix(j)] = {load}(base + s0 + j); }} }}", i * w);
         }
     } else {
-        let _ = writeln!(src, "    for (var j = t; j < len; j += {w}u) {{ tile[ix(j)] = a[base + s0 + j]; }}");
+        let _ = writeln!(src, "    for (var j = t; j < len; j += {w}u) {{ tile[ix(j)] = {load}(base + s0 + j); }}");
     }
     src.push_str(&format!(
         "    workgroupBarrier();
@@ -905,7 +945,7 @@ struct Cells {
 
 /// What the first pass of a reduction reads its cells from.
 #[derive(Clone, Copy)]
-enum Input<'b> {
+pub(crate) enum Input<'b> {
     Buffer(Bound<'b>),
     /// A lazy expression: computed inside the pass when it can be (see [`jit::axis_reduce`]),
     /// else evaluated into a buffer first.
@@ -1088,7 +1128,7 @@ impl<'a> Lines<'a> {
     /// [`Pass::ChunkLookback`]) in one pass over `input` (see there): a launch that zeroes the
     /// counter and the statuses of the chunks, then the scan. Both are launches, so a recording
     /// or a graph of the caller replays them together and every replay starts from zero.
-    fn lookback(&mut self, n: u32, lines: u32, out: Bound<'_>, input: Bound<'_>) -> Result<()> {
+    fn lookback(&mut self, n: u32, lines: u32, out: Bound<'_>, input: Input<'_>) -> Outcome<()> {
         let nb = n.div_ceil(LOOKBACK_CHUNK);
         // `k`, the chunk size of the other passes, is the window of the look-back here.
         let geometry = [n, 1, lines, nb, lookback_window()];
@@ -1097,7 +1137,32 @@ impl<'a> Lines<'a> {
         let zeroed = u32::try_from(1 + chunks).map_err(|_| LumaError::InvalidShape("too many chunks".into()))?;
         let zero = self.ctx.builtin(Builtin::Fill, "u32")?;
         launch_1d(self.ctx, &zero, zeroed, &[RawArg::write(&status, u64::from(zeroed) * 4), RawArg::Uniform(bytemuck::bytes_of(&0u32))])?;
-        self.launch(Pass::ChunkLookback, geometry, out, input, Some(Bound { buffer: &status, bytes }))
+        self.launch_scan(Pass::ChunkLookback, geometry, out, input, Some(Bound { buffer: &status, bytes }))
+    }
+
+    /// One scan pass over `input` into `out`: a buffer is read as is; a pending operand is computed in the kernel (a fused first
+    /// read, see [`scan_body`]) unless it cannot be (see [`jit::axis_reduce`]), when it is evaluated first. `pre` is the prefix of the
+    /// blocks before (seeded passes) or the statuses of a look-back. Only `+` of a pending operand is fused: that is the only
+    /// operator the fused kernels know, and the only one `run_scan` leaves pending.
+    fn launch_scan(&mut self, pass: Pass, geometry: [u32; 5], out: Bound<'_>, input: Input<'_>, pre: Option<Bound<'_>>) -> Outcome<()> {
+        let evaluated;
+        let input = match input {
+            Input::Buffer(input) => input,
+            Input::Plan(_) => unreachable!("scans have no planned operands"),
+            Input::Pending(node) => {
+                let (workgroups, size) = self.grid(pass, geometry)?;
+                let scan = AxisPass { pass, ops: ReduceList::new(&[ReduceOp::Sum]), partial: false, split: false, line_major: false, scan: true };
+                let writes = [RawArg::write(out.buffer, out.bytes)];
+                let reads: Vec<RawArg<'_>> = pre.iter().map(|pre| if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) }).collect();
+                if jit::axis_reduce(&mut self.emit, node, scan, geometry, workgroups, size, &writes, &reads)? {
+                    return Ok(());
+                }
+                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+                evaluated = storage.pin_single_read()?;
+                Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() }
+            }
+        };
+        Ok(self.launch(pass, geometry, out, input, pre)?)
     }
 
     /// One reducing pass of `ops` over `input` into `outs`: a buffer for every op if there are
@@ -1111,7 +1176,7 @@ impl<'a> Lines<'a> {
         outs: &[Bound<'_>],
         input: Input<'_>,
     ) -> Outcome<()> {
-        let pass = AxisPass { pass, ops, partial, split: outs.len() > 1, line_major: line_major(pass, geometry[3]) };
+        let pass = AxisPass { pass, ops, partial, split: outs.len() > 1, line_major: line_major(pass, geometry[3]), scan: false };
         let (workgroups, size) = self.grid(pass.pass, geometry)?;
         let writes: Vec<RawArg<'_>> = outs.iter().map(|out| RawArg::write(out.buffer, out.bytes)).collect();
         let evaluated;
@@ -1143,41 +1208,63 @@ impl<'a> Lines<'a> {
         Ok((self.scratch.take(bytes)?, bytes))
     }
 
-    /// The inclusive scan of every line of `input` into `out`. The strategy comes from the registry (`families::scan`): the
-    /// order of its table is the order of the conditions this function had.
+    /// The inclusive scan of every line of `input` into `out`.
     #[track_caller]
     pub(crate) fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
-        let boundary = Boundary::new(FamilyTag::Scan, "scan", Location::caller(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: self.grouping_free(), by_key: false }));
+        self.scan_input(Input::Buffer(input), n, stride, lines, out).map_err(Failure::into_error)
+    }
+
+    /// [`Lines::scan`] of an operand that may be pending (`+` only, see [`Lines::launch_scan`]). The strategy comes from the registry
+    /// (`families::scan`): the order of its table is the order of the conditions this function had. A pending operand is computed
+    /// in the kernels that read it when the strategy takes a prologue (`Strategy::prologue`) and recomputing it beats storing it.
+    #[track_caller]
+    pub(crate) fn scan_input(&mut self, input: Input<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Outcome<()> {
+        let operand = match input {
+            Input::Pending(node) if crate::jit::worth_storing(node) => ScanOperand::Costly,
+            Input::Pending(_) => ScanOperand::Cheap,
+            Input::Buffer(_) | Input::Plan(_) => ScanOperand::Buffer,
+        };
+        let boundary = Boundary::new(FamilyTag::Scan, "scan", Location::caller(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: self.grouping_free(), by_key: false, operand }));
         let (id, params) = candidates(self.ctx, &boundary).next().expect("a scan strategy always fits");
         note(self.ctx, &boundary, id, &params, &[]);
         let Params::Scan(params) = params else { unreachable!("a scan strategy runs with scan parameters") };
+        // The operand the kernels read: the pending expression where they compute it, else its buffer (evaluated once for all of them).
+        let evaluated;
+        let input = match input {
+            Input::Pending(node) if !params.fused => {
+                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+                evaluated = storage.pin_single_read()?;
+                Input::Buffer(Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() })
+            }
+            other => other,
+        };
         match id {
-            StrategyId::SCAN_ROWS => self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None),
-            StrategyId::SCAN_WARP => self.launch(Pass::Warp { vec: params.vec }, [n, 1, lines, 1, n], out, input, None),
+            StrategyId::SCAN_ROWS => self.launch_scan(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None),
+            StrategyId::SCAN_WARP => self.launch_scan(Pass::Warp { vec: params.vec }, [n, 1, lines, 1, n], out, input, None),
             StrategyId::SCAN_LOOKBACK => self.lookback(n, lines, out, input),
-            StrategyId::SCAN_CHUNK_SINGLE => self.launch(Pass::ChunkScan { seeded: false }, [n, 1, lines, 1, SCAN_CHUNK], out, input, None),
+            StrategyId::SCAN_CHUNK_SINGLE => self.launch_scan(Pass::ChunkScan { seeded: false }, [n, 1, lines, 1, SCAN_CHUNK], out, input, None),
             StrategyId::SCAN_CHUNK_THREE_PASS => {
                 let nb = params.nb;
                 let geometry = [n, 1, lines, nb, SCAN_CHUNK];
                 let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
                 let totals = Bound { buffer: &totals, bytes };
-                self.launch(Pass::ChunkFold, geometry, totals, input, None)?;
+                self.launch_scan(Pass::ChunkFold, geometry, totals, input, None)?;
                 let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
                 let prefix = Bound { buffer: &prefix, bytes };
-                self.scan(totals, nb, 1, lines, prefix)?;
-                self.launch(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix))
+                self.scan_input(Input::Buffer(totals), nb, 1, lines, prefix)?;
+                self.launch_scan(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix))
             }
-            StrategyId::SCAN_SEQ => self.launch(Pass::Seq, [n, stride, lines, 1, n], out, input, None),
+            StrategyId::SCAN_SEQ => self.launch_scan(Pass::Seq, [n, stride, lines, 1, n], out, input, None),
             StrategyId::SCAN_FOLD_WALK => {
                 let (nb, k) = (params.nb, params.k);
                 let geometry = [n, stride, lines, nb, k];
                 let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
                 let totals = Bound { buffer: &totals, bytes };
-                self.launch(Pass::Fold, geometry, totals, input, None)?;
+                self.launch_scan(Pass::Fold, geometry, totals, input, None)?;
                 let (prefix, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
                 let prefix = Bound { buffer: &prefix, bytes };
-                self.scan(totals, nb, lines, lines, prefix)?;
-                self.launch(Pass::Walk, geometry, out, input, Some(prefix))
+                self.scan_input(Input::Buffer(totals), nb, lines, lines, prefix)?;
+                self.launch_scan(Pass::Walk, geometry, out, input, Some(prefix))
             }
             other => unreachable!("{other:?} is not a strategy of a scan along an axis"),
         }
@@ -1260,8 +1347,8 @@ impl<T: ScalarType> Array<T> {
     /// Runs the scan of `op` along `axis`; `sum` if `op` is `+` (see [`Array::sum_operator`]).
     fn run_scan(&self, axis: usize, op: &ScanOp<'_, T>, sum: bool) -> Outcome<Array<T>> {
         let ctx = self.context();
-        let (pin, bytes) = self.ready()?;
         if ElemTy::of::<T>()?.layout() != ElemLayout::plain(4) {
+            self.ready()?;
             return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ElemTy::of::<T>()?.display())).into());
         }
         let shape = self.shape();
@@ -1274,9 +1361,19 @@ impl<T: ScalarType> Array<T> {
         let out_pin = out_storage.pin_single()?;
         let (n, stride, lines) = self.line_geometry(axis)?;
         let mut run = Lines::new(ctx, &operator, T::wgsl_type());
-        let input = Bound { buffer: pin.buffer(), bytes };
+        // The sum of a pending operand computes it in the scan's own kernels (a mask or a cast feeding a `cumsum` is never written);
+        // any other operator needs the operand in a buffer.
+        let ready;
+        let input = match self.pending() {
+            Some(node) if sum => Input::Pending(node),
+            _ => {
+                let (pin, bytes) = self.ready()?;
+                ready = pin;
+                Input::Buffer(Bound { buffer: ready.buffer(), bytes })
+            }
+        };
         let target = Bound { buffer: out_pin.buffer(), bytes: out.byte_len() };
-        run.scan(input, n, stride, lines, target)?;
+        run.scan_input(input, n, stride, lines, target)?;
         drop(run);
         crate::jit::check_finite(ctx, &out_storage, ElemTy::of::<T>()?)?;
         Ok(out)
@@ -1887,6 +1984,51 @@ mod tests {
         }
         let short = Array::<u32>::from_slice_on(&look, &words(CHUNK, 7), CHUNK).unwrap();
         assert_eq!(launches(&look, &short, &|x, y| x + y), 3, "one chunk");
+    }
+
+    /// The sum of a pending operand is computed in the scan's kernels (fold and scan of a line of several chunks, the look-back,
+    /// strided lines): the same bits as the scan of the evaluated operand, for integers and for floats whose grouping is fixed.
+    #[test]
+    fn a_pending_operand_scans_as_its_buffer_does() {
+        for lookback in [true, false] {
+            let ctx = cpu(lookback);
+            for (k, &len) in LENGTHS.iter().enumerate() {
+                let data = words(len, k as u64 + 11);
+                let x = Array::<u32>::from_slice_on(&ctx, &data, len).unwrap();
+                let got = (&x * 3u32 + 1u32).cumsum(0).to_vec().unwrap();
+                let mut run = 0u32;
+                let want: Vec<u32> = data
+                    .iter()
+                    .map(|&v| {
+                        run = run.wrapping_add(v.wrapping_mul(3).wrapping_add(1));
+                        run
+                    })
+                    .collect();
+                assert!(got == want, "u32, length {len}, look-back {lookback}: element {:?} differs", first_difference(&got, &want));
+
+                let data = floats(len, k as u64 + 1);
+                let (pending, other) = (Array::from_slice_on(&ctx, &data, len).unwrap(), Array::from_slice_on(&ctx, &data, len).unwrap());
+                let evaluated = &other * 0.5f32;
+                evaluated.eval().unwrap();
+                let (got, want) = ((&pending * 0.5f32).cumsum(0).to_vec().unwrap(), evaluated.cumsum(0).to_vec().unwrap());
+                assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "f32, length {len}, look-back {lookback}");
+            }
+            // Strided lines: one invocation each, and blocks with a fold.
+            for (n, lines) in [(40usize, 7usize), (3000, 5)] {
+                let data = words(n * lines, 5);
+                let x = Array::<u32>::from_slice_on(&ctx, &data, [lines, n]).unwrap();
+                let got = (&x + 7u32).cumsum(1).to_vec().unwrap();
+                let mut want = vec![0u32; n * lines];
+                for l in 0..lines {
+                    let mut run = 0u32;
+                    for s in 0..n {
+                        run = run.wrapping_add(data[l + lines * s].wrapping_add(7));
+                        want[l + lines * s] = run;
+                    }
+                }
+                assert!(got == want, "strided {n} x {lines}, look-back {lookback}");
+            }
+        }
     }
 
     /// A step that scans, traced once and replayed (`Array::iterate`): the zeroing of the status

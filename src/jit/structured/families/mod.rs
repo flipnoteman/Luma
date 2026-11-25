@@ -27,6 +27,12 @@ pub(super) const fn entry(id: StrategyId, name: &'static str, needs: Caps, split
     Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(id.1 as u16), baseline: true, group: id.1, prologue: false, epilogue: false, fits, cost: None, split, warm: no_warm, lower: None }
 }
 
+/// `strategy` taking a pending operand into its first read (`Strategy::prologue`).
+pub(super) const fn with_prologue(mut strategy: Strategy) -> Strategy {
+    strategy.prologue = true;
+    strategy
+}
+
 /// Baseline strategies are never warmed (they may block on their own compile, as before).
 fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
     Ok(Warm { kernels: Vec::new() })

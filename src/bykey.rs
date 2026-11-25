@@ -30,7 +30,7 @@ use crate::builtin::BinOp;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu_type::{ElemLayout, Numeric, ScalarType};
-use crate::jit::structured::boundary::ScanAttrs;
+use crate::jit::structured::boundary::{ScanAttrs, ScanOperand};
 use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params};
 use crate::jit::{ElemTy, Operator};
 use crate::ops::{fold_workgroups, Outcome, Rhs};
@@ -434,7 +434,7 @@ impl<T: Numeric> Array<T> {
         let out_pin = out_storage.pin_single()?;
         let lines = u32::try_from(self.len() / n).map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
         let n32 = u32::try_from(n).map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
-        let boundary = Boundary::new(FamilyTag::Scan, "scan_by_key", Location::caller(), [n32, 1, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: false, by_key: true }));
+        let boundary = Boundary::new(FamilyTag::Scan, "scan_by_key", Location::caller(), [n32, 1, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: false, by_key: true, operand: ScanOperand::Buffer }));
         let (chosen, params) = candidates(ctx, &boundary).next().expect("a by-key scan strategy always fits");
         note(ctx, &boundary, chosen, &params, &[]);
         let nb = match params {

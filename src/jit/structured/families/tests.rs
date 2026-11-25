@@ -7,7 +7,7 @@ use std::panic::Location;
 use luma_core::BackendKind;
 
 use crate::context::{Context, ContextOptions};
-use crate::jit::structured::boundary::{dim, ScanAttrs, ScatterAttrs, ScatterOp, SortAttrs, SortParams, SortPayload, SortStage};
+use crate::jit::structured::boundary::{dim, ScanAttrs, ScanOperand, ScatterAttrs, ScatterOp, SortAttrs, SortParams, SortPayload, SortStage};
 use crate::jit::structured::strategy::{candidates, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::sort::{ballot_bytes, sweep_bytes, sweep_per_thread, WORKGROUP};
 use crate::scan::{strided_block, target_threads, LOOKBACK_CHUNK, SCAN_CHUNK, SHORT_LINE, WARP_MIN_LINES};
@@ -115,7 +115,7 @@ fn scatter_matches_the_legacy_conditions() {
 // -- Scan --
 
 fn scan_boundary(n: u32, stride: u32, lines: u32, grouping_free: bool, by_key: bool) -> Boundary<'static> {
-    Boundary::new(FamilyTag::Scan, "scan", here(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free, by_key }))
+    Boundary::new(FamilyTag::Scan, "scan", here(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free, by_key, operand: ScanOperand::Buffer }))
 }
 
 #[test]

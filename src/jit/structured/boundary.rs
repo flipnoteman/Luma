@@ -85,6 +85,19 @@ pub(crate) struct ScanAttrs {
     /// The operator groups however it likes (`u32`/`i32`, or an extremum): a look-back may take any earlier chunk's prefix.
     pub(crate) grouping_free: bool,
     pub(crate) by_key: bool,
+    /// What the scan reads: an evaluated buffer, or a pending expression (cheap to compute again, or worth storing).
+    pub(crate) operand: ScanOperand,
+}
+
+/// The operand of a scan, as far as the choice of its prologue needs to know.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ScanOperand {
+    Buffer,
+    /// A pending expression that costs less to compute in each kernel that reads it than to write and read back
+    /// (`jit::worth_storing` is false).
+    Cheap,
+    /// A pending expression that is worth storing: computed in the kernels only where one kernel reads it.
+    Costly,
 }
 
 /// What a scan runs with: `vec` words per load of a warp pass, `nb` chunks (blocks) per line, `k` cells per block.
@@ -93,10 +106,12 @@ pub(crate) struct ScanParams {
     pub(crate) vec: u32,
     pub(crate) nb: u32,
     pub(crate) k: u32,
+    /// The kernels compute a pending operand themselves (the strategy's prologue): `prologue=fused` in the Decision.
+    pub(crate) fused: bool,
 }
 
 impl ScanParams {
-    pub(crate) const NONE: ScanParams = ScanParams { vec: 0, nb: 1, k: 0 };
+    pub(crate) const NONE: ScanParams = ScanParams { vec: 0, nb: 1, k: 0, fused: false };
 }
 
 // -- Scatter --

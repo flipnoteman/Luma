@@ -62,6 +62,7 @@ mod profile_drain;
 mod quantile;
 mod records;
 mod scan;
+mod scan_prologue;
 mod scatter_add;
 mod search;
 mod segments;

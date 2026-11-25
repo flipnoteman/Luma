@@ -1994,6 +1994,7 @@ pub(crate) fn axis_plan(ctx: &crate::context::Context, operands: &[&Arc<Node>], 
         partial: false,
         split: false,
         line_major: false,
+        scan: false,
     };
     let fused = flatten_inner(&roots, Tail::AxisReduce(placeholder), &[]).ok()?;
     drop(roots);

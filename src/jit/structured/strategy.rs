@@ -244,6 +244,7 @@ impl Params {
                 "radix_count_scan" => "radix",
                 other => other,
             }),
+            Params::Scan(params) if params.fused => Cow::Owned(format!("{name} prologue=fused")),
             Params::Scan(_) | Params::Scatter(_) => Cow::Borrowed(name),
         }
     }

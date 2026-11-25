@@ -859,6 +859,18 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         }
     }
     if let Tail::AxisReduce(pass) = key.tail
+        && pass.scan
+    {
+        // A scan's other reads, after the inputs: the prefix of the blocks before (seeded passes) or the statuses of the chunks.
+        if pass.pass.seeded() {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> pre: array<{}>;", out_ty(key.instrs.len().saturating_sub(1)));
+            binding += 1;
+        } else if pass.pass == crate::scan::Pass::ChunkLookback {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read_write> st: array<atomic<u32>>;");
+            binding += 1;
+        }
+    }
+    if let Tail::AxisReduce(pass) = key.tail
         && pass.pass == crate::scan::Pass::Segments
     {
         // The offsets of the segments, after the inputs.

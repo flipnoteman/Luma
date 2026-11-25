@@ -46,6 +46,21 @@ pub fn run(h: &mut Harness) {
             h.case("scan/cumsum_u32", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || x.cumsum(0).eval().unwrap());
         }
         {
+            // The operand of a cumsum is an expression (a cast of a scaled value, as the mask of a compaction or the flags of a
+            // factorize): it is computed inside the scan's kernels, not written first.
+            let n: usize = if cpu { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 10_000_000) };
+            let data = values(n, 54, 0.0, 1.0);
+            let x = upload(h, &data, n);
+            let mut want = vec![0u32; n];
+            let mut run = 0u32;
+            for (w, &v) in want.iter_mut().zip(&data) {
+                run += (v * 4.0) as u32;
+                *w = run;
+            }
+            assert_eq!((&x * 4.0f32).to_u32().cumsum(0).to_vec().unwrap(), want, "scan/cumsum_fused");
+            h.case("scan/cumsum_fused", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || (&x * 4.0f32).to_u32().cumsum(0).eval().unwrap());
+        }
+        {
             let n = n.min(1 << 24);
             let data = values(n, 53, -1.0, 1.0);
             let x = upload(h, &data, n);
