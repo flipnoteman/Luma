@@ -954,6 +954,12 @@ fn note_miss(jit: &JitState) {
     }
 }
 
+/// Notes an evaluation that a followed tape replayed: to the cache it is a hit (the evaluation
+/// would have found its plan), so it ends a run of misses as a hit does.
+pub(super) fn note_replayed(jit: &JitState) {
+    lock(&jit.plans).misses = 0;
+}
+
 /// Runs `plan` over the leaves and scalars of `walk`.
 fn replay(ctx: &Context, plan: &Plan, walk: &Walk) -> Result<(), ()> {
     let class_words: Vec<u32> = walk.classes.iter().map(|&(_, bits)| bits as u32).collect();

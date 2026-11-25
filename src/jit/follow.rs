@@ -1518,6 +1518,7 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     match replayed {
         Ok(()) => {
             jit.plan_stats.hits.fetch_add(1, Ordering::Relaxed);
+            plancache::note_replayed(jit);
             jit.follow.stats.replayed.fetch_add(1, Ordering::Relaxed);
             Eval::Replayed
         }
