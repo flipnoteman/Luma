@@ -360,6 +360,11 @@ mod imp {
         /// Idle upload staging buffers, safe to write.
         uploads: Mutex<FreeUploads>,
         free_chunks: Mutex<Vec<Chunk>>,
+        /// Whether `armed_tag` names the next launch, which `Backend::time_next_launch` asked to time.
+        armed: AtomicBool,
+        armed_tag: AtomicU64,
+        /// GPU times of armed launches, pushed by the completion handlers and taken by `drain_launch_times`.
+        launch_times: Arc<Mutex<Vec<(u64, Duration)>>>,
         max_buffer_bytes: u64,
         batch: Mutex<Batch>,
         /// The process-wide device. Must stay the last field: it outlives everything of this backend.
@@ -584,6 +589,9 @@ mod imp {
                 mappable: Mutex::new(FreeUploads::new(shared.cap)),
                 uploads: Mutex::new(FreeUploads::new(shared.cap)),
                 free_chunks: Mutex::new(Vec::new()),
+                armed: AtomicBool::new(false),
+                armed_tag: AtomicU64::new(0),
+                launch_times: Arc::new(Mutex::new(Vec::new())),
                 max_buffer_bytes: shared.info.limits.max_buffer_bytes,
                 batch: Mutex::new(batch),
                 shared,
@@ -783,6 +791,12 @@ mod imp {
 
         /// Commits the pending command buffer, if there is one, and retires what it reads.
         fn commit_locked(&self, batch: &mut Batch) -> Option<MtlCommandBuffer> {
+            self.commit_timed(batch, None)
+        }
+
+        /// Commits the pending command buffer; with `timing`, its GPU time is reported under that
+        /// tag by the completion handler, which `drain_launch_times` reads without waiting.
+        fn commit_timed(&self, batch: &mut Batch, timing: Option<u64>) -> Option<MtlCommandBuffer> {
             Self::end_compute(batch);
             Self::end_blit(batch);
             batch.dispatches = 0;
@@ -790,9 +804,18 @@ mod imp {
             let cb = batch.cb.take()?;
             let seq = self.submitted.load(Ordering::Relaxed) + 1;
             let done = Arc::clone(&self.done);
+            let times = timing.map(|tag| (tag, Arc::clone(&self.launch_times)));
             let block = RcBlock::new(move |finished: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 // SAFETY: Metal passes the command buffer that completed, alive for the call.
                 let finished = unsafe { finished.as_ref() };
+                if let Some((tag, times)) = &times {
+                    if finished.status() != MTLCommandBufferStatus::Error {
+                        let seconds = finished.GPUEndTime() - finished.GPUStartTime();
+                        if seconds.is_finite() && seconds > 0.0 {
+                            lock(times).push((*tag, Duration::from_secs_f64(seconds)));
+                        }
+                    }
+                }
                 let error = (finished.status() == MTLCommandBufferStatus::Error).then(|| match finished.error() {
                     Some(error) => error.localizedDescription().to_string(),
                     None => "the command buffer failed without an error".to_owned(),
@@ -1159,19 +1182,29 @@ mod imp {
             let mut guard = self.batch()?;
             let batch = &mut *guard;
             let profiled = batch.profiler.is_some();
+            let timed = if self.armed.load(Ordering::Relaxed) && self.armed.swap(false, Ordering::Acquire) {
+                // A launch the profiler already times on its own is not timed twice.
+                (!profiled).then(|| self.armed_tag.load(Ordering::Relaxed))
+            } else {
+                None
+            };
             if matches!(dispatch, Dispatch::Direct(groups) if groups.contains(&0)) {
                 if let Some(samples) = &mut batch.profiler {
                     samples.push((Arc::clone(&kernel.label), None));
                 }
                 return Ok(batch.dispatches);
             }
-            if profiled {
+            if profiled || timed.is_some() {
                 // The launch gets a command buffer of its own, so that its GPU time is its own.
                 self.commit_locked(batch);
             }
             let encoder = self.compute_encoder(batch)?;
             // SAFETY: `encoder` lives in `batch.compute` for the duration of `encode_launch`.
             self.encode_launch(batch, unsafe { encoder.as_ref() }, kernel, native, dispatch, size, args)?;
+            if timed.is_some() {
+                self.commit_timed(batch, timed);
+                return Ok(0);
+            }
             if profiled {
                 let cb = self.commit_locked(batch);
                 if let Some(samples) = &mut batch.profiler {
@@ -1317,7 +1350,21 @@ mod imp {
             // Nothing caches buffers by identity, and command buffers retain what they use.
         }
 
+        fn can_time_launches(&self) -> bool {
+            true
+        }
+
+        fn time_next_launch(&self, tag: u64) {
+            self.armed_tag.store(tag, Ordering::Relaxed);
+            self.armed.store(true, Ordering::Release);
+        }
+
+        fn drain_launch_times(&self, out: &mut Vec<(u64, Duration)>) {
+            out.append(&mut lock(&self.launch_times));
+        }
+
         fn flush_batch(&self) -> Result<(), BackendError> {
+            self.armed.store(false, Ordering::Relaxed);
             if !self.open_work.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -1415,6 +1462,8 @@ mod imp {
         }
 
         fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {
+            // The launch an armed tag was meant for is captured, not run: the tag is dropped.
+            self.armed.store(false, Ordering::Relaxed);
             let mut cmds = Vec::with_capacity(launches.len());
             let mut direct_args = Vec::with_capacity(launches.len() * 4);
             let mut bytes = Vec::with_capacity(launches.len() * 16);
@@ -1525,5 +1574,69 @@ mod imp {
             assert_eq!(lock(&done.error).as_deref(), Some("boom"));
         }
 
+        /// A one-store kernel and a buffer for it, through the backend API.
+        #[cfg(target_os = "macos")]
+        fn store_kernel(backend: &dyn Backend) -> (CompiledKernel, Buffer) {
+            use luma_core::kir::{BuiltinVar, KirType, ModuleBuilder};
+            use luma_core::{BindingInfo, BindingKind};
+            let mut mb = ModuleBuilder::new("launch_timing_metal_test", "main", [4, 1, 1]);
+            let out = mb.add_storage_read_write("out", KirType::U32);
+            let mut b = mb.entry_builder();
+            let gid = b.builtin(BuiltinVar::GlobalInvocationId);
+            let i = b.field(gid, 0, KirType::U32);
+            b.store(out, i, i + b.lit_u32(1));
+            b.finish();
+            let m = mb.finish();
+            let raw = backend.compile_kernel(&m, None, "launch_timing_metal_test", KernelTrust::Trusted).unwrap();
+            let bindings = vec![BindingInfo { name: "out".into(), kind: BindingKind::StorageReadWrite, element_stride: Some(4), min_size: None }];
+            let kernel = CompiledKernel::new("launch_timing_metal_test".into(), raw, bindings, 1, None, [4, 1, 1]);
+            let buffer = backend.create_buffer(16, BufferUsage::STORAGE, false).unwrap();
+            (kernel, buffer)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn launch(backend: &dyn Backend, kernel: &CompiledKernel, buffer: &Buffer) {
+            backend.record_launch(kernel, Dispatch::Direct([1, 1, 1]), [4, 1, 1], &[RawArg::write(buffer, 16)]).unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn an_armed_launch_reports_a_time() {
+            let Ok(backend) = open() else {
+                println!("SKIPPED: no Metal device");
+                return;
+            };
+            assert!(backend.can_time_launches());
+            let (kernel, buffer) = store_kernel(&*backend);
+            backend.time_next_launch(7);
+            launch(&*backend, &kernel, &buffer);
+            backend.sync(Duration::from_secs(5)).unwrap();
+            let mut out = Vec::new();
+            let start = Instant::now();
+            while out.is_empty() && start.elapsed() < Duration::from_secs(5) {
+                backend.drain_launch_times(&mut out);
+                std::thread::yield_now();
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].0, 7);
+            assert!(out[0].1 > Duration::ZERO);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn a_flushed_arm_is_dropped() {
+            let Ok(backend) = open() else {
+                println!("SKIPPED: no Metal device");
+                return;
+            };
+            let (kernel, buffer) = store_kernel(&*backend);
+            backend.time_next_launch(9);
+            backend.flush_batch().unwrap();
+            launch(&*backend, &kernel, &buffer);
+            backend.sync(Duration::from_secs(5)).unwrap();
+            let mut out = Vec::new();
+            backend.drain_launch_times(&mut out);
+            assert!(out.is_empty());
+        }
     }
 }

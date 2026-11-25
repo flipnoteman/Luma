@@ -33,7 +33,7 @@ use crate::codegen;
 static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| std::env::var_os("LUMA_WGPU_DUMP").filter(|v| !v.is_empty()).map(Into::into));
 
 use crate::device::{self, Gpu, lock};
-use crate::profiler::Profiler;
+use crate::profiler::{LaunchTimers, Profiler};
 
 // -- Usages --
 
@@ -495,6 +495,11 @@ struct Batch {
     uploads: Vec<Buffer>,
     /// Present while profiling is enabled.
     profiler: Option<Profiler>,
+    /// The tag the next launch of the thread that armed it is timed under (see
+    /// `Backend::time_next_launch`). Dropped by every flush.
+    armed: Option<(std::thread::ThreadId, u64)>,
+    /// Whether a launch of this batch holds a slot of `WgpuBackend::timers`.
+    timed: bool,
 }
 
 /// What a kernel may use of the shader features the device was opened with.
@@ -590,6 +595,8 @@ pub struct WgpuBackend {
     /// Layout of `@group(0)`: the grid uniform, at a dynamic offset into the arena.
     grid_layout: wgpu::BindGroupLayout,
     timestamps: bool,
+    /// The slots of the sampled launch timing; locked after the batch, never before.
+    timers: Mutex<LaunchTimers>,
     uniform_align: u64,
     storage_offset_align: u64,
     max_dynamic_uniforms: u32,
@@ -681,6 +688,8 @@ impl WgpuBackend {
             offsets: Vec::new(),
             uploads: Vec::new(),
             profiler: None,
+            armed: None,
+            timed: false,
         };
 
         Ok(WgpuBackend {
@@ -696,6 +705,7 @@ impl WgpuBackend {
             dispatches_pending: AtomicU32::new(0),
             grid_layout,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            timers: Mutex::new(LaunchTimers::default()),
             uniform_align: info.limits.uniform_align,
             storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
             max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
@@ -966,6 +976,8 @@ impl WgpuBackend {
         batch.pass = None;
         batch.bound = Bound::default();
         batch.dispatches = 0;
+        // A tag nothing consumed belongs to no launch of the next batch.
+        batch.armed = None;
         self.dispatches_pending.store(0, Ordering::Relaxed);
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
@@ -984,6 +996,9 @@ impl WgpuBackend {
         // The uniform copies go first: the batch's dispatches read what they write.
         let commands = batch.encoder.take().map(|encoder| encoder.finish());
         let submission = (uniforms.is_some() || commands.is_some()).then(|| self.queue().submit(uniforms.into_iter().chain(commands)));
+        if std::mem::take(&mut batch.timed) {
+            lock(&self.timers).submitted(submission.as_ref());
+        }
         if !retired.is_empty() {
             self.retire_chunks(retired);
         }
@@ -1403,7 +1418,7 @@ impl Backend for WgpuBackend {
         }
         let device = self.device();
         let align = self.uniform_align;
-        let Batch { encoder, prefix, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } = batch;
+        let Batch { encoder, prefix, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, armed, timed, .. } = batch;
 
         // Uniform values go into fresh arena slots, all of this launch's in one chunk. The grid
         // uniform shares the slot of an earlier launch of the same size.
@@ -1510,10 +1525,23 @@ impl Backend for WgpuBackend {
 
         // Record. Launches share one compute pass; a profiled launch gets a pass of its own that
         // carries the timestamp writes.
-        let profiled = profiler.is_some();
-        if profiled {
+        // A launch armed for timing gets a slot of the ring, unless the profiler times it anyway
+        // or the ring is full: then the tag is dropped.
+        let mut timer = None;
+        if let Some((thread, tag)) = *armed {
+            if thread == std::thread::current().id() {
+                *armed = None;
+                if profiler.is_none() {
+                    timer = lock(&self.timers).begin(device, tag);
+                    *timed |= timer.is_some();
+                }
+            }
+        }
+        let own_pass = profiler.is_some() || timer.is_some();
+        if own_pass {
             *pass = None;
         }
+        let timers = timer.map(|_| lock(&self.timers));
         let encoder = encoder.get_or_insert_with(|| self.new_encoder());
         if *dispatches == 0 && prefix.is_none() {
             self.copy_prefix(encoder, prefix, uniforms, epoch);
@@ -1521,7 +1549,11 @@ impl Backend for WgpuBackend {
         let pass_slot = pass;
         let pass = pass_slot.get_or_insert_with(|| {
             *bound = Bound::default();
-            let timestamp_writes = profiler.as_mut().map(|p| p.writes(device, &kernel.label));
+            let timestamp_writes = match (profiler.as_mut(), timer, timers.as_deref()) {
+                (Some(p), _, _) => Some(p.writes(device, &kernel.label)),
+                (None, Some(slot), Some(timers)) => Some(timers.writes(slot)),
+                _ => None,
+            };
             encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes }).forget_lifetime()
         });
         if bound.kernel != Some(kernel.id) {
@@ -1544,9 +1576,10 @@ impl Backend for WgpuBackend {
             (Dispatch::Indirect { .. }, Some((buffer, offset))) => pass.dispatch_workgroups_indirect(buffer, offset),
             (Dispatch::Indirect { .. }, None) => return Err(BackendError::Gpu("an indirect dispatch lost its buffer".into())),
         }
-        if profiled {
+        if own_pass {
             *pass_slot = None;
         }
+        drop(timers);
         *dispatches += 1;
         self.dispatches_pending.store(*dispatches, Ordering::Relaxed);
         Ok(*dispatches)
@@ -1623,6 +1656,24 @@ impl Backend for WgpuBackend {
     fn notify_released(&self, buffers: &[Buffer]) {
         if !buffers.is_empty() {
             lock(&self.released).extend(buffers.iter().cloned());
+        }
+    }
+
+    fn can_time_launches(&self) -> bool {
+        self.timestamps
+    }
+
+    fn time_next_launch(&self, tag: u64) {
+        if self.timestamps {
+            if let Ok(mut batch) = self.batch() {
+                batch.armed = Some((std::thread::current().id(), tag));
+            }
+        }
+    }
+
+    fn drain_launch_times(&self, out: &mut Vec<(u64, Duration)>) {
+        if self.timestamps {
+            lock(&self.timers).drain(self.device(), self.queue(), out);
         }
     }
 
@@ -1923,5 +1974,111 @@ mod tests {
             Err(other) => panic!("{other}"),
         }
         assert!(matches!(backend.finish_profiling(Vec::new()), Err(BackendError::Profiling(_))));
+    }
+
+    /// A backend that can time launches, or `None` (printing why) where it cannot.
+    fn open_timing() -> Option<WgpuBackend> {
+        let Some(backend) = open() else {
+            println!("SKIPPED: no adapter");
+            return None;
+        };
+        if !backend.can_time_launches() {
+            println!("SKIPPED: no timestamp queries");
+            return None;
+        }
+        Some(backend)
+    }
+
+    /// A kernel writing `2 * i` to `out`, and the buffers to launch it with.
+    fn double_launch(backend: &WgpuBackend) -> (CompiledKernel, Buffer, Buffer) {
+        let mut mb = ModuleBuilder::new("double", "main", [64, 1, 1]);
+        let out = mb.add_storage_read_write("out", KirType::U32);
+        let mut b = mb.entry_builder();
+        let gid = b.builtin(BuiltinVar::GlobalInvocationId);
+        let i = b.field(gid, 0, KirType::U32);
+        let n = b.grid_size(0);
+        let oob = b.ge(i, n);
+        b.if_then(oob, |b| b.ret(None));
+        let two = b.lit_u32(2);
+        b.store(out, i, i * two);
+        b.finish();
+        let module = mb.finish();
+        let (declared, used) = used_bindings(&module);
+        let raw_kernel = backend.compile_kernel(&module, used.as_deref(), "double", KernelTrust::Trusted).expect("compiles");
+        let infos = vec![module.bindings[0].info()];
+        let kernel = CompiledKernel::new(Arc::from("double"), raw_kernel, infos, declared, used, [64, 1, 1]);
+        let buffer = backend.create_buffer(4096, STORAGE_USAGE, false).expect("a buffer");
+        let unused = backend.create_buffer(16, STORAGE_USAGE, false).expect("a buffer");
+        (kernel, buffer, unused)
+    }
+
+    #[test]
+    fn an_armed_launch_reports_a_time() {
+        let Some(backend) = open_timing() else { return };
+        let (kernel, buffer, _) = double_launch(&backend);
+        let args = [RawArg::write(&buffer, 4096)];
+        backend.time_next_launch(7);
+        backend.record_launch(&kernel, Dispatch::Direct([16, 1, 1]), [1000, 1, 1], &args).unwrap();
+        // The unarmed launch after it is not timed.
+        backend.record_launch(&kernel, Dispatch::Direct([16, 1, 1]), [1000, 1, 1], &args).unwrap();
+        backend.flush_batch().unwrap();
+        backend.sync(Duration::ZERO).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..1000 {
+            backend.drain_launch_times(&mut times);
+            if !times.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(times.len(), 1, "{times:?}");
+        assert_eq!(times[0].0, 7);
+        assert!(times[0].1 > Duration::ZERO);
+        assert!(times[0].1 < Duration::from_secs(5));
+        // Reported once.
+        backend.drain_launch_times(&mut times);
+        assert_eq!(times.len(), 1);
+    }
+
+    #[test]
+    fn draining_never_blocks_on_unfinished_work() {
+        let Some(backend) = open_timing() else { return };
+        let (kernel, buffer, _) = double_launch(&backend);
+        let args = [RawArg::write(&buffer, 4096)];
+        backend.time_next_launch(1);
+        backend.record_launch(&kernel, Dispatch::Direct([16, 1, 1]), [1000, 1, 1], &args).unwrap();
+        backend.flush_batch().unwrap();
+        let start = Instant::now();
+        let mut times = Vec::new();
+        backend.drain_launch_times(&mut times);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Whatever the timing, once the GPU is idle it is reported exactly once.
+        backend.sync(Duration::ZERO).unwrap();
+        for _ in 0..1000 {
+            backend.drain_launch_times(&mut times);
+            if !times.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(times.len(), 1, "{times:?}");
+    }
+
+    #[test]
+    fn an_armed_tag_is_dropped_by_a_flush_and_never_reaches_a_later_launch() {
+        let Some(backend) = open_timing() else { return };
+        let (kernel, buffer, _) = double_launch(&backend);
+        let args = [RawArg::write(&buffer, 4096)];
+        backend.time_next_launch(9);
+        backend.flush_batch().unwrap();
+        backend.record_launch(&kernel, Dispatch::Direct([16, 1, 1]), [1000, 1, 1], &args).unwrap();
+        backend.flush_batch().unwrap();
+        backend.sync(Duration::ZERO).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..20 {
+            backend.drain_launch_times(&mut times);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(times.is_empty(), "{times:?}");
     }
 }

@@ -333,6 +333,9 @@ fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[boo
     Ok(CudaKernel { func, workgroup: optimized.workgroup_size, shared_bytes: 0, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides })
 }
 
+/// Sampled launches kept until they are drained.
+const MAX_TIMED: usize = 64;
+
 /// The output tiles of the tensor-core products, largest first (see [`crate::tensor`]).
 const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
 
@@ -764,6 +767,12 @@ struct State {
     /// return to the pool when that copy is done, not when the batch they were queued in is.
     staging: VecDeque<(CudaEvent, Pinned)>,
     free_events: Vec<CudaEvent>,
+    /// Events created with timing, for the sampled launches (`free_events` are not).
+    free_timing_events: Vec<CudaEvent>,
+    /// The tag the next launch of that thread is timed under (`Backend::time_next_launch`).
+    armed: Option<(std::thread::ThreadId, u64)>,
+    /// Timed launches not yet reported, oldest first: tag, start and end.
+    timed: VecDeque<(u64, CudaEvent, CudaEvent)>,
     pinned_free: Vec<Pinned>,
     pinned_idle: usize,
     pinned_busy: usize,
@@ -962,6 +971,9 @@ impl CudaBackend {
             submitted: VecDeque::new(),
             staging: VecDeque::new(),
             free_events: Vec::new(),
+            free_timing_events: Vec::new(),
+            armed: None,
+            timed: VecDeque::new(),
             pinned_free: Vec::new(),
             pinned_idle: 0,
             pinned_busy: 0,
@@ -1041,6 +1053,8 @@ impl CudaBackend {
     /// nothing was recorded since the last flush.
     fn flush_locked(&self, st: &mut State) -> Result<Option<Arc<CudaEvent>>, BackendError> {
         st.dispatches = 0;
+        // A tag not consumed by a launch of this batch is dropped, never carried to the next.
+        st.armed = None;
         self.pending.store(0, Ordering::Relaxed);
         if !st.dirty {
             return Ok(None);
@@ -1062,6 +1076,14 @@ impl CudaBackend {
         match st.free_events.pop() {
             Some(event) => Ok(event),
             None => self.shared.ctx.new_event(None).map_err(gpu),
+        }
+    }
+
+    /// An event that records time, recycled when there is a spare one.
+    fn timing_event(&self, st: &mut State) -> Result<CudaEvent, BackendError> {
+        match st.free_timing_events.pop() {
+            Some(event) => Ok(event),
+            None => self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu),
         }
     }
 
@@ -1290,6 +1312,19 @@ impl CudaBackend {
         } else {
             None
         };
+        // A sampled launch is bracketed by its own pair, outside the profiler's. The tag is taken
+        // here whatever happens next, so that it never outlives the launch it was armed for.
+        let sampled = match st.armed {
+            Some((thread, tag)) if thread == std::thread::current().id() => {
+                st.armed = None;
+                let start = self.timing_event(st)?;
+                let end = self.timing_event(st)?;
+                start.record(&self.stream).map_err(gpu)?;
+                st.dirty = true;
+                Some((tag, start, end))
+            }
+            _ => None,
+        };
         // SAFETY: the function belongs to a module kept alive by the kernel; `params.ptrs` point
         // to values that live until the call returns (the driver copies them), and every buffer
         // named stays alive in the batch until the work completes.
@@ -1308,6 +1343,17 @@ impl CudaBackend {
             st.dispatches += 1;
         }
         enqueued.map_err(gpu)?;
+        if let Some((tag, start, end)) = sampled {
+            end.record(&self.stream).map_err(gpu)?;
+            if st.timed.len() >= MAX_TIMED {
+                // Nobody is draining: the oldest sample goes, its events are reused.
+                if let Some((_, start, end)) = st.timed.pop_front() {
+                    st.free_timing_events.push(start);
+                    st.free_timing_events.push(end);
+                }
+            }
+            st.timed.push_back((tag, start, end));
+        }
         if let Some((start, end)) = timing {
             end.record(&self.stream).map_err(gpu)?;
             if let Some(samples) = st.profiler.as_mut() {
@@ -1321,8 +1367,13 @@ impl CudaBackend {
     /// (or only read it) have no edge between them and may run concurrently, otherwise each one
     /// follows the one before it.
     fn try_capture(&self, launches: &[GraphLaunch<'_>], edges: bool) -> Result<Arc<dyn ExecGraph>, BackendError> {
-        if lock(&self.state).profiler.is_some() {
-            return Err(BackendError::Unsupported("graphs are not captured while profiling".into()));
+        {
+            let mut st = lock(&self.state);
+            // The launches go into the graph, not through `record_launch`: a tag armed for one is dropped.
+            st.armed = None;
+            if st.profiler.is_some() {
+                return Err(BackendError::Unsupported("graphs are not captured while profiling".into()));
+            }
         }
         let natives: Vec<&CudaKernel> = launches
             .iter()
@@ -1516,13 +1567,13 @@ impl Backend for CudaBackend {
     }
 
     fn compile_gemm(&self, spec: &GemmSpec) -> Option<RawKernel> {
-        match compile_gemm_ptx(&self.shared, spec) {
-            Ok(kernel) => Some(RawKernel::new(kernel)),
-            Err(error) => {
-                log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}");
-                None
-            }
-        }
+        // Loaded on a worker thread (which binds the context in `compile_gemm_ptx`): a failure
+        // arrives at the first resolve.
+        let shared = Arc::clone(&self.shared);
+        let spec = *spec;
+        Some(RawKernel::spawn(move || {
+            compile_gemm_ptx(&shared, &spec).inspect_err(|error| log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}"))
+        }))
     }
 
     fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
@@ -1539,6 +1590,8 @@ impl Backend for CudaBackend {
         let (grid, indirect, indirect_buffer) = resolve_dispatch(dispatch)?;
         let mut st = lock(&self.state);
         if grid.contains(&0) {
+            // Nothing runs, so nothing is timed.
+            st.armed = None;
             if let Some(samples) = st.profiler.as_mut() {
                 samples.push(Sample { label: Arc::clone(&kernel.label), events: None });
             }
@@ -1627,6 +1680,7 @@ impl Backend for CudaBackend {
     fn record_graph(&self, graph: &dyn ExecGraph, dispatches: u32) -> Result<u32, BackendError> {
         let graph = graph.downcast_ref::<CudaExecGraph>().ok_or_else(|| BackendError::Unsupported("graph was captured by another backend".into()))?;
         let mut st = lock(&self.state);
+        st.armed = None;
         if st.profiler.is_some() {
             return Err(BackendError::Unsupported("cannot replay a graph while profiling".into()));
         }
@@ -1875,6 +1929,36 @@ impl Backend for CudaBackend {
         Ok(profile)
     }
 
+    fn can_time_launches(&self) -> bool {
+        true
+    }
+
+    fn time_next_launch(&self, tag: u64) {
+        lock(&self.state).armed = Some((std::thread::current().id(), tag));
+    }
+
+    fn drain_launch_times(&self, out: &mut Vec<(u64, Duration)>) {
+        let mut st = lock(&self.state);
+        if st.timed.is_empty() || self.bind().is_err() {
+            return;
+        }
+        while let Some((_, _, end)) = st.timed.front() {
+            // Never waits: an unfinished launch stays queued for a later drain.
+            if !end.try_is_complete().unwrap_or(false) {
+                break;
+            }
+            let Some((tag, start, end)) = st.timed.pop_front() else { break };
+            // Both events are complete: `elapsed_ms` returns at once.
+            if let Ok(ms) = start.elapsed_ms(&end) {
+                out.push((tag, Duration::from_secs_f64(f64::from(ms.max(0.0)) * 1e-3)));
+            }
+            if st.free_timing_events.len() < 2 * MAX_TIMED {
+                st.free_timing_events.push(start);
+                st.free_timing_events.push(end);
+            }
+        }
+    }
+
     fn is_profiling(&self) -> Result<bool, BackendError> {
         Ok(lock(&self.state).profiler.is_some())
     }
@@ -1916,6 +2000,7 @@ fn cuda_code_revision() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luma_core::hal::{BindingInfo, BindingKind};
 
     /// A launch of a test: its `(buffer, writes)` arguments, a buffer given by a number, and the
     /// buffer of its workgroup counts.
@@ -1983,5 +2068,142 @@ mod tests {
 
     fn open_backend() -> Result<CudaBackend, BackendError> {
         CudaBackend::new()
+    }
+
+    /// A device whose matrix product kernels exist, or `None` (the test is skipped).
+    fn gemm_backend() -> Option<(CudaBackend, GemmSpec)> {
+        let backend = match open_backend() {
+            Ok(backend) => backend,
+            Err(error) => {
+                println!("SKIPPED: no CUDA device ({error})");
+                return None;
+            }
+        };
+        let Some(&(rows, cols)) = backend.gemm_tiles(true).first() else {
+            println!("SKIPPED: the device has no native matrix product kernels");
+            return None;
+        };
+        Some((backend, GemmSpec { rows, cols, lhs_transposed: false, rhs_transposed: false, exact: true }))
+    }
+
+    fn wait_ready(kernel: &RawKernel) {
+        let start = Instant::now();
+        while !kernel.is_ready() {
+            assert!(start.elapsed() < Duration::from_secs(60), "the kernel never finished compiling");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The kernel of `spec` as a launchable one, once compiled.
+    fn gemm_kernel(backend: &CudaBackend, spec: &GemmSpec) -> CompiledKernel {
+        let raw = backend.compile_gemm(spec).expect("the backend plans the product");
+        wait_ready(&raw);
+        let binding = |name: &str, kind| BindingInfo { name: name.into(), kind, element_stride: None, min_size: None };
+        let bindings = vec![
+            binding("c", BindingKind::StorageReadWrite),
+            binding("a", BindingKind::StorageRead),
+            binding("b", BindingKind::StorageRead),
+            BindingInfo { min_size: Some(16), ..binding("u", BindingKind::Uniform) },
+        ];
+        CompiledKernel::new("gemm".into(), raw, bindings, 4, None, [1, 1, 1])
+    }
+
+    /// Records one product of `m x k` by `k x n`, a single workgroup per output tile.
+    fn launch_gemm(backend: &CudaBackend, kernel: &CompiledKernel, spec: &GemmSpec, m: u32, n: u32, k: u32) {
+        let make = |bytes: u64| backend.create_buffer(bytes, BufferUsage::STORAGE, false).expect("a buffer");
+        let (c, a, b) = (make(u64::from(m) * u64::from(n) * 4), make(u64::from(m) * u64::from(k) * 4), make(u64::from(k) * u64::from(n) * 4));
+        let mut uniform = Vec::new();
+        for value in [m, n, k, k] {
+            uniform.extend_from_slice(&value.to_le_bytes());
+        }
+        let grid = [n.div_ceil(spec.cols), m.div_ceil(spec.rows), 1];
+        let args = [RawArg::write(&c, c.size()), RawArg::read(&a, a.size()), RawArg::read(&b, b.size()), RawArg::Uniform(&uniform)];
+        backend.record_launch(kernel, Dispatch::Direct(grid), [grid[0] * spec.cols, grid[1] * spec.rows, 1], &args).expect("the launch is recorded");
+    }
+
+    #[test]
+    fn a_gemm_kernel_compiles_in_the_background() {
+        let Some((backend, spec)) = gemm_backend() else { return };
+        let raw = backend.compile_gemm(&spec).expect("the backend plans the product");
+        // Loading the PTX takes a driver call on a worker thread: it is not done on return.
+        assert!(!raw.is_ready(), "compile_gemm returned a loaded module");
+        wait_ready(&raw);
+        raw.resolve::<CudaKernel>().expect("the module loads");
+    }
+
+    #[test]
+    fn an_armed_launch_reports_a_time() {
+        let Some((backend, spec)) = gemm_backend() else { return };
+        let kernel = gemm_kernel(&backend, &spec);
+        assert!(backend.can_time_launches());
+        // Not armed: nothing is reported.
+        launch_gemm(&backend, &kernel, &spec, 1024, 1024, 1024);
+        backend.sync(Duration::ZERO).unwrap();
+        let mut out = Vec::new();
+        backend.drain_launch_times(&mut out);
+        assert!(out.is_empty(), "{out:?}");
+        backend.time_next_launch(7);
+        launch_gemm(&backend, &kernel, &spec, 1024, 1024, 1024);
+        // The tag was taken by that launch: the next one is not timed.
+        launch_gemm(&backend, &kernel, &spec, 1024, 1024, 1024);
+        backend.sync(Duration::ZERO).unwrap();
+        backend.drain_launch_times(&mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 7);
+        assert!(out[0].1 > Duration::ZERO, "{out:?}");
+        backend.drain_launch_times(&mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn draining_never_blocks_on_unfinished_work() {
+        let Some((backend, spec)) = gemm_backend() else { return };
+        let kernel = gemm_kernel(&backend, &spec);
+        backend.time_next_launch(3);
+        // Hundreds of GFLOP: far longer than the drain below.
+        launch_gemm(&backend, &kernel, &spec, 4096, 4096, 8192);
+        backend.flush_batch().unwrap();
+        let mut out = Vec::new();
+        let start = Instant::now();
+        backend.drain_launch_times(&mut out);
+        let drained = start.elapsed();
+        assert!(out.is_empty(), "{out:?}");
+        assert!(backend.pending.load(Ordering::Relaxed) == 0 && lock(&backend.state).timed.len() == 1);
+        backend.sync(Duration::ZERO).unwrap();
+        println!("an unfinished drain took {drained:?}");
+        backend.drain_launch_times(&mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 3);
+        assert!(out[0].1 > Duration::ZERO);
+    }
+
+    #[test]
+    fn a_graph_capture_is_never_armed() {
+        let Some((backend, spec)) = gemm_backend() else { return };
+        let kernel = gemm_kernel(&backend, &spec);
+        let make = |bytes: u64| backend.create_buffer(bytes, BufferUsage::STORAGE, false).expect("a buffer");
+        let (c, a, b) = (make(64 * 64 * 4), make(64 * 64 * 4), make(64 * 64 * 4));
+        let mut uniform = Vec::new();
+        for value in [64u32, 64, 64, 64] {
+            uniform.extend_from_slice(&value.to_le_bytes());
+        }
+        let args = [RawArg::write(&c, c.size()), RawArg::read(&a, a.size()), RawArg::read(&b, b.size()), RawArg::Uniform(&uniform)];
+        let grid = [64u32.div_ceil(spec.cols), 64u32.div_ceil(spec.rows), 1];
+        let launch = GraphLaunch { kernel: &kernel, dispatch: Dispatch::Direct(grid), size: [64, 64, 1], args: &args };
+
+        // Armed, then the launch goes into a graph: the tag is dropped.
+        backend.time_next_launch(1);
+        let graph = backend.capture_graph(&[launch]).expect("the graph is captured");
+        assert!(lock(&backend.state).armed.is_none());
+        launch_gemm(&backend, &kernel, &spec, 256, 256, 256);
+        backend.record_graph(&*graph, 0).unwrap();
+        // Armed, then the batch is flushed: the tag is dropped too.
+        backend.time_next_launch(2);
+        backend.flush_batch().unwrap();
+        launch_gemm(&backend, &kernel, &spec, 256, 256, 256);
+        backend.sync(Duration::ZERO).unwrap();
+        let mut out = Vec::new();
+        backend.drain_launch_times(&mut out);
+        assert!(out.is_empty(), "{out:?}");
     }
 }

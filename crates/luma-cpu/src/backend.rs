@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,11 @@ pub struct CpuBackend {
     dispatches: AtomicU32,
     mappable: Mutex<FreeUploads>,
     profiler: Mutex<Option<ProfileSamples>>,
+    /// Whether `armed_tag` names the next launch, which `Backend::time_next_launch` asked to time.
+    armed: AtomicBool,
+    armed_tag: AtomicU64,
+    /// Finished timings of armed launches, taken by `Backend::drain_launch_times`.
+    launch_times: Mutex<Vec<(u64, Duration)>>,
 }
 
 impl fmt::Debug for CpuBackend {
@@ -126,6 +131,9 @@ pub fn open() -> Result<Box<dyn Backend>, BackendError> {
         dispatches: AtomicU32::new(0),
         mappable: Mutex::new(FreeUploads::new(MAPPABLE_CAP)),
         profiler: Mutex::new(None),
+        armed: AtomicBool::new(false),
+        armed_tag: AtomicU64::new(0),
+        launch_times: Mutex::new(Vec::new()),
     }))
 }
 
@@ -624,6 +632,12 @@ impl Backend for CpuBackend {
     ) -> Result<u32, BackendError> {
         let workgroups = workgroups_of(dispatch)?;
         let elapsed = self.run(kernel, workgroups, size, args)?;
+        if self.armed.load(Ordering::Relaxed) && self.armed.swap(false, Ordering::Acquire) {
+            // An empty grid has no time worth reporting; its arm is consumed all the same.
+            if !workgroups.contains(&0) {
+                lock(&self.launch_times).push((self.armed_tag.load(Ordering::Relaxed), elapsed));
+            }
+        }
         if workgroups.contains(&0) {
             if let Some(samples) = lock(&self.profiler).as_mut() {
                 samples.push((Arc::clone(&kernel.label), Duration::ZERO));
@@ -738,7 +752,21 @@ impl Backend for CpuBackend {
 
     fn flush_batch(&self) -> Result<(), BackendError> {
         self.dispatches.store(0, Ordering::Relaxed);
+        self.armed.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn can_time_launches(&self) -> bool {
+        true
+    }
+
+    fn time_next_launch(&self, tag: u64) {
+        self.armed_tag.store(tag, Ordering::Relaxed);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn drain_launch_times(&self, out: &mut Vec<(u64, Duration)>) {
+        out.append(&mut lock(&self.launch_times));
     }
 
     fn sync(&self, _spin_budget: Duration) -> Result<Duration, BackendError> {
@@ -809,6 +837,8 @@ impl Backend for CpuBackend {
     }
 
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {
+        // The launch an armed tag was meant for is captured, not run: the tag is dropped.
+        self.armed.store(false, Ordering::Relaxed);
         let launches = launches
             .iter()
             .map(|l| CapturedCpuLaunch {
@@ -883,5 +913,71 @@ mod tests {
         let c1 = k1.downcast_ref::<CompiledCpuKernel>().unwrap();
         let c2 = k2.downcast_ref::<CompiledCpuKernel>().unwrap();
         assert_eq!(c1.exec.bytes(), c2.exec.bytes());
+    }
+
+    /// A one-store kernel, compiled and launched through the backend API.
+    fn store_kernel(backend: &dyn Backend) -> (CompiledKernel, Buffer) {
+        use luma_core::kir::{BuiltinVar, KirType, ModuleBuilder};
+        use luma_core::{BindingInfo, BindingKind, BufferUsage};
+        let mut mb = ModuleBuilder::new("launch_timing_cpu_test", "main", [4, 1, 1]);
+        let out = mb.add_storage_read_write("out", KirType::U32);
+        let mut b = mb.entry_builder();
+        let gid = b.builtin(BuiltinVar::GlobalInvocationId);
+        let i = b.field(gid, 0, KirType::U32);
+        b.store(out, i, i + b.lit_u32(1));
+        b.finish();
+        let m = mb.finish();
+        let raw = backend
+            .compile_kernel(&m, None, "launch_timing_cpu_test", luma_core::KernelTrust::Trusted)
+            .unwrap();
+        let bindings = vec![BindingInfo {
+            name: "out".into(),
+            kind: BindingKind::StorageReadWrite,
+            element_stride: Some(4),
+            min_size: None,
+        }];
+        let kernel = CompiledKernel::new("launch_timing_cpu_test".into(), raw, bindings, 1, None, [4, 1, 1]);
+        let buffer = backend.create_buffer(16, BufferUsage::STORAGE, false).unwrap();
+        (kernel, buffer)
+    }
+
+    fn launch(backend: &dyn Backend, kernel: &CompiledKernel, buffer: &Buffer) {
+        backend
+            .record_launch(kernel, luma_core::Dispatch::Direct([1, 1, 1]), [4, 1, 1], &[luma_core::RawArg::write(buffer, 16)])
+            .unwrap();
+    }
+
+    #[test]
+    fn an_armed_launch_reports_a_time() {
+        let backend = open().unwrap();
+        assert!(backend.can_time_launches());
+        let (kernel, buffer) = store_kernel(&*backend);
+        launch(&*backend, &kernel, &buffer);
+        let mut out = Vec::new();
+        backend.drain_launch_times(&mut out);
+        assert!(out.is_empty(), "an unarmed launch reports nothing");
+        backend.time_next_launch(7);
+        launch(&*backend, &kernel, &buffer);
+        backend.drain_launch_times(&mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 7);
+        assert!(out[0].1 > Duration::ZERO);
+        // The arm was consumed by the one launch.
+        launch(&*backend, &kernel, &buffer);
+        out.clear();
+        backend.drain_launch_times(&mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_flushed_arm_is_dropped() {
+        let backend = open().unwrap();
+        let (kernel, buffer) = store_kernel(&*backend);
+        backend.time_next_launch(9);
+        backend.flush_batch().unwrap();
+        launch(&*backend, &kernel, &buffer);
+        let mut out = Vec::new();
+        backend.drain_launch_times(&mut out);
+        assert!(out.is_empty());
     }
 }
