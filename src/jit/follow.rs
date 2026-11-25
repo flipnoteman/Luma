@@ -548,11 +548,16 @@ struct State {
     stats: Option<Arc<Stats>>,
     kinds: Vec<StepKind>,
     clock: u64,
+    /// Steps of any kind recorded or followed in vain in a row, and the steps still to leave alone
+    /// because of them (a program whose steps are never the same, a new kind each time, would
+    /// otherwise never back off: each kind has its own backoff).
+    streak: u32,
+    quiet: u32,
     phase: Phase,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, phase: Phase::Idle }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, phase: Phase::Idle }) };
     /// Whether the calls of this thread need to be looked at: false while the step is neither
     /// recorded nor followed, which is all a call costs then.
     static GATE: Cell<bool> = const { Cell::new(true) };
@@ -624,6 +629,10 @@ impl State {
         }
         kind.fails = (kind.fails + 1).min(7);
         kind.cooldown = if kind.fails >= 2 { (1u32 << (kind.fails - 1)).min(64) } else { 0 };
+        self.streak = (self.streak + 1).min(9);
+        if self.streak >= 4 {
+            self.quiet = 1 << (self.streak - 3);
+        }
     }
 
     /// A step of kind `key` was replayed: only that earns the kind its trust back (a tape that is
@@ -632,6 +641,8 @@ impl State {
         let kind = self.kind(key);
         kind.fails = 0;
         kind.cooldown = 0;
+        self.streak = 0;
+        self.quiet = 0;
     }
 }
 
@@ -722,6 +733,11 @@ impl State {
         }
         // A step begins.
         if !jit.follow.claim() {
+            self.set(Phase::Skip);
+            return Entered::Done(Begun::Go(Go::Skip));
+        }
+        if self.quiet > 0 {
+            self.quiet -= 1;
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
