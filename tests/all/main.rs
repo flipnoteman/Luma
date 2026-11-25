@@ -18,6 +18,7 @@ mod bitwise;
 mod bmm;
 mod bool;
 mod bool_packed;
+mod boundary_launches;
 mod bykey;
 mod check_finite;
 mod chunked;

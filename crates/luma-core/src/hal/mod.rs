@@ -413,6 +413,16 @@ pub enum DecisionSite {
     QrPanel,
     /// Reduction strategy (host, merged, bits, single or two passes, axis lines).
     ReducePlan,
+    /// Scan strategy (rows, warp, look-back, chunked, strided; by key).
+    ScanPlan,
+    /// Scatter strategy (host, plain, atomic with private or global bins).
+    ScatterPlan,
+    /// Binary search (the unrolled search expression).
+    SearchPlan,
+    /// Compaction strategy (`filter`, `nonzero`: count then scatter).
+    CompactPlan,
+    /// Merge strategy (merge of sorted arrays; `factorize`).
+    MergePlan,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }
