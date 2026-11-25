@@ -126,6 +126,40 @@ fn the_second_call_runs_on_new_buffers() {
 }
 
 #[test]
+fn a_matmul_in_a_recording_runs_the_tile_family_the_eager_step_does() {
+    // The product of an MLP layer (native on the CPU and Metal backends, tiled or tensor-core GEMM on the GPU ones):
+    // what a recording captures is the kernel the planner chose without one, not a shader fallback.
+    let ctx = ctx();
+    let (x, w, b) = (on(&ctx, [784, 256], 3), on(&ctx, [512, 784], 4), on(&ctx, [512, 1], 5));
+    ctx.record_decisions(true);
+    let (loss, _) = mlp_step(&x, &w, &b);
+    loss.eval().unwrap();
+    let eager: Vec<String> = ctx.take_decisions().into_iter().filter(|d| d.op == "matmul").map(|d| d.chosen.into_owned()).collect();
+    ctx.record_decisions(false);
+    assert_eq!(eager.len(), 1, "{eager:?}");
+    if eager[0] == "host" {
+        // A small product on a unified-memory device runs on the host outside a recording; nothing to compare.
+        return;
+    }
+    let family = |chosen: &str| match chosen.split(' ').next() {
+        Some("native") => "Native",
+        Some("gemm") => "Gemm",
+        Some("skinny") => "Skinny",
+        _ => "T",
+    };
+    assert!(ctx.begin_recording(Vec::new()));
+    let (loss, _) = mlp_step(&x, &w, &b);
+    loss.eval().unwrap();
+    let recording = ctx.end_recording().expect("the step records");
+    let tiles: Vec<&str> = recording.cmds.iter().map(|cmd| &*cmd.kernel.label).filter(|label| label.starts_with("Matmul")).collect();
+    assert_eq!(tiles.len(), 1, "{tiles:?}");
+    assert!(tiles[0].contains(&format!("tile: {}", family(&eager[0]))), "eager chose {:?}, the recording captured {:?}", eager[0], tiles[0]);
+    if matches!(ctx.backend(), luma_core::BackendKind::Cpu) {
+        assert!(tiles[0].contains("tile: Native"), "{:?}", tiles[0]);
+    }
+}
+
+#[test]
 fn outputs_are_independent_arrays() {
     let ctx = ctx();
     let compiled = trace(|inp| (&inp.get::<f32>(0) + 1.0).into());
