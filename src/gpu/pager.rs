@@ -918,7 +918,7 @@ impl Context {
                 victim.has_copy.store(false, Ordering::Release);
                 pager.host_copy_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
                 #[cfg(debug_assertions)]
-                if pager.clean_evictions.load(Ordering::Relaxed) % 16 == 0 {
+                if pager.clean_evictions.load(Ordering::Relaxed).is_multiple_of(16) {
                     let real = self.read_spill(&buffer, victim.bytes)?;
                     assert!(real.as_slice() == data.as_slice(), "a kept host copy differs from the device buffer: a write did not invalidate it");
                 }

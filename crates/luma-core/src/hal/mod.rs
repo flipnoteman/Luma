@@ -1445,7 +1445,7 @@ pub fn check_transfer(stage: &Stage, dir: StageDir, buffer: &Buffer, offset: u64
     if offset.checked_add(bytes).is_none_or(|end| end > buffer.size()) {
         return Err(BackendError::MapRange(format!("transferring {bytes} bytes at {offset} of a buffer of {}", buffer.size())));
     }
-    if offset % 4 != 0 || bytes % 4 != 0 {
+    if !offset.is_multiple_of(4) || !bytes.is_multiple_of(4) {
         return Err(BackendError::MapRange(format!("a transfer of {bytes} bytes at {offset} is not a multiple of 4")));
     }
     Ok(())
