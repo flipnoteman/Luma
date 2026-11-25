@@ -91,6 +91,10 @@ fn rate(bytes: u64, passes: u64, f: &mut dyn FnMut()) -> f64 {
 }
 
 pub(super) fn run(h: &mut Harness) {
+    // A decision log (gate 4) compares planner decisions: these cases add none and write gigabytes.
+    if std::env::var_os("LUMA_BENCH_DECISIONS").is_some() {
+        return;
+    }
     if !["file/sum_cold", "file/sum_warm", "file/axpy_to_file", "file/chain3_reads_3x"].iter().any(|case| h.want(case)) {
         return;
     }

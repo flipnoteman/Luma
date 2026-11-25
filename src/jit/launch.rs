@@ -959,7 +959,7 @@ pub(super) fn store_args<'a>(
         .iter()
         .enumerate()
         .map(|(o, out)| {
-            let pin = if key.in_place.iter().any(|&(_, output)| output as usize == o) { out.pin(j) } else { out.pin_overwrite(j) };
+            let pin = if !key.in_place.is_empty() && key.in_place.iter().any(|&(_, output)| output as usize == o) { out.pin(j) } else { out.pin_overwrite(j) };
             pin.map(|pin| (pin, out.segment_byte_len(j)))
         })
         .collect::<Result<Vec<_>, _>>()?;

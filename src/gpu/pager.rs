@@ -790,8 +790,12 @@ impl Segment {
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone(), write: counted });
             }
-            let evicted_by_lineage = matches!(&*lock(&self.state), State::Lineage);
-            let away = matches!(&*lock(&self.state), State::Away);
+            let (evicted_by_lineage, away, host) = match &*lock(&self.state) {
+                State::Lineage => (true, false, false),
+                State::Away => (false, true, false),
+                State::Host(_) => (false, false, true),
+                _ => (false, false, false),
+            };
             if evicted_by_lineage {
                 self.ctx.abort_recording_for("recompute of an evicted segment")?;
             } else if away {
@@ -800,7 +804,7 @@ impl Segment {
                 if !matches!(&*lock(&self.state), State::Away) {
                     continue;
                 }
-            } else if matches!(&*lock(&self.state), State::Host(_)) {
+            } else if host {
                 self.ctx.abort_recording_for("host segment upload")?;
             }
             let window = match &*lock(&self.state) {
@@ -1011,6 +1015,25 @@ impl Segment {
     }
 }
 
+impl Segment {
+    /// What dropping a file-backed segment that is on the device does besides recycling the buffer:
+    /// the last dirty copy of the data goes to the file first (a failure is logged and kept for `flush`).
+    #[cold]
+    #[inline(never)]
+    fn drop_homed(&self, buffer: &Buffer) {
+        if let Some(home) = self.home()
+            && !self.home_valid.load(Ordering::Acquire)
+        {
+            let written = self.ctx.read_spill(buffer, self.bytes).and_then(|data| self.write_home(home, &data));
+            if let Err(error) = written {
+                home.store.failed_with(&error);
+                log::error!("luma: could not write back a dropped file segment: {error}");
+            }
+        }
+        self.ctx.pager().resident_homed_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+    }
+}
+
 impl Drop for Segment {
     fn drop(&mut self) {
         // The texture reads the buffer: it goes before the buffer does.
@@ -1022,21 +1045,10 @@ impl Drop for Segment {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         match std::mem::replace(state, State::Empty) {
             State::Device(buffer) => {
-                if let Some(home) = self.home.as_ref().filter(|_| !self.detached.load(Ordering::Acquire))
-                    && !self.home_valid.load(Ordering::Acquire)
-                {
-                    // The last dirty copy of the data: it goes to the file before the buffer is recycled.
-                    let written = self.ctx.read_spill(&buffer, self.bytes).and_then(|data| self.write_home(home, &data));
-                    if let Err(error) = written {
-                        home.store.failed_with(&error);
-                        log::error!("luma: could not write back a dropped file segment: {error}");
-                    }
-                }
-                let pager = self.ctx.pager();
-                pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
                 if self.home.is_some() {
-                    pager.resident_homed_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+                    self.drop_homed(&buffer);
                 }
+                self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
                 self.ctx.recycle(buffer);
             }
             State::Host(data) => {

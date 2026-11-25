@@ -2152,24 +2152,30 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
     Ok(())
 }
 
+/// Past 2^32 elements (a file array, see `Array::open`) only the operations that reach nothing but
+/// their own element run: a shift (a view reads another element than its own) needs a 32-bit index,
+/// of the result or of what it reads. (A generator cannot be that long: only a file array's shape
+/// passes `Shape::validate_wide`.)
+#[inline(never)]
+fn check_not_wide(len: usize, args: &Args) -> std::result::Result<(), LumaError> {
+    let read = match &args[0] {
+        Src::Buffer(storage) => storage.len(),
+        Src::Node(node) => node.len(),
+        Src::Scalar(_) => 0,
+    };
+    if len.max(read) > u32::MAX as usize {
+        return Err(LumaError::DimensionTooLarge { shape: [len.max(read), 1, 1, 1] });
+    }
+    Ok(())
+}
+
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
 /// the math functions and `powf` only on the CUDA and CPU backends (and needs a device with 64-bit shader floats), `Df32`
 /// only the operations of its library, `C32` the field operations, `exp`, `sqrt`, equality and the
 /// real parts, and none of the three has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
-fn check_supported(ctx: &Context, op: &Op, name: &str, len: usize, args: &Args) -> std::result::Result<(), LumaError> {
-    // Past 2^32 elements (a file array, see `Array::open`) only the operations that reach nothing but their own element run: a shift (a view reads another element than its own) or a generator needs a 32-bit index, of the result or of what it reads.
-    if matches!(op.kind, OpKind::Shift(_) | OpKind::Generate(_)) {
-        let read = match &args[0] {
-            Src::Buffer(storage) => storage.len(),
-            Src::Node(node) => node.len(),
-            Src::Scalar(_) => 0,
-        };
-        if len.max(read) > u32::MAX as usize {
-            return Err(LumaError::DimensionTooLarge { shape: [len.max(read), 1, 1, 1] });
-        }
-    }
+fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
     let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32 | ElemTy::C32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
@@ -2280,7 +2286,7 @@ fn create_with(
         }
     }
     let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
-    check_supported(ctx, op, name, len, &args).map_err(Failure::New)?;
+    check_supported(ctx, op, name).map_err(Failure::New)?;
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
@@ -2319,6 +2325,9 @@ fn create_with(
     // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
     // work of the expression (operands that are shared count once per use).
     let is_shift = matches!(op.kind, OpKind::Shift(_));
+    if is_shift {
+        check_not_wide(len, &args).map_err(Failure::New)?;
+    }
     let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
     for (i, arg) in args.iter().take(arity).enumerate() {
         if let Src::Node(operand) = arg {

@@ -606,15 +606,16 @@ impl<T: ScalarType> Array<T> {
 
     fn run_reduce(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
-        // A file array of more than 2^32 elements: only the whole-array reductions that need no count or index.
-        if self.is_wide() && !matches!(name, "sum" | "prod" | "product" | "min" | "max" | "any" | "all") {
-            return Err(self.too_wide().into());
-        }
         let shape = Shape::from(tag.op_count());
         let elem = T::LAYOUT.stride() as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.
         let src = self.src()?;
+        // A file array of more than 2^32 elements: only the whole-array reductions that need no count or index.
+        let elements = self.len();
+        if elements > u32::MAX as usize && !matches!(name, "sum" | "prod" | "product" | "min" | "max" | "any" | "all") {
+            return Err(self.too_wide().into());
+        }
         // An `f32` reduction stays lazy even on a buffer, so that steps on its result fuse into
         // its last pass (see `Structured`); other types have no such steps and record at once.
         let operand = match (self.pending(), src) {
@@ -628,7 +629,7 @@ impl<T: ScalarType> Array<T> {
             // evaluates the readers first, which records the reduction's read ahead of the
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
             let args = [operand, Src::unused(), Src::unused()];
-            let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
+            let reader = jit::create(ctx, elements, Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
             let ty = ElemTy::of::<T>()?;
             let len = reader.len();
             let reduced = Arc::new(Structured::new(

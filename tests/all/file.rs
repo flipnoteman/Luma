@@ -662,6 +662,7 @@ fn lineage_eviction_is_refused_for_an_away_input() {
 // -- Wide-lite --
 
 /// A sparse file of `2^32 + 1` bytes with a 1 at both ends, opened as `[6700417, 641]` `u8`.
+#[cfg(unix)]
 fn wide_file() -> (Temp, Array<u8>) {
     let file = temp_file("wide");
     let len = (1u64 << 32) + 1;
@@ -678,6 +679,7 @@ fn wide_file() -> (Temp, Array<u8>) {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_wide_u8_file_sums_ends_and_all() {
     let (_file, array) = wide_file();
     assert_eq!(array.len(), (1usize << 32) + 1);
@@ -693,6 +695,7 @@ fn a_wide_u8_file_sums_ends_and_all() {
 }
 
 #[test]
+#[cfg(unix)]
 fn wide_arrays_refuse_shifts_generators_views_axis_reductions_and_sorts() {
     let (_file, array) = wide_file();
     let refused = |what: &str, result: luma::Result<()>| match result {
@@ -710,6 +713,7 @@ fn wide_arrays_refuse_shifts_generators_views_axis_reductions_and_sorts() {
 }
 
 #[test]
+#[cfg(unix)]
 fn wide_arrays_refuse_mean_var_and_std() {
     let (_file, array) = wide_file();
     let wide = array.to_f32();
@@ -727,6 +731,7 @@ fn wide_arrays_refuse_mean_var_and_std() {
 }
 
 #[test]
+#[cfg(unix)]
 #[ignore = "16 GiB of disk and several minutes; run with LUMA_TEST_WIDE=1 -- --ignored"]
 fn a_wide_f32_file_of_16_gib_sums() {
     if std::env::var_os("LUMA_TEST_WIDE").is_none() {
