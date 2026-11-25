@@ -425,6 +425,16 @@ pub enum DecisionSite {
     MergePlan,
     /// Dense factorisation strategy (the leaf and recursion of LU, Cholesky, QR, triangular solves, SVD, eigh; refined solves).
     FactorPlan,
+    /// FFT strategy (Stockham or Bluestein, the real-transform packings, the convolution).
+    SpectralPlan,
+    /// How a sampler reads its source (hardware filter, texture gather or buffer).
+    SamplePlan,
+    /// Convolution strategy (direct tiled or per element, FFT whole or overlap-save, the FIR forms).
+    ConvPlan,
+    /// Windowed image kernel strategy (tiled window, separable extremum, the median selections).
+    WindowPlan,
+    /// Ops declared on the registry with one strategy (vision, image, IIR, sparse products).
+    OpaquePlan,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }

@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use std::panic::Location;
 
 use super::{geometry, plane_grid};
+use crate::jit::structured::opaque::opaque;
 use crate::array::Array;
 use crate::builtin::Builtin;
 use crate::context::{RawArg, Scratch};
@@ -285,6 +286,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn anisotropic_diffusion(&self, timestep: f32, conductance: f32, iterations: u32, flux: FluxFunction, equation: DiffusionEq) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_DIFFUSION, "anisotropic_diffusion", location);
         Array::resolve(self.context(), self.shape(), run(self, timestep, conductance, iterations, flux, equation), "anisotropic_diffusion", location)
     }
 }

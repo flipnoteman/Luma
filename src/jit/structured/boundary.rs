@@ -153,6 +153,113 @@ pub(crate) struct ScatterParams {
     pub(crate) len: u32,
 }
 
+// -- Conv --
+
+/// Which selection a conv boundary stands for: `conv1d`'s launch, `fft::convolve`, or the entry of `fir`/`fir_long`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ConvStage {
+    /// `launch_conv`: one direct convolution launch.
+    Direct,
+    /// `fft::convolve`: one FFT convolution of a single buffer.
+    Fft,
+    /// `fir`: the direct kernel for filters of up to 256 taps, else on to `Long`.
+    Fir,
+    /// `fir_long`: a filter longer than the direct kernel.
+    FirLong,
+}
+
+/// What a conv boundary reads; `dims` is `[kernel_len, input_len, stride, batch]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ConvAttrs {
+    pub(crate) stage: ConvStage,
+    pub(crate) kernel_len: u32,
+    pub(crate) input_len: u32,
+    /// Outputs of the whole convolution (`Fft`) or of the launch (`Direct`).
+    pub(crate) out_len: u32,
+    pub(crate) stride: u32,
+    /// Signals filtered together (`FirLong`), else 1.
+    pub(crate) batch: u32,
+    /// The device's FFT tile (`fft::tile_log`), 0 outside `Fft`.
+    pub(crate) tile_log: u32,
+}
+
+/// What a convolution runs with: the tiled kernel's shape, the transform's sizes, the launches of a block-of-taps FIR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ConvParams {
+    pub(crate) per_thread: u32,
+    pub(crate) workgroup: u32,
+    /// `log2` of the padded whole transform (`Fft`).
+    pub(crate) log_n: u32,
+    /// `log2` of the overlap-save block; 0 where the whole signal is one transform.
+    pub(crate) log_b: u32,
+    /// Launches of a block-of-taps FIR (`ceil(k / 256)`).
+    pub(crate) blocks: u32,
+}
+
+impl ConvParams {
+    pub(crate) const NONE: ConvParams = ConvParams { per_thread: 0, workgroup: 0, log_n: 0, log_b: 0, blocks: 0 };
+}
+
+// -- Window --
+
+/// Which selection a window boundary stands for: the entry of `minfilt`/`maxfilt`, or the kernel's plan.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum WindowStage {
+    Entry,
+    Plan,
+}
+
+/// What a window boundary reads; `dims` is `[k0, k1, k2, stride0]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct WindowAttrs {
+    pub(crate) stage: WindowStage,
+    pub(crate) op: crate::image::window::Op,
+    pub(crate) k: [u16; 3],
+    pub(crate) stride: [u8; 3],
+    pub(crate) three_d: bool,
+    /// The cells of the weights / mask binding.
+    pub(crate) aux_cells: u64,
+    pub(crate) pixel: crate::image::window::Pixel,
+    pub(crate) edge: crate::image::window::Edge,
+}
+
+/// The kernel a window plan fits (`None` at the entry of an extremum: the passes plan their own).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WindowParams {
+    pub(crate) window: Option<crate::image::window::Window>,
+}
+
+// -- Opaque --
+
+/// What a sparse product reads, as far as its selection goes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct OpaqueAttrs {
+    pub(crate) nnz: u64,
+    /// Rows of the result (`outer`): the mean row length is `nnz / outer`.
+    pub(crate) outer: u64,
+    /// The compressed format the product sums over without atomics (CSR `A x`, CSC `A^T x`).
+    pub(crate) native: bool,
+    /// The first use of a non-native format (it scatters; the next one converts).
+    pub(crate) first_non_native: bool,
+    /// Columns of the dense operand (1: a vector).
+    pub(crate) columns: u32,
+    /// The matrix has rows longer than `SHORT_ROWS` (the merge tiles exist); read from the memoised row plan.
+    pub(crate) tiles: bool,
+    /// The matrix has rows longer than `LONG_ROW`.
+    pub(crate) long: bool,
+}
+
+/// What a sparse product runs with: the lanes of the row kernel (`2^lanes_log` per row), the tiles of the merge kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OpaqueParams {
+    pub(crate) lanes_log: u32,
+    pub(crate) tiles: u32,
+}
+
+impl OpaqueParams {
+    pub(crate) const NONE: OpaqueParams = OpaqueParams { lanes_log: 0, tiles: 0 };
+}
+
 // -- Light ports: tag, site and `note` --
 
 /// `FamilyTag::Compact`: the tile count and scatter of a compaction.
@@ -179,6 +286,8 @@ pub(crate) fn note_light(ctx: &Context, family: FamilyTag, op: &'static str, loc
         FamilyTag::Search => DecisionSite::SearchPlan,
         FamilyTag::Compact => DecisionSite::CompactPlan,
         FamilyTag::Merge => DecisionSite::MergePlan,
+        FamilyTag::Spectral => DecisionSite::SpectralPlan,
+        FamilyTag::Sample => DecisionSite::SamplePlan,
         _ => unreachable!("only the light ports note a label"),
     };
     ctx.jit().note_decision(Decision::new(op, location, site, label));

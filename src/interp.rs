@@ -134,12 +134,12 @@ impl Array<f32> {
         };
         out[dim] = p[dim];
         let out = Shape::from(out);
-        let result = self.approx_sample(pos, pos, out, [Grid { dim, start, step }, Grid { dim, start, step }], 1, p, method, off_grid);
+        let result = self.approx_sample(pos, pos, out, [Grid { dim, start, step }, Grid { dim, start, step }], 1, p, method, off_grid, op, location);
         Array::resolve(ctx, out, result, op, location)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn approx_sample(&self, pos0: &Array<f32>, pos1: &Array<f32>, out: Shape, grid: [Grid; 2], ndims: usize, pos_dims: [usize; 4], method: Interp, off_grid: f32) -> Outcome<Array<f32>> {
+    fn approx_sample(&self, pos0: &Array<f32>, pos1: &Array<f32>, out: Shape, grid: [Grid; 2], ndims: usize, pos_dims: [usize; 4], method: Interp, off_grid: f32, op: &'static str, location: &'static Location<'static>) -> Outcome<Array<f32>> {
         let ctx = self.context();
         self.src()?;
         pos0.src()?;
@@ -160,7 +160,7 @@ impl Array<f32> {
             matrix: [0.0; 9],
             perspective: false,
         };
-        Ok(sampling.run(ctx)?)
+        Ok(sampling.run(ctx, op, location)?)
     }
 
     /// Interpolation along the first two dimensions at the positions `(pos0, pos1)`, like
@@ -225,7 +225,7 @@ impl Array<f32> {
         }
         let out = Shape::from(out);
         let grid = [Grid { dim: dims[0], start: start[0], step: step[0] }, Grid { dim: dims[1], start: start[1], step: step[1] }];
-        let result = self.approx_sample(pos0, pos1, out, grid, 2, p, method, off_grid);
+        let result = self.approx_sample(pos0, pos1, out, grid, 2, p, method, off_grid, op, location);
         Array::resolve(ctx, out, result, op, location)
     }
 }

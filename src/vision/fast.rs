@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 use std::panic::Location;
 
 use super::{invalid, plane, tile_grid, to_u32, Kernel as Any, Keypoints};
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::RawArg;
@@ -273,7 +274,7 @@ impl Array<f32> {
     /// ```
     #[track_caller]
     pub fn fast(&self, threshold: f32, arc_length: u32, non_max: bool, feature_ratio: f32, edge: usize) -> Result<Option<Keypoints>> {
-        let _ = Location::caller();
+        opaque!(self.context(), VISION_FAST, "fast", Location::caller());
         run(self, threshold, arc_length, non_max, feature_ratio, edge).map_err(Failure::into_error)
     }
 }

@@ -19,6 +19,7 @@ mod bmm;
 mod bool;
 mod bool_packed;
 mod boundary_decisions;
+mod boundary_decisions_c;
 mod boundary_launches;
 mod bykey;
 mod check_finite;

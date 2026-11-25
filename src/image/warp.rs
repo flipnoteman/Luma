@@ -109,7 +109,7 @@ fn failure<T: crate::gpu_type::GpuType>(ctx: &Context, shape: Shape, error: Luma
 fn run_sampling(src: &Array<f32>, out: Shape, mut sampling: Sampling<'_>, op: &'static str, location: &'static Location<'static>) -> Array<f32> {
     let ctx = src.context();
     sampling.out = out;
-    let result = src.src().and_then(|_| Ok(sampling.run(ctx)?));
+    let result = src.src().and_then(|_| Ok(sampling.run(ctx, op, location)?));
     Array::resolve(ctx, out, result, op, location)
 }
 

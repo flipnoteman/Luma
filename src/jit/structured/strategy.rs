@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::Arc;
 
-use super::boundary::{CompactAttrs, FactorAttrs, FactorParams, LineSolveAttrs, LineSolveParams, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
+use super::boundary::{ConvAttrs, ConvParams, OpaqueAttrs, OpaqueParams, WindowAttrs, WindowParams, CompactAttrs, FactorAttrs, FactorParams, LineSolveAttrs, LineSolveParams, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
 use super::emit::Emit;
 use super::contraction::{ContractionParams, ContractionView};
 use super::Structured;
@@ -35,10 +35,15 @@ pub(crate) enum FamilyTag {
     Contraction,
     LineSolve,
     Factor,
+    Spectral,
+    Sample,
+    Conv,
+    Window,
+    Opaque,
 }
 
 /// How many families have a table.
-pub(crate) const FAMILY_COUNT: usize = 10;
+pub(crate) const FAMILY_COUNT: usize = 15;
 
 /// Most entries one family's table may have (the ranking cache keeps them in a `u32` mask and an array).
 pub(crate) const MAX_PER_FAMILY: usize = 12;
@@ -57,6 +62,11 @@ impl FamilyTag {
             FamilyTag::Contraction => 7,
             FamilyTag::LineSolve => 8,
             FamilyTag::Factor => 9,
+            FamilyTag::Spectral => 10,
+            FamilyTag::Sample => 11,
+            FamilyTag::Conv => 12,
+            FamilyTag::Window => 13,
+            FamilyTag::Opaque => 14,
         }
     }
 
@@ -72,6 +82,11 @@ impl FamilyTag {
             FamilyTag::Contraction => "contraction",
             FamilyTag::LineSolve => "line_solve",
             FamilyTag::Factor => "factor",
+            FamilyTag::Spectral => "spectral",
+            FamilyTag::Sample => "sample",
+            FamilyTag::Conv => "conv",
+            FamilyTag::Window => "window",
+            FamilyTag::Opaque => "opaque",
         }
     }
 
@@ -87,6 +102,11 @@ impl FamilyTag {
             "contraction" => Some(FamilyTag::Contraction),
             "line_solve" => Some(FamilyTag::LineSolve),
             "factor" => Some(FamilyTag::Factor),
+            "spectral" => Some(FamilyTag::Spectral),
+            "sample" => Some(FamilyTag::Sample),
+            "conv" => Some(FamilyTag::Conv),
+            "window" => Some(FamilyTag::Window),
+            "opaque" => Some(FamilyTag::Opaque),
             _ => None,
         }
     }
@@ -183,8 +203,8 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 
 /// One table per family; the shared edit of a new family is one line here.
 ///
-/// Search, Compact and Merge are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES, &super::families::line_solve::LINE_SOLVE_STRATEGIES, &super::families::factor::FACTOR_STRATEGIES];
+/// Search, Compact, Merge, Spectral and Sample are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES, &super::families::line_solve::LINE_SOLVE_STRATEGIES, &super::families::factor::FACTOR_STRATEGIES, &[], &[], &super::families::conv::CONV_STRATEGIES, &super::families::window::WINDOW_STRATEGIES, &super::families::opaque::OPAQUE_STRATEGIES];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
@@ -233,6 +253,11 @@ impl Subject<'_> {
             FamilyTag::Contraction => DecisionSite::MatmulPlan,
             FamilyTag::LineSolve => DecisionSite::LineSolvePlan,
             FamilyTag::Factor => DecisionSite::FactorPlan,
+            FamilyTag::Spectral => DecisionSite::SpectralPlan,
+            FamilyTag::Sample => DecisionSite::SamplePlan,
+            FamilyTag::Conv => DecisionSite::ConvPlan,
+            FamilyTag::Window => DecisionSite::WindowPlan,
+            FamilyTag::Opaque => DecisionSite::OpaquePlan,
         }
     }
 
@@ -252,6 +277,9 @@ pub(crate) enum Params {
     Contraction(ContractionParams),
     LineSolve(LineSolveParams),
     Factor(FactorParams),
+    Conv(ConvParams),
+    Window(WindowParams),
+    Opaque(OpaqueParams),
 }
 
 impl Params {
@@ -274,11 +302,12 @@ impl Params {
             }),
             Params::Scan(params) if params.fused => Cow::Owned(format!("{name} prologue=fused")),
             Params::Factor(params) if params.nb > 0 => Cow::Owned(format!("{name} nb={}", params.nb)),
-            Params::Scan(_) | Params::Scatter(_) | Params::Factor(_) => Cow::Borrowed(name),
+            Params::Scan(_) | Params::Scatter(_) | Params::Factor(_) | Params::Conv(_) | Params::Window(_) => Cow::Borrowed(name),
             Params::Contraction(params) => Cow::Owned(super::contraction::label(params, subject, ctx)),
             // The line solver's log has said `cyclic ...` or `thomas ...` since it recorded its choice: the strategies that are
             // not cyclic reduction (the native and the stacked ones included) are all the Thomas algorithm there.
             Params::LineSolve(params) => Cow::Owned(params.legacy_label(name)),
+            Params::Opaque(_) => Cow::Owned(format!("opaque::{name}")),
         }
     }
 }
@@ -396,6 +425,9 @@ pub(crate) enum BoundaryAttrs {
     Sort(SortAttrs),
     Scan(ScanAttrs),
     Scatter(ScatterAttrs),
+    Conv(ConvAttrs),
+    Window(WindowAttrs),
+    Opaque(OpaqueAttrs),
     /// Light ports: nothing selects on these, they only tell the Decision (and the signature) what the op was.
     Compact(CompactAttrs),
     Merge(MergeAttrs),

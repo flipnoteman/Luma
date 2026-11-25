@@ -10,11 +10,14 @@
 //! kernel that does all of it.
 
 use std::fmt::Write as _;
+use std::panic::Location;
 
 use crate::array::Array;
 use crate::context::Context;
 use crate::error::LumaError;
 use crate::interp::Interp;
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
 use crate::jit::cost::{read_path, ReadPath, ReadPattern, TextureRead};
 use crate::kernel::{uniform, KernelArg};
 use crate::ops::fold_workgroups;
@@ -136,7 +139,7 @@ pub(crate) fn broadcast_strides(dims: [usize; 4]) -> [u32; 4] {
 
 impl Sampling<'_> {
     /// Runs the kernel and returns the output array.
-    pub(crate) fn run(&self, ctx: &Context) -> Result<Array<f32>, LumaError> {
+    pub(crate) fn run(&self, ctx: &Context, op: &'static str, location: &'static Location<'static>) -> Result<Array<f32>, LumaError> {
         let in_dims = self.src.shape().dims();
         let to_u32 = |v: usize| u32::try_from(v).map_err(|_| LumaError::DimensionTooLarge { shape: self.out.dims() });
         let count = self.out.len();
@@ -204,6 +207,12 @@ impl Sampling<'_> {
         // The source as a texture, where it is one 2-D slice the device can see as one and the
         // read path pays (see `crate::jit::cost::read_path`).
         let read_mode = self.read_mode(ctx);
+        // The legacy label of the read: the texture unit's filter, a gather through a texture, or the buffer.
+        note_light(ctx, FamilyTag::Sample, op, location, match read_mode {
+            Read::Sample => "sample::texture_linear",
+            Read::Load | Read::Gather => "sample::texture_gather",
+            Read::Buffer => "sample::buffer",
+        });
         let filter = if read_mode == Read::Sample { luma_core::TextureFilter::Linear } else { luma_core::TextureFilter::Nearest };
         let texture = match read_mode {
             Read::Buffer => None,

@@ -12,6 +12,7 @@ use std::panic::Location;
 
 use super::detect::{self, Detector, Tile};
 use super::Kernel as Corners;
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::error::Result;
 use crate::ops::Outcome;
@@ -144,7 +145,7 @@ impl Array<f32> {
     /// ```
     #[track_caller]
     pub fn susan(&self, radius: usize, diff_thr: f32, geom_thr: f32, feature_ratio: f32, edge: usize) -> Result<Option<Keypoints>> {
-        let _ = Location::caller();
+        opaque!(self.context(), VISION_SUSAN, "susan", Location::caller());
         run(self, radius, diff_thr, geom_thr, feature_ratio, edge).map_err(Failure::into_error)
     }
 }

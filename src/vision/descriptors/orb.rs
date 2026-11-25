@@ -22,6 +22,7 @@ use std::fmt::Write as _;
 
 use super::orb_pattern::{PATCH, PATTERN};
 use super::{resize, Kernel as Descriptors};
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::RawArg;
@@ -708,7 +709,7 @@ impl Array<f32> {
     /// ```
     #[track_caller]
     pub fn orb(&self, fast_thr: f32, max_feat: u32, scale_factor: f32, levels: u32, blur_img: bool) -> crate::error::Result<Option<(Keypoints, Array<u32>)>> {
-        let _ = std::panic::Location::caller();
+        opaque!(self.context(), VISION_ORB, "orb", std::panic::Location::caller());
         run(self, fast_thr, max_feat, scale_factor, levels, blur_img).map_err(Failure::into_error)
     }
 }

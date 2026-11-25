@@ -15,6 +15,7 @@ use std::panic::Location;
 
 use super::detect::{self, Detector, Tile};
 use super::Kernel as Corners;
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::error::Result;
 use crate::ops::Outcome;
@@ -237,7 +238,7 @@ impl Array<f32> {
     /// ```
     #[track_caller]
     pub fn harris(&self, max_corners: usize, min_response: f32, sigma: f32, block_size: usize, k_thr: f32) -> Result<Option<Keypoints>> {
-        let _ = Location::caller();
+        opaque!(self.context(), VISION_HARRIS, "harris", Location::caller());
         run(self, max_corners, min_response, sigma, block_size, k_thr).map_err(Failure::into_error)
     }
 }

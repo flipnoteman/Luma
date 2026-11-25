@@ -22,6 +22,7 @@
 use std::fmt::Write as _;
 
 use super::{resize, Kernel as Descriptors};
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::RawArg;
@@ -1043,7 +1044,7 @@ impl Array<f32> {
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn sift(&self, n_layers: u32, contrast_thr: f32, edge_thr: f32, init_sigma: f32, double_input: bool, intensity_scale: f32, feature_ratio: f32) -> crate::error::Result<Option<(Keypoints, Array<f32>)>> {
-        let _ = std::panic::Location::caller();
+        opaque!(self.context(), VISION_SIFT, "sift", std::panic::Location::caller());
         run(self, false, n_layers, contrast_thr, edge_thr, init_sigma, double_input, intensity_scale, feature_ratio).map_err(Failure::into_error)
     }
 
@@ -1071,7 +1072,7 @@ impl Array<f32> {
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn gloh(&self, n_layers: u32, contrast_thr: f32, edge_thr: f32, init_sigma: f32, double_input: bool, intensity_scale: f32, feature_ratio: f32) -> crate::error::Result<Option<(Keypoints, Array<f32>)>> {
-        let _ = std::panic::Location::caller();
+        opaque!(self.context(), VISION_GLOH, "gloh", std::panic::Location::caller());
         run(self, true, n_layers, contrast_thr, edge_thr, init_sigma, double_input, intensity_scale, feature_ratio).map_err(Failure::into_error)
     }
 }

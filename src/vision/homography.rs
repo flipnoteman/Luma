@@ -12,6 +12,7 @@
 use std::panic::Location;
 
 use super::{invalid, to_u32, Kernel as Any};
+use crate::jit::structured::opaque::opaque;
 use crate::array::Array;
 use crate::builtin::Builtin;
 use crate::context::{RawArg, Scratch};
@@ -327,6 +328,7 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 pub fn homography(x_src: &Array<f32>, y_src: &Array<f32>, x_dst: &Array<f32>, y_dst: &Array<f32>, method: HomographyMethod, inlier_thr: f32, iterations: u32) -> (Array<f32>, Array<u32>) {
     let location = Location::caller();
     let ctx = x_src.context();
+    opaque!(ctx, VISION_HOMOGRAPHY, "homography", location);
     match run(x_src, y_src, x_dst, y_dst, method, inlier_thr, iterations) {
         Ok(pair) => pair,
         Err(failure) => {

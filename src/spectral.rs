@@ -9,6 +9,23 @@
 
 use std::panic::Location;
 
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
+
+/// The public op a transform serves and where it was written, for the `SpectralPlan` Decisions.
+#[derive(Clone, Copy)]
+pub(crate) struct Site {
+    op: &'static str,
+    location: &'static Location<'static>,
+}
+
+impl Site {
+    #[inline(always)]
+    fn note(self, ctx: &Context, label: &'static str) {
+        note_light(ctx, FamilyTag::Spectral, self.op, self.location, label);
+    }
+}
+
 use crate::array::Array;
 use crate::builtin::Builtin;
 use crate::complex::C32;
@@ -508,8 +525,10 @@ pub(crate) fn run_axis(
     inverse: bool,
     scale: f32,
     io: &AxisIo<'_>,
+    site: Site,
 ) -> Result<(), LumaError> {
     if is_smooth(n) {
+        site.note(ctx, "spectral::stockham");
         return run_lines(
             ctx,
             scratch,
@@ -538,6 +557,7 @@ pub(crate) fn run_axis(
     if io.load == LoadKind::RealPair || io.store == StoreKind::RealPair || io.store_table.is_some() || io.load_table.is_some() {
         return Err(LumaError::InvalidShape("internal: Bluestein with packed or tabled ends".into()));
     }
+    site.note(ctx, "spectral::bluestein");
     let tables = chirp_tables(ctx, n, inverse)?;
     let (m, chirp, b_hat) = (tables.m, &tables.chirp, &tables.b_hat);
     let size_bytes = |len: u32| u64::from(outer) * u64::from(len) * u64::from(inner) * 8;
@@ -680,6 +700,7 @@ fn launch_real_stage(
 
 /// The transform of real values along `axis` of `dims` into the half spectrum (`n / 2 + 1`
 /// values), scaled by `factor`.
+#[allow(clippy::too_many_arguments)]
 fn real_forward(
     ctx: &Context,
     scratch: &mut Scratch<'_>,
@@ -688,6 +709,7 @@ fn real_forward(
     factor: f32,
     src: (&luma_core::Buffer, u64),
     dst: (&luma_core::Buffer, u64),
+    site: Site,
 ) -> Result<(), LumaError> {
     let (outer, n, inner) = geometry(dims, axis)?;
     if n % 2 == 0 && is_smooth(n / 2) {
@@ -697,6 +719,7 @@ fn real_forward(
         let sizes = partition(h, tile_elems(ctx));
         if inner == 1 && sizes.len() >= 2 && sizes.last().is_some_and(|&d| 2 * d <= tile_elems(ctx)) {
             // The last pass unpacks the spectrum in workgroup memory.
+            site.note(ctx, "spectral::real_fwd_fused");
             return run_lines(
                 ctx,
                 scratch,
@@ -720,6 +743,7 @@ fn real_forward(
                 },
             );
         }
+        site.note(ctx, "spectral::real_fwd_staged");
         let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
         let z = scratch.take(bytes)?;
         run_lines(
@@ -746,8 +770,9 @@ fn real_forward(
         )?;
         return launch_real_stage(ctx, true, (outer, h, inner), factor, (&z, bytes), dst, None);
     }
+    site.note(ctx, "spectral::real_fwd_direct");
     let io = AxisIo { src, dst, load: LoadKind::Real, store: StoreKind::Complex, n_in: None, n_out: Some(n / 2 + 1), n_full: 0, store_table: None, load_table: None };
-    run_axis(ctx, scratch, (outer, n, inner), false, factor, &io)
+    run_axis(ctx, scratch, (outer, n, inner), false, factor, &io, site)
 }
 
 /// The inverse of [`real_forward`]: `n` real values from the half spectrum along `axis` of
@@ -762,6 +787,7 @@ fn real_inverse(
     src: (&luma_core::Buffer, u64),
     dst: (&luma_core::Buffer, u64),
     product: Option<(&luma_core::Buffer, u64)>,
+    site: Site,
 ) -> Result<(), LumaError> {
     let (outer, n, inner) = geometry(dims, axis)?;
     let k = n / 2 + 1;
@@ -772,6 +798,7 @@ fn real_inverse(
         let h = n / 2;
         if inner == 1 {
             // The first pass packs the half spectrum as it loads it.
+            site.note(ctx, "spectral::real_inv_fused");
             return run_lines(
                 ctx,
                 scratch,
@@ -795,6 +822,7 @@ fn real_inverse(
                 },
             );
         }
+        site.note(ctx, "spectral::real_inv_staged");
         let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
         let z = scratch.take(bytes)?;
         launch_real_stage(ctx, false, (outer, h, inner), 1.0, src, (&z, bytes), product)?;
@@ -821,8 +849,9 @@ fn real_inverse(
             },
         );
     }
+    site.note(ctx, "spectral::real_inv_direct");
     let io = AxisIo { src, dst, load: LoadKind::Hermitian, store: StoreKind::Real, n_in: Some(k), n_out: None, n_full: n, store_table: None, load_table: None };
-    run_axis(ctx, scratch, (outer, n, inner), true, factor, &io)
+    run_axis(ctx, scratch, (outer, n, inner), true, factor, &io, site)
 }
 
 /// What the first axis of a transform reads.
@@ -833,6 +862,7 @@ enum Input {
 }
 
 /// The complex transform of the array in `src` (of `dims`) along each of `axes` in turn.
+#[allow(clippy::too_many_arguments)]
 fn run_complex(
     ctx: &Context,
     dims: [usize; 4],
@@ -841,6 +871,7 @@ fn run_complex(
     axes: &[usize],
     inverse: bool,
     norm: FftNorm,
+    site: Site,
 ) -> Outcome<Array<C32>> {
     for &a in axes {
         check_axis(a)?;
@@ -870,6 +901,7 @@ fn run_complex(
             inverse,
             factor,
             &AxisIo { src: (&current.0, current.1), dst: (&target.0, target.1), load, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table: None },
+            site,
         )?;
         current = target;
     }
@@ -878,7 +910,7 @@ fn run_complex(
 
 /// The half spectrum of real input: the first of `axes` is halved, the others are complex
 /// transforms of the result.
-fn run_real_forward(input: &Array<f32>, axes: &[usize], norm: FftNorm) -> Outcome<Array<C32>> {
+fn run_real_forward(input: &Array<f32>, axes: &[usize], norm: FftNorm, site: Site) -> Outcome<Array<C32>> {
     let ctx = input.context();
     let mut dims = input.shape().dims();
     for &a in axes {
@@ -900,7 +932,7 @@ fn run_real_forward(input: &Array<f32>, axes: &[usize], norm: FftNorm) -> Outcom
     let half_bytes = bytes_of(half);
     let rest = &axes[1..];
     let target = if rest.is_empty() { (out_pin.buffer().clone(), out_bytes) } else { (scratch.take(half_bytes)?, half_bytes) };
-    real_forward(ctx, &mut scratch, dims, first, norm.factor(n, false), (in_pin.buffer(), in_bytes), (&target.0, target.1))?;
+    real_forward(ctx, &mut scratch, dims, first, norm.factor(n, false), (in_pin.buffer(), in_bytes), (&target.0, target.1), site)?;
     dims = half;
     let mut current = target;
     for (i, &axis) in rest.iter().enumerate() {
@@ -914,6 +946,7 @@ fn run_real_forward(input: &Array<f32>, axes: &[usize], norm: FftNorm) -> Outcom
             false,
             factor,
             &AxisIo { src: (&current.0, current.1), dst: (&next.0, next.1), load: LoadKind::Complex, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table: None },
+            site,
         )?;
         current = next;
     }
@@ -928,6 +961,7 @@ fn run_real_inverse(
     n: usize,
     norm: FftNorm,
     product: Option<&Array<C32>>,
+    site: Site,
 ) -> Outcome<Array<f32>> {
     let ctx = input.context();
     let dims = input.shape().dims();
@@ -964,11 +998,12 @@ fn run_real_inverse(
             true,
             factor,
             &AxisIo { src: (&current.0, current.1), dst: (&next.0, next.1), load: LoadKind::Complex, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table },
+            site,
         )?;
         current = next;
     }
     let product = if rest.is_empty() { table } else { None };
-    real_inverse(ctx, &mut scratch, out_dims, first, norm.factor(n, true), (&current.0, current.1), (out_pin.buffer(), out_bytes), product)?;
+    real_inverse(ctx, &mut scratch, out_dims, first, norm.factor(n, true), (&current.0, current.1), (out_pin.buffer(), out_bytes), product, site)?;
     Ok(output)
 }
 
@@ -1035,7 +1070,7 @@ impl Array<C32> {
     #[track_caller]
     pub fn fft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
-        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, false, norm));
+        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, false, norm, Site { op: "fft", location }));
         Array::resolve(self.context(), self.shape(), result, "fft", location)
     }
 
@@ -1043,7 +1078,7 @@ impl Array<C32> {
     #[track_caller]
     pub fn ifft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
-        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, true, norm));
+        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, true, norm, Site { op: "ifft", location }));
         Array::resolve(self.context(), self.shape(), result, "ifft", location)
     }
 
@@ -1077,7 +1112,7 @@ impl Array<C32> {
         if let Some(&a) = axes.first().filter(|&&a| a < 4) {
             dims[a] = n;
         }
-        let result = run_real_inverse(self, axes, n, norm, None);
+        let result = run_real_inverse(self, axes, n, norm, None, Site { op: "irfft", location });
         Array::resolve(self.context(), Shape::from(dims), result, "irfft", location)
     }
 }
@@ -1102,7 +1137,7 @@ impl Array<f32> {
     pub fn fft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
         let result = self.ready().and_then(|(pin, bytes): (_, u64)| {
-            run_complex(self.context(), self.shape().dims(), (pin.buffer().clone(), bytes), Input::Real, axes, false, norm)
+            run_complex(self.context(), self.shape().dims(), (pin.buffer().clone(), bytes), Input::Real, axes, false, norm, Site { op: "fft", location })
         });
         Array::resolve(self.context(), self.shape(), result, "fft", location)
     }
@@ -1142,7 +1177,7 @@ impl Array<f32> {
         if let Some(&a) = axes.first().filter(|&&a| a < 4) {
             dims[a] = dims[a] / 2 + 1;
         }
-        let result = run_real_forward(self, axes, norm);
+        let result = run_real_forward(self, axes, norm, Site { op: "rfft", location });
         Array::resolve(self.context(), Shape::from(dims), result, "rfft", location)
     }
 }
@@ -1161,7 +1196,7 @@ fn fft_size(n: usize) -> usize {
 }
 
 /// The convolution of the first `nd` axes of `signal` with `kernel`, batched over the others.
-fn run_convolve(signal: &Array<f32>, kernel: &Array<f32>, nd: usize, mode: ConvMode) -> Outcome<Array<f32>> {
+fn run_convolve(signal: &Array<f32>, kernel: &Array<f32>, nd: usize, mode: ConvMode, site: Site) -> Outcome<Array<f32>> {
     if !signal.context().same_as(kernel.context()) {
         return Err(LumaError::ContextMismatch.into());
     }
@@ -1175,6 +1210,7 @@ fn run_convolve(signal: &Array<f32>, kernel: &Array<f32>, nd: usize, mode: ConvM
             .into());
         }
     }
+    site.note(signal.context(), "spectral::convolve");
     let mut padded = s;
     let mut widths_s = [(0usize, 0usize); 4];
     let mut widths_k = [(0usize, 0usize); 4];
@@ -1190,7 +1226,7 @@ fn run_convolve(signal: &Array<f32>, kernel: &Array<f32>, nd: usize, mode: ConvM
     // Inverse in the reverse order: the last forward axis first, where the product happens.
     let mut inverse_axes = vec![0];
     inverse_axes.extend((1..nd).rev());
-    let full = run_real_inverse(&spectrum, &inverse_axes, padded[0], FftNorm::Backward, Some(&kernel_spectrum))?;
+    let full = run_real_inverse(&spectrum, &inverse_axes, padded[0], FftNorm::Backward, Some(&kernel_spectrum), site)?;
     let mut out = full;
     for d in 0..nd {
         let (start, len) = match mode {
@@ -1240,7 +1276,7 @@ impl Array<f32> {
                 ConvMode::Full => s[d] + k[d].max(1) - 1,
             };
         }
-        let result = run_convolve(self, kernel, nd, mode);
+        let result = run_convolve(self, kernel, nd, mode, Site { op: "fft_convolve", location });
         Array::resolve(self.context(), Shape::from(dims), result, "fft_convolve", location)
     }
 }

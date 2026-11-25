@@ -16,7 +16,7 @@
 mod pointwise;
 mod sat;
 mod warp;
-mod window;
+pub(crate) mod window;
 
 use std::panic::Location;
 use std::sync::Arc;
@@ -27,6 +27,9 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu::pager::Pin;
 use crate::gpu_type::{Numeric, ScalarType};
+use crate::jit::structured::opaque::opaque;
+use crate::jit::structured::boundary::{dim, WindowAttrs, WindowParams, WindowStage};
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 use crate::view::PadMode;
@@ -303,39 +306,58 @@ fn geometry(shape: Shape, spec: &Spec) -> Result<Geometry, Failure> {
 }
 
 /// The kernel for `spec` on `pixel`, with the largest tile whose staged window fits the
-/// device's workgroup memory.
-fn plan(ctx: &Context, spec: &Spec, pixel: Pixel, edge: Edge) -> Result<Window, Failure> {
-    let limit = u64::from(ctx.tuning().workgroup_storage);
-    let blocked = spec.op == Op::Correlate && spec.stride[1] == 1 && !spec.three_d;
-    let candidates: &[([u8; 3], u8)] = if spec.three_d && spec.op != Op::BilateralColor {
+/// device's workgroup memory: the `Window` family's selection (`window::tiled` and the median selections).
+fn plan(ctx: &Context, spec: &Spec, pixel: Pixel, edge: Edge, name: &'static str, location: &'static Location<'static>) -> Result<Window, Failure> {
+    let to_k = |v: usize| u16::try_from(v).map_err(|_| invalid(format!("window of {v} cells is too large")));
+    let k = [to_k(spec.k[0])?, to_k(spec.k[1])?, to_k(spec.k[2])?];
+    let to_s = |v: usize| u8::try_from(v).map_err(|_| invalid(format!("stride {v} is too large")));
+    let stride = [to_s(spec.stride[0])?, to_s(spec.stride[1])?, to_s(spec.stride[2])?];
+    let boundary = Boundary::new(
+        FamilyTag::Window,
+        name,
+        location,
+        [u32::from(k[0]), u32::from(k[1]), u32::from(k[2]), u32::from(stride[0])],
+        BoundaryAttrs::Window(WindowAttrs { stage: WindowStage::Plan, op: spec.op, k, stride, three_d: spec.three_d, aux_cells: spec.aux_cells as u64, pixel, edge }),
+    );
+    let Some((chosen, params)) = first_candidate(ctx, &boundary) else {
+        return Err(LumaError::Unsupported(format!("a window of {:?} cells does not fit workgroup memory", spec.k)).into());
+    };
+    note(ctx, &boundary, chosen, &params, &[]);
+    let Params::Window(WindowParams { window: Some(w) }) = params else { unreachable!("a window plan carries its kernel") };
+    Ok(w)
+}
+
+/// The first of the tile candidates of `op` whose window fits workgroup memory (`limit` bytes) and a workgroup of 256 invocations:
+/// today's `plan`, a pure function of its arguments (the `fits` of the `Window` strategies call it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn first_fit(limit: u64, op: Op, k: [u16; 3], stride: [u8; 3], three_d: bool, aux_cells: u64, pixel: Pixel, edge: Edge) -> Option<Window> {
+    let blocked = op == Op::Correlate && stride[1] == 1 && !three_d;
+    let cells01 = usize::from(k[0]) * usize::from(k[1]);
+    let candidates: &[([u8; 3], u8)] = if three_d && op != Op::BilateralColor {
         &[([32, 4, 2], 1), ([16, 4, 2], 1), ([8, 4, 2], 1), ([8, 4, 1], 1), ([4, 4, 1], 1)]
     } else if blocked {
         &[([32, 32, 1], 4), ([32, 16, 1], 2), ([32, 8, 1], 1), ([16, 8, 1], 1), ([8, 8, 1], 1)]
-    } else if spec.op == Op::Correlate || spec.op == Op::Bilateral || (spec.op == Op::Median && spec.k[0] * spec.k[1] > window::MEDIAN_BLOCKED_CELLS) {
+    } else if op == Op::Correlate || op == Op::Bilateral || (op == Op::Median && cells01 > window::MEDIAN_BLOCKED_CELLS) {
         &[([32, 8, 1], 1), ([16, 8, 1], 1), ([8, 8, 1], 1), ([8, 4, 1], 1)]
     } else {
         // Larger tiles (four outputs per invocation) cost less halo per output and keep more
         // loads in flight: 3x3 filters at 4K ran 1.5x faster than with 32 x 8 tiles.
         &[([32, 32, 1], 4), ([32, 16, 1], 2), ([32, 8, 1], 1), ([16, 8, 1], 1), ([8, 8, 1], 1), ([8, 4, 1], 1)]
     };
-    let to_k = |v: usize| u16::try_from(v).map_err(|_| invalid(format!("window of {v} cells is too large")));
-    let k = [to_k(spec.k[0])?, to_k(spec.k[1])?, to_k(spec.k[2])?];
-    let to_s = |v: usize| u8::try_from(v).map_err(|_| invalid(format!("stride {v} is too large")));
-    let stride = [to_s(spec.stride[0])?, to_s(spec.stride[1])?, to_s(spec.stride[2])?];
     for &(tile, ry) in candidates {
-        let stage_aux = spec.aux_cells * 4 <= 8192;
-        let w = Window { op: spec.op, pixel, k, stride, edge, tile, ry, stage_aux };
+        let stage_aux = aux_cells * 4 <= 8192;
+        let w = Window { op, pixel, k, stride, edge, tile, ry, stage_aux };
         if window::shared_bytes(&w) <= limit && window::invocations(&w) <= 256 {
-            return Ok(w);
+            return Some(w);
         }
         if stage_aux {
             let w = Window { stage_aux: false, ..w };
             if window::shared_bytes(&w) <= limit && window::invocations(&w) <= 256 {
-                return Ok(w);
+                return Some(w);
             }
         }
     }
-    Err(LumaError::Unsupported(format!("a window of {:?} cells does not fit workgroup memory", spec.k)).into())
+    None
 }
 
 /// Records the launch of `w` and returns nothing: the results are in `outs`.
@@ -373,7 +395,7 @@ fn launch_window(
 
 /// The windowed filter `spec` over `input`: one output array (two for the derivatives), each
 /// of the shape of the filtered axes and the batch of `input`.
-fn run_window<T: ImagePixel>(input: &Array<T>, spec: &Spec, aux: Option<&Array<impl ScalarType>>) -> Outcome<Vec<Array<T>>> {
+fn run_window<T: ImagePixel>(input: &Array<T>, spec: &Spec, aux: Option<&Array<impl ScalarType>>, name: &'static str, location: &'static Location<'static>) -> Outcome<Vec<Array<T>>> {
     let ctx = input.context();
     input.storage()?;
     let geo = geometry(input.shape(), spec)?;
@@ -397,7 +419,7 @@ fn run_window<T: ImagePixel>(input: &Array<T>, spec: &Spec, aux: Option<&Array<i
         Op::Max | Op::MaskedMax => T::lowest_bits(),
         _ => 0,
     };
-    let w = plan(ctx, spec, T::pixel(), edge)?;
+    let w = plan(ctx, spec, T::pixel(), edge, name, location)?;
     let mut shape = input.shape().dims();
     for d in 0..if spec.three_d { 3 } else { 2 } {
         shape[d] = geo.m[d] as usize;
@@ -469,7 +491,7 @@ impl<T: ImagePixel> Array<T> {
                     return Err(invalid(format!("mask of shape {d:?} does not have the window's shape {want:?}")));
                 }
             }
-            Ok(single(run_window(self, &spec, mask)?))
+            Ok(single(run_window(self, &spec, mask, name, location)?))
         })();
         finish(self, result, name, location)
     }
@@ -511,14 +533,30 @@ impl<T: ImagePixel> Array<T> {
 
     fn extremum(&self, op: Op, window: [usize; 2], border: Border, location: &'static Location<'static>, name: &'static str) -> Array<T> {
         let k = window3(&window);
-        if k[0] * k[1] >= 25 && k[0] > 1 && k[1] > 1 {
-            let (before, after) = anchored(k);
+        let saturate = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+        let boundary = Boundary::new(
+            FamilyTag::Window,
+            name,
+            location,
+            [dim(k[0]), dim(k[1]), dim(k[2]), 1],
+            BoundaryAttrs::Window(WindowAttrs {
+                stage: WindowStage::Entry,
+                op,
+                k: [saturate(k[0]), saturate(k[1]), saturate(k[2])],
+                stride: [1; 3],
+                three_d: false,
+                aux_cells: 0,
+                pixel: T::pixel(),
+                edge: Edge::Clamp,
+            }),
+        );
+        if let Some((chosen, params)) = first_candidate(self.context(), &boundary) {
+            note(self.context(), &boundary, chosen, &params, &[]);
             let pass = |input: &Array<T>, k: [usize; 3]| -> Outcome<Array<T>> {
                 let (before, after) = anchored(k);
                 let spec = Spec { op, k, stride: [1; 3], before, after, border, three_d: false, c1: 0, aux_cells: 0 };
-                Ok(single(run_window(input, &spec, None::<&Array<f32>>)?))
+                Ok(single(run_window(input, &spec, None::<&Array<f32>>, name, location)?))
             };
-            let _ = (before, after);
             let result = pass(self, [k[0], 1, 1]).and_then(|rows| pass(&rows, [1, k[1], 1]));
             return finish(self, result, name, location);
         }
@@ -599,6 +637,7 @@ impl<T: ImagePixel> Array<T> {
     pub fn hist_equal(&self, hist: &Array<u32>) -> Array<T> {
         let location = Location::caller();
         let ctx = self.context();
+        opaque!(ctx, IMAGE_HIST_EQUAL, "hist_equal", location);
         if hist.is_empty() || !ctx.same_as(hist.context()) {
             let error = if hist.is_empty() { LumaError::InvalidShape("empty histogram".into()) } else { LumaError::ContextMismatch };
             return Array::poisoned(ctx, self.shape(), Arc::new(LumaError::Op { op: "hist_equal", location, source: Arc::new(error) }));
@@ -624,6 +663,7 @@ impl<T: Numeric + ImagePixel> Array<T> {
     #[track_caller]
     pub fn sat(&self) -> Array<T> {
         let location = Location::caller();
+        opaque!(self.context(), IMAGE_SAT, "sat", location);
         match run_sat(self) {
             Ok(table) => table,
             // An array over several buffers: two scans.
@@ -694,7 +734,7 @@ impl Array<f32> {
                 stride[2] = 1;
             }
             let run = Spec { op: Op::Correlate, k, stride, before, after, border: spec.border, three_d, c1: 0, aux_cells: kernel.len() };
-            Ok(single(run_window(self, &run, Some(kernel))?))
+            Ok(single(run_window(self, &run, Some(kernel), name, location)?))
         })();
         finish(self, result, name, location)
     }
@@ -759,7 +799,7 @@ impl Array<f32> {
                 a[axis] = after[axis];
                 s[axis] = spec.stride[axis];
                 let run = Spec { op: Op::Correlate, k: kk, stride: s, before: b, after: a, border: spec.border, three_d: false, c1: 0, aux_cells: taps.len() };
-                run_window(input, &run, Some(taps)).map(single)
+                run_window(input, &run, Some(taps), "conv2_sep", location).map(single)
             };
             let rows = pass(self, along0, 0)?;
             pass(&rows, along1, 1)
@@ -791,7 +831,7 @@ impl Array<f32> {
     pub fn sobel_magnitude(&self) -> Array<f32> {
         let location = Location::caller();
         let spec = self.sobel_spec(Op::SobelMagnitude, Border::Edge);
-        finish(self, run_window(self, &spec, None::<&Array<f32>>).map(single), "sobel_magnitude", location)
+        finish(self, run_window(self, &spec, None::<&Array<f32>>, "sobel_magnitude", location).map(single), "sobel_magnitude", location)
     }
 
     /// The cheap magnitude `|d0| + |d1|` of the Sobel gradient.
@@ -799,7 +839,7 @@ impl Array<f32> {
     pub fn sobel_magnitude_fast(&self) -> Array<f32> {
         let location = Location::caller();
         let spec = self.sobel_spec(Op::SobelFast, Border::Edge);
-        finish(self, run_window(self, &spec, None::<&Array<f32>>).map(single), "sobel_magnitude_fast", location)
+        finish(self, run_window(self, &spec, None::<&Array<f32>>, "sobel_magnitude_fast", location).map(single), "sobel_magnitude_fast", location)
     }
 
     fn sobel_spec(&self, op: Op, border: Border) -> Spec {
@@ -808,7 +848,7 @@ impl Array<f32> {
 
     fn sobel_run(&self, op: Op, border: Border, name: &'static str, location: &'static Location<'static>) -> (Array<f32>, Array<f32>) {
         let spec = self.sobel_spec(op, border);
-        finish_pair(self, run_window(self, &spec, None::<&Array<f32>>), name, location)
+        finish_pair(self, run_window(self, &spec, None::<&Array<f32>>, name, location), name, location)
     }
 
     /// The gradient `(d0, d1)` along axis 0 and axis 1 of every `[H, W]` plane (axes 2 and 3 are
@@ -818,7 +858,8 @@ impl Array<f32> {
     #[track_caller]
     pub fn grad(&self) -> (Array<f32>, Array<f32>) {
         let spec = Spec { op: Op::Gradient, k: [3, 3, 1], stride: [1; 3], before: [1, 1, 0], after: [1, 1, 0], border: Border::Edge, three_d: false, c1: 0, aux_cells: 0 };
-        finish_pair(self, run_window(self, &spec, None::<&Array<f32>>), "grad", Location::caller())
+        let location = Location::caller();
+        finish_pair(self, run_window(self, &spec, None::<&Array<f32>>, "grad", location), "grad", location)
     }
 
     /// The bilateral filter of every `[H, W]` plane (axes 2 and 3 are a batch): every cell
@@ -844,7 +885,7 @@ impl Array<f32> {
                 c1: (-1.0 / (2.0 * range_sigma * range_sigma)).to_bits(),
                 aux_cells: 0,
             };
-            bilateral_run(self, &spec, spatial_sigma)
+            bilateral_run(self, &spec, spatial_sigma, "bilateral", location)
         })();
         finish(self, result, "bilateral", location)
     }
@@ -872,7 +913,7 @@ impl Array<f32> {
                 c1: (-1.0 / (2.0 * range_sigma * range_sigma)).to_bits(),
                 aux_cells: 0,
             };
-            bilateral_run(self, &spec, spatial_sigma)
+            bilateral_run(self, &spec, spatial_sigma, "bilateral_color", location)
         })();
         finish(self, result, "bilateral_color", location)
     }
@@ -886,6 +927,7 @@ impl Array<f32> {
     pub fn moments(&self) -> Array<f32> {
         let location = Location::caller();
         let ctx = self.context();
+        opaque!(ctx, IMAGE_MOMENTS, "moments", location);
         let result = (|| {
             self.storage()?;
             let shape = self.shape();
@@ -910,6 +952,7 @@ impl Array<f32> {
     pub fn unwrap(&self, window: [usize; 2], stride: [usize; 2], pad: [usize; 2], column: bool) -> Array<f32> {
         let location = Location::caller();
         let ctx = self.context();
+        opaque!(ctx, IMAGE_UNWRAP, "unwrap", location);
         let mut dims = self.shape().dims();
         let result = (|| {
             self.storage()?;
@@ -937,6 +980,7 @@ impl Array<f32> {
     pub fn wrap(&self, out_dims: [usize; 2], window: [usize; 2], stride: [usize; 2], pad: [usize; 2], column: bool) -> Array<f32> {
         let location = Location::caller();
         let ctx = self.context();
+        opaque!(ctx, IMAGE_WRAP, "wrap", location);
         let dims = self.shape().dims();
         let result = (|| {
             self.storage()?;
@@ -958,6 +1002,7 @@ impl Array<f32> {
 
     fn color(&self, op: Color, params: [f32; 3], standard: u32, name: &'static str, location: &'static Location<'static>) -> Array<f32> {
         let ctx = self.context();
+        opaque!(ctx, IMAGE_POINTWISE, name, location);
         let (cin, cout) = op.planes();
         let mut dims = self.shape().dims();
         let result = (|| {
@@ -1082,11 +1127,11 @@ fn check_sigma(spatial: f32, range: f32) -> Result<(), Failure> {
 }
 
 /// Runs a bilateral kernel: the spatial exponent factor `-1 / (2 s^2)` goes in `p.c0`.
-fn bilateral_run(input: &Array<f32>, spec: &Spec, spatial_sigma: f32) -> Outcome<Array<f32>> {
+fn bilateral_run(input: &Array<f32>, spec: &Spec, spatial_sigma: f32, name: &'static str, location: &'static Location<'static>) -> Outcome<Array<f32>> {
     let ctx = input.context();
     input.storage()?;
     let geo = geometry(input.shape(), spec)?;
-    let w = plan(ctx, spec, Pixel::F32, Edge::Clamp)?;
+    let w = plan(ctx, spec, Pixel::F32, Edge::Clamp, name, location)?;
     let out = Array::<f32>::alloc(ctx, input.shape())?;
     let (src_pin, src_bytes) = input.ready()?;
     let (out_pin, out_bytes) = out.ready()?;

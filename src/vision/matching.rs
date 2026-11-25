@@ -9,6 +9,7 @@ mod template;
 
 use std::panic::Location;
 
+use crate::jit::structured::opaque::opaque;
 use crate::array::Array;
 use crate::error::Result;
 use crate::gpu_type::ScalarType;
@@ -69,6 +70,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn match_template(&self, template: &Array<f32>, metric: MatchType) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_MATCH_TEMPLATE, "match_template", location);
         let result = template::run(self, template, metric);
         Array::resolve(self.context(), self.shape(), result, "match_template", location)
     }
@@ -163,7 +165,9 @@ impl Neighbour for i32 {
 /// assert_eq!(dist.to_vec()?, [1.0, 32.0, 2.0, 32.0]);
 /// # Ok(()) }
 /// ```
+#[track_caller]
 pub fn nearest_neighbour<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_dim: usize, n_dist: usize, dist: DistType) -> Result<(Array<u32>, Array<T::Dist>)> {
+    opaque!(query.context(), VISION_NEAREST_NEIGHBOUR, "nearest_neighbour", std::panic::Location::caller());
     neighbours::run(query, train, dist_dim, n_dist, dist)
 }
 
@@ -185,7 +189,9 @@ pub fn nearest_neighbour<T: Neighbour>(query: &Array<T>, train: &Array<T>, dist_
 /// assert_eq!(dist.to_vec()?, [2, 3]);
 /// # Ok(()) }
 /// ```
+#[track_caller]
 pub fn hamming_matcher(query: &Array<u32>, train: &Array<u32>, dist_dim: usize, n_dist: usize) -> Result<(Array<u32>, Array<u32>)> {
+    opaque!(query.context(), VISION_HAMMING, "hamming_matcher", std::panic::Location::caller());
     neighbours::run(query, train, dist_dim, n_dist, DistType::Shd)
 }
 

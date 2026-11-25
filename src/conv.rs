@@ -4,10 +4,12 @@
 use std::panic::Location;
 
 use crate::array::{Array, Storage};
-use crate::builtin::{conv_tile, Builtin, CONV_MAX_STRIDE};
+use crate::builtin::{conv_tile, Builtin};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::fft;
+use crate::jit::structured::boundary::{ConvAttrs, ConvStage};
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::ops::{fold_workgroups, launch_1d, Outcome};
 use crate::shape::Shape;
 
@@ -21,7 +23,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn conv1d(&self, kernel: &Array<f32>, stride: usize, padding: usize) -> Array<f32> {
         let location = Location::caller();
-        let result = run_conv1d(self, kernel, stride, padding);
+        let result = run_conv1d(self, kernel, stride, padding, location);
         Array::resolve(self.context(), self.shape(), result, "conv1d", location)
     }
 
@@ -33,7 +35,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn conv1d_fft(&self, kernel: &Array<f32>) -> Array<f32> {
         let location = Location::caller();
-        let result = run_conv1d_fft(self, kernel);
+        let result = run_conv1d_fft(self, kernel, location);
         Array::resolve(self.context(), self.shape(), result, "conv1d_fft", location)
     }
 }
@@ -63,6 +65,7 @@ fn run_conv1d(
     kernel: &Array<f32>,
     stride: usize,
     padding: usize,
+    location: &'static Location<'static>,
 ) -> Outcome<Array<f32>> {
     check_operands(input, kernel)?;
     let ctx = input.context();
@@ -99,7 +102,7 @@ fn run_conv1d(
         let (out_pin, out_bytes) = output.ready()?;
         let (in_pin, in_bytes) = input.ready()?;
         let (k_pin, k_bytes) = kernel.ready()?;
-        launch_conv(ctx, params, (out_pin.buffer(), out_bytes), (in_pin.buffer(), in_bytes), (k_pin.buffer(), k_bytes))?;
+        launch_conv(ctx, params, (out_pin.buffer(), out_bytes), (in_pin.buffer(), in_bytes), (k_pin.buffer(), k_bytes), location)?;
         return Ok(output);
     }
 
@@ -138,7 +141,7 @@ fn run_conv1d(
                 to_u32(window, "Input length")?,
                 to_u32(pieces, "Output length")?,
             ];
-            launch_conv(ctx, params, (&out, pieces as u64 * 4), (&win, window as u64 * 4), kernel_buf)?;
+            launch_conv(ctx, params, (&out, pieces as u64 * 4), (&win, window as u64 * 4), kernel_buf, location)?;
         }
         scatter(ctx, &out, 0, output_storage, a, pieces)?;
     }
@@ -158,6 +161,7 @@ fn launch_conv(
     out: (&luma_core::Buffer, u64),
     input: (&luma_core::Buffer, u64),
     kernel: (&luma_core::Buffer, u64),
+    location: &'static Location<'static>,
 ) -> Result<(), LumaError> {
     let args = [
         RawArg::write(out.0, out.1),
@@ -165,8 +169,18 @@ fn launch_conv(
         RawArg::read(kernel.0, kernel.1),
         RawArg::Uniform(bytemuck::bytes_of(&params)),
     ];
-    if params[1] <= CONV_MAX_STRIDE {
-        let (wg, per_thread) = (ctx.tuning().conv_workgroup, ctx.tuning().conv_per_thread);
+    let boundary = Boundary::new(
+        FamilyTag::Conv,
+        "conv1d",
+        location,
+        [params[0], params[3], params[1], params[4]],
+        BoundaryAttrs::Conv(ConvAttrs { stage: ConvStage::Direct, kernel_len: params[0], input_len: params[3], out_len: params[4], stride: params[1], batch: 1, tile_log: 0 }),
+    );
+    let (chosen, chosen_params) = first_candidate(ctx, &boundary).expect("a direct convolution always fits");
+    note(ctx, &boundary, chosen, &chosen_params, &[]);
+    if chosen == StrategyId::CONV_DIRECT_TILED {
+        let Params::Conv(plan) = chosen_params else { unreachable!("a conv strategy carries ConvParams") };
+        let (wg, per_thread) = (plan.workgroup, plan.per_thread);
         let core = ctx.builtin(Builtin::Conv1dTiled(params[1], per_thread), "f32")?;
         let groups = fold_workgroups(ctx, params[4].div_ceil(conv_tile(params[1], per_thread, wg)))?;
         ctx.launch(&core, groups, [params[4], 1, 1], &args)?;
@@ -231,7 +245,7 @@ fn segment_span(storage: &Storage, start: usize, len: usize) -> std::ops::Range<
     start / c..(start + len - 1) / c + 1
 }
 
-fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>> {
+fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>, location: &'static Location<'static>) -> Outcome<Array<f32>> {
     check_operands(input, kernel)?;
     let ctx = input.context();
 
@@ -251,7 +265,7 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>
             kernel: (k_pin.buffer(), k_bytes, kernel_len),
             output: (out_pin.buffer(), out_bytes, to_u32(output_len, "Output length")?),
         };
-        fft::convolve(ctx, &operands, &mut Scratch::new(ctx))?;
+        fft::convolve(ctx, &operands, &mut Scratch::new(ctx), "conv1d_fft", location)?;
         return Ok(output);
     }
 
@@ -277,7 +291,7 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>
             kernel: (k_pin.buffer(), k_bytes, kernel_len),
             output: (&tmp, tmp_len as u64 * 4, to_u32(tmp_len, "Window length")?),
         };
-        fft::convolve(ctx, &operands, &mut scratch)?;
+        fft::convolve(ctx, &operands, &mut scratch, "conv1d_fft", location)?;
         scatter(ctx, &tmp, a - w0, output_storage, a, b - a)?;
     }
     Ok(output)

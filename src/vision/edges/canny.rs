@@ -32,6 +32,7 @@ use std::fmt::Write as _;
 use std::panic::Location;
 
 use super::{geometry, plane_grid};
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::{RawArg, Scratch};
@@ -605,6 +606,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn canny(&self, threshold: CannyThreshold, low: f32, high: f32, sobel_window: u32, fast: bool) -> Array<bool> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_CANNY, "canny", location);
         Array::resolve(self.context(), self.shape(), run(self, threshold, low, high, sobel_window, fast), "canny", location)
     }
 }

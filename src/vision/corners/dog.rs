@@ -13,6 +13,7 @@ use std::panic::Location;
 
 use super::detect::{self, Tile};
 use super::Kernel as Corners;
+use crate::jit::structured::opaque::opaque;
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::RawArg;
@@ -140,6 +141,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn dog(&self, radius1: usize, radius2: usize) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_DOG, "dog", location);
         let result = self.run_dog(radius1, radius2);
         Array::resolve(self.context(), self.shape(), result, "dog", location)
     }

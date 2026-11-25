@@ -17,6 +17,7 @@ pub(crate) mod boundary;
 pub(crate) mod contraction;
 pub(crate) mod emit;
 pub(crate) mod families;
+pub(crate) mod opaque;
 pub(crate) mod select;
 pub(crate) mod strategy;
 pub(crate) mod telemetry;

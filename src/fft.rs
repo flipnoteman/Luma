@@ -23,6 +23,9 @@
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
+use crate::jit::structured::boundary::{ConvAttrs, ConvStage};
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params as StrategyParams, StrategyId};
+use std::panic::Location;
 use crate::ops::fold_workgroups;
 
 /// Tiles of `2^TILE_LOG` complex values (32 KiB) where the device allows, else half that.
@@ -527,7 +530,7 @@ pub(crate) struct Operands<'a> {
 }
 
 /// The tile size of the device: as large as its workgroup memory allows.
-fn tile_log(ctx: &Context) -> u32 {
+pub(crate) fn tile_log(ctx: &Context) -> u32 {
     let bytes = ctx.info().limits.max_workgroup_storage_bytes;
     if bytes >= 8 << TILE_LOG {
         TILE_LOG
@@ -660,11 +663,39 @@ fn run(ctx: &Context, batch: &Batch<'_>) -> Result<(), LumaError> {
     Ok(())
 }
 
+/// The overlap-save rule of [`convolve`]: the block size (`log2`) and its cost, where blocks of a smaller transform cost fewer bytes
+/// moved per output than one transform of the whole signal (`2^log_n` points); `None` for the whole signal. A pure function of its
+/// arguments, called by the selection of `Conv`.
+pub(crate) fn overlap_blocks(kernel_len: u32, out_len: u32, log_n: u32, tile_log: u32) -> Option<(u32, f64)> {
+    // Bytes moved per output, up to a constant: the transformed values per output times the
+    // passes over them (plus, for the single transform, those of the kernel's spectrum).
+    let full_cost = f64::from(1u32 << log_n) / f64::from(out_len)
+        * f64::from(passes(log_n, tile_log) + passes(log_n, tile_log).div_ceil(2));
+    let smallest = (2 * kernel_len)
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(tile_log);
+    (smallest..smallest + 3)
+        .filter(|&log_b| log_b < log_n)
+        .map(|log_b| {
+            let step = (1u32 << log_b) - (kernel_len - 1);
+            (
+                log_b,
+                f64::from(1u32 << log_b) / f64::from(step) / 2.0
+                    * f64::from(passes(log_b, tile_log)),
+            )
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .filter(|&(_, cost)| cost < full_cost)
+}
+
 /// Records the full linear convolution of `ops.input` with `ops.kernel` into `ops.output`.
 pub(crate) fn convolve(
     ctx: &Context,
     ops: &Operands<'_>,
     scratch: &mut Scratch<'_>,
+    op: &'static str,
+    location: &'static Location<'static>,
 ) -> Result<(), LumaError> {
     let kernel_len = ops.kernel.2;
     let out_len = ops.output.2;
@@ -676,26 +707,17 @@ pub(crate) fn convolve(
         })?
         .trailing_zeros();
 
-    // Bytes moved per output, up to a constant: the transformed values per output times the
-    // passes over them (plus, for the single transform, those of the kernel's spectrum).
-    let full_cost = f64::from(1u32 << log_n) / f64::from(out_len)
-        * f64::from(passes(log_n, tile_log) + passes(log_n, tile_log).div_ceil(2));
-    let smallest = (2 * kernel_len)
-        .next_power_of_two()
-        .trailing_zeros()
-        .max(tile_log);
-    let blocks = (smallest..smallest + 3)
-        .filter(|&log_b| log_b < log_n)
-        .map(|log_b| {
-            let step = (1u32 << log_b) - (kernel_len - 1);
-            (
-                log_b,
-                f64::from(1u32 << log_b) / f64::from(step) / 2.0
-                    * f64::from(passes(log_b, tile_log)),
-            )
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .filter(|&(_, cost)| cost < full_cost);
+    let boundary = Boundary::new(
+        FamilyTag::Conv,
+        op,
+        location,
+        [kernel_len, ops.input.2, 1, out_len],
+        BoundaryAttrs::Conv(ConvAttrs { stage: ConvStage::Fft, kernel_len, input_len: ops.input.2, out_len, stride: 1, batch: 1, tile_log }),
+    );
+    let (chosen, chosen_params) = first_candidate(ctx, &boundary).expect("an FFT convolution always fits");
+    note(ctx, &boundary, chosen, &chosen_params, &[]);
+    let StrategyParams::Conv(plan_params) = chosen_params else { unreachable!("a conv strategy carries ConvParams") };
+    let blocks = (chosen == StrategyId::CONV_FFT_BLOCKED).then_some(plan_params.log_b);
 
     let base = Params {
         s: 0,
@@ -709,7 +731,7 @@ pub(crate) fn convolve(
         groups: 0,
     };
     let (log_b, total, input, output, lead, step) = match blocks {
-        Some((log_b, _)) => {
+        Some(log_b) => {
             let step = (1u32 << log_b) - (kernel_len - 1);
             let pairs = out_len.div_ceil(step).div_ceil(2);
             let total = pairs

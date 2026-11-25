@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use std::panic::Location;
 
 use super::{geometry, plane_grid};
+use crate::jit::structured::opaque::opaque;
 use crate::array::Array;
 use crate::builtin::Builtin;
 use crate::context::RawArg;
@@ -215,6 +216,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn mean_shift(&self, spatial_sigma: f32, chromatic_sigma: f32, iterations: u32, is_color: bool) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_MEAN_SHIFT, "mean_shift", location);
         Array::resolve(self.context(), self.shape(), run(self, spatial_sigma, chromatic_sigma, iterations, is_color), "mean_shift", location)
     }
 }

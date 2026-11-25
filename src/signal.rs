@@ -28,18 +28,21 @@ use std::panic::Location;
 
 use crate::array::{Array, Failure};
 use crate::error::LumaError;
+use crate::jit::structured::opaque::opaque;
+use crate::jit::structured::boundary::{dim, ConvAttrs, ConvStage};
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use crate::kernel::{uniform, KernelArg};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 
 /// The longest filter the direct FIR kernel runs; longer ones use the FFT convolution.
-const FIR_DIRECT_MAX: usize = 256;
+pub(crate) const FIR_DIRECT_MAX: usize = 256;
 /// Filters at least this long use the FFT convolution when the signal is a single vector (see
 /// `Array::fir`).
-const FIR_FFT_MIN: usize = 384;
+pub(crate) const FIR_FFT_MIN: usize = 384;
 /// Batches of this many signals or more are filtered by blocks of taps, which handle the batch
 /// in one launch, instead of one FFT convolution per signal.
-const FIR_FFT_MAX_BATCH: usize = 16;
+pub(crate) const FIR_FFT_MAX_BATCH: usize = 16;
 /// Outputs per workgroup of the FIR kernel (`FIR_WORKGROUP` invocations of eight outputs).
 const FIR_TILE: u32 = 1024;
 const FIR_WORKGROUP: u32 = 128;
@@ -218,11 +221,11 @@ impl Array<f32> {
     #[track_caller]
     pub fn fir(&self, b: &Array<f32>) -> Array<f32> {
         let location = Location::caller();
-        let result = self.run_fir(b);
+        let result = self.run_fir(b, location);
         Array::resolve(self.context(), self.shape(), result, "fir", location)
     }
 
-    fn run_fir(&self, b: &Array<f32>) -> Outcome<Array<f32>> {
+    fn run_fir(&self, b: &Array<f32>, location: &'static Location<'static>) -> Outcome<Array<f32>> {
         let ctx = self.context();
         self.src()?;
         b.src()?;
@@ -232,8 +235,25 @@ impl Array<f32> {
         let (n, k) = (self.shape().dims()[0], b.shape().dims()[0]);
         let (out_shape, x_stride, b_stride) = batch_layout(self.shape(), b.shape())?;
         let to_u32 = |v: usize| u32::try_from(v).map_err(|_| LumaError::DimensionTooLarge { shape: self.shape().dims() });
-        if k > FIR_DIRECT_MAX {
-            return self.fir_long(b, out_shape);
+        let boundary = Boundary::new(
+            FamilyTag::Conv,
+            "fir",
+            location,
+            [dim(k), dim(n), 1, dim(out_shape.len() / n)],
+            BoundaryAttrs::Conv(ConvAttrs {
+                stage: ConvStage::Fir,
+                kernel_len: dim(k),
+                input_len: dim(n),
+                out_len: dim(n),
+                stride: 1,
+                batch: dim(out_shape.len() / n),
+                tile_log: 0,
+            }),
+        );
+        let (chosen, params) = first_candidate(ctx, &boundary).expect("a filter always fits a strategy");
+        note(ctx, &boundary, chosen, &params, &[]);
+        if chosen != StrategyId::CONV_FIR_DIRECT {
+            return self.fir_long(b, out_shape, chosen);
         }
         let batch = to_u32(out_shape.len() / n)?;
         let tiles = to_u32(n.div_ceil(FIR_TILE as usize))?;
@@ -248,10 +268,10 @@ impl Array<f32> {
 
     /// Filters longer than the direct kernel's limit: the FFT convolution for a single vector or a
     /// few signals (one convolution each), else blocks of taps over the whole batch.
-    fn fir_long(&self, b: &Array<f32>, out_shape: Shape) -> Outcome<Array<f32>> {
+    fn fir_long(&self, b: &Array<f32>, out_shape: Shape, chosen: StrategyId) -> Outcome<Array<f32>> {
         let (n, k) = (self.shape().dims()[0], b.shape().dims()[0]);
         let batch = out_shape.len() / n;
-        if k < FIR_FFT_MIN || batch >= FIR_FFT_MAX_BATCH {
+        if chosen == StrategyId::CONV_FIR_BLOCKS {
             // y = the sum over blocks of taps of fir(block) of the signal delayed by the block's
             // offset: every block is one launch over the whole batch.
             let mut sum: Option<Array<f32>> = None;
@@ -699,6 +719,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn iir(&self, b: &[f32], a: &[f32]) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), SIGNAL_IIR, "iir", location);
         let result = normalize(b, a).map_err(Failure::from).and_then(|(b, a)| self.run_iir(&b, &a));
         Array::resolve(self.context(), self.shape(), result, "iir", location)
     }
@@ -729,6 +750,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn iir_sos(&self, sections: &[[f32; 6]]) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), SIGNAL_IIR_SOS, "iir_sos", location);
         if sections.is_empty() {
             return fail(self.context(), self.shape(), LumaError::InvalidShape("iir_sos: no sections".into()), "iir_sos", location);
         }

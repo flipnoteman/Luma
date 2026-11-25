@@ -4,11 +4,14 @@
 
 pub(crate) mod factor;
 pub(crate) mod line_solve;
+pub(crate) mod conv;
+pub(crate) mod opaque;
 pub(crate) mod scan;
 pub(crate) mod scatter;
 pub(crate) mod sort;
+pub(crate) mod window;
 
-use super::strategy::{BitClass, FamilyTag, FitsFn, NumClass, Params, SplitClass, Strategy, StrategyId, Subject, Warm};
+use super::strategy::{BoundaryAttrs, BitClass, FamilyTag, FitsFn, NumClass, Params, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::Failure;
 use crate::caps::Caps;
 use crate::context::Context;
@@ -44,6 +47,15 @@ pub(super) fn split_global(_: &Subject<'_>, _: &Params) -> SplitClass {
     SplitClass::Global
 }
 
+/// A kernel that reads a halo of `k - 1` cells around its tile: conv and window strategies give the radius themselves.
+pub(super) fn split_halo(subject: &Subject<'_>, _: &Params) -> SplitClass {
+    let radius = match boundary(subject).attrs {
+        BoundaryAttrs::Window(attrs) => u32::from(attrs.k[0].max(attrs.k[1]).max(attrs.k[2]).saturating_sub(1)),
+        _ => 0,
+    };
+    SplitClass::Halo { flat_radius: radius }
+}
+
 pub(super) fn split_map(_: &Subject<'_>, _: &Params) -> SplitClass {
     SplitClass::Map
 }
@@ -65,3 +77,5 @@ pub(super) const fn id(family: FamilyTag, at: u8) -> StrategyId {
 mod dense_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_conv;

@@ -471,7 +471,7 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
 }
 
 /// [`plain`] of every family's table, worked out once.
-static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES)];
+static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES), true, true, plain(&super::families::conv::CONV_STRATEGIES), plain(&super::families::window::WINDOW_STRATEGIES), plain(&super::families::opaque::OPAQUE_STRATEGIES)];
 
 /// Whether every entry is a baseline without a cost: selection is the priority chain.
 const fn plain(entries: &[Strategy]) -> bool {

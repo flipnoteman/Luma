@@ -8,6 +8,7 @@ pub use deconv::{InverseDeconvAlgo, IterativeDeconvAlgo};
 
 use std::panic::Location;
 
+use crate::jit::structured::opaque::opaque;
 use crate::array::Array;
 
 /// The neighbours of a pixel that connect it to a component (ArrayFire's `af_connectivity`).
@@ -67,6 +68,7 @@ impl Array<bool> {
     #[track_caller]
     pub fn regions(&self, connectivity: Connectivity) -> Array<u32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_REGIONS, "regions", location);
         let result = label::run(self, connectivity);
         Array::resolve(self.context(), self.shape(), result, "regions", location)
     }
@@ -123,6 +125,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn confidence_cc(&self, seeds_x: &Array<u32>, seeds_y: &Array<u32>, radius: u32, multiplier: u32, iterations: u32, segmented_value: f32) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_CONFIDENCE_CC, "confidence_cc", location);
         let result = confidence::run(self, seeds_x, seeds_y, radius, multiplier, iterations).map(|seg| seg.to_f32() * segmented_value);
         Array::resolve(self.context(), self.shape(), result, "confidence_cc", location)
     }
@@ -204,6 +207,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn iterative_deconv(&self, psf: &Array<f32>, iterations: u32, relaxation: f32, algo: IterativeDeconvAlgo) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_DECONV, "iterative_deconv", location);
         let result = deconv::iterative(self, psf, iterations, relaxation, algo);
         Array::resolve(self.context(), self.shape(), result, "iterative_deconv", location)
     }
@@ -229,6 +233,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn inverse_deconv(&self, psf: &Array<f32>, gamma: f32, algo: InverseDeconvAlgo) -> Array<f32> {
         let location = Location::caller();
+        opaque!(self.context(), VISION_DECONV, "inverse_deconv", location);
         let result = deconv::inverse(self, psf, gamma, algo);
         Array::resolve(self.context(), self.shape(), result, "inverse_deconv", location)
     }

@@ -56,6 +56,9 @@ use std::sync::{Arc, OnceLock};
 use crate::array::Array;
 use crate::context::{default_context, Context};
 use crate::error::{LumaError, Result};
+use crate::jit::structured::boundary::{dim, OpaqueAttrs};
+use crate::jit::structured::opaque::opaque;
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::scatter::AtomicElem;
 use crate::search::Side;
 use crate::shape::Shape;
@@ -146,6 +149,19 @@ const MERGE_WG: u32 = 128;
 const MERGE_PER: u32 = 4;
 /// Entries of a tile.
 const MERGE_TILE: u32 = MERGE_WG * MERGE_PER;
+
+/// Tiles of the merge kernel over `nnz` entries.
+pub(crate) fn merge_tiles(nnz: usize) -> u32 {
+    nnz.div_ceil(MERGE_TILE as usize) as u32
+}
+
+/// `log2` of the lanes the row kernel gives each row of a vector product: two to four entries per lane (a barrier costs more than an
+/// idle lane, a long serial walk more than a few barriers: measured on an RTX 3090, 5 entries per row best with one or two lanes, 16
+/// with eight), at most 16 lanes (2^4).
+pub(crate) fn lanes_log(nnz: usize, outer: usize) -> u32 {
+    let avg = nnz as f64 / outer as f64;
+    ((avg / 3.0).max(1.0).log2().ceil() as u32).min(4)
+}
 
 /// The tile kernel of a vector product over a matrix with rows longer than [`SHORT_ROWS`]: a
 /// workgroup takes a tile of [`MERGE_TILE`] consecutive entries, whatever the lengths of the rows
@@ -704,6 +720,7 @@ impl Sparse<f32> {
     #[track_caller]
     pub fn from_dense(dense: &Array<f32>, format: SparseFormat) -> Sparse {
         let loc = Location::caller();
+        opaque!(dense.context(), SPARSE_CONVERT, "Sparse::from_dense", loc);
         let ctx = dense.context();
         let d = dense.shape().dims();
         let (cols, rows) = (d[0], d[1]);
@@ -759,6 +776,7 @@ impl Sparse<f32> {
     #[track_caller]
     pub fn from_triplets(rows: usize, cols: usize, row_idx: &Array<u32>, col_idx: &Array<u32>, values: &Array<f32>, format: SparseFormat) -> Sparse {
         let loc = Location::caller();
+        opaque!(values.context(), SPARSE_CONVERT, "Sparse::from_triplets", loc);
         let ctx = values.context();
         let n = values.len();
         let bad = if let Some(e) = check_dims(rows, cols) {
@@ -952,7 +970,9 @@ impl Sparse<f32> {
     /// [`Sparse::from_triplets`]): two radix sorts of the new major index, of as many bits as it
     /// needs, that carry the other index and the values along. Conversions to COO move no data beyond expanding the pointer. A
     /// poisoned matrix converts to a poisoned matrix.
+    #[track_caller]
     pub fn to_format(&self, format: SparseFormat) -> Sparse {
+        opaque!(&self.ctx, SPARSE_CONVERT, "Sparse::to_format", Location::caller());
         if self.error.is_some() || format == self.format {
             return self.clone();
         }
@@ -1001,7 +1021,9 @@ impl Sparse<f32> {
     /// The transpose, a `cols x rows` matrix. Free for the compressed formats (a CSR matrix is
     /// the CSC form of its transpose: the arrays are shared and only the format changes) and for
     /// COO (rows and columns swap).
+    #[track_caller]
     pub fn transpose(&self) -> Sparse {
+        opaque!(&self.ctx, SPARSE_CONVERT, "Sparse::transpose", Location::caller());
         let expanded = OnceLock::new();
         if let Some(e) = self.expanded.get() {
             let _ = expanded.set(e.clone());
@@ -1077,12 +1099,27 @@ impl Sparse<f32> {
         if !self.ctx.same_as(x.context()) {
             return Array::poisoned(&self.ctx, out_shape, failure(op, loc, LumaError::ContextMismatch));
         }
+        let boundary = |native: bool, first_non_native: bool, tiles: bool, long: bool| {
+            Boundary::new(
+                FamilyTag::Opaque,
+                op,
+                loc,
+                [dim(self.nnz), dim(outer), dim(c), 0],
+                BoundaryAttrs::Opaque(OpaqueAttrs { nnz: self.nnz as u64, outer: outer as u64, native, first_non_native, columns: dim(c), tiles, long }),
+            )
+        };
         if self.nnz == 0 {
+            let boundary = boundary(true, false, false, false);
+            if let Some((chosen, params)) = first_candidate(&self.ctx, &boundary) {
+                note(&self.ctx, &boundary, chosen, &params, &[]);
+            }
             return Array::zeros_on(&self.ctx, out_shape).unwrap_or_else(|e| Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)));
         }
         // The sum over a compressed pointer needs no atomics: CSR `A x`, CSC `A^T x`.
         let native = matches!((self.format, transposed), (SparseFormat::Csr, false) | (SparseFormat::Csc, true));
-        if !native && self.scattered.fetch_add(1, Ordering::Relaxed) >= 1 {
+        // The first product of a non-native format scatters; the next ones convert to the native format once and select again.
+        let first_non_native = !native && self.scattered.fetch_add(1, Ordering::Relaxed) == 0;
+        if !native && !first_non_native {
             let form = if transposed { self.compressed(SparseFormat::Csc) } else { self.compressed(SparseFormat::Csr) };
             return form.product(x, transposed, op, loc);
         }
@@ -1090,21 +1127,28 @@ impl Sparse<f32> {
         if native {
             let minor = if self.format == SparseFormat::Csr { self.col.as_ref() } else { self.row.as_ref() };
             let (minor, ptr) = (minor.expect("entries"), self.ptr.as_ref().expect("compressed"));
-            let plan = match self.row_plan(ptr) {
+            let plan = match self.row_plan(ptr, op, loc) {
                 Ok(plan) => plan,
                 Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
-            if let (1, Some(tiles)) = (c, &plan.tiles) {
+            let boundary = boundary(true, false, plan.tiles.is_some(), plan.long.is_some());
+            let (chosen, params) = first_candidate(&self.ctx, &boundary).expect("the row kernels always fit a native product");
+            note(&self.ctx, &boundary, chosen, &params, &[]);
+            let Params::Opaque(params) = params else { unreachable!("an opaque strategy carries OpaqueParams") };
+            if let (StrategyId::OPAQUE_SPARSE_SPMV_MERGE, Some(tiles)) = (chosen, &plan.tiles) {
                 return match self.merge_product((ptr, minor, val), tiles, &x.reshape(inner), outer) {
                     Ok(y) => y.reshape(out_shape),
                     Err(e) => Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
                 };
             }
-            return match self.rows_kernels(plan, (ptr, minor, val), x, c, outer) {
+            return match self.rows_kernels(plan, params.lanes_log, (ptr, minor, val), x, c, outer) {
                 Ok(y) => y.reshape(out_shape),
                 Err(e) => Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
         }
+        let boundary = boundary(false, true, false, false);
+        let (chosen, params) = first_candidate(&self.ctx, &boundary).expect("the scatter fits a first non-native product");
+        note(&self.ctx, &boundary, chosen, &params, &[]);
         let (r, cc) = self.coords();
         let (gather, scatter) = if transposed { (r, cc) } else { (cc, r) };
         if c == 1 {
@@ -1132,8 +1176,9 @@ impl Sparse<f32> {
     }
 
     /// The row lengths of a compressed matrix (see [`RowPlan`]), read back at the first product.
-    fn row_plan(&self, ptr: &Array<u32>) -> Result<RowPlan> {
+    fn row_plan(&self, ptr: &Array<u32>, op: &'static str, loc: &'static Location<'static>) -> Result<RowPlan> {
         let plan = self.long.get_or_init(|| {
+            opaque!(&self.ctx, SPARSE_ROW_PLAN, op, loc);
             let n = ptr.len() - 1;
             let len = ptr.slice(0, 1..=n) - ptr.slice(0, 0..n);
             let max_len = len.max().item().map_err(Arc::new)?;
@@ -1218,7 +1263,7 @@ impl Sparse<f32> {
     /// invocations of a row read the same entry and `c` adjacent elements of `X`, so the gather is
     /// coalesced), longer rows by a workgroup per row (and column). Sums are in entry order per
     /// lane, so the results are the same on every run.
-    fn rows_kernels(&self, plan: RowPlan, (ptr, minor, val): (&Array<u32>, &Array<u32>, &Array<f32>), x: &Array<f32>, c: usize, outer: usize) -> Result<Array<f32>> {
+    fn rows_kernels(&self, plan: RowPlan, lanes_log: u32, (ptr, minor, val): (&Array<u32>, &Array<u32>, &Array<f32>), x: &Array<f32>, c: usize, outer: usize) -> Result<Array<f32>> {
         let shape = if c == 1 { Shape::from(outer) } else { Shape::new([c, outer, 1, 1]) };
         shape.validate()?;
         let total = u32::try_from(shape.len()).map_err(|_| LumaError::DimensionTooLarge { shape: shape.dims() })?;
@@ -1229,11 +1274,6 @@ impl Sparse<f32> {
             Ok([groups.min(GRID_X), groups.div_ceil(GRID_X), 1])
         };
         if c == 1 {
-            let avg = self.nnz as f64 / outer as f64;
-            // Two to four entries per lane: a barrier costs more than an idle lane, a long serial
-            // walk more than a few barriers (measured on an RTX 3090: 5 entries per row best with
-            // one or two lanes, 16 with eight).
-            let lanes_log = ((avg / 3.0).max(1.0).log2().ceil() as u32).min(4);
             let kernel = self.ctx.kernel(SPMV_ROWS).label("sparse_spmv_rows").build()?;
             let params = RowParams { shape: lanes_log, total: outer as u32, cap: LONG_ROW, chunks: 1 };
             let groups = (outer << lanes_log).div_ceil(WORKGROUP as usize);
@@ -1300,6 +1340,7 @@ impl Sparse<f32> {
     }
 
     fn elementwise_dense(&self, dense: &Array<f32>, op: &'static str, loc: &'static Location<'static>, f: impl FnOnce(&Array<f32>, Array<f32>) -> Array<f32>) -> Sparse {
+        opaque!(&self.ctx, SPARSE_ELEMENTWISE, op, loc);
         if let Some(e) = self.dense_operand_error(dense, op, loc) {
             return Self::poisoned(&self.ctx, self.rows, self.cols, self.format, e);
         }
@@ -1340,6 +1381,7 @@ impl Sparse<f32> {
     }
 
     fn accumulate(&self, dense: &Array<f32>, negate_dense: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+        opaque!(&self.ctx, SPARSE_ELEMENTWISE, op, loc);
         if let Some(e) = self.dense_operand_error(dense, op, loc) {
             return Array::poisoned(&self.ctx, self.dense_shape(), e);
         }
