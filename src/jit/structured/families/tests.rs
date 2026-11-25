@@ -1,6 +1,7 @@
-//! The `fits` tables of the boundary families on both sides of every threshold, and the legacy mirror: the conditions as they were
-//! written inline before the registry (`f0e5723`), checked against the registry's first candidate over a grid of random shapes
-//! and tunings. Built on the CPU backend with hand-made `Tuning`s, so it runs without a GPU.
+//! The `fits` tables of the boundary families on both sides of every threshold, forcing by name, nested selection and declined
+//! candidates. Built on the CPU backend with hand-made `Tuning`s, so it runs without a GPU. (A mirror of the inline conditions of
+//! `f0e5723` checked the first candidate over 10 000 random shapes per family while the ports went through their gate cycle; it was
+//! deleted after, as the spec says.)
 
 use std::panic::Location;
 
@@ -10,7 +11,7 @@ use crate::context::{Context, ContextOptions};
 use crate::jit::structured::boundary::{dim, ScanAttrs, ScanOperand, ScatterAttrs, ScatterOp, SortAttrs, SortParams, SortPayload, SortStage};
 use crate::jit::structured::strategy::{candidates, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::sort::{ballot_bytes, sweep_bytes, sweep_per_thread, WORKGROUP};
-use crate::scan::{strided_block, target_threads, LOOKBACK_CHUNK, SCAN_CHUNK, SHORT_LINE, WARP_MIN_LINES};
+use crate::scan::{LOOKBACK_CHUNK, SCAN_CHUNK, WARP_MIN_LINES};
 use crate::tuning::Tuning;
 
 fn cpu_with(tune: impl FnOnce(&mut Tuning)) -> Context {
@@ -31,17 +32,6 @@ impl Rng {
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    /// Log-uniform in `1..=max`, so the thresholds (255, 4096, 65536, ...) are all within reach.
-    fn log(&mut self, max: u64) -> u64 {
-        let bits = 64 - max.leading_zeros();
-        let width = 1 + self.next() % u64::from(bits);
-        (1 + self.next() % (1 << width)).min(max)
-    }
-
-    fn flag(&mut self) -> bool {
-        self.next() & 1 == 1
     }
 }
 
@@ -74,42 +64,6 @@ fn scatter_fits_on_both_sides_of_the_private_threshold() {
         assert_eq!(first(&ctx, &scatter_boundary(op, 100, 1600, false, false, false)), StrategyId::SCATTER_ATOMIC_PRIVATE);
     }
     assert_eq!(first(&ctx, &scatter_boundary(ScatterOp::None, 100, 1600, false, false, false)), StrategyId::SCATTER_PLAIN);
-}
-
-/// The inline condition of `put_with` and `jit::assign::scatter` at `f0e5723`.
-fn legacy_scatter(host_ok: bool, atomic: ScatterOp, base: usize, count: usize, view: bool, read_view: bool, host_site: bool) -> StrategyId {
-    if host_site {
-        if atomic == ScatterOp::None && host_ok && !view && !read_view && base <= 65_536 && count <= 65_536 {
-            return StrategyId::SCATTER_HOST;
-        }
-        // Not a host site choice: the caller goes on to the kernel.
-        return StrategyId::SCATTER_PLAIN;
-    }
-    match atomic {
-        ScatterOp::None => StrategyId::SCATTER_PLAIN,
-        _ if base <= 4096 && count / 16 >= base => StrategyId::SCATTER_ATOMIC_PRIVATE,
-        _ => StrategyId::SCATTER_ATOMIC_GLOBAL,
-    }
-}
-
-#[test]
-fn scatter_matches_the_legacy_conditions() {
-    let ctx = cpu_with(|_| {});
-    let mut rng = Rng(0x5ca7_7e12);
-    for _ in 0..10_000 {
-        let atomic = [ScatterOp::None, ScatterOp::Add, ScatterOp::Min, ScatterOp::Max][(rng.next() % 4) as usize];
-        let (base, count) = (rng.log(1 << 20) as usize, rng.log(1 << 24) as usize);
-        let (view, read_view, host_site) = (rng.flag() && rng.flag(), rng.flag() && rng.flag(), rng.flag());
-        let got = candidates(&ctx, &scatter_boundary(atomic, base, count, view, read_view, host_site)).next().map(|(id, _)| id);
-        let want = legacy_scatter(ctx.can_run_on_host(), atomic, base, count, view, read_view, host_site);
-        // `can_run_on_host()` is false on the CPU backend: the host site has no candidate and the caller goes on to the kernel.
-        if host_site {
-            assert_eq!(got, None, "{atomic:?} {base} {count}");
-            assert_eq!(want, StrategyId::SCATTER_PLAIN);
-        } else {
-            assert_eq!(got, Some(want), "{atomic:?} {base} {count}");
-        }
-    }
 }
 
 // -- Scan --
@@ -156,49 +110,6 @@ fn scan_fits_on_both_sides_of_every_threshold() {
     });
     assert_eq!(first(&plain, &scan_boundary(1000, 1, 100_000, true, false)), StrategyId::SCAN_CHUNK_SINGLE);
     assert_eq!(first(&plain, &scan_boundary(100_000, 1, 1, true, false)), StrategyId::SCAN_CHUNK_THREE_PASS);
-}
-
-/// `Lines::scan` at `f0e5723`, in its order.
-fn legacy_scan(tuning: &Tuning, n: u32, stride: u32, lines: u32, grouping_free: bool) -> StrategyId {
-    if stride == 1 {
-        if n <= SHORT_LINE {
-            return StrategyId::SCAN_ROWS;
-        }
-        if lines >= tuning.scaled(WARP_MIN_LINES) && tuning.subgroup32 {
-            return StrategyId::SCAN_WARP;
-        }
-        if tuning.lookback_scan && n > LOOKBACK_CHUNK && grouping_free {
-            return StrategyId::SCAN_LOOKBACK;
-        }
-        return if n.div_ceil(SCAN_CHUNK) == 1 { StrategyId::SCAN_CHUNK_SINGLE } else { StrategyId::SCAN_CHUNK_THREE_PASS };
-    }
-    match strided_block(n, lines, target_threads(tuning)) {
-        None => StrategyId::SCAN_SEQ,
-        Some(_) => StrategyId::SCAN_FOLD_WALK,
-    }
-}
-
-#[test]
-fn scan_matches_the_legacy_conditions() {
-    let mut rng = Rng(0x00c0_ffee);
-    let mut checked = 0;
-    for variant in 0..8u32 {
-        let ctx = cpu_with(|t| {
-            t.subgroup32 = variant & 1 != 0;
-            t.lookback_scan = variant & 2 != 0;
-            t.compute_units = [82, 48, 14][(variant >> 2) as usize % 3] + variant;
-        });
-        for _ in 0..1250 {
-            let n = rng.log(1 << 24) as u32;
-            let stride = if rng.flag() { 1 } else { rng.log(64) as u32 };
-            let lines = rng.log(1 << 18) as u32;
-            let free = rng.flag();
-            let got = first(&ctx, &scan_boundary(n, stride, lines, free, false));
-            assert_eq!(got, legacy_scan(ctx.tuning(), n, stride, lines, free), "n={n} stride={stride} lines={lines} free={free} variant={variant}");
-            checked += 1;
-        }
-    }
-    assert_eq!(checked, 10_000);
 }
 
 // -- Sort --
@@ -272,46 +183,6 @@ fn sort_fits_on_both_sides_of_every_threshold() {
     assert!(candidates(&ctx, &sort_boundary(SortStage::ByKeyAxis, [10, 1, 1, 0], SortPayload::None, false)).next().is_none());
     // The entry of a sort has the host path only, and the CPU backend has none.
     assert!(candidates(&ctx, &sort_boundary(SortStage::Entry, [1000, 1, 1, 0], SortPayload::None, false)).next().is_none());
-}
-
-/// `radix_sort` at `f0e5723`.
-fn legacy_radix(tuning: &Tuning, n: u32) -> StrategyId {
-    let ballots = tuning.subgroup32 && ballot_bytes() <= tuning.workgroup_storage;
-    if tuning.lookback_scan && ballots && sweep_bytes(16) <= tuning.workgroup_storage && n < 1 << 30 {
-        StrategyId::SORT_RADIX_SWEEP
-    } else if ballots {
-        StrategyId::SORT_RADIX_BALLOTS
-    } else {
-        StrategyId::SORT_RADIX_COUNT_SCAN
-    }
-}
-
-/// `run_sort_axis` at `f0e5723`.
-fn legacy_axis(ctx: &Context, n: u32) -> StrategyId {
-    if n <= crate::segsort::max_line(ctx) { StrategyId::SORT_LINES } else { StrategyId::SORT_LINES_RADIX }
-}
-
-#[test]
-fn sort_matches_the_legacy_conditions() {
-    let mut rng = Rng(0x0050_77ed);
-    let storages = [0, 4096, 12_287, 12_288, 16_384, ballot_bytes() - 1, ballot_bytes(), sweep_bytes(16) - 1, sweep_bytes(16), sweep_bytes(32), 49_152, 65_536];
-    let mut checked = 0;
-    for variant in 0..8u32 {
-        let ctx = cpu_with(|t| {
-            t.subgroup32 = variant & 1 != 0;
-            t.lookback_scan = variant & 2 != 0;
-            t.workgroup_storage = storages[(variant as usize * 3 + 1) % storages.len()];
-        });
-        for round in 0..1250 {
-            // Every 4th round re-draws the storage edge so each threshold is hit with each flag combination.
-            let n = if round % 50 == 0 { (1u32 << 30) - 1 + (round / 50) % 3 } else { rng.log(u64::from(u32::MAX)) as u32 };
-            assert_eq!(radix(&ctx, n, SortPayload::None), legacy_radix(ctx.tuning(), n), "n={n} variant={variant}");
-            let line = rng.log(1 << 14) as u32;
-            assert_eq!(first(&ctx, &sort_boundary(SortStage::Axis, [line, 1, 3, 0], SortPayload::None, false)), legacy_axis(&ctx, line), "line={line} variant={variant}");
-            checked += 1;
-        }
-    }
-    assert_eq!(checked, 10_000);
 }
 
 /// Forcing a strategy: the output is the same, the Decision says which ran; one that does not fit the call is not taken.
