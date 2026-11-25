@@ -24,6 +24,11 @@ pub(crate) static OPAQUE_STRATEGIES: [Strategy; 4] = [
     entry(StrategyId::OPAQUE_SPARSE_ROWS, "sparse_rows", Caps::empty(), split_global, fits_rows),
 ];
 
+/// The guard, the scatter, and the native kernels: runs of the table, so a product scans only the entries of its own case.
+pub(crate) const EMPTY_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(1).0;
+pub(crate) const SCATTER_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(1).1.split_at(1).0;
+pub(crate) const NATIVE_STRATEGIES: &[Strategy] = OPAQUE_STRATEGIES.split_at(2).1;
+
 fn attrs(subject: &Subject<'_>) -> OpaqueAttrs {
     match boundary(subject).attrs {
         BoundaryAttrs::Opaque(attrs) => attrs,

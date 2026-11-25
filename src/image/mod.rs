@@ -29,7 +29,8 @@ use crate::gpu::pager::Pin;
 use crate::gpu_type::{Numeric, ScalarType};
 use crate::jit::structured::opaque::opaque;
 use crate::jit::structured::boundary::{dim, WindowAttrs, WindowParams, WindowStage};
-use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params};
+use crate::jit::structured::families::window as window_family;
+use crate::jit::structured::strategy::{first_candidate_in, note, Boundary, BoundaryAttrs, FamilyTag, Params};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 use crate::view::PadMode;
@@ -319,7 +320,7 @@ fn plan(ctx: &Context, spec: &Spec, pixel: Pixel, edge: Edge, name: &'static str
         [u32::from(k[0]), u32::from(k[1]), u32::from(k[2]), u32::from(stride[0])],
         BoundaryAttrs::Window(WindowAttrs { stage: WindowStage::Plan, op: spec.op, k, stride, three_d: spec.three_d, aux_cells: spec.aux_cells as u64, pixel, edge }),
     );
-    let Some((chosen, params)) = first_candidate(ctx, &boundary) else {
+    let Some((chosen, params)) = first_candidate_in(window_family::PLAN_STRATEGIES, ctx, &boundary) else {
         return Err(LumaError::Unsupported(format!("a window of {:?} cells does not fit workgroup memory", spec.k)).into());
     };
     note(ctx, &boundary, chosen, &params, &[]);
@@ -550,7 +551,7 @@ impl<T: ImagePixel> Array<T> {
                 edge: Edge::Clamp,
             }),
         );
-        if let Some((chosen, params)) = first_candidate(self.context(), &boundary) {
+        if let Some((chosen, params)) = first_candidate_in(window_family::ENTRY_STRATEGIES, self.context(), &boundary) {
             note(self.context(), &boundary, chosen, &params, &[]);
             let pass = |input: &Array<T>, k: [usize; 3]| -> Outcome<Array<T>> {
                 let (before, after) = anchored(k);

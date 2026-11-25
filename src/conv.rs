@@ -9,7 +9,8 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::fft;
 use crate::jit::structured::boundary::{ConvAttrs, ConvStage};
-use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
+use crate::jit::structured::families::conv;
+use crate::jit::structured::strategy::{first_candidate_in, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::ops::{fold_workgroups, launch_1d, Outcome};
 use crate::shape::Shape;
 
@@ -176,7 +177,7 @@ fn launch_conv(
         [params[0], params[3], params[1], params[4]],
         BoundaryAttrs::Conv(ConvAttrs { stage: ConvStage::Direct, kernel_len: params[0], input_len: params[3], out_len: params[4], stride: params[1], batch: 1, tile_log: 0 }),
     );
-    let (chosen, chosen_params) = first_candidate(ctx, &boundary).expect("a direct convolution always fits");
+    let (chosen, chosen_params) = first_candidate_in(conv::DIRECT_STRATEGIES, ctx, &boundary).expect("a direct convolution always fits");
     note(ctx, &boundary, chosen, &chosen_params, &[]);
     if chosen == StrategyId::CONV_DIRECT_TILED {
         let Params::Conv(plan) = chosen_params else { unreachable!("a conv strategy carries ConvParams") };

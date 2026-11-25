@@ -58,7 +58,8 @@ use crate::context::{default_context, Context};
 use crate::error::{LumaError, Result};
 use crate::jit::structured::boundary::{dim, OpaqueAttrs};
 use crate::jit::structured::opaque::opaque;
-use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
+use crate::jit::structured::families::opaque as opaque_family;
+use crate::jit::structured::strategy::{first_candidate_in, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::scatter::AtomicElem;
 use crate::search::Side;
 use crate::shape::Shape;
@@ -1110,7 +1111,7 @@ impl Sparse<f32> {
         };
         if self.nnz == 0 {
             let boundary = boundary(true, false, false, false);
-            if let Some((chosen, params)) = first_candidate(&self.ctx, &boundary) {
+            if let Some((chosen, params)) = first_candidate_in(opaque_family::EMPTY_STRATEGIES, &self.ctx, &boundary) {
                 note(&self.ctx, &boundary, chosen, &params, &[]);
             }
             return Array::zeros_on(&self.ctx, out_shape).unwrap_or_else(|e| Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)));
@@ -1132,7 +1133,7 @@ impl Sparse<f32> {
                 Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
             let boundary = boundary(true, false, plan.tiles.is_some(), plan.long.is_some());
-            let (chosen, params) = first_candidate(&self.ctx, &boundary).expect("the row kernels always fit a native product");
+            let (chosen, params) = first_candidate_in(opaque_family::NATIVE_STRATEGIES, &self.ctx, &boundary).expect("the row kernels always fit a native product");
             note(&self.ctx, &boundary, chosen, &params, &[]);
             let Params::Opaque(params) = params else { unreachable!("an opaque strategy carries OpaqueParams") };
             if let (StrategyId::OPAQUE_SPARSE_SPMV_MERGE, Some(tiles)) = (chosen, &plan.tiles) {
@@ -1147,7 +1148,7 @@ impl Sparse<f32> {
             };
         }
         let boundary = boundary(false, true, false, false);
-        let (chosen, params) = first_candidate(&self.ctx, &boundary).expect("the scatter fits a first non-native product");
+        let (chosen, params) = first_candidate_in(opaque_family::SCATTER_STRATEGIES, &self.ctx, &boundary).expect("the scatter fits a first non-native product");
         note(&self.ctx, &boundary, chosen, &params, &[]);
         let (r, cc) = self.coords();
         let (gather, scatter) = if transposed { (r, cc) } else { (cc, r) };

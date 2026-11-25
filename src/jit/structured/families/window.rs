@@ -26,6 +26,10 @@ pub(crate) static WINDOW_STRATEGIES: [Strategy; 4] = [
     entry(StrategyId::WINDOW_TILED, "tiled", Caps::empty(), split_halo, fits_tiled),
 ];
 
+/// The entries that apply at `WindowStage::Entry` and `Plan`: runs of the table, so an op scans only its own.
+pub(crate) const ENTRY_STRATEGIES: &[Strategy] = WINDOW_STRATEGIES.split_at(1).0;
+pub(crate) const PLAN_STRATEGIES: &[Strategy] = WINDOW_STRATEGIES.split_at(1).1;
+
 fn attrs(subject: &Subject<'_>) -> WindowAttrs {
     match boundary(subject).attrs {
         BoundaryAttrs::Window(attrs) => attrs,

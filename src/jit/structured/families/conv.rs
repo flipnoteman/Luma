@@ -34,6 +34,11 @@ pub(crate) static CONV_STRATEGIES: [Strategy; 7] = [
     entry(StrategyId::CONV_FIR_FFT, "fir_fft", Caps::empty(), split_halo, fits_fir_fft),
 ];
 
+/// The entries that apply at `ConvStage::Direct`, `Fft` and `Fir`: runs of the table, so an op scans only its own.
+pub(crate) const DIRECT_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(2).0;
+pub(crate) const FFT_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(2).1.split_at(2).0;
+pub(crate) const FIR_STRATEGIES: &[Strategy] = CONV_STRATEGIES.split_at(4).1;
+
 fn attrs(subject: &Subject<'_>) -> ConvAttrs {
     match boundary(subject).attrs {
         BoundaryAttrs::Conv(attrs) => attrs,

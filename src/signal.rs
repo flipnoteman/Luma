@@ -30,7 +30,8 @@ use crate::array::{Array, Failure};
 use crate::error::LumaError;
 use crate::jit::structured::opaque::opaque;
 use crate::jit::structured::boundary::{dim, ConvAttrs, ConvStage};
-use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
+use crate::jit::structured::families::conv;
+use crate::jit::structured::strategy::{first_candidate_in, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use crate::kernel::{uniform, KernelArg};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
@@ -235,27 +236,21 @@ impl Array<f32> {
         let (n, k) = (self.shape().dims()[0], b.shape().dims()[0]);
         let (out_shape, x_stride, b_stride) = batch_layout(self.shape(), b.shape())?;
         let to_u32 = |v: usize| u32::try_from(v).map_err(|_| LumaError::DimensionTooLarge { shape: self.shape().dims() });
+        let signals = out_shape.len() / n;
+        let (kernel_len, input_len, batch) = (dim(k), dim(n), dim(signals));
         let boundary = Boundary::new(
             FamilyTag::Conv,
             "fir",
             location,
-            [dim(k), dim(n), 1, dim(out_shape.len() / n)],
-            BoundaryAttrs::Conv(ConvAttrs {
-                stage: ConvStage::Fir,
-                kernel_len: dim(k),
-                input_len: dim(n),
-                out_len: dim(n),
-                stride: 1,
-                batch: dim(out_shape.len() / n),
-                tile_log: 0,
-            }),
+            [kernel_len, input_len, 1, batch],
+            BoundaryAttrs::Conv(ConvAttrs { stage: ConvStage::Fir, kernel_len, input_len, out_len: input_len, stride: 1, batch, tile_log: 0 }),
         );
-        let (chosen, params) = first_candidate(ctx, &boundary).expect("a filter always fits a strategy");
+        let (chosen, params) = first_candidate_in(conv::FIR_STRATEGIES, ctx, &boundary).expect("a filter always fits a strategy");
         note(ctx, &boundary, chosen, &params, &[]);
         if chosen != StrategyId::CONV_FIR_DIRECT {
             return self.fir_long(b, out_shape, chosen);
         }
-        let batch = to_u32(out_shape.len() / n)?;
+        let batch = to_u32(signals)?;
         let tiles = to_u32(n.div_ceil(FIR_TILE as usize))?;
         let groups = tiles.checked_mul(batch).ok_or(LumaError::DimensionTooLarge { shape: out_shape.dims() })?;
         let grid = fold_workgroups(ctx, groups)?;

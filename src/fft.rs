@@ -24,7 +24,8 @@ use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::structured::boundary::{ConvAttrs, ConvStage};
-use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params as StrategyParams, StrategyId};
+use crate::jit::structured::families::conv;
+use crate::jit::structured::strategy::{first_candidate_in, note, Boundary, BoundaryAttrs, FamilyTag, Params as StrategyParams, StrategyId};
 use std::panic::Location;
 use crate::ops::fold_workgroups;
 
@@ -714,7 +715,7 @@ pub(crate) fn convolve(
         [kernel_len, ops.input.2, 1, out_len],
         BoundaryAttrs::Conv(ConvAttrs { stage: ConvStage::Fft, kernel_len, input_len: ops.input.2, out_len, stride: 1, batch: 1, tile_log }),
     );
-    let (chosen, chosen_params) = first_candidate(ctx, &boundary).expect("an FFT convolution always fits");
+    let (chosen, chosen_params) = first_candidate_in(conv::FFT_STRATEGIES, ctx, &boundary).expect("an FFT convolution always fits");
     note(ctx, &boundary, chosen, &chosen_params, &[]);
     let StrategyParams::Conv(plan_params) = chosen_params else { unreachable!("a conv strategy carries ConvParams") };
     let blocks = (chosen == StrategyId::CONV_FFT_BLOCKED).then_some(plan_params.log_b);
