@@ -349,6 +349,38 @@ mod tests {
         assert_eq!(ctx.jit().telemetry.pending.load(Ordering::Relaxed), 0);
     }
 
+    /// The context of the backend the tests run on (`LUMA_BACKEND`), sampling every execution.
+    fn default_backend() -> Context {
+        Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.telemetry_every = 1).unwrap()
+    }
+
+    #[test]
+    fn an_armed_launch_reports_a_time() {
+        let ctx = default_backend();
+        if !ctx.caps().contains(Caps::TELEMETRY) {
+            println!("SKIPPED: {} cannot time launches", ctx.device_name());
+            return;
+        }
+        let b = boundary();
+        let subject = Subject::Boundary(&b);
+        let id = StrategyId(FamilyTag::Reduce, 2);
+        let mut begun = sampled(&ctx, &subject, id);
+        launch_fill(&mut begun.emit);
+        launch_fill(&mut begun.emit);
+        ctx.jit().telemetry.finish(&ctx, begun, true);
+        // The timings arrive once the work has run; wgpu reports them from a later poll.
+        let cell = CellKey { strategy: id, shape: ShapeClass::of(subject.dims()), numerics: ctx.numerics() };
+        for _ in 0..400 {
+            ctx.sync().unwrap();
+            if ctx.jit().telemetry.samples(&cell) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(ctx.jit().telemetry.samples(&cell), 1, "{}: the sampled execution of two launches was never timed", ctx.device_name());
+        assert!(ctx.jit().telemetry.measured(&cell, 1).is_some_and(|ns| ns > 0.0));
+    }
+
     #[test]
     fn more_than_eight_launches_discard_the_sample() {
         let ctx = cpu(1);
