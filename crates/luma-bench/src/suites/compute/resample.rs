@@ -66,6 +66,11 @@ fn approx(h: &mut Harness) {
     });
 }
 
+/// The spacing of the `f32` values around `x` (`x > 0`).
+fn ulp(x: f64) -> f64 {
+    2f64.powi(x.log2().floor() as i32 - 23)
+}
+
 fn warp(h: &mut Harness) {
     h.guarded("warp", |h| {
         let (w, hh) = if h.ctx.is_cpu() { pick(h, (256, 256), (1024, 1024)) } else { pick(h, (1024, 1024), (3840, 2160)) };
@@ -89,9 +94,8 @@ fn warp(h: &mut Harness) {
             1e-4,
             // The kernels divide the output index by the scale (like ArrayFire) and CUDA's f32 division is
             // `div.approx.ftz` (2 ulp; wgpu on the same GPU gives the same bits), so a source coordinate is
-            // up to 2 ulp off: 2 * 2^(floor(log2 n) - 23) pixels along an axis of n pixels, which moves a
-            // value of [0, 1] by that much at most (neighbours differ by less than 1).
-            [w, hh].iter().map(|&n| 2.0 * 2f64.powi(((n as f64).log2().floor() as i32) - 23)).sum::<f64>(),
+            // up to 2 ulp off, which moves a value of [0, 1] by that much at most (neighbours differ by less than 1).
+            2.0 * (ulp(w as f64) + ulp(hh as f64)),
         );
         for (name, method) in [("nearest", Interp::Nearest), ("bilinear", Interp::Linear), ("bicubic", Interp::Cubic)] {
             h.case(&format!("warp/resize_{name}"), &format!("{w}x{hh} -> {ow}x{oh}"), pix(ow * oh), &mut || ia.resize(ow, oh, method).eval().unwrap());
@@ -114,7 +118,9 @@ fn warp(h: &mut Harness) {
             },
             1019,
             2e-4,
-            2e-5,
+            // `m0 x + m1 y + m2` in `f32` is within 3 ulp of its value (a product, a fused product and a sum, each at
+            // most one ulp of the largest coordinate), which moves a value of [0, 1] by that much at most.
+            2e-5f64.max(3.0 * (ulp(f64::from(m[0].abs()) * w as f64 + f64::from(m[1].abs()) * hh as f64 + f64::from(m[2].abs())) + ulp(f64::from(m[3].abs()) * w as f64 + f64::from(m[4].abs()) * hh as f64 + f64::from(m[5].abs())))),
         );
         h.case("warp/transform_bilinear", &format!("{w}x{hh}"), pix(w * hh), &mut || ia.transform(m, w, hh, Interp::Linear, true).eval().unwrap());
         h.case("warp/rotate_bilinear", &format!("{w}x{hh}"), pix(w * hh), &mut || ia.rotate(0.3, true, Interp::Linear).eval().unwrap());

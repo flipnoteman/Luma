@@ -2,11 +2,12 @@
 # Interleaved A/B of two luma refs in one GPU-queue job (or locally on the CPU backend): both
 # binaries are built first, then every suite runs A B B A (round 1), B A A B (round 2), ..., so
 # clock, thermal and host-load drift hit both sides alike.
-# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS]
+# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR]
 #   BASE/NEW  git refs of this repo or paths to luma trees
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
 #   SUITES    comma list (default: ml,cfd,datasci,compute,jit,sparse)   BACKENDS  default "cuda wgpu"
 #   --rounds  A/B pairs per side and suite (default 1: A B B A, two samples per side)
+#   --only    luma-bench --only SUBSTR (cases whose full name `suite/case` contains it)
 #   --timeout gpuq timeout of the job (default 7200). gpuq copies out/ back only when the job ends by itself, so the
 #             job stops starting runs 300 s before the timeout and ends normally (the results so far are kept).
 # luma-bench exits 1 when a case is skipped (its check failed) or failed; that round still has the JSON of every case
@@ -17,10 +18,10 @@
 set -euo pipefail
 pos=() quick="" rounds=1 timeout=7200
 while [ $# -gt 0 ]; do
-  case $1 in --quick) quick=--quick ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
+  case $1 in --quick) quick="$quick --quick" ;; --only) quick="$quick --only $2"; shift ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
   shift
 done
-[ ${#pos[@]} -ge 3 ] || { sed -n 2,16p "$0"; exit 2; }
+[ ${#pos[@]} -ge 3 ] || { sed -n 2,17p "$0"; exit 2; }
 base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,compute,jit,sparse} backends=${pos[4]:-cuda wgpu}
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
