@@ -245,14 +245,20 @@ fn adam_case(h: &mut Harness, cfg: Cfg) {
         let (_, g) = host_grads(&cfg, &hp, &x, &labels, &masks);
         // m = (1 - b1) g is linear in the gradient and checked tightly; the parameters move by
         // about `lr` in the sign of g (they are checked with a few elements allowed off, those
-        // whose gradient is at rounding level).
+        // whose gradient is at rounding level). The default product is TF32 where the context has it:
+        // the gradient of the last layer (`h2^T dl`, whose terms cancel: the rows of `dl` sum to zero) then
+        // carries an error of 2^-10 of the sum of |h2 dl|, which flips the sign of the entries near zero
+        // and so moves their parameter by `2 lr` the other way. That is 0.27 % of `w3` here (7 of 2560,
+        // 14 of 5120; none in f32 under `LUMA_NUMERICS=strict`, none on wgpu), so under TF32 the
+        // allowance is 1 %.
+        let frac = if h.ctx.numerics().tf32_matmul() { 1e-2 } else { 2e-3 };
         let (lr, b1, b2, eps) = (Adam::LR, Adam::B1, Adam::B2, Adam::EPS);
         for i in 0..6 {
             let want: Vec<f32> = g[i].iter().map(|g| (1.0 - b1) * g).collect();
             check(&format!("{case}: m{i}"), &adam.m[i].to_vec().unwrap(), &want, 1e-3, 5e-3 * (1.0 - b1) * max_abs(&g[i]) + 1e-9);
             let alpha = lr * (1.0 - b2).sqrt() / (1.0 - b1);
             let wanted: Vec<f32> = hp[i].iter().zip(&g[i]).map(|(p, g)| p - alpha * (1.0 - b1) * g / (((1.0 - b2) * g * g).sqrt() + eps)).collect();
-            check_frac(&format!("{case}: param {i}"), &net.p[i].to_vec().unwrap(), &wanted, 1e-3, 2e-2 * lr, 2e-3);
+            check_frac(&format!("{case}: param {i}"), &net.p[i].to_vec().unwrap(), &wanted, 1e-3, 2e-2 * lr, frac);
         }
         h.case(&case, &cfg.size(), Work::Flops(step), &mut || adam.step(&mut net));
     });

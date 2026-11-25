@@ -2,20 +2,25 @@
 # Interleaved A/B of two luma refs in one GPU-queue job (or locally on the CPU backend): both
 # binaries are built first, then every suite runs A B B A (round 1), B A A B (round 2), ..., so
 # clock, thermal and host-load drift hit both sides alike.
-# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick]
+# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS]
 #   BASE/NEW  git refs of this repo or paths to luma trees
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
 #   SUITES    comma list (default: ml,cfd,datasci,compute,jit,sparse)   BACKENDS  default "cuda wgpu"
 #   --rounds  A/B pairs per side and suite (default 1: A B B A, two samples per side)
+#   --timeout gpuq timeout of the job (default 7200). gpuq copies out/ back only when the job ends by itself, so the
+#             job stops starting runs 300 s before the timeout and ends normally (the results so far are kept).
+# luma-bench exits 1 when a case is skipped (its check failed) or failed; that round still has the JSON of every case
+# that ran. The runs' stdout is kept next to it (out/<label>-<backend>-<suite>-<side><n>.txt) and the job log ends with
+# a count of the SKIPPED / FAILED lines per side, backend and suite.
 # Results: out/<label>-<backend>-<suite>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir);
 # compare with tools/benchcmp.py --base 'DIR/<base>-cuda-*' --new 'DIR/<new>-cuda-*'.
 set -euo pipefail
-pos=() quick="" rounds=1
+pos=() quick="" rounds=1 timeout=7200
 while [ $# -gt 0 ]; do
-  case $1 in --quick) quick=--quick ;; --rounds) rounds=$2; shift ;; *) pos+=("$1") ;; esac
+  case $1 in --quick) quick=--quick ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
   shift
 done
-[ ${#pos[@]} -ge 3 ] || { sed -n 2,11p "$0"; exit 2; }
+[ ${#pos[@]} -ge 3 ] || { sed -n 2,16p "$0"; exit 2; }
 base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,compute,jit,sparse} backends=${pos[4]:-cuda wgpu}
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
@@ -56,7 +61,8 @@ A=\$PWD/bin/a B=\$PWD/bin/b
 CA=\$(mktemp -d) CB=\$(mktemp -d)
 one() { # side backend suite round
   local bin=\$A lab=$la cache=\$CA; [ \$1 = b ] && bin=\$B lab=$lb cache=\$CB
-  LUMA_CACHE_DIR=\$cache LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > /dev/null 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
+  [ \$SECONDS -lt $((timeout - 300)) ] || { echo \"benchab: \$1 \$2 \$3 round \$4 not started: deadline\"; return 0; }
+  LUMA_CACHE_DIR=\$cache LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > out/\$lab-\$2-\$3-\$1\$4.txt 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
 }"
 loop="for be in BACKENDS; do
   for suite in ${suites//,/ }; do
@@ -66,7 +72,9 @@ loop="for be in BACKENDS; do
       echo \"\$(date +%T) \$be \$suite round \$r done\"
     done
   done
-done"
+done
+echo \"benchab: SKIPPED / FAILED cases, runs per side-backend-suite:\"
+grep -H -E '^(SKIPPED|FAILED): ' out/*.txt | sed -E 's|^out/(.*)-[ab][0-9]+[.]txt:|\\1 |' | sort | uniq -c | cut -c1-400 || true"
 if [ "$host" = cpu ]; then
   cmd="$run
 export LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent
@@ -80,6 +88,6 @@ cmd="$run
 ${loop/BACKENDS/$backends}"
 cmd=${cmd//'$bin --suite'/'LUMA_BACKEND=$2 $bin --suite'}
 cd "$snap"
-id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout 7200 -- bash -c "$cmd")
+id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout "$timeout" -- bash -c "$cmd")
 echo "job: $id  (A $la vs B $lb, host $host, suites $suites, backends: $backends, rounds $rounds)"
 echo "results: ${GPUQ_DIR:-$HOME/.cache/bowshock-gpuq}/done/$id/out/ ; compare: tools/benchcmp.py --base 'OUT/$la-cuda-*' --new 'OUT/$lb-cuda-*'"

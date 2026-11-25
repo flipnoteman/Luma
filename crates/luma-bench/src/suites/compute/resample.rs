@@ -87,7 +87,11 @@ fn warp(h: &mut Harness) {
             },
             1013,
             1e-4,
-            1e-5,
+            // The kernels divide the output index by the scale (like ArrayFire) and CUDA's f32 division is
+            // `div.approx.ftz` (2 ulp; wgpu on the same GPU gives the same bits), so a source coordinate is
+            // up to 2 ulp off: 2 * 2^(floor(log2 n) - 23) pixels along an axis of n pixels, which moves a
+            // value of [0, 1] by that much at most (neighbours differ by less than 1).
+            [w, hh].iter().map(|&n| 2.0 * 2f64.powi(((n as f64).log2().floor() as i32) - 23)).sum::<f64>(),
         );
         for (name, method) in [("nearest", Interp::Nearest), ("bilinear", Interp::Linear), ("bicubic", Interp::Cubic)] {
             h.case(&format!("warp/resize_{name}"), &format!("{w}x{hh} -> {ow}x{oh}"), pix(ow * oh), &mut || ia.resize(ow, oh, method).eval().unwrap());
