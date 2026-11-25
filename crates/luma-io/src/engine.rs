@@ -444,18 +444,22 @@ fn worker(shared: &Shared) {
             }
         };
         shared.jobs_run.fetch_add(1, Ordering::Relaxed);
-        let len = job.stage.len;
+        let Job { file, kind, offset, stage, done } = job;
+        let len = stage.len;
         // Once one job has failed the ticket's result is decided: skip the rest.
-        let r = if job.done.failed() { Ok(()) } else { run_job(&job) };
-        job.done.finish_job(len as u64, r);
+        let r = if done.failed() { Ok(()) } else { run_job(&file, kind, offset, stage) };
+        // The job's hold on the file goes before the ticket completes: whoever sees the ticket
+        // complete may close the file at once, and an open descriptor would keep its lock.
+        drop(file);
+        done.finish_job(len as u64, r);
     }
 }
 
-fn run_job(job: &Job) -> io::Result<()> {
-    let file = &job.file.file;
-    match job.kind {
-        Kind::Read => read_full(job.stage.ptr, job.stage.len, job.offset, |p, n, o| read_at(file, p, n, o)),
-        Kind::Write => write_full(job.stage.ptr, job.stage.len, job.offset, |b, o| write_at(file, b, o)),
+fn run_job(file: &IoFile, kind: Kind, offset: u64, stage: StagePtr) -> io::Result<()> {
+    let file = &file.file;
+    match kind {
+        Kind::Read => read_full(stage.ptr, stage.len, offset, |p, n, o| read_at(file, p, n, o)),
+        Kind::Write => write_full(stage.ptr, stage.len, offset, |b, o| write_at(file, b, o)),
     }
 }
 
