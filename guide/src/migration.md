@@ -1,5 +1,48 @@
 # Migration
 
+## From 0.5.2 to the next release
+
+Programs written against 0.5.2 compile and behave as before; the items below are deprecated (removed in 0.6)
+and have replacements already.
+
+### `Numerics` replaces `fast_math`, `tf32_matmul` and the TF32 variables
+
+| 0.5.2 | now |
+| --- | --- |
+| `ContextOptions::fast_math(true)` | `ContextOptions::numerics(Numerics::fast())` |
+| `ContextOptions::tf32_matmul(false)` | `ContextOptions::numerics(Numerics::strict())` |
+| `Context::tf32_matmul()` | `Context::numerics().tf32_matmul()` |
+| `LUMA_FAST_MATH=1` | `LUMA_NUMERICS=fast` (or `+fast-math`) |
+| `LUMA_TF32_MATMUL=0` | `LUMA_NUMERICS=strict` (or `-tf32-matmul`) |
+| `LUMA_LINALG_TF32=1` | `LUMA_NUMERICS=default+tf32-linalg` |
+
+The old fields, builders and variables still work (the variables with a one-time warning) and are applied over
+`numerics`. `LUMA_NUMERICS` panics on an unknown value in `ContextOptions::from_env`; the linear-algebra
+TF32 switch is read per context now, not once per process. See [Environment variables](environment.md).
+
+### `Profile::splits` and `FusionSplit` are deprecated
+
+Use `Profile::cuts()` for the cuts (an iterator of operation, location and `SplitReason`) and
+`Context::take_decisions()` right after `finish_profiling` / `profile` for every planner decision
+([Why was it cut](performance.md#why-was-it-cut-cuts-and-decisions)). `Backend::finish_profiling` keeps its
+`splits` argument until 0.6.
+
+### New
+
+- `Array<f16>` and `Array<bf16>` ([Half-precision floats](half.md)).
+- `ContextOptions::host_budget` / `LUMA_HOST_BUDGET`, `Context::paging_stats()` and `Context::memory_model()`
+  ([Transfers](performance.md#transfers)); evicting an array the host holds a copy of, or a cheap result of
+  arrays that stay on the device, transfers nothing.
+- `Context::record_decisions(true)` / `LUMA_RECORD_DECISIONS=1` and `Context::take_decisions()`.
+- Buffers are sized in eighth-octave classes instead of powers of two, so up to 1.4x more data stays on the
+  device before paging on a mix of odd sizes.
+
+### For backend implementors
+
+`kir::ir::IrUnOp` gained `F32ToF16Bits`, `F16BitsToF32` and `RoundF16`: a backend that matches it exhaustively
+needs three more arms. Everything else the HAL gained (the transfer lane: `stage_alloc`, `transfer_in`,
+`transfer_out`, `barrier`, tickets; `memory_now`, `l2_cache_bytes`, `storage_offset_align`) has a default.
+
 ## From 0.5.1 to 0.5.2
 
 0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear

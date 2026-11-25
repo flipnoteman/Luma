@@ -1,4 +1,4 @@
-//! Keccak-f[1600] as a loop of 24 rounds (one traced round, so the host builds about 700 nodes per
+//! Keccak-f\[1600\] as a loop of 24 rounds (one traced round, so the host builds about 700 nodes per
 //! permutation instead of 10 000) and the hash functions of FIPS 203 on batches of rows.
 
 use luma::*;
@@ -30,7 +30,7 @@ fn round_constant(lfsr: &Array<u32>) -> (Array<u32>, Array<u32>, Array<u32>) {
     (lo.expect("seven bits"), hi.expect("bit 63"), r)
 }
 
-/// Keccak-f[1600]: the 24 rounds as a register loop of one traced round.
+/// Keccak-f\[1600\]: the 24 rounds as a register loop of one traced round.
 pub fn keccak_f_loop(a: &State) -> State {
     let one = Array::<u32>::full_on(a[0].context(), a[0].shape(), 1).expect("a register");
     // The absorbed words are one kernel, not one per word: requested together, then recorded (and

@@ -316,8 +316,17 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
   to one of its inputs computes it first.
 - `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory and the
   budget, `ctx.paging_stats()` the evictions by kind (`clean_evictions`, `readback_evictions`,
-  `recompute_evictions`); `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
+  `recompute_evictions`), the host copies kept (`host_copy_bytes`) and, where the device says, its free
+  memory (`device_free_bytes`); `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
   temporaries the next one cannot reuse.
+- Host memory for spilled arrays and for kept copies is limited by `ContextOptions::host_budget` /
+  `LUMA_HOST_BUDGET` (default half of the available host memory). Over it, kept copies go first; arrays
+  that exist only in host memory stay, with a warning once.
+- Buffers are sized in eighth-octave classes (a multiple of a sixteenth of the next power of two above
+  4 KiB, so at most 12.5% padding): arrays of odd sizes keep more data resident than power-of-two sizes would.
+- `ctx.memory_model()` is the calibrated memory hierarchy of the device (L2 size and bandwidth, workgroup-memory
+  bandwidth, the cost of strided, gathered and transposed reads relative to coalesced, dependent-load latency);
+  `examples/device_info` prints it. The planner does not read it yet.
 
 ## A checklist for a slow program
 

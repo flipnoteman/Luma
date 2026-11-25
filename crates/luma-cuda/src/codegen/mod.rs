@@ -4,7 +4,7 @@
 //! math functions are calls to `__nv_*`. Every value is either SSA lanes (scalar or vector) or a
 //! byte-addressed temporary (struct / array); places are `i8*` plus byte offsets, which a load or
 //! store turns into one typed `getelementptr` of the pointer they came from (see `fb`). Scalar
-//! locals that are declared once and never reassigned are SSA values ([`ssa_locals`]); the others
+//! locals that are declared once and never reassigned are SSA values (`ssa_locals`); the others
 //! are `alloca [N x i8]` slots, which LLVM promotes to registers. The IR is kept small on purpose:
 //! NVVM parses and optimizes it for every kernel the first time it is built, and the instructions
 //! nothing uses are removed before it is handed over.

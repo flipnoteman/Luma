@@ -180,8 +180,8 @@ pub struct ContextOptions {
     pub memory_budget: Option<u64>,
     /// Bytes of host memory the context may use for host copies of device data: the segments it
     /// moved off the device plus the copies it keeps of segments that were brought back (see
-    /// [`PagingStats::host_copy_bytes`]). Kept copies are dropped first when it is exceeded.
-    /// `None`: half of the available host memory at open, capped by the cgroup limit.
+    /// [`crate::PagingStats::host_copy_bytes`]). Kept copies are dropped first when it is exceeded.
+    /// `None`: half of the available host memory at open, at most half of the cgroup limit.
     /// `LUMA_HOST_BUDGET`.
     pub host_budget: Option<u64>,
     /// Largest buffer an array is split into: a power of two from 1024 up to the largest

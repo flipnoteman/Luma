@@ -48,7 +48,8 @@
 //!   ([`ColorSpace`]), and feature detection and matching (`fast`, `harris`, `orb`, `sift`, `canny`,
 //!   `match_template`, connected components; points come back as [`Keypoints`]).
 //! * **Element types**: `f32`, `u32`, `i32`, `bool`, compact integers (`u8`, `i8`, `u16`, `i16`),
-//!   [`Df32`] (double-float) and `f64` where the device has it.
+//!   two-byte floats (`f16`, `bf16`: storage plus `f32` compute), [`Df32`] (double-float) and `f64`
+//!   where the device has it.
 //! * **Matrix products**: [`Array::matmul`] runs on tensor cores in TF32 on CUDA devices of compute
 //!   capability 8.0 and up (results differ from the exact product by TF32 rounding);
 //!   [`ContextOptions::numerics`] with [`Numerics::strict`] or `LUMA_NUMERICS=strict` turns that off for a context and
