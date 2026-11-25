@@ -313,58 +313,10 @@ fn inference_case(h: &mut Harness, cfg: Cfg) {
     });
 }
 
-/// The SGD step as a compiled callable (`luma::trace`): inputs `x, labels, w1..b3, lr` (the rate is a one-element array), outputs
-/// the loss and the six new parameters. Traced once before the timed calls; a call only encodes the recorded launches.
-fn compiled_case(h: &mut Harness, cfg: Cfg, case: &str) {
-    let (_, step) = cfg.flops();
-    if !fits(h, step) {
-        return;
-    }
-    h.guarded(case, |h| {
-        let (x, labels, hp) = data(&cfg);
-        let net = Net::new(h, &cfg, &hp, &x, &labels);
-        let (classes, batch) = (net.classes.clone(), cfg.batch);
-        let compiled = trace(move |inp| {
-            let net = Net { p: (0..6).map(|i| inp.get::<f32>(2 + i)).collect(), x: inp.get::<f32>(0), labels: inp.get::<u32>(1), classes: classes.clone(), batch };
-            let lr = inp.get::<f32>(8);
-            let (loss, g) = net.grads();
-            let mut out = Outputs::new().push(loss);
-            for (p, g) in net.p.iter().zip(&g) {
-                out = out.push(p - &(g * &lr));
-            }
-            out
-        });
-        let step_once = |params: &[Array<f32>], lr: &Array<f32>| -> Vec<Array<f32>> {
-            let mut args: Vec<&dyn AnyArray> = vec![&net.x, &net.labels];
-            args.extend(params.iter().map(|p| p as &dyn AnyArray));
-            args.push(lr);
-            let mut out = compiled.call(&args).unwrap();
-            (0..7).map(|i| out.take::<f32>(i).unwrap()).collect()
-        };
-        // One step against the eager step from the same parameters.
-        let lr_check = arr(h, &[0.5], 1);
-        let got = step_once(&net.p, &lr_check);
-        let mut eager = Net::new(h, &cfg, &hp, &x, &labels);
-        eager.sgd(0.5);
-        for (i, (g, w)) in got[1..].iter().zip(&eager.p).enumerate() {
-            check(&format!("{case}: param {i}"), &g.to_vec().unwrap(), &w.to_vec().unwrap(), 1e-3, 1e-5);
-        }
-        let lr = arr(h, &[0.01], 1);
-        let mut params = net.p.clone();
-        h.case(case, &cfg.size(), Work::Flops(step), &mut || {
-            let out = step_once(&params, &lr);
-            params = out[1..].to_vec();
-            out[0].eval().unwrap();
-        });
-    });
-}
-
 pub fn run(h: &mut Harness) {
     for cfg in CONFIGS {
         sgd_case(h, cfg);
     }
-    compiled_case(h, CONFIGS[0], "train/mlp_step_compiled");
-    compiled_case(h, CONFIGS[1], "train/mlp_step_compiled_medium");
     for cfg in [CONFIGS[0], CONFIGS[1], CONFIGS[2]] {
         adam_case(h, cfg);
     }

@@ -87,8 +87,6 @@ mod guide {
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
     pub mod loops {}
-    #[doc = include_str!("../guide/src/trace.md")]
-    pub mod trace {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
     #[doc = include_str!("../guide/src/complex.md")]
@@ -193,7 +191,11 @@ mod stats;
 mod spectral;
 mod sparse;
 mod texture;
+// The replay engine behind compiled callables: internal until the library drives it by itself.
+#[allow(dead_code)]
 mod trace;
+#[cfg(test)]
+mod trace_tests;
 mod tuning;
 mod until;
 mod view;
@@ -220,7 +222,6 @@ pub use image::{transform_coordinates, transform_coordinates_on, TransformMatrix
 pub use interp::Interp;
 pub use signal::IIR_MAX_ORDER;
 pub use until::{compile_until_all, iterate_until_all, CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until};
-pub use trace::{trace, trace_with, Compiled, DimClass, Inputs, Outputs, Results, ShapeClass, TraceError, TraceOptions, TraceStats, VariantInfo};
 pub use linalg::{
     solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,

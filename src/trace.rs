@@ -10,13 +10,12 @@
 //! exact shapes of the arguments; the shape class only says how much a retrace costs.
 
 use std::fmt;
-use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use luma_core::Buffer;
 
-use crate::array::{Array, Failure, Storage};
+use crate::array::{Array, Failure as ArrayFailure, Storage};
 use crate::context::{default_context, Cmd, CmdArg, Context};
 use crate::erased::{AnyArray, Dyn, ElemKind, Erased, StorageRef};
 use crate::error::{LumaError, Result};
@@ -36,12 +35,6 @@ const MAX_EAGER: usize = 64;
 // -- Options -------------------------------------------------------------------------------------
 
 /// How a [`Compiled`] behaves. Build one with [`TraceOptions::new`] and the methods below.
-///
-/// ```
-/// use luma::TraceOptions;
-/// let opts = TraceOptions::new().strict().max_variants(2);
-/// # let _ = opts;
-/// ```
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct TraceOptions {
@@ -100,8 +93,7 @@ impl TraceOptions {
 
 // -- Errors --------------------------------------------------------------------------------------
 
-/// Why a function could not be traced or a [`Compiled`] could not be called. Carried by
-/// [`LumaError::Trace`].
+/// Why a function could not be traced or a [`Compiled`] could not be called.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum TraceError {
@@ -175,14 +167,59 @@ impl TraceError {
 }
 
 fn refused(error: TraceError) -> Failure {
-    Failure::New(LumaError::Trace(error))
+    Failure::Trace(error)
 }
 
-/// The error a public method returns for a failure inside it.
-fn report(failure: Failure, op: &'static str, location: &'static Location<'static>) -> LumaError {
-    match failure {
-        Failure::Inherited(error) => LumaError::clone(&error),
-        Failure::New(error) => LumaError::Op { op, location, source: Arc::new(error) },
+/// What a traced call fails with: a refusal of the trace itself, or an error of the library
+/// underneath (a poisoned argument's error is passed on as it is).
+#[derive(Debug)]
+pub enum Failure {
+    Trace(TraceError),
+    New(LumaError),
+    Inherited(Arc<LumaError>),
+}
+
+impl From<LumaError> for Failure {
+    fn from(error: LumaError) -> Self {
+        Failure::New(error)
+    }
+}
+
+impl From<ArrayFailure> for Failure {
+    fn from(failure: ArrayFailure) -> Self {
+        match failure {
+            ArrayFailure::New(error) => Failure::New(error),
+            ArrayFailure::Inherited(error) => Failure::Inherited(error),
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Trace(error) => error.fmt(f),
+            Failure::New(error) => error.fmt(f),
+            Failure::Inherited(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Failure {
+    /// The refusal of the trace, if this is one.
+    pub fn trace_error(&self) -> Option<&TraceError> {
+        match self {
+            Failure::Trace(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// The error underneath, for a caller that reports through [`LumaError`].
+    pub fn into_error(self) -> LumaError {
+        match self {
+            Failure::Trace(error) => LumaError::Unsupported(error.to_string()),
+            Failure::New(error) => error,
+            Failure::Inherited(error) => LumaError::clone(&error),
+        }
     }
 }
 
@@ -297,9 +334,7 @@ impl Inputs<'_> {
 
     /// Argument `i` as an `Array<T>`: a poisoned array ([`TraceError::Signature`], at the next
     /// synchronisation point) if there is no such argument or it holds another element type.
-    #[track_caller]
     pub fn get<T: GpuType>(&self, i: usize) -> Array<T> {
-        let location = Location::caller();
         let problem = match self.probes.get(i) {
             Some(probe) => match probe.clone().downcast::<T>() {
                 Ok(array) => return array,
@@ -310,7 +345,7 @@ impl Inputs<'_> {
                 got: format!("input {i}"),
             },
         };
-        let error = LumaError::Op { op: "Inputs::get", location, source: Arc::new(LumaError::Trace(problem)) };
+        let error = LumaError::InvalidShape(problem.to_string());
         Array::poisoned(self.ctx, Shape::from(1), Arc::new(error))
     }
 }
@@ -426,23 +461,10 @@ pub struct Compiled {
 }
 
 /// Records the launches `f` makes once and returns a [`Compiled`] that replays them over new
-/// arguments, with no graph building, planning or fusion work per call.
-///
-/// ```no_run
-/// use luma::{trace, Array};
-///
-/// let step = trace(|inp| {
-///     let (x, w) = (inp.get::<f32>(0), inp.get::<f32>(1));
-///     let y = x.matmul(&w).maximum(0.0);
-///     (y.sum(), y).into()
-/// });
-/// let x = Array::from_slice(&[1.0f32; 64], [8, 8])?;
-/// let w = Array::from_slice(&[0.5f32; 64], [8, 8])?;
-/// let mut out = step.call(&[&x, &w])?; // the first call traces, then runs
-/// let (loss, y) = (out.take::<f32>(0)?, out.take::<f32>(1)?);
-/// # let _ = (loss, y);
-/// # Ok::<(), luma::LumaError>(())
-/// ```
+/// arguments, with no graph building, planning or fusion work per call. The first call with a
+/// signature traces `f` (the launches it makes while the context records) and runs the result;
+/// later calls with the same element types and shapes only encode the recorded launches over the
+/// arguments' buffers and new buffers for the outputs.
 ///
 /// `f` is kept, because a new signature retraces, and runs once per trace on probe arrays, never
 /// per call. It may build arrays from its [`Inputs`] and from arrays it captured, call any
@@ -475,31 +497,24 @@ impl Compiled {
     /// tracing it first if there is none. Returns the function's outputs as arrays of their own.
     ///
     /// Nothing is read back: the call only records launches, like any operation on arrays.
-    #[track_caller]
-    pub fn call(&self, args: &[&dyn AnyArray]) -> Result<Results> {
-        let location = Location::caller();
-        self.inner.call(args).map_err(|failure| report(failure, "Compiled::call", location))
+    pub fn call(&self, args: &[&dyn AnyArray]) -> std::result::Result<Results, Failure> {
+        self.inner.call(args)
     }
 
     /// [`Compiled::call`] for a function with exactly one output, of element type `T`.
-    #[track_caller]
-    pub fn call1<T: GpuType>(&self, args: &[&dyn AnyArray]) -> Result<Array<T>> {
-        let location = Location::caller();
-        let mut results = self.inner.call(args).map_err(|failure| report(failure, "Compiled::call1", location))?;
+    pub fn call1<T: GpuType>(&self, args: &[&dyn AnyArray]) -> std::result::Result<Array<T>, Failure> {
+        let mut results = self.inner.call(args)?;
         if results.len() != 1 {
-            let error = LumaError::InvalidShape(format!("call1 needs a function with one output, this one returns {}", results.len()));
-            return Err(LumaError::Op { op: "Compiled::call1", location, source: Arc::new(error) });
+            return Err(Failure::New(LumaError::InvalidShape(format!("call1 needs a function with one output, this one returns {}", results.len()))));
         }
-        results.take::<T>(0).map_err(|error| LumaError::Op { op: "Compiled::call1", location, source: Arc::new(error) })
+        Ok(results.take::<T>(0)?)
     }
 
     /// Traces the function for the signature of `args` without running it (and without a
     /// retrace later), so that a loop or a [strict](TraceOptions::strict) callable starts warm.
     /// A signature that has a variant already is left alone.
-    #[track_caller]
-    pub fn precompile(&self, args: &[&dyn AnyArray]) -> Result<()> {
-        let location = Location::caller();
-        self.inner.precompile(args).map_err(|failure| report(failure, "Compiled::precompile", location))
+    pub fn precompile(&self, args: &[&dyn AnyArray]) -> std::result::Result<(), Failure> {
+        self.inner.precompile(args)
     }
 
     /// What the callable has done so far.
@@ -725,7 +740,7 @@ impl Callable {
         }
         match self.trace(ctx, stamp, args) {
             Ok(variant) => Ok(Some(self.insert(variant))),
-            Err(Failure::New(LumaError::Trace(error))) if self.opts.eager_fallback && error.falls_back() => {
+            Err(Failure::Trace(error)) if self.opts.eager_fallback && error.falls_back() => {
                 self.warn_once(&error.to_string());
                 let mut eager = lock(&self.eager);
                 if eager.len() >= MAX_EAGER {

@@ -159,8 +159,6 @@ pub enum LumaError {
     Map(String),
     /// Accessing the mapped readback buffer failed.
     MapRange(String),
-    /// A compiled callable ([`trace`](crate::trace)) could not be traced or called; see [`TraceError`](crate::TraceError).
-    Trace(crate::trace::TraceError),
 }
 
 impl fmt::Display for LumaError {
@@ -242,7 +240,6 @@ impl fmt::Display for LumaError {
             LumaError::Poll(e) => write!(f, "GPU poll failed: {e}"),
             LumaError::Map(e) => write!(f, "Failed to read data back from GPU: {e}"),
             LumaError::MapRange(e) => write!(f, "Failed to map staging buffer: {e}"),
-            LumaError::Trace(e) => write!(f, "{e}"),
         }
     }
 }

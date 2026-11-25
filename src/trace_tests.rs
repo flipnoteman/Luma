@@ -1,12 +1,30 @@
-//! `luma::trace`: a function traced once and replayed over new arrays, with no graph building per call.
-
-use crate::common::values;
+//! The replay engine behind compiled callables (`crate::trace`): a function traced once and
+//! replayed over new arrays, with no graph building per call.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use luma::*;
+use crate::trace::{trace, trace_with, Failure, Outputs, ShapeClass, TraceError, TraceOptions};
+use crate::*;
+
+/// Deterministic pseudo-random values in `lo..hi` (a small LCG).
+fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lo + ((state >> 40) as f32) / (1u64 << 24) as f32 * (hi - lo)
+        })
+        .collect()
+}
+
+fn assert_close(got: &[f32], want: &[f32], rel: f32, abs: f32) {
+    assert_eq!(got.len(), want.len(), "length");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= abs.max(rel * w.abs()), "index {i}: got {g}, want {w}");
+    }
+}
 
 fn ctx() -> Context {
     Context::new().unwrap()
@@ -25,11 +43,17 @@ fn bits(array: &Array<f32>) -> Vec<u32> {
     array.to_vec().unwrap().iter().map(|v| v.to_bits()).collect()
 }
 
-/// The `TraceError` inside an error, through any `Op` wrappers.
-fn trace_error(error: &LumaError) -> &TraceError {
-    match error.root() {
-        LumaError::Trace(error) => error,
-        other => panic!("not a trace error: {other}"),
+/// The `TraceError` of a refused call.
+fn trace_error(error: &Failure) -> &TraceError {
+    error.trace_error().unwrap_or_else(|| panic!("not a trace error: {error}"))
+}
+
+/// The error of the library underneath a failure.
+fn root_of(error: &Failure) -> LumaError {
+    match error {
+        Failure::New(e) => e.root().clone(),
+        Failure::Inherited(e) => e.root().clone(),
+        Failure::Trace(e) => LumaError::Unsupported(e.to_string()),
     }
 }
 
@@ -276,7 +300,7 @@ fn these_library_ops_trace() {
 type Body = Box<dyn Fn(&Array<f32>) -> Outputs + Send + Sync>;
 
 /// The error the first call of a function traced over `x` gives.
-fn first_error(body: Body, x: &Array<f32>) -> LumaError {
+fn first_error(body: Body, x: &Array<f32>) -> Failure {
     trace(move |inp| body(&inp.get::<f32>(0))).call(&[x]).unwrap_err()
 }
 
@@ -343,7 +367,6 @@ fn readback_in_the_function_is_an_aborted_trace_naming_the_reason() {
         let error = first_error(body, &x);
         let TraceError::Aborted { reason: got } = trace_error(&error) else { panic!("{name}: {error}") };
         assert_eq!(*got, reason, "{name}");
-        assert!(error.to_string().contains("Compiled::call"), "{name}: {error}");
     }
     // Host data goes to a device through a transfer, which a recording cannot hold; where the
     // device shares memory with the host (the CPU backend) the array is a constant of the trace.
@@ -423,11 +446,11 @@ fn a_poisoned_argument_returns_its_error() {
     let good = on(&ctx, 3, 37);
     let bad = &good + &on(&ctx, 2, 38);
     let error = compiled.call(&[&bad]).unwrap_err();
-    assert!(matches!(error.root(), LumaError::ShapeMismatch { .. }), "{error}");
+    assert!(matches!(root_of(&error), LumaError::ShapeMismatch { .. }), "{error}");
     // With a variant for the shape, too.
     compiled.call1::<f32>(&[&good]).unwrap();
     let error = compiled.call(&[&bad]).unwrap_err();
-    assert!(matches!(error.root(), LumaError::ShapeMismatch { .. }), "{error}");
+    assert!(matches!(root_of(&error), LumaError::ShapeMismatch { .. }), "{error}");
     assert_eq!(compiled.stats().traces, 1);
 }
 
@@ -436,7 +459,7 @@ fn arguments_of_two_contexts_are_refused() {
     let (one, other) = (ctx(), ctx());
     let compiled = trace(|inp| (&inp.get::<f32>(0) + &inp.get::<f32>(1)).into());
     let error = compiled.call(&[&on(&one, 8, 1), &on(&other, 8, 2)]).unwrap_err();
-    assert!(matches!(error.root(), LumaError::ContextMismatch), "{error}");
+    assert!(matches!(root_of(&error), LumaError::ContextMismatch), "{error}");
 }
 
 #[test]
@@ -662,7 +685,7 @@ fn a_compiled_call_inside_iterate_all_is_refused_and_the_recording_survives() {
     for _ in 0..4 {
         want = (0..want.len()).map(|i| want[(i + want.len() - 1) % want.len()] * 0.5).collect();
     }
-    crate::common::assert_close(&out.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_close(&out.to_vec().unwrap(), &want, 1e-6, 1e-6);
     assert_eq!(compiled.stats().traces, 0, "nothing was traced inside the loop");
     // Outside the loop the callable works.
     assert_eq!(compiled.call1::<f32>(&[&x]).unwrap().len(), 512);
@@ -705,7 +728,7 @@ fn eager_fallback_inside_a_recording_runs_the_function_once() {
     for _ in 0..3 {
         want = (0..want.len()).map(|i| want[(i + want.len() - 1) % want.len()] * 0.5).collect();
     }
-    crate::common::assert_close(&out.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_close(&out.to_vec().unwrap(), &want, 1e-6, 1e-6);
     let stats = compiled.stats();
     assert_eq!(runs.load(Ordering::Relaxed) as u64, stats.eager_calls, "one run of the function per call: {stats:?}");
     assert!(stats.eager_calls >= 1 && stats.variants == 0, "{stats:?}");

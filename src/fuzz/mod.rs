@@ -1492,11 +1492,11 @@ fn any_arrays(arrs: &[Arr]) -> Vec<&dyn crate::AnyArray> {
 
 /// Argument `j` of the traced function as the array a leaf statement made, copied: the function
 /// may write what it made, which it may not do to an argument.
-fn traced_arg(inp: &crate::Inputs<'_>, j: usize, ty: Ty) -> Arr {
+fn traced_arg(inp: &crate::trace::Inputs<'_>, j: usize, ty: Ty) -> Arr {
     by_ty!(ty, T => T::wrap(inp.get::<T>(j).copy()))
 }
 
-fn push_output(outputs: crate::Outputs, arr: &Arr) -> crate::Outputs {
+fn push_output(outputs: crate::trace::Outputs, arr: &Arr) -> crate::trace::Outputs {
     with_arr!(arr, a => outputs.push(a.clone()))
 }
 
@@ -1536,7 +1536,7 @@ fn agree(host: &Result<(), ErrKind>, luma: &Result<(), LumaError>, at: &str) -> 
 }
 
 /// Compares the outputs of one call (`live[k]` is the variable output `k` holds) with the oracle's variables.
-fn check_outputs(math: bool, live: &[usize], results: crate::Results, host: &HostEnv, call: &str) -> Result<(), Fail> {
+fn check_outputs(math: bool, live: &[usize], results: crate::trace::Results, host: &HostEnv, call: &str) -> Result<(), Fail> {
     let items = results.into_vec();
     if items.len() != live.len() {
         return Err(Fail::Mismatch(format!("{call}: {} outputs for {} live variables", items.len(), live.len())));
@@ -1602,7 +1602,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     let stmts = program.stmts.clone();
     let host_outcomes = outcomes.clone();
     let inside = Cx { ctx: ctx.clone(), math: program.math };
-    let compiled = crate::trace(move |inp| {
+    let compiled = crate::trace::trace(move |inp| {
         let mut env: Env = Vec::new();
         let (mut next, mut stopped) = (0, None);
         for (k, stmt) in stmts.iter().enumerate() {
@@ -1622,7 +1622,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
                 }
             }
         }
-        let mut outputs = crate::Outputs::new();
+        let mut outputs = crate::trace::Outputs::new();
         let mut live = Vec::new();
         for (i, var) in env.iter().enumerate() {
             if let Some(arr) = var {
@@ -1636,11 +1636,11 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
 
     let first = match compiled.call(&any_arrays(&args_a)) {
         Ok(results) => results,
-        Err(error) => {
-            return match error.root() {
+        Err(failure) => {
+            return match failure.trace_error() {
                 // What a traced function may not do: the program ends here.
-                LumaError::Trace(_) => Err(Fail::Limit(format!("not traceable: {error}"))),
-                _ => Err(limit_or_fail(&error, "the first call")),
+                Some(_) => Err(Fail::Limit(format!("not traceable: {failure}"))),
+                None => Err(limit_or_fail(&failure.into_error(), "the first call")),
             };
         }
     };
@@ -1650,7 +1650,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     }
     check_outputs(program.math, &live, first, &host_a, "the first call")?;
     // Other data through the same variant: nothing is traced again.
-    let second = compiled.call(&any_arrays(&args_b)).map_err(|e| limit_or_fail(&e, "the second call"))?;
+    let second = compiled.call(&any_arrays(&args_b)).map_err(|e| limit_or_fail(&e.into_error(), "the second call"))?;
     check_outputs(program.math, &live, second, &host_b, "the second call")?;
     if compiled.stats().traces != 1 {
         return Err(Fail::Mismatch(format!("the callable traced {} times for one signature", compiled.stats().traces)));
