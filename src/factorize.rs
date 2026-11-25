@@ -4,6 +4,8 @@ use std::any::Any;
 use std::panic::Location;
 use std::sync::Arc;
 
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
 use crate::array::Array;
 use crate::reduce::Reduction;
 use crate::ops::select;
@@ -45,6 +47,7 @@ impl<T: SortKey> Array<T> {
             && self.error().is_none()
             && let Some(pair) = crate::host::try_factorize(self)
         {
+            note_light(ctx, FamilyTag::Merge, "factorize", Location::caller(), "merge::factorize_host");
             return Ok(pair);
         }
         if n > 0 && !ctx.recording_here() {
@@ -56,10 +59,12 @@ impl<T: SortKey> Array<T> {
                 None
             };
             if let Some((uniques, codes)) = fast {
+                note_light(ctx, FamilyTag::Merge, "factorize", Location::caller(), "merge::factorize_small_range");
                 let uniques = *uniques.downcast::<Array<T>>().expect("uniques have the type of the keys");
                 return Ok((uniques, codes.reshape(self.shape())));
             }
         }
+        note_light(ctx, FamilyTag::Merge, "factorize", Location::caller(), "merge::factorize_sort");
         let flat = self.reshape(n);
         let (sorted, perm) = flat.sort_with_indices()?;
         // A new value starts where the key differs from its predecessor and at element 0. Two

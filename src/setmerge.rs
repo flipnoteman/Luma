@@ -30,6 +30,8 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use crate::jit::structured::boundary::note_light;
+use crate::jit::structured::strategy::FamilyTag;
 use crate::array::{Array, Failure, Storage};
 use crate::context::RawArg;
 use crate::error::LumaError;
@@ -576,8 +578,10 @@ impl<T: SortKey> Array<T> {
         let total = u32::try_from(na + nb).map_err(|_| too_large())?;
         // Status words keep counts in 30 bits; the fused kernel needs ordered memory across workgroups.
         if ctx.tuning().lookback_scan && ctx.tuning().subgroup32 && total < 1 << 30 {
+            note_light(ctx, FamilyTag::Merge, "merge_sorted", std::panic::Location::caller(), "merge::wide");
             self.merge_wide(other, op, total)
         } else {
+            note_light(ctx, FamilyTag::Merge, "merge_sorted", std::panic::Location::caller(), "merge::three_kernels");
             self.merge_three_kernels(other, op, total)
         }
     }
