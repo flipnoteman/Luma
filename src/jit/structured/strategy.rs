@@ -171,7 +171,7 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 /// One table per family; the shared edit of a new family is one line here.
 ///
 /// Search, Compact and Merge are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &[], &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[]];
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[]];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {

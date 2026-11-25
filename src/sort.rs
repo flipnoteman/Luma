@@ -62,7 +62,8 @@ use std::sync::Arc;
 
 use luma_core::Buffer;
 
-use crate::profile::{Decision, DecisionSite};
+use crate::jit::structured::boundary::{dim, SortAttrs, SortParams, SortPayload, SortStage};
+use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
@@ -76,17 +77,17 @@ use crate::shape::Shape;
 use crate::tuning::Tuning;
 
 /// Invocations of a workgroup of the sort kernels.
-const WORKGROUP: u32 = 256;
+pub(crate) const WORKGROUP: u32 = 256;
 /// Keys an invocation owns in a tile of the split ranking.
 const PER_THREAD: u32 = 8;
 /// Keys a workgroup handles per pass with the split ranking.
-const TILE: u32 = WORKGROUP * PER_THREAD;
+pub(crate) const TILE: u32 = WORKGROUP * PER_THREAD;
 /// Keys an invocation owns in a tile of the ballot kernels.
-const BALLOT_PER_THREAD: u32 = 16;
+pub(crate) const BALLOT_PER_THREAD: u32 = 16;
 /// Tiles whose counts a counting workgroup writes together.
 const COUNT_TILES: u32 = 4;
 /// Bits of the digit of a pass.
-const DIGIT_BITS: u32 = 8;
+pub(crate) const DIGIT_BITS: u32 = 8;
 /// Digits (counters per tile).
 const DIGITS: u32 = 1 << DIGIT_BITS;
 
@@ -311,7 +312,7 @@ const SWEEP_HEADER: u32 = SWEEP_TICKETS + 8;
 /// Keys an invocation owns in a tile of the sweep kernels, the most of 32 (16 with a payload), 24
 /// and 16 whose workgroup memory fits (more keys per tile make longer runs of equal digits to write, and fewer
 /// statuses).
-fn sweep_per_thread(tuning: &Tuning, payload: bool) -> u32 {
+pub(crate) fn sweep_per_thread(tuning: &Tuning, payload: bool) -> u32 {
     // With a payload the registers of the tile are twice as many and 16 keys per invocation was
     // measured faster (RTX 3090, 10M keys: argsort 0.83 ms against 0.85 at 24 and 0.90 at 32).
     let wanted: u32 = if payload { 16 } else { 32 };
@@ -320,7 +321,7 @@ fn sweep_per_thread(tuning: &Tuning, payload: bool) -> u32 {
 
 /// Bytes of workgroup memory of the sweep kernel with `per_thread` keys per invocation: the
 /// counters, the digit bases, two arrays of subgroup totals, a ticket and the staged keys.
-fn sweep_bytes(per_thread: u32) -> u32 {
+pub(crate) fn sweep_bytes(per_thread: u32) -> u32 {
     let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + 2 * (WORKGROUP / SUBGROUP) + 1 + WORKGROUP * per_thread;
     words * 4
 }
@@ -846,14 +847,14 @@ fn main(
 
 /// Bytes of workgroup memory the ballot scatter kernel declares: the counters (a word per digit and
 /// subgroup, padded), the digit bases, the subgroup totals, and the staged keys (reused for the payload).
-fn ballot_bytes() -> u32 {
+pub(crate) fn ballot_bytes() -> u32 {
     let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + WORKGROUP / SUBGROUP + WORKGROUP * BALLOT_PER_THREAD;
     words * 4
 }
 
 /// Whether a sort ranks with ballots: subgroups of 32 invocations and room for the ballot
 /// kernel's workgroup memory.
-fn use_ballots(tuning: &Tuning) -> bool {
+pub(crate) fn use_ballots(tuning: &Tuning) -> bool {
     tuning.subgroup32 && ballot_bytes() <= tuning.workgroup_storage
 }
 
@@ -905,23 +906,53 @@ impl Keys<'_> {
     }
 }
 
+/// The boundary of the selection at the entry of a sort of `len` elements, and the host path's parameters if the registry has it
+/// apply (it may still decline: `try_*` answers `None` and the sort goes on to the radix kernels).
+fn host_candidate(ctx: &Context, op: &'static str, location: &'static Location<'static>, len: usize, errored: bool) -> Option<(Boundary<'static>, Params)> {
+    let boundary = Boundary::new(
+        FamilyTag::Sort,
+        op,
+        location,
+        [dim(len), 1, 1, 0],
+        BoundaryAttrs::Sort(SortAttrs { stage: SortStage::Entry, payload: SortPayload::None, errored, value4: false, key_bits: 32, len: len as u64 }),
+    );
+    let params = candidates(ctx, &boundary).find_map(|(id, params)| (id == StrategyId::SORT_HOST).then_some(params))?;
+    Some((boundary, params))
+}
+
 /// Records the stable LSD radix sort of the `u32` words of `keys` (see [`Spec`]), carrying
 /// `payload`. `keys` is read as is by the first pass, through `spec.transform`.
 pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, spec: Spec) -> Outcome<Sorted> {
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
-    let sweep = use_sweep(ctx, n32);
-    ctx.jit().note_with(|loc| {
-        let chosen = if sweep { "sweep" } else if use_ballots(ctx.tuning()) { "radix ballot" } else { "radix" };
-        Decision::new("sort", loc, DecisionSite::SortPlan, chosen)
-    });
-    if sweep {
-        return radix_sweep(ctx, keys, payload, spec, n32);
+    let boundary = Boundary::new(
+        FamilyTag::Sort,
+        "sort",
+        Location::caller(),
+        [n32, 1, 1, 0],
+        BoundaryAttrs::Sort(SortAttrs {
+            stage: SortStage::Radix,
+            payload: match payload {
+                Payload::None => SortPayload::None,
+                Payload::Index => SortPayload::Index,
+                Payload::Buffer(_) => SortPayload::Buffer,
+            },
+            errored: false,
+            value4: false,
+            key_bits: spec.key_bits.clamp(1, 32) as u8,
+            len: n as u64,
+        }),
+    );
+    let (chosen, params) = candidates(ctx, &boundary).next().expect("the count/scan/scatter radix sort always fits");
+    note(ctx, &boundary, chosen, &params, &[]);
+    let Params::Sort(params) = params else { unreachable!("a sort strategy runs with sort parameters") };
+    if chosen == StrategyId::SORT_RADIX_SWEEP {
+        return radix_sweep(ctx, keys, payload, spec, n32, params);
     }
-    let ballot = use_ballots(ctx.tuning());
-    let tiles = n32.div_ceil(if ballot { WORKGROUP * BALLOT_PER_THREAD } else { TILE });
-    let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
+    let ballot = chosen == StrategyId::SORT_RADIX_BALLOTS;
+    let tiles = n32.div_ceil(params.tile);
+    let passes = params.passes;
     let bytes = n as u64 * 4;
     // The counts of a digit are `cstride` words, a whole number of the `vec4`s a counting
     // workgroup writes; the words past `tiles` stay zero.
@@ -1041,7 +1072,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
 /// Whether a sort runs as the single sweep (see [`radix_sweep`]): the device orders memory
 /// across workgroups (the look-back of the scan needs the same), ranks with ballots, and every
 /// count fits the 30 bits of a status word.
-fn use_sweep(ctx: &Context, n: u32) -> bool {
+pub(crate) fn use_sweep(ctx: &Context, n: u32) -> bool {
     let tuning = ctx.tuning();
     tuning.lookback_scan && use_ballots(tuning) && sweep_bytes(16) <= tuning.workgroup_storage && n < 1 << 30
 }
@@ -1057,12 +1088,11 @@ fn use_sweep(ctx: &Context, n: u32) -> bool {
 /// The work buffer holds, in words: the counters of the digits of every pass (written by the
 /// histogram, read by the sweeps), the ticket counters of the passes, and the statuses, `tiles *
 /// 256` words per pass. It is zeroed by one launch ahead of the kernels.
-fn radix_sweep(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, spec: Spec, n32: u32) -> Outcome<Sorted> {
+fn radix_sweep(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, spec: Spec, n32: u32, params: SortParams) -> Outcome<Sorted> {
     let n = n32 as usize;
-    let per_thread = sweep_per_thread(ctx.tuning(), !matches!(payload, Payload::None));
-    let tile_keys = WORKGROUP * per_thread;
-    let tiles = n32.div_ceil(tile_keys);
-    let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
+    let per_thread = params.per_thread;
+    let tiles = n32.div_ceil(params.tile);
+    let passes = params.passes;
     let bytes = n as u64 * 4;
     let work_words = u64::from(SWEEP_HEADER) + u64::from(passes) * u64::from(tiles) * u64::from(DIGITS);
     let work_bytes = work_words * 4;
@@ -1233,11 +1263,10 @@ impl<T: SortKey> Array<T> {
             self.storage()?;
             return Ok(self.clone());
         }
-        if ctx.can_run_on_host()
-            && self.len() <= crate::host::MAX_SORT_ELEMS
-            && self.error().is_none()
+        if let Some((boundary, params)) = host_candidate(ctx, "sort", Location::caller(), self.len(), self.error().is_some())
             && let Some(sorted) = crate::host::try_sort(self, descending)
         {
+            note(ctx, &boundary, StrategyId::SORT_HOST, &params, &[]);
             return Ok(sorted);
         }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: true };
@@ -1263,11 +1292,10 @@ impl<T: SortKey> Array<T> {
             self.storage()?;
             return Ok(Array::<u32>::zeros_on(ctx, self.len())?.storage()?.clone());
         }
-        if ctx.can_run_on_host()
-            && self.len() <= crate::host::MAX_SORT_ELEMS
-            && self.error().is_none()
+        if let Some((boundary, params)) = host_candidate(ctx, "argsort", Location::caller(), self.len(), self.error().is_some())
             && let Some(storage) = crate::host::try_argsort(self, descending)
         {
+            note(ctx, &boundary, StrategyId::SORT_HOST, &params, &[]);
             return Ok(storage);
         }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: false };
@@ -1286,11 +1314,10 @@ impl<T: SortKey> Array<T> {
             self.storage()?;
             return Ok((self.clone(), Array::<u32>::zeros_on(ctx, self.shape())?));
         }
-        if ctx.can_run_on_host()
-            && self.len() <= crate::host::MAX_SORT_ELEMS
-            && self.error().is_none()
+        if let Some((boundary, params)) = host_candidate(ctx, "sort_with_indices", Location::caller(), self.len(), self.error().is_some())
             && let Some(pair) = crate::host::try_sort_with_indices(self)
         {
+            note(ctx, &boundary, StrategyId::SORT_HOST, &params, &[]);
             return Ok(pair);
         }
         let spec = Spec { transform: T::TRANSFORM, descending: false, key_bits: 32, want_keys: true };
@@ -1439,7 +1466,16 @@ impl<T: SortKey> Array<T> {
             values.storage()?;
             return Ok((self.clone(), values.clone()));
         }
-        if V::LAYOUT == ElemLayout::plain(4) && !(ctx.can_run_on_host() && self.len() <= crate::host::MAX_SORT_ELEMS) {
+        let boundary = Boundary::new(
+            FamilyTag::Sort,
+            "sort_by_key",
+            Location::caller(),
+            [dim(self.len()), 1, 1, 0],
+            BoundaryAttrs::Sort(SortAttrs { stage: SortStage::ByKey, payload: SortPayload::Buffer, errored: false, value4: V::LAYOUT == ElemLayout::plain(4), key_bits: key_bits.clamp(1, 32) as u8, len: self.len() as u64 }),
+        );
+        let (chosen, params) = candidates(ctx, &boundary).next().expect("the permutation sort always fits");
+        note(ctx, &boundary, chosen, &params, &[]);
+        if chosen == StrategyId::SORT_BY_KEY_PAYLOAD {
             let spec = Spec { transform: T::TRANSFORM, descending, key_bits, want_keys: true };
             let sorted = self.radix(Payload::Buffer(values.storage()?), spec)?;
             let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
@@ -1472,10 +1508,19 @@ impl<T: SortKey> Array<T> {
         let len = self.len();
         let flat = self.reshape(len);
         let flat_values = values.reshape(len);
-        if len == n {
+        let boundary = Boundary::new(
+            FamilyTag::Sort,
+            "sort_by_key_axis",
+            Location::caller(),
+            [dim(n), dim(len / n), dim(len / n), 0],
+            BoundaryAttrs::Sort(SortAttrs { stage: SortStage::ByKeyAxis, payload: SortPayload::None, errored: false, value4: false, key_bits: 32, len: len as u64 }),
+        );
+        // One line is the flat by-key sort, which selects for itself.
+        let Some((chosen, params)) = candidates(ctx, &boundary).next() else {
             let (keys, moved) = flat.run_sort_by_key(&flat_values, descending)?;
             return Ok((keys.reshape(shape), moved.reshape(shape)));
-        }
+        };
+        note(ctx, &boundary, chosen, &params, &[]);
         // Sort everything by key carrying the flat index, then sort that stably by the line of
         // the index carrying the index again (see `sort_lines`): the result is, line by line, the
         // input positions in key order; keys and values are gathered from them.
@@ -1513,7 +1558,16 @@ impl<T: SortKey> Array<T> {
             return Ok(self.clone());
         }
         let stride: usize = dims[..axis].iter().product();
-        if n <= crate::segsort::max_line(self.context()) as usize {
+        let boundary = Boundary::new(
+            FamilyTag::Sort,
+            "sort_axis",
+            Location::caller(),
+            [dim(n), dim(stride), dim(self.len() / n), 0],
+            BoundaryAttrs::Sort(SortAttrs { stage: SortStage::Axis, payload: SortPayload::None, errored: false, value4: false, key_bits: 32, len: self.len() as u64 }),
+        );
+        let (chosen, params) = candidates(self.context(), &boundary).next().expect("a sort along an axis always fits");
+        note(self.context(), &boundary, chosen, &params, &[]);
+        if chosen == StrategyId::SORT_LINES {
             return self.sort_short_lines(stride, n);
         }
         let sorted = self.sort_lines(axis)?;

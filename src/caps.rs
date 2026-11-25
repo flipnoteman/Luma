@@ -51,6 +51,11 @@ impl Caps {
         (self.0 & other.0) == other.0
     }
 
+    /// `self` and the capabilities of `other`.
+    pub(crate) const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// No capability.
     pub(crate) const fn empty() -> Self {
         Self(0)
