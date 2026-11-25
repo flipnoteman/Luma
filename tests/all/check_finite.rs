@@ -7,7 +7,7 @@ use common::values;
 use luma::{Array, Context, ContextOptions, LumaError};
 
 fn checked() -> Context {
-    Context::with_options(ContextOptions::default().check_finite(true)).unwrap()
+    Context::with_options(ContextOptions::from_env().check_finite(true)).unwrap()
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn writes_into_arrays_are_checked() {
 
 #[test]
 fn a_default_context_computes_infinities() {
-    let ctx = Context::with_options(ContextOptions::default()).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env()).unwrap();
     let x = Array::from_slice_on(&ctx, &values(8, 3, 1.0, 2.0), 8).unwrap();
     let y = (&x / 0.0).to_vec().unwrap();
     assert!(y.iter().all(|v| v.is_infinite()));

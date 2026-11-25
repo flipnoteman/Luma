@@ -30,18 +30,25 @@ if ctx.profiling_supported() {
 
 A [`Profile`](https://docs.rs/luma/latest/luma/struct.Profile.html) has `kernels` (one
 [`KernelTiming`](https://docs.rs/luma/latest/luma/struct.KernelTiming.html) per label, the most
-expensive first: label, launches, total, min, max, and a `mean()` method), `splits`, `launches()` and `total()`.
+expensive first: label, launches, total, min, max, and a `mean()` method), `decisions`, `cuts()`, `launches()` and `total()`.
 Fused kernels are labelled by what they hold (`Fused(Mul, Add, Sqrt) f32`, `FusedReduce(Sum: Mul)
 f32`); your own kernels by `.label(..)` or their entry point.
 
 While profiling, every launch gets a compute pass of its own so that it can be timed. Use it to find
 where the GPU time goes, not to measure throughput. For the host's time, time the calls themselves.
 
-### Why was it cut: `splits`
+### Why was it cut: `cuts()` and `decisions`
 
-Each [`FusionSplit`](https://docs.rs/luma/latest/luma/struct.FusionSplit.html) names the operation
-and source line where an expression was cut, and the
-[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html):
+`Profile::cuts()` gives the cuts of expressions in a profiled region: the operation and
+source line where an expression was cut, and the
+[`SplitReason`](https://docs.rs/luma/latest/luma/enum.SplitReason.html). Every choice the planner made
+while profiling
+([`Decision`](https://docs.rs/luma/latest/luma/struct.Decision.html): the operation, its source line,
+the [`DecisionSite`](https://docs.rs/luma/latest/luma/enum.DecisionSite.html), the chosen label and the
+alternatives that lost) is returned by `Context::take_decisions()` right after
+`Context::finish_profiling()` (or `Context::profile`). To record decisions without
+profiling (host paths, the plan cache and graph capture stay on), use `Context::record_decisions(true)`
+(or `LUMA_RECORD_DECISIONS=1`) and `Context::take_decisions()`.
 
 | Reason | Meaning |
 | --- | --- |
@@ -68,10 +75,10 @@ if ctx.profiling_supported() {
     })?;
     r?;
     assert!(profile.launches() > 1);
-    for split in &profile.splits {
-        println!("{split}");                            // split at file:line:col (`op`): N operations > 2
+    for (op, location, reason) in profile.cuts() {
+        println!("{op} at {location}: {reason:?}");     // add at file:line:col: Nodes { nodes: 3, limit: 2 }
     }
-    assert!(profile.splits.iter().any(|s| matches!(s.reason, SplitReason::Nodes { .. })));
+    assert!(profile.cuts().any(|(_, _, reason)| matches!(reason, SplitReason::Nodes { .. })));
 }
 # Ok::<(), luma::LumaError>(())
 ```
@@ -272,8 +279,8 @@ loop primitives, which trace the step once, are the cheaper form where they fit.
 On a CUDA device with tensor cores (compute capability 8.0 and up) `matmul` runs in TF32 by default: the
 operands are rounded to 10 bits of mantissa and the products accumulated in `f32`, so results differ from
 the exact `f32` product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
-RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. `ContextOptions::tf32_matmul(false)`
-or `LUMA_TF32_MATMUL=0` turns it off for a context, `matmul_f32` is the exact product of one call, and
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. `ContextOptions::numerics(Numerics::strict())`
+or `LUMA_NUMERICS=strict` turns it off for a context, `matmul_f32` is the exact product of one call, and
 `matmul_tf32` forces TF32 ([Tensor cores](data.md#tensor-cores-tf32)). `matmul_batched` is always `f32`.
 Other backends compute `f32` products as before. A product whose output is small and whose `K` is long (a
 Gram matrix, a gradient `Xᵀr`) runs as a kernel family with no workgroup staging, and `matmul_nt`,
@@ -302,10 +309,24 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
 - On unified memory, `from_slice` uploads into mappable buffers that are reused (zero-copy).
 - Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
   `LUMA_MEMORY_BUDGET` to something your machine can keep on the device. Arrays split over several
-  buffers are never staged and cannot be passed to custom kernels.
-- `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory, and the
-  budget; `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
+  buffers are never staged and cannot be passed to custom kernels. A moved array that the host
+  already holds a copy of (it came back and was only read since) moves nothing, and a cheap
+  elementwise result of arrays that stay on the device (at least 16 KiB, in one buffer) is
+  dropped and recomputed at its next use, which costs a kernel instead of a transfer; writing
+  to one of its inputs computes it first.
+- `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory and the
+  budget, `ctx.paging_stats()` the evictions by kind (`clean_evictions`, `readback_evictions`,
+  `recompute_evictions`), the host copies kept (`host_copy_bytes`) and, where the device says, its free
+  memory (`device_free_bytes`); `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
   temporaries the next one cannot reuse.
+- Host memory for spilled arrays and for kept copies is limited by `ContextOptions::host_budget` /
+  `LUMA_HOST_BUDGET` (default half of the available host memory). Over it, kept copies go first; arrays
+  that exist only in host memory stay, with a warning once.
+- Buffers are sized in eighth-octave classes (a multiple of a sixteenth of the next power of two above
+  4 KiB, so at most 12.5% padding): arrays of odd sizes keep more data resident than power-of-two sizes would.
+- `ctx.memory_model()` is the calibrated memory hierarchy of the device (L2 size and bandwidth, workgroup-memory
+  bandwidth, the cost of strided, gathered and transposed reads relative to coalesced, dependent-load latency);
+  `examples/device_info` prints it. The planner does not read it yet.
 
 ## A checklist for a slow program
 
@@ -313,7 +334,7 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
    dominates? Is the time in kernels at all, or in the host (then it is `eval`, readbacks, or
    array construction)?
 2. **Count launches** per step. A step that should be one fused kernel and is ten means a cut:
-   print `profile.splits` and read the reason.
+   print `profile.cuts()` and read the reason.
 3. **Look for readbacks** inside loops: `item()`, `to_vec()`, `max().item()?` per iteration. Move
    them out of the loop or use `iterate_until_all`.
 4. **Use the loop primitives** where the step fits; check that the step is elementwise (register

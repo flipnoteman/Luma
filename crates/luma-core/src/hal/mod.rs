@@ -2,6 +2,7 @@
 //! every GPU backend implements.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::panic::Location;
@@ -12,12 +13,16 @@ use std::time::Duration;
 pub mod cache;
 pub mod copy;
 mod deferred;
+pub mod hostbytes;
 pub mod texture;
+mod transfer;
 pub mod topology;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
 pub use texture::{TextureCaps, TextureDesc, TextureFilter, TextureFormat};
+pub use hostbytes::HostBytes;
+pub use transfer::{NativeStage, Stage, StageDir, Ticket};
 
 /// Which backend a context runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -213,16 +218,78 @@ pub struct CostModel {
     pub f64_factor: Option<f64>,
 }
 
+/// How bytes move inside a device, measured by calibration next to the [`CostModel`] numbers.
+/// Wave 1 only measures and exposes them; no planning decision reads them yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct MemoryModel {
+    /// L2 cache size: the device attribute where the backend reports it (CUDA), else the
+    /// measured knee of the copy bandwidth over power-of-two working sets, which is only an upper
+    /// bound (the largest size still much faster than DRAM, within one doubling of the real size):
+    /// consumers must not assume it is exact. `None` where no sharp knee was found.
+    pub l2_bytes: Option<u64>,
+    /// Whether `l2_bytes` is exact (a device attribute) rather than the power-of-two upper bound
+    /// of the knee; `false` when `l2_bytes` is `None`.
+    pub l2_exact: bool,
+    /// Read bandwidth, GB/s, of a copy whose traffic wraps over a working set inside L2 (the
+    /// largest measured set that is at least 1.5 times faster than DRAM).
+    pub l2_gbs: f64,
+    /// Workgroup-memory read bandwidth, GB/s; `None` on the CPU.
+    pub shared_gbs: Option<f64>,
+    /// Time per byte relative to coalesced access for strides of 2, 8 and 32 elements.
+    pub strided_factor: [f64; 3],
+    /// Time per byte of random 4-byte gathers relative to coalesced access.
+    pub gather_factor: f64,
+    /// Time per byte of a naive transposed read relative to coalesced access.
+    pub transpose_factor: f64,
+    /// Nanoseconds per dependent load of a one-workgroup chain.
+    pub latency_ns: f64,
+}
+
+impl MemoryModel {
+    /// A memory model of the given numbers (see the fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(l2_bytes: Option<u64>, l2_exact: bool, l2_gbs: f64, shared_gbs: Option<f64>, strided_factor: [f64; 3], gather_factor: f64, transpose_factor: f64, latency_ns: f64) -> MemoryModel {
+        MemoryModel { l2_bytes, l2_exact, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns }
+    }
+}
+
+impl fmt::Display for MemoryModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.l2_bytes {
+            Some(bytes) => write!(f, "L2 {}{:.2} MiB at {:.0} GB/s", if self.l2_exact { "" } else { "up to " }, bytes as f64 / (1 << 20) as f64, self.l2_gbs)?,
+            None => write!(f, "L2 unknown size at {:.0} GB/s", self.l2_gbs)?,
+        }
+        match self.shared_gbs {
+            Some(gbs) => write!(f, ", workgroup memory {gbs:.0} GB/s")?,
+            None => write!(f, ", no workgroup memory figure")?,
+        }
+        let [s2, s8, s32] = self.strided_factor;
+        write!(f, ", strided x{s2:.2} / x{s8:.2} / x{s32:.2} (2 / 8 / 32), gather x{:.2}, transpose x{:.2}, latency {:.0} ns", self.gather_factor, self.transpose_factor, self.latency_ns)
+    }
+}
+
 impl CostModel {
+    /// A cost model of the given measurements.
+    pub const fn new(launch_us: f64, bandwidth_gbs: f64, f32_ops_per_ns: f64, df32_factor: f64, f64_factor: Option<f64>) -> CostModel {
+        CostModel { launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor }
+    }
+
+    /// This model with `change` applied.
+    pub fn with(mut self, change: impl FnOnce(&mut CostModel)) -> CostModel {
+        change(&mut self);
+        self
+    }
+
     /// RTX 3090 (Vulkan), measured by calibration (best of several runs).
-    pub const NVIDIA: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 27.0, f64_factor: Some(41.0) };
+    pub const NVIDIA: CostModel = CostModel::new(2.9, 740.0, 16000.0, 27.0, Some(41.0));
     /// Every other GPU, measured on a RADV Raphael iGPU (best of 5 runs).
-    pub const GENERIC: CostModel = CostModel { launch_us: 2.0, bandwidth_gbs: 62.0, f32_ops_per_ns: 370.0, df32_factor: 44.0, f64_factor: Some(11.0) };
+    pub const GENERIC: CostModel = CostModel::new(2.0, 62.0, 370.0, 44.0, Some(11.0));
     /// Mesa llvmpipe on a Ryzen 9 7950X (best of 5 runs).
-    pub const CPU: CostModel = CostModel { launch_us: 32.0, bandwidth_gbs: 31.0, f32_ops_per_ns: 30.0, df32_factor: 2.3, f64_factor: Some(1.1) };
+    pub const CPU: CostModel = CostModel::new(32.0, 31.0, 30.0, 2.3, Some(1.1));
     /// The numbers tests pin so that kernel counts do not depend on the machine.
     #[doc(hidden)]
-    pub const TEST: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 36.0, f64_factor: Some(41.0) };
+    pub const TEST: CostModel = CostModel::new(2.9, 740.0, 16000.0, 36.0, Some(41.0));
 
     /// The fixed numbers of a tuning profile, used when calibration is off or fails.
     pub fn fallback(profile: TuningProfile) -> CostModel {
@@ -261,7 +328,7 @@ impl KernelTiming {
 }
 
 /// Why the fusion engine ended a kernel before the expression did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SplitReason {
     /// The expression held more operations than the fusion limit allows.
@@ -320,7 +387,113 @@ pub enum SplitReason {
     },
 }
 
+/// Where the planner chose between alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecisionSite {
+    /// An expression was cut into several kernels (see [`SplitReason`]).
+    Cut(SplitReason),
+    /// The inliner judged whether a shared sub-expression is recomputed or stored.
+    Inline,
+    /// An operand was staged (through shared memory or registers) or read directly.
+    Staging,
+    /// Work per thread of an elementwise kernel.
+    Coarsen,
+    /// A transpose fused with its consumer or not.
+    TransposeFusion,
+    /// How a view is read (direct, texture, packed).
+    ReadPath,
+    /// Matrix product strategy.
+    MatmulPlan,
+    /// Sort strategy.
+    SortPlan,
+    /// Line solver (cyclic reduction) strategy.
+    LineSolvePlan,
+    /// QR panel strategy.
+    QrPanel,
+    /// A cached plan was replayed: no planning decision was made.
+    PlanReplay,
+}
+
+/// What became of a candidate that was not chosen.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Verdict {
+    /// Its estimated cost.
+    Estimate {
+        /// Nanoseconds.
+        ns: f64,
+    },
+    /// It did not apply, for this reason.
+    Rejected(&'static str),
+}
+
+/// One choice of the planner between alternatives, recorded while profiling or after
+/// [`Context::record_decisions`](https://docs.rs/luma). Labels are stable strings (no pointers or ids).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Decision {
+    /// The operation whose creation (or evaluation) caused the decision.
+    pub op: &'static str,
+    /// Where that operation was written.
+    pub location: &'static Location<'static>,
+    /// What was decided.
+    pub site: DecisionSite,
+    /// The chosen alternative, e.g. `tiled 128x64 split=4`, `coarsen 4`, `texture`.
+    pub chosen: Cow<'static, str>,
+    /// The alternatives that were not chosen (may be empty).
+    pub candidates: Vec<(Cow<'static, str>, Verdict)>,
+    /// The choice came from a memo (judgement cache, recipes).
+    pub cached: bool,
+}
+
+impl Decision {
+    /// A decision with no candidates, not cached.
+    pub fn new(op: &'static str, location: &'static Location<'static>, site: DecisionSite, chosen: impl Into<Cow<'static, str>>) -> Decision {
+        Decision { op, location, site, chosen: chosen.into(), candidates: Vec::new(), cached: false }
+    }
+
+    /// Adds a rejected alternative.
+    #[must_use]
+    pub fn candidate(mut self, label: impl Into<Cow<'static, str>>, verdict: Verdict) -> Decision {
+        self.candidates.push((label.into(), verdict));
+        self
+    }
+
+    /// Sets whether the choice came from a memo.
+    #[must_use]
+    pub fn cached(mut self, cached: bool) -> Decision {
+        self.cached = cached;
+        self
+    }
+}
+
+impl fmt::Display for Decision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let DecisionSite::Cut(reason) = self.site else {
+            return write!(f, "{:?} at {} (`{}`): {}", self.site, self.location, self.op, self.chosen);
+        };
+        write!(f, "split at {} (`{}`): ", self.location, self.op)?;
+        match reason {
+            SplitReason::Nodes { nodes, limit } => write!(f, "{nodes} operations > {limit}"),
+            SplitReason::Depth { limit } => write!(f, "depth > {limit}"),
+            SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
+            SplitReason::Live { live, limit } => write!(f, "{live} live values > {limit}"),
+            SplitReason::Scalars { words, limit } => write!(f, "{words} scalar words > {limit}"),
+            SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
+            SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
+            SplitReason::Shared { weight } => write!(f, "an expression of {weight} operations read by pending operations outside the kernel is stored, not recomputed in each"),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "{}", self.chosen),
+        }
+    }
+}
+
 /// A point where an expression was cut into several kernels, and why.
+///
+/// Deprecated with [`Profile::splits`]: [`Profile::cuts`] gives the same three values, and
+/// `Context::take_decisions` every decision of the planner (`DecisionSite::Cut` is a cut).
+#[deprecated(since = "0.5.2", note = "use `Profile::cuts()` (or `Decision` with `DecisionSite::Cut`); removed in 0.6")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionSplit {
     /// The operation whose creation (or evaluation) caused the cut.
@@ -331,6 +504,7 @@ pub struct FusionSplit {
     pub reason: SplitReason,
 }
 
+#[allow(deprecated)]
 impl fmt::Display for FusionSplit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "split at {} (`{}`): ", self.location, self.op)?;
@@ -343,6 +517,8 @@ impl fmt::Display for FusionSplit {
             SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
             SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
             SplitReason::Shared { weight } => write!(f, "an expression of {weight} operations read by pending operations outside the kernel is stored, not recomputed in each"),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "{:?}", self.reason),
         }
     }
 }
@@ -351,17 +527,27 @@ impl fmt::Display for FusionSplit {
 ///
 /// A duration is the time from the start to the end of the compute pass of one launch, so it
 /// includes the GPU's own scheduling of that pass but not the time between launches or any host
-/// time.
+/// time. The planner's decisions of the profiled region are not part of it: they are read with
+/// `Context::take_decisions` after `Context::finish_profiling`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(deprecated)]
 pub struct Profile {
     /// One entry per kernel label, the one with the most total time first.
     pub kernels: Vec<KernelTiming>,
     /// Where lazy expressions were cut into several kernels while profiling, in the order they
-    /// happened (see [`SplitReason`]).
+    /// happened (see [`SplitReason`]). Read them with [`Profile::cuts`].
+    #[deprecated(since = "0.5.2", note = "use `Profile::cuts()` (or `Context::take_decisions()`); removed in 0.6")]
     pub splits: Vec<FusionSplit>,
 }
 
 impl Profile {
+    /// The cuts of lazy expressions into several kernels, with their operation, location and
+    /// reason, in the order they happened.
+    #[allow(deprecated)]
+    pub fn cuts(&self) -> impl Iterator<Item = (&'static str, &'static Location<'static>, SplitReason)> + '_ {
+        self.splits.iter().map(|s| (s.op, s.location, s.reason))
+    }
+
     /// The entry of the kernel with this label.
     pub fn get(&self, label: &str) -> Option<&KernelTiming> {
         self.kernels.iter().find(|k| k.label == label)
@@ -401,6 +587,7 @@ impl Profile {
     }
 }
 
+#[allow(deprecated)]
 impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self.kernels.iter().map(|k| k.label.len()).max().unwrap_or(0).max(6);
@@ -532,25 +719,73 @@ impl BufferUsage {
 /// Copies between buffers and writes into them are multiples of this many bytes.
 pub const COPY_BUFFER_ALIGNMENT: u64 = 4;
 
+/// Smallest buffer size class.
+const MIN_BUFFER_SIZE: u64 = 16;
+
+/// Buffers up to this many bytes round to a power of two; larger ones to an eighth-octave class.
+const FINE_CLASS_START: u64 = 4096;
+
+/// Size class for a buffer holding `bytes` bytes, the one rule every backend and the pool share.
+///
+/// Up to 4 KiB: the next power of two (at least 16 bytes). Above: the next multiple of
+/// `next_power_of_two(bytes) / 16`, which cuts each octave into 8 steps (at most 12.5% waste,
+/// every class a multiple of 512 bytes). Clamped to `max_size & !3`; `None` if `bytes` itself
+/// exceeds that.
+///
+/// Buffers of a class may be larger than the data they hold, so users must track the logical
+/// size themselves and never rely on `Buffer::size()` / WGSL `arrayLength`.
+pub fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
+    // Keep copy sizes aligned even when the limit is not.
+    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
+    if bytes > max_size {
+        return None;
+    }
+    let bytes = bytes.max(MIN_BUFFER_SIZE);
+    let Some(pow2) = bytes.checked_next_power_of_two() else {
+        return Some(max_size);
+    };
+    let class = if bytes <= FINE_CLASS_START {
+        pow2
+    } else {
+        let step = pow2 / 16;
+        bytes.next_multiple_of(step)
+    };
+    Some(class.min(max_size))
+}
+
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A backend's own buffer object, held type-erased by [`Buffer`].
 pub trait NativeBuffer: Any + fmt::Debug + Send + Sync + 'static {}
 
-/// A device buffer of any backend. Cloning shares the buffer; equality is identity.
+/// A device buffer of any backend. Cloning shares the buffer; equality is identity (a view made
+/// by [`Buffer::at`] is equal to the buffer it views).
 #[derive(Clone, Debug)]
 pub struct Buffer {
     id: u64,
     size: u64,
     usage: BufferUsage,
     native: Arc<dyn NativeBuffer>,
+    offset: u64,
 }
 
 impl Buffer {
     /// Wraps a backend's buffer of `size` bytes.
     pub fn new(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
-        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native) }
+        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0 }
+    }
+    /// A view of this buffer that a launch binds from `offset` bytes on (a storage argument of a
+    /// backend whose [`Backend::storage_offset_align`] is not 0, with `offset` a multiple of it;
+    /// [`CompiledKernel::check_offsets`] checks). The view is the same buffer for everything
+    /// else: same id, same [`Buffer::size`] (the whole buffer), same memory.
+    #[must_use]
+    pub fn at(&self, offset: u64) -> Buffer {
+        Buffer { offset: self.offset + offset, ..self.clone() }
+    }
+    /// Where a launch starts binding this buffer: 0 except for a view made by [`Buffer::at`].
+    pub fn offset(&self) -> u64 {
+        self.offset
     }
     /// Unique per buffer.
     pub fn id(&self) -> u64 {
@@ -673,6 +908,33 @@ impl CompiledKernel {
         Ok(())
     }
 
+    /// Checks that each storage argument that is a view with an offset (see [`Buffer::at`]) lies
+    /// within its buffer and starts at a multiple of `align` (the device's
+    /// [`Backend::storage_offset_align`]; `0` allows no offset).
+    pub fn check_offsets(&self, args: &[RawArg<'_>], align: u64) -> Result<(), BackendError> {
+        for (position, arg) in self.bound(args) {
+            let RawArg::Storage { buffer, bytes, .. } = arg else { continue };
+            let offset = buffer.offset();
+            if offset == 0 {
+                continue;
+            }
+            if align == 0 || offset % align != 0 {
+                return Err(BackendError::KernelBinding(format!(
+                    "kernel `{}` argument {position}: offset {offset} is not a multiple of the device's storage offset alignment ({align}; 0: no offsets)",
+                    self.label
+                )));
+            }
+            if offset.checked_add(*bytes).is_none_or(|end| end > buffer.size()) {
+                return Err(BackendError::KernelBinding(format!(
+                    "kernel `{}` argument {position}: range {offset}+{bytes} exceeds the buffer ({} bytes)",
+                    self.label,
+                    buffer.size()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that each argument the kernel binds is of the kind of its binding, for the same
     /// reason as [`check_count`](Self::check_count).
     pub fn check_kinds(&self, args: &[RawArg<'_>]) -> Result<(), BackendError> {
@@ -700,9 +962,11 @@ impl CompiledKernel {
 /// One argument of a launch.
 #[derive(Clone, Copy, Debug)]
 pub enum RawArg<'a> {
-    /// A storage buffer, of which the kernel may reach the first `bytes`.
+    /// A storage buffer, of which the kernel may reach the first `bytes` bytes from the start
+    /// of the buffer, or, for a view made by [`Buffer::at`], from the view's offset
+    /// ([`Buffer::offset`]).
     Storage {
-        /// The buffer.
+        /// The buffer (or a view of a range of it).
         buffer: &'a Buffer,
         /// Bytes bound.
         bytes: u64,
@@ -793,6 +1057,15 @@ pub struct DeviceLimits {
     pub max_workgroup_invocations: u32,
     /// Workgroup shared memory, bytes.
     pub max_workgroup_storage_bytes: u32,
+}
+
+/// Live device memory, from [`Backend::memory_now`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryNow {
+    /// Bytes free.
+    pub free: u64,
+    /// Bytes in total.
+    pub total: u64,
 }
 
 /// What a backend knows about its device.
@@ -927,6 +1200,21 @@ pub struct GemmSpec {
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
     fn info(&self) -> &DeviceInfo;
+    /// L2 cache size, bytes, if the backend can tell (CUDA); `None` by default.
+    fn l2_cache_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Alignment of the offset of a bound storage range, bytes: a [`Buffer::at`] view with an
+    /// offset that is a multiple of it may be passed as a storage argument ([`RawArg`]). `0`
+    /// (the default) means the backend binds a buffer only from its start and never gets a view
+    /// with an offset.
+    fn storage_offset_align(&self) -> u64 {
+        0
+    }
+    /// Free and total device memory right now, where the API reports it (`None` otherwise).
+    fn memory_now(&self) -> Option<MemoryNow> {
+        None
+    }
     /// The device's on-disk cache.
     fn disk_cache(&self) -> &Arc<DiskCache>;
     /// The device's cost model, set once calibrated.
@@ -936,6 +1224,13 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn create_buffer(&self, size: u64, usage: BufferUsage, mapped: bool) -> Option<Buffer>;
     /// Allocates a buffer holding `data`.
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError>;
+    /// Allocates a buffer that is the destination or source of [`Backend::transfer_in`] /
+    /// [`Backend::transfer_out`]: one whose free is not ordered on the compute lane (on CUDA a
+    /// stream-ordered pool block could be freed while the transfer lane still copies). The
+    /// default is [`Backend::create_buffer`].
+    fn create_buffer_unordered(&self, size: u64, usage: BufferUsage) -> Option<Buffer> {
+        self.create_buffer(size, usage, false)
+    }
     /// Returns a `MAP_WRITE` buffer for reuse.
     fn recycle_mappable(&self, buffer: Buffer);
     /// Host pointer to the first `bytes` of `buffer` when directly CPU-accessible and idle (no
@@ -998,11 +1293,99 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn sync(&self, spin_budget: Duration) -> Result<Duration, BackendError>;
     /// Reads `src` into `dst`; `spill` allows a larger-than-memory chunked readback.
     fn read_into(&self, src: &Buffer, dst: &mut [MaybeUninit<u8>], spill: bool, spin_budget: Duration) -> Result<Duration, BackendError>;
+    /// Host memory of `bytes` bytes for transfers in direction `dir`, zeroed. The default is heap
+    /// memory; CUDA hands out pinned memory held until the stage is dropped.
+    fn stage_alloc(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        Ok(Stage::heap(bytes, dir))
+    }
+    /// The bytes of `stage`, valid while the host owns it.
+    fn stage_ptr<'a>(&self, stage: &'a mut Stage) -> &'a mut [u8] {
+        stage.as_mut_slice()
+    }
+    /// Copies the first `bytes` bytes of `stage` into `dst` at `dst_offset` once every ticket of
+    /// `after` has completed, without waiting for the copy. `dst` must come from
+    /// [`Backend::create_buffer_unordered`]. Offset and length are multiples of 4. Compute work
+    /// recorded afterwards does not wait for the copy unless it follows [`Backend::barrier`] with
+    /// the returned ticket. Until the ticket completes the host leaves `stage` alone and `dst`
+    /// alive.
+    ///
+    /// The default records an upload on the compute lane (which orders it after everything
+    /// recorded, so `after` is already satisfied) and submits; the ticket is that submission.
+    fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
+        let data = &stage.as_slice()[..bytes as usize];
+        let max = self.info().limits.max_buffer_bytes;
+        if dst_offset == 0 {
+            self.record_upload(dst, data, max)?;
+        } else {
+            let scratch = self.create_buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST, false).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.record_upload(&scratch, data, max)?;
+            self.record_copy(&scratch, 0, dst, dst_offset, bytes)?;
+        }
+        self.flush_batch()?;
+        Ok(Ticket::flushed())
+    }
+    /// Copies `bytes` bytes of `src` from `src_offset` into the start of `stage` once every
+    /// ticket of `after` has completed. The default reads back synchronously, so the ticket is
+    /// done on return.
+    fn transfer_out(&self, src: &Buffer, src_offset: u64, stage: &mut Stage, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        check_transfer(stage, StageDir::FromDevice, src, src_offset, bytes)?;
+        let host = &mut stage.as_mut_slice()[..bytes as usize];
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `read_into` only writes.
+        let host = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<MaybeUninit<u8>>(), host.len()) };
+        if src_offset == 0 {
+            self.read_into(src, host, false, Duration::ZERO)?;
+        } else {
+            let scratch = self.create_buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST, false).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.record_copy(src, src_offset, &scratch, 0, bytes)?;
+            self.read_into(&scratch, host, false, Duration::ZERO)?;
+        }
+        Ok(Ticket::done())
+    }
+    /// Orders compute work recorded after this call behind every ticket of `after`, and returns
+    /// a ticket for the compute work recorded so far (and `after`): with an empty `after` it is
+    /// how a transfer is made to wait for a kernel. The default submits the pending batch (the
+    /// compute lane is in order, so there is nothing to wait for).
+    fn barrier(&self, after: &[Ticket]) -> Result<Ticket, BackendError> {
+        let _ = after;
+        self.flush_batch()?;
+        Ok(Ticket::flushed())
+    }
+    /// Whether the work of `t` has completed.
+    fn ticket_done(&self, t: &Ticket) -> Result<bool, BackendError> {
+        if t.is_done_marker() {
+            Ok(true)
+        } else if t.is_flushed_marker() {
+            Ok(!self.gpu_busy())
+        } else {
+            Err(BackendError::Unsupported("a ticket of another backend".into()))
+        }
+    }
+    /// Waits for the work of `t`, polling for `spin` before blocking.
+    fn ticket_wait(&self, t: &Ticket, spin: Duration) -> Result<(), BackendError> {
+        if t.is_done_marker() {
+            Ok(())
+        } else if t.is_flushed_marker() {
+            self.sync(spin).map(|_| ())
+        } else {
+            Err(BackendError::Unsupported("a ticket of another backend".into()))
+        }
+    }
     /// Releases cached resources that are idle.
     fn reclaim_idle(&self) -> Result<(), BackendError>;
     /// Starts timing launches.
     fn enable_profiling(&self) -> Result<(), BackendError>;
     /// Stops timing and returns the profile with `splits` attached.
+    ///
+    /// Deprecated: the `splits` argument and [`Profile::splits`] go in 0.6, where this takes no
+    /// argument and a backend returns its `Profile` without them (the context reports the
+    /// planner's cuts through [`Profile::cuts`] and every other decision through
+    /// `Context::take_decisions`). Until then a backend attaches `splits` to the profile as it
+    /// always did; the context passes the cuts of the profiled region.
+    #[deprecated(since = "0.5.2", note = "0.6 drops the `splits` argument; the cuts are `Profile::cuts()`, every decision `Context::take_decisions()`")]
+    #[allow(deprecated)]
     fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError>;
     /// Whether profiling is enabled.
     fn is_profiling(&self) -> Result<bool, BackendError>;
@@ -1049,6 +1432,23 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_line_solve(&self, _spec: &LineSolveSpec) -> Option<RawKernel> {
         None
     }
+}
+
+/// Checks the direction and ranges of a transfer between `stage` and `buffer`.
+pub fn check_transfer(stage: &Stage, dir: StageDir, buffer: &Buffer, offset: u64, bytes: u64) -> Result<(), BackendError> {
+    if stage.dir() != dir {
+        return Err(BackendError::Unsupported(format!("a stage for {:?} was used for {dir:?}", stage.dir())));
+    }
+    if bytes > stage.len() {
+        return Err(BackendError::MapRange(format!("transferring {bytes} bytes through a stage of {}", stage.len())));
+    }
+    if offset.checked_add(bytes).is_none_or(|end| end > buffer.size()) {
+        return Err(BackendError::MapRange(format!("transferring {bytes} bytes at {offset} of a buffer of {}", buffer.size())));
+    }
+    if offset % 4 != 0 || bytes % 4 != 0 {
+        return Err(BackendError::MapRange(format!("a transfer of {bytes} bytes at {offset} is not a multiple of 4")));
+    }
+    Ok(())
 }
 
 /// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.

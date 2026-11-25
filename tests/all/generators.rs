@@ -83,7 +83,7 @@ fn a_reduction_of_generators_launches_no_store_kernel() {
 
 #[test]
 fn chunked_arrays_see_the_same_values() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1 << 12)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 12)).unwrap();
     let n = 10_000;
     let u = Array::<f32>::uniform_on(&ctx, n, SEED).unwrap();
     let want = uniform_cpu(n, SEED);

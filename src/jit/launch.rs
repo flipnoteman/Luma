@@ -19,7 +19,8 @@ use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
 use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
-use crate::profile::SplitReason;
+use crate::profile::{Decision, DecisionSite, SplitReason};
+use std::panic::Location;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
@@ -177,7 +178,7 @@ fn launch_loop(
     let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ElemLayout::plain(4))).collect();
     let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
-    let in_pins = fixed.iter().map(|input| input.pin(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let in_pins = fixed.iter().map(|input| input.pin_read(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
     let mut words = Vec::with_capacity(scalars.len() + 1);
     words.push(steps);
     words.extend_from_slice(scalars);
@@ -228,7 +229,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
         if fused.inputs.len() > max_inputs
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
-            jit.note_split(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
+            jit.note_cut(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;
@@ -245,7 +246,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
                 .max_by_key(|&(_, size)| size)
                 .map(|(i, _)| i)
         {
-            jit.note_split(node.name, node.location, SplitReason::Scalars { words: fused.scalars.len(), limit: max_words });
+            jit.note_cut(node.name, node.location, SplitReason::Scalars { words: fused.scalars.len(), limit: max_words });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;
@@ -254,7 +255,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
             && let Some((outs, live)) = live_split(&fused, max_inputs, max_live)
         {
             rounds += 1;
-            jit.note_split(node.name, node.location, SplitReason::Live { live, limit: max_live });
+            jit.note_cut(node.name, node.location, SplitReason::Live { live, limit: max_live });
             drop(fused);
             evaluate_group(&outs);
             continue;
@@ -802,6 +803,44 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
     }
 }
 
+/// What a launch binds to read an input: the pinned buffer, or a view of it that starts at the
+/// input's window (see [`Buffer::at`]), and the bytes of it.
+pub(super) struct InPin {
+    pin: Pin,
+    view: Option<Buffer>,
+    bytes: u64,
+}
+
+impl InPin {
+    fn new(pin: Pin, bytes: u64) -> Self {
+        InPin { pin, view: None, bytes }
+    }
+
+    /// Pins the only segment of `input`. A window whose range starts where the device allows a
+    /// binding to is bound as that range of its pack's buffer, instead of being copied out. A
+    /// recording captures buffers whole (its commands are replayed with other buffers swapped
+    /// in), so it keeps copying.
+    fn of(input: &Storage) -> Result<Self, LumaError> {
+        let ctx = input.ctx();
+        if let Some((pack, at)) = input.window()
+            && !ctx.recording_here()
+        {
+            let offset = pack.layout().bytes(at);
+            let align = ctx.hal().storage_offset_align();
+            if offset == 0 || (align != 0 && offset % align == 0) {
+                let pin = pack.pin_read(0)?;
+                let view = (offset != 0).then(|| pin.buffer().at(offset));
+                return Ok(InPin { pin, view, bytes: input.byte_len() });
+            }
+        }
+        Ok(InPin::new(input.pin_read(0)?, input.byte_len()))
+    }
+
+    pub(super) fn raw(&self) -> RawArg<'_> {
+        RawArg::read(self.view.as_ref().unwrap_or(self.pin.buffer()), self.bytes)
+    }
+}
+
 /// Pins what segment `j` (of `n` elements) of a launch binds as inputs, in the binding order of
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
 /// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
@@ -812,7 +851,7 @@ pub(super) fn pin_inputs(
     ids: Option<&[Vec<u32>]>,
     j: usize,
     n: u32,
-) -> Result<Vec<(Pin, u64)>, LumaError> {
+) -> Result<Vec<InPin>, LumaError> {
     let bytes = |input: &Storage| input.layout().bytes(n as usize);
     let mut pins = Vec::with_capacity(inputs.len());
     let mut stored = inputs.iter();
@@ -827,18 +866,18 @@ pub(super) fn pin_inputs(
             // An input of the length of the output is bound by segment; a single buffer of
             // another length (the source of a view) is bound whole.
             pins.push(if input.segments() > 1 {
-                (input.pin(j)?, input.segment_byte_len(j))
+                InPin::new(input.pin_read(j)?, input.segment_byte_len(j))
             } else {
-                (input.pin(0)?, input.byte_len())
+                InPin::of(input)?
             });
             continue;
         };
         if direct(&key.instrs, k as u32) {
-            pins.push((input.pin(j)?, bytes(input)));
+            pins.push(InPin::new(input.pin_read(j)?, bytes(input)));
         }
         for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
             let id = id as usize;
-            pins.push((input.pin(id)?, input.segment_byte_len(id)));
+            pins.push(InPin::new(input.pin_read(id)?, input.segment_byte_len(id)));
         }
     }
     Ok(pins)
@@ -882,7 +921,7 @@ pub(super) fn params<'a>(
 pub(super) struct StoreArgs<'a> {
     pub(super) n: u32,
     outs: Vec<(Pin, u64)>,
-    ins: Vec<(Pin, u64)>,
+    ins: Vec<InPin>,
     words: Cow<'a, [u32]>,
 }
 
@@ -890,7 +929,7 @@ impl StoreArgs<'_> {
     pub(super) fn raw(&self) -> Vec<RawArg<'_>> {
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(self.outs.len() + self.ins.len() + 1);
         raw.extend(self.outs.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
-        raw.extend(self.ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.extend(self.ins.iter().map(InPin::raw));
         if !self.words.is_empty() {
             raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.words)));
         }
@@ -959,6 +998,22 @@ fn launch_store(
     Ok(())
 }
 
+/// The operation and location of the first output of `fused`, for the decision log (`None` for
+/// traced steps, which keep no nodes).
+fn origin_of(fused: &Fused) -> Option<(&'static str, &'static Location<'static>)> {
+    let node = fused.instr_nodes.get(*fused.key.outputs.first()? as usize)?.as_ref()?;
+    Some((node.name, node.location))
+}
+
+/// Records how many elements per invocation the launch of `key` computes, if it could have been
+/// more than one.
+fn note_coarsen(ctx: &crate::context::Context, key: &FusedKey, origin: (&'static str, &'static Location<'static>)) {
+    let jit = ctx.jit();
+    if jit.recording_decisions() && super::coarsen::coarsenable(key) {
+        jit.note_decision(Decision::new(origin.0, origin.1, DecisionSite::Coarsen, format!("coarsen {}", key.coarsen.max(1))));
+    }
+}
+
 /// Drops the staging the judgement chose (see `inline::judge`) if the launch cannot run it: the
 /// kernel runs over segments (`key.spans`), or `len` is not the cells of the staged output.
 fn settle_staging(key: &mut FusedKey, len: usize) {
@@ -985,6 +1040,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
 /// [`run_store`] without the plan cache's recording.
 fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
+    let origin = ctx.jit().recording_decisions().then(|| origin_of(&fused)).flatten().unwrap_or(("elementwise", Location::caller()));
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
     drop((fused_nodes, instr_nodes, sub_roots));
@@ -1014,7 +1070,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     if let Some(plan) = super::transpose::plan(ctx, &key, &inputs, len) {
         return Ok(vec![super::transpose::run(ctx, &plan, &inputs[0], len)?]);
     }
-    if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len)? {
+    if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len, origin.0, origin.1)? {
         return Ok(vec![super::transpose::run_fused(ctx, &plan, &inputs, len, reused)?]);
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
@@ -1023,8 +1079,10 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
         key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
     }
     key.coarsen = super::coarsen::plan(ctx, &key, len);
+    note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
+    let taken_over = reused.is_some();
     let outputs = match reused {
         Some(storage) => vec![storage],
         None => {
@@ -1038,6 +1096,10 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     };
     let refs: Vec<&Storage> = outputs.iter().collect();
     launch_store(ctx, &core, &key, &refs, &inputs, &scalars, shifted.as_ref())?;
+    if !taken_over && count == 1 && shifted.is_none() && super::lineage::wanted(ctx, &key, &outputs[0], &inputs) {
+        let lineage = super::lineage::Lineage::new(core, key, scalars, len, &inputs);
+        outputs[0].only_segment().set_lineage(lineage, &inputs);
+    }
     Ok(outputs)
 }
 
@@ -1059,6 +1121,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     fused.mark_fused();
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     drop((fused_nodes, instr_nodes, sub_roots));
+    let origin = (node.name, node.location);
     let at = inputs.iter().position(|input| Arc::ptr_eq(input, target));
     if let Some(k) = at {
         if !in_place_eligible(&key, k as u32) {
@@ -1073,6 +1136,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
         key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
     }
     key.coarsen = super::coarsen::plan(ctx, &key, node.len());
+    note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     check_finite(ctx, target, node.op().out_ty())?;
@@ -1135,7 +1199,7 @@ pub(super) fn run_mapped(
     let words = params(&key, None, None, 0, n as usize, runs.as_ref(), &scalars)?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + ins.len() + 1);
     raw.extend(outs.iter().zip(bases).map(|(pin, base)| RawArg::write(pin.buffer(), base.byte_len())));
-    raw.extend(ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(ins.iter().map(InPin::raw));
     if !words.is_empty() {
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
     }
@@ -1313,7 +1377,7 @@ pub(super) fn reduce_fused(
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
         raw.push(RawArg::write(&out, out_bytes));
-        raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.extend(pins.iter().map(InPin::raw));
         if let Some(values) = &values {
             raw.push(RawArg::write(ctx.reduce_counter()?, 4));
             raw.push(RawArg::write(values, cell));
@@ -1410,7 +1474,7 @@ pub(super) fn reduce_and_store_fused(
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 4);
     raw.push(RawArg::write(&partial, out_bytes));
     raw.extend(store_pins.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     if let Some(values) = &values {
         raw.push(RawArg::write(ctx.reduce_counter()?, 4));
         raw.push(RawArg::write(values, cell));
@@ -1587,7 +1651,7 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
     let pins = pin_inputs(&key, inputs, None, 0, n)?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
     raw.push(RawArg::write(&out, out_bytes));
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     if single_pass {
         raw.push(RawArg::write(ctx.reduce_counter()?, 4));
         raw.push(RawArg::write(target, cell));
@@ -1617,7 +1681,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
     for j in 0..storage.segments() {
         let bytes = storage.segment_byte_len(j);
         let words = len_u32((bytes / 4) as usize)?;
-        let pin = storage.pin(j)?;
+        let pin = storage.pin_read(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;
         launch_1d(ctx, &core, words, &[RawArg::write(&flags, u64::from(words) * 4), RawArg::read(pin.buffer(), bytes)])?;
         let result = crate::reduce::finish_passes(ctx, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;
@@ -1823,7 +1887,7 @@ pub(crate) fn matmul(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
     raw.push(out);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend(ready.iter().flatten().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, size, &raw)?;
@@ -1863,7 +1927,7 @@ pub(crate) fn axis_reduce(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + reads.len() + 1);
     raw.extend_from_slice(outs);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, workgroups, size, &raw)?;
@@ -1973,7 +2037,7 @@ pub(crate) fn axis_reduce_planned(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
     raw.extend_from_slice(outs);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
@@ -2018,7 +2082,7 @@ pub(crate) fn radix_pass(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + writes.len() + reads.len() + 1);
     raw.extend_from_slice(writes);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, [words[0], 1, 1], &raw)?;
@@ -2092,7 +2156,7 @@ pub(crate) fn solve(
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(writes.len() + pins.len() + ready.len() + 2);
     raw.extend_from_slice(writes);
-    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(InPin::raw));
     raw.extend(ready.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
     raw.extend(starts);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));

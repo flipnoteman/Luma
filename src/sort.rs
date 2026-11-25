@@ -62,6 +62,7 @@ use std::sync::Arc;
 
 use luma_core::Buffer;
 
+use crate::profile::{Decision, DecisionSite};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
@@ -910,7 +911,12 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
-    if use_sweep(ctx, n32) {
+    let sweep = use_sweep(ctx, n32);
+    ctx.jit().note_with(|loc| {
+        let chosen = if sweep { "sweep" } else if use_ballots(ctx.tuning()) { "radix ballot" } else { "radix" };
+        Decision::new("sort", loc, DecisionSite::SortPlan, chosen)
+    });
+    if sweep {
         return radix_sweep(ctx, keys, payload, spec, n32);
     }
     let ballot = use_ballots(ctx.tuning());

@@ -19,7 +19,7 @@ use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d, len_u32, workgroups_1d};
 use crate::reduce::finish_passes_gated;
 
-use super::launch::{self, params, pin_inputs, store_args};
+use super::launch::{self, params, pin_inputs, store_args, InPin};
 use super::program::{flatten, flatten_inner, Fused, Tail};
 use super::{ElemTy, Node};
 
@@ -117,7 +117,7 @@ pub(crate) fn force_with_record<T: GpuType>(
     if SEPARATE_RECORD.with(std::cell::Cell::get) {
         return None;
     }
-    let (operand, ops, finish) = record.reduced()?.fusable()?;
+    let (operand, ops, finish) = record.structured()?.fusable()?;
     if ops.as_slice().len() != 1 || ctx.check_finite() || !operand.is_pending() {
         return None;
     }
@@ -407,7 +407,7 @@ fn run(
             if let Some(next) = next_pins.get(s) {
                 raw.push(RawArg::write(next.buffer(), len as u64 * ELEMENT_BYTES));
             }
-            raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+            raw.extend(pins.iter().map(InPin::raw));
             if let (Some(counter), Some(result)) = (counter, &single_value) {
                 raw.push(RawArg::write(counter, 4));
                 raw.push(RawArg::write(result, ELEMENT_BYTES));

@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
-    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
+    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
-use luma_core::hal::copy_parallel;
+use luma_core::hal::{check_transfer, copy_parallel, size_class};
+use luma_core::{Stage, StageDir, Ticket};
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
 use crate::codegen;
@@ -74,6 +75,10 @@ fn wgpu_usage(usage: BufferUsage) -> wgpu::BufferUsages {
 /// A wgpu buffer held by a [`Buffer`].
 #[derive(Debug)]
 struct WgpuBuffer(wgpu::Buffer);
+
+/// The submission a transfer or barrier ticket waits for.
+#[derive(Debug)]
+struct WgpuTicket(wgpu::SubmissionIndex);
 
 impl NativeBuffer for WgpuBuffer {}
 
@@ -179,21 +184,6 @@ impl Hasher for FxHasher {
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 // -- Sizes --
-
-/// Smallest buffer the pools hand out.
-const MIN_BUFFER_SIZE: u64 = 16;
-
-/// Size class for a buffer holding `bytes` bytes: the next power of two (at least
-/// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
-fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
-    // Keep copy sizes aligned even when the limit is not.
-    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
-    if bytes > max_size {
-        return None;
-    }
-    let class = bytes.max(MIN_BUFFER_SIZE).checked_next_power_of_two().unwrap_or(max_size);
-    Some(class.min(max_size))
-}
 
 /// How an idle staging buffer is matched to a request.
 #[derive(Clone, Copy)]
@@ -432,14 +422,14 @@ struct CachedGroup {
     /// What is bound, in binding order. Uniforms are identified by their arena chunk (the slot
     /// is a dynamic offset). Holding the buffers keeps them alive as long as the group is cached,
     /// so a buffer's identity cannot be reused by another one.
-    entries: Box<[(Buffer, u64)]>,
+    entries: Box<[(Buffer, u64, u64)]>,
     group: wgpu::BindGroup,
 }
 
 impl CachedGroup {
-    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64)>) -> bool {
+    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64, u64)>) -> bool {
         self.kernel == kernel
-            && self.entries.iter().all(|(a, a_bytes)| entries.next().is_some_and(|(b, b_bytes)| a == b && *a_bytes == b_bytes))
+            && self.entries.iter().all(|(a, a_offset, a_bytes)| entries.next().is_some_and(|(b, b_offset, b_bytes)| a == b && *a_offset == b_offset && *a_bytes == b_bytes))
             && entries.next().is_none()
     }
 }
@@ -457,7 +447,7 @@ impl BindGroupCache {
     /// Invalidates indices into buckets: only call it while nothing is bound.
     fn forget(&mut self, buffers: &[Buffer]) {
         self.buckets.retain(|_, bucket| {
-            bucket.retain(|group| !group.entries.iter().any(|(b, _)| buffers.contains(b)));
+            bucket.retain(|group| !group.entries.iter().any(|(b, _, _)| buffers.contains(b)));
             !bucket.is_empty()
         });
         self.len = self.buckets.values().map(Vec::len).sum();
@@ -510,7 +500,8 @@ struct Batch {
 /// What a kernel may use of the shader features the device was opened with.
 fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
     use naga::valid::Capabilities as Caps;
-    let mut caps = Caps::empty();
+    // `pack2x16float` / `unpack2x16float` (the half-float conversions) need no device feature on a GPU.
+    let mut caps = Caps::SHADER_FLOAT16_IN_FLOAT32;
     if features.contains(wgpu::Features::SUBGROUP) {
         caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
     }
@@ -600,6 +591,7 @@ pub struct WgpuBackend {
     grid_layout: wgpu::BindGroupLayout,
     timestamps: bool,
     uniform_align: u64,
+    storage_offset_align: u64,
     max_dynamic_uniforms: u32,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
@@ -705,6 +697,7 @@ impl WgpuBackend {
             grid_layout,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             uniform_align: info.limits.uniform_align,
+            storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
             max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
             max_buffer_bytes,
             info,
@@ -930,6 +923,41 @@ impl WgpuBackend {
     /// submission goes ahead and the waiting paths report the error.
     fn busy(&self) -> bool {
         matches!(self.device().poll(wgpu::PollType::Poll), Ok(status) if !status.is_queue_empty())
+    }
+
+    /// Records a copy of `data` into `dst` at `offset`, ordered after everything recorded so
+    /// far. `data.len()` must be a multiple of 4.
+    ///
+    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
+    /// copies out of one is submitted it is mapped again, and the next upload of its size class
+    /// writes straight into it.
+    fn upload_at(&self, dst: &Buffer, offset: u64, data: &[u8], max_buffer_bytes: u64) -> Result<(), BackendError> {
+        let dst = raw(dst)?;
+        let bytes = data.len() as u64;
+        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
+        {
+            let mut view = own(&staging).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
+            write_parallel(data, view.slice(..));
+        }
+        own(&staging).unmap();
+
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_buffer(own(&staging), 0, dst, offset, bytes);
+        lock(&self.uploads).in_flight += staging.size();
+        guard.uploads.push(staging);
+        Ok(())
+    }
+
+    /// Submits the pending batch; the ticket is its submission (done when nothing was pending).
+    fn submitted_ticket(&self) -> Ticket {
+        match self.batch() {
+            Ok(mut batch) => match self.flush_locked(&mut batch) {
+                Some(index) => Ticket::new(WgpuTicket(index)),
+                None => Ticket::done(),
+            },
+            Err(_) => Ticket::done(),
+        }
     }
 
     /// Submits the pending batch (if there is one) and prepares the next. Never waits.
@@ -1187,6 +1215,10 @@ impl Backend for WgpuBackend {
         &self.info
     }
 
+    fn storage_offset_align(&self) -> u64 {
+        self.storage_offset_align
+    }
+
     fn disk_cache(&self) -> &Arc<DiskCache> {
         &self.disk
     }
@@ -1356,6 +1388,7 @@ impl Backend for WgpuBackend {
         // error of its caller, not of the batch.
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
+        kernel.check_offsets(args, self.storage_offset_align)?;
         let native = kernel.raw.downcast_ref::<WgpuKernel>().ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))?;
         let indirect = match dispatch {
             Dispatch::Direct(_) => None,
@@ -1426,25 +1459,26 @@ impl Backend for WgpuBackend {
         // this launch's slots were allocated from.
         let bindings = || {
             kernel.bound(args).map(|(_, arg)| match *arg {
-                RawArg::Storage { buffer, bytes, .. } => (buffer, bytes),
-                RawArg::Uniform(data) => (uniforms, data.len() as u64),
+                RawArg::Storage { buffer, bytes, .. } => (buffer, buffer.offset(), bytes),
+                RawArg::Uniform(data) => (uniforms, 0, data.len() as u64),
             })
         };
         let mut hasher = FxHasher::default();
         kernel.id.hash(&mut hasher);
-        for (buffer, bytes) in bindings() {
+        for (buffer, offset, bytes) in bindings() {
             buffer.hash(&mut hasher);
+            offset.hash(&mut hasher);
             bytes.hash(&mut hasher);
         }
         let key = hasher.finish();
         let textured_group;
         let (args_group, cached) = if native.textured {
             let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-            for (((binding, _), (buffer, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
+            for (((binding, _), (buffer, offset, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
                 let resource = match info.kind {
                     BindingKind::Texture2d => BindingResource::TextureView(&texture(buffer)?.view),
                     BindingKind::Sampler => BindingResource::Sampler(&texture(buffer)?.sampler),
-                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset, size: std::num::NonZeroU64::new(bytes) }),
                 };
                 group_entries.push(BindGroupEntry { binding, resource });
             }
@@ -1456,14 +1490,14 @@ impl Backend for WgpuBackend {
                 Some(index) => index,
                 None => {
                     let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-                    for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
+                    for ((binding, _), (buffer, offset, bytes)) in kernel.bound(args).zip(bindings()) {
                         group_entries.push(BindGroupEntry {
                             binding,
-                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset, size: std::num::NonZeroU64::new(bytes) }),
                         });
                     }
                     let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
-                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
+                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, offset, bytes)| (buffer.clone(), offset, bytes)).collect(), group });
                     bind_groups.len += 1;
                     bucket.len().saturating_sub(1)
                 }
@@ -1532,28 +1566,46 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
-    /// Records a copy of `data` into the start of `dst`, ordered after everything recorded so
-    /// far. `data.len()` must be a multiple of 4.
-    ///
-    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
-    /// copies out of one is submitted it is mapped again, and the next upload of its size class
-    /// writes straight into it.
     fn record_upload(&self, dst: &Buffer, data: &[u8], max_buffer_bytes: u64) -> Result<(), BackendError> {
-        let dst = raw(dst)?;
-        let bytes = data.len() as u64;
-        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
-        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
-        {
-            let mut view = own(&staging).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
-            write_parallel(data, view.slice(..));
-        }
-        own(&staging).unmap();
+        self.upload_at(dst, 0, data, max_buffer_bytes)
+    }
 
-        let mut guard = self.batch()?;
-        self.encoder(&mut guard).copy_buffer_to_buffer(own(&staging), 0, dst, 0, bytes);
-        lock(&self.uploads).in_flight += staging.size();
-        guard.uploads.push(staging);
-        Ok(())
+    fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, _after: &[Ticket]) -> Result<Ticket, BackendError> {
+        // One queue, in order: `after` is satisfied by everything recorded so far. The only
+        // overlap is host staging against compute: the copy shares the queue with the kernels.
+        check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
+        self.upload_at(dst, dst_offset, &stage.as_slice()[..bytes as usize], self.info().limits.max_buffer_bytes)?;
+        Ok(self.submitted_ticket())
+    }
+
+    fn barrier(&self, _after: &[Ticket]) -> Result<Ticket, BackendError> {
+        Ok(self.submitted_ticket())
+    }
+
+    fn ticket_done(&self, t: &Ticket) -> Result<bool, BackendError> {
+        let Some(WgpuTicket(index)) = t.downcast_ref() else {
+            return if t.is_done_marker() { Ok(true) } else { Err(BackendError::Unsupported("a ticket of another backend".into())) };
+        };
+        match self.device().poll(wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: Some(Duration::ZERO) }) {
+            Ok(_) => Ok(true),
+            Err(wgpu::PollError::Timeout) => Ok(false),
+            Err(e) => Err(BackendError::Poll(e.to_string())),
+        }
+    }
+
+    fn ticket_wait(&self, t: &Ticket, spin: Duration) -> Result<(), BackendError> {
+        let Some(WgpuTicket(index)) = t.downcast_ref() else {
+            return if t.is_done_marker() { Ok(()) } else { Err(BackendError::Unsupported("a ticket of another backend".into())) };
+        };
+        let deadline = Instant::now() + spin;
+        while Instant::now() < deadline {
+            if self.ticket_done(t)? {
+                return self.take_gpu_error();
+            }
+            std::hint::spin_loop();
+        }
+        self.device().poll(wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None }).map_err(|e| BackendError::Poll(e.to_string()))?;
+        self.take_gpu_error()
     }
 
     fn record_graph(&self, _graph: &dyn ExecGraph, _dispatches: u32) -> Result<u32, BackendError> {
@@ -1718,7 +1770,8 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
-    fn finish_profiling(&self, splits: Vec<FusionSplit>) -> Result<Profile, BackendError> {
+    #[allow(deprecated)]
+    fn finish_profiling(&self, splits: Vec<luma_core::FusionSplit>) -> Result<Profile, BackendError> {
         let mut profiler = {
             let mut batch = self.batch()?;
             let Some(profiler) = batch.profiler.take() else {
@@ -1752,14 +1805,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_classes_round_up_to_powers_of_two_and_clamp() {
+    fn size_classes_use_eighth_octaves_and_clamp() {
         const MAX: u64 = 1 << 32;
         assert_eq!(size_class(1, MAX), Some(16));
         assert_eq!(size_class(17, MAX), Some(32));
-        assert_eq!(size_class(12_000_012, MAX), Some(16_777_216));
+        assert_eq!(size_class(5000, MAX), Some(5120));
+        assert_eq!(size_class(12_000_012, MAX), Some(12_582_912));
         let max = (3 << 30) + 2;
-        assert_eq!(size_class((1 << 30) + 4, max), Some(2 << 30));
-        assert_eq!(size_class((2 << 30) + 4, max), Some(3 << 30));
+        assert_eq!(size_class((1 << 30) + 4, max), Some((1 << 30) + (1 << 27)));
+        assert_eq!(size_class((2 << 30) + 4, max), Some((2 << 30) + (1 << 28)));
         assert_eq!(size_class((3 << 30) + 4, max), None);
     }
 
@@ -1854,6 +1908,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn profiling_reports_each_launch_or_says_it_is_unsupported() {
         let Some(backend) = open() else { return };
         assert!(!backend.is_profiling().unwrap());

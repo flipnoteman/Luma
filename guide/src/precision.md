@@ -127,14 +127,14 @@ values of its terms of the `f32` product (the precision of PyTorch's `allow_tf32
 
 * `a.matmul_f32(&b)` is the exact `f32` product of one call (fused multiply-adds over `k` in a
   fixed order, so results are reproducible);
-* `ContextOptions::tf32_matmul(false)` or `LUMA_TF32_MATMUL=0` makes every `matmul` of a context
-  that product (`Context::tf32_matmul()` reports the setting), and `a.matmul_tf32(&b)` forces TF32
+* `ContextOptions::numerics(Numerics::strict())` or `LUMA_NUMERICS=strict` makes every `matmul` of a context
+  that product (`Context::numerics()` reports the setting), and `a.matmul_tf32(&b)` forces TF32
   whatever the context says.
 
 The dense factorisations and solves ([Dense linear algebra](linear-algebra.md)) do not follow the
 context setting: their update products are `matmul_f32`. Only the update products of Cholesky and
 the blocked triangular solves can take tensor cores, with the opt-in environment variable
-`LUMA_LINALG_TF32=1` (off by default). Accumulators' `Covariance` also forms its products in
+`LUMA_NUMERICS=default+tf32-linalg` (off by default). Accumulators' `Covariance` also forms its products in
 `f32`, never TF32 ([Incremental accumulation](accumulators.md)).
 
 ## Casts
@@ -223,9 +223,9 @@ assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this
 ## Fast math
 
 By default Luma rewrites expressions only where the result is bit-identical (`x * 1`, `-(-x)`,
-`min(x, x)`, `abs(abs(x))`, `select` with two equal branches, `x * 0` on integers, ...). `fast_math` (a
-[`ContextOptions`](https://docs.rs/luma/latest/luma/struct.ContextOptions.html) field,
-`LUMA_FAST_MATH=1`) also allows rewrites that change values, which can make a kernel shorter:
+`min(x, x)`, `abs(abs(x))`, `select` with two equal branches, `x * 0` on integers, ...). `Numerics::fast()` (the `numerics` field of
+[`ContextOptions`](https://docs.rs/luma/latest/luma/struct.ContextOptions.html),
+`LUMA_NUMERICS=fast`) also allows rewrites that change values, which can make a kernel shorter:
 
 | Rewrite | Changes |
 | --- | --- |
@@ -241,7 +241,7 @@ By default Luma rewrites expressions only where the result is bit-identical (`x 
 ```rust
 use luma::*;
 
-let ctx = Context::with_options(ContextOptions::default().fast_math(true))?;
+let ctx = Context::with_options(ContextOptions::default().numerics(Numerics::fast()))?;
 let x = Array::from_slice_on(&ctx, &[0.0f32, f32::INFINITY, 3.0], 3)?;
 assert_eq!((&x / &x).to_vec()?, vec![1.0, 1.0, 1.0]);   // x / x is 1, NaNs ignored
 assert_eq!((&x * 0.0).to_vec()?, vec![0.0, 0.0, 0.0]);

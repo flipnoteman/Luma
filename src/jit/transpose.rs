@@ -27,6 +27,7 @@ use crate::error::LumaError;
 use crate::ops::{fold_workgroups, len_u32};
 
 use luma_core::KernelTrust;
+use crate::profile::{Decision, DecisionSite, Verdict};
 
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
@@ -56,7 +57,7 @@ fn word_ty(ty: ElemTy) -> Option<&'static str> {
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => Some("u32"),
         ElemTy::Df32 | ElemTy::C32 => Some("vec2<f32>"),
         ElemTy::U8 | ElemTy::I8 => Some("u8"),
-        ElemTy::U16 | ElemTy::I16 => Some("u16"),
+        ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => Some("u16"),
         ElemTy::Bool | ElemTy::F64 => None,
     }
 }
@@ -248,16 +249,30 @@ fn cache_hash(key: &FusedKey) -> u64 {
 /// result are coalesced. Everything else (shifts other than views, sub-programs, generators,
 /// elements other than `f32`, `u32` and `i32`, several outputs, a transposed operand of another
 /// geometry than the others) is left to the generic kernel, which is also what the CPU backend runs.
-pub(super) fn plan_fused(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], scalars: &[u32], len: usize) -> Result<Option<FusedPlan>, LumaError> {
+pub(super) fn plan_fused(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], scalars: &[u32], len: usize, op: &'static str, location: &'static std::panic::Location<'static>) -> Result<Option<FusedPlan>, LumaError> {
     // The cheap tests first: most store programs have no transposed operand.
     if len < MIN_FUSED_LEN
-        // The CPU backend runs the generic kernel faster (a tile and a barrier cost more than the strided reads do).
-        || ctx.is_cpu()
         || key.tail != Tail::Store
         || !key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) if map.axes[0].from != 0 && map.out_len() == len))
     {
         return Ok(None);
     }
+    // The CPU backend runs the generic kernel faster (a tile and a barrier cost more than the strided reads do).
+    let found = if ctx.is_cpu() { None } else { fused_plan(ctx, key, inputs, scalars, len)? };
+    let jit = ctx.jit();
+    if jit.recording_decisions() {
+        let decision = match &found {
+            Some(_) => Decision::new(op, location, DecisionSite::TransposeFusion, "fused transpose"),
+            None if ctx.is_cpu() => Decision::new(op, location, DecisionSite::TransposeFusion, "generic").candidate("fused transpose", Verdict::Rejected("cpu")),
+            None => Decision::new(op, location, DecisionSite::TransposeFusion, "generic").candidate("fused transpose", Verdict::Rejected("not covered")),
+        };
+        jit.note_decision(decision);
+    }
+    Ok(found)
+}
+
+/// [`plan_fused`] for a program that has a transposed operand.
+fn fused_plan(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], scalars: &[u32], len: usize) -> Result<Option<FusedPlan>, LumaError> {
     let jit = ctx.jit();
     let hash = cache_hash(key);
     let known = lock(&jit.fused.0).get(&hash).and_then(|list| list.iter().find(|entry| entry.matches(key)).map(|entry| entry.program.clone()));

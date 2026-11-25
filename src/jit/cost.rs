@@ -9,9 +9,10 @@ use crate::builtin::{df_library, BinOp, CmpOp, Part, UnOp};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
+use crate::profile::{Decision, DecisionSite};
 use crate::ops::launch_1d;
 
-pub(crate) use luma_core::CostModel;
+pub(crate) use luma_core::{CostModel, MemoryModel};
 
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 
@@ -181,8 +182,18 @@ fn gather_saving(pattern: ReadPattern, taps: u32) -> f64 {
 /// a write of it and a launch, and is made per use, so it pays only when the saving exceeds that.
 /// The saving is the table of [`gather_saving`] where measured (NVIDIA); every other device reads
 /// from the buffer.
+#[track_caller]
 pub(crate) fn read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
-    if ctx.hal().texture_caps().is_none() || ctx.tuning().profile != luma_core::TuningProfile::Nvidia {
+    let path = choose_read_path(ctx, read);
+    ctx.jit().note_with(|loc| {
+        let chosen = if path == ReadPath::Texture { "texture" } else { "plain" };
+        Decision::new("read", loc, DecisionSite::ReadPath, chosen)
+    });
+    path
+}
+
+fn choose_read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
+    if !ctx.caps().contains(crate::caps::Caps::TEXTURE_PROFITABLE) {
         return ReadPath::Plain;
     }
     let cost = ctx.cost_model();
@@ -225,29 +236,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-/// Best wall-clock nanoseconds per launch of a kernel over `n` elements with uniform `{k, 0}`:
-/// one warm-up measurement, then the best of [`BEST_OF`], each `reps` launches and one `sync`.
-/// The input and output are whole device buffers of `n` elements, not array storage, so the
-/// measurement does not depend on the context's chunk size.
-fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
-    let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), luma_core::KernelTrust::Trusted)?;
-    let bytes = u64::from(n) * 4;
-    let input = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
-    let output = match ctx.alloc_buffer(bytes, STORAGE_USAGE) {
-        Ok(output) => output,
-        Err(err) => {
-            ctx.recycle(input);
-            return Err(err);
-        }
-    };
-    let words = [k, 0u32];
-    let measured = || -> Result<f64> {
-        let raw = [RawArg::read(&input, bytes), RawArg::write(&output, bytes), RawArg::Uniform(bytemuck::cast_slice(&words))];
+/// A calibration kernel with its buffers, so that several parameter values are timed without
+/// compiling or allocating again.
+struct Rig {
+    core: crate::kernel::KernelCore,
+    input: luma_core::Buffer,
+    output: luma_core::Buffer,
+    threads: u32,
+    bytes: u64,
+}
+
+impl Rig {
+    /// `source` over `threads` invocations with whole device buffers of `elems` elements (not
+    /// array storage, so the measurement does not depend on the context's chunk size).
+    fn new(ctx: &Context, source: String, label: &str, threads: u32, elems: u32) -> Result<Rig> {
+        let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), luma_core::KernelTrust::Trusted)?;
+        let bytes = u64::from(elems) * 4;
+        let input = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
+        let output = match ctx.alloc_buffer(bytes, STORAGE_USAGE) {
+            Ok(output) => output,
+            Err(err) => {
+                ctx.recycle(input);
+                return Err(err);
+            }
+        };
+        Ok(Rig { core, input, output, threads, bytes })
+    }
+
+    /// Best wall-clock nanoseconds per launch with uniform `{k, g}`: one warm-up measurement,
+    /// then the best of [`BEST_OF`], each `reps` launches and one `sync`.
+    fn time(&self, ctx: &Context, k: u32, g: u32, reps: u32) -> Result<f64> {
+        self.time_best_of(ctx, k, g, reps, BEST_OF)
+    }
+
+    /// [`Rig::time`] with the best of `best_of` measurements.
+    fn time_best_of(&self, ctx: &Context, k: u32, g: u32, reps: u32, best_of: usize) -> Result<f64> {
+        let words = [k, g];
+        let raw = [RawArg::read(&self.input, self.bytes), RawArg::write(&self.output, self.bytes), RawArg::Uniform(bytemuck::cast_slice(&words))];
         let mut best = f64::INFINITY;
-        for round in 0..=BEST_OF {
+        for round in 0..=best_of {
             let start = Instant::now();
             for _ in 0..reps {
-                launch_1d(ctx, &core, n, &raw)?;
+                launch_1d(ctx, &self.core, self.threads, &raw)?;
             }
             ctx.sync()?;
             let ns = start.elapsed().as_secs_f64() * 1e9 / f64::from(reps);
@@ -256,16 +286,218 @@ fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps:
             }
         }
         Ok(best)
-    };
-    let best = measured();
-    ctx.recycle(input);
-    ctx.recycle(output);
+    }
+
+    fn release(self, ctx: &Context) {
+        ctx.recycle(self.input);
+        ctx.recycle(self.output);
+    }
+}
+
+/// Best wall-clock nanoseconds per launch of a kernel over `n` elements with uniform `{k, 0}`
+/// (see [`Rig::time`]); the input and output are `n` elements.
+fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
+    let rig = Rig::new(ctx, source, label, n, n)?;
+    let best = rig.time(ctx, k, 0, reps);
+    rig.release(ctx);
     best
 }
 
+/// The coalesced, strided, gathered and transposed copy of the memory measurement: `out0[i] =
+/// in0[j]`, with `j` chosen by `p.g` (a stride, `0` for a hash of `i`, `0xffffffff` for the
+/// transposed index of a `p.k` x `p.k` matrix). One kernel for all, so the factors compare
+/// kernels that differ only in the index.
+const PATTERN: &str = "
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    let n = luma.size.x;
+    if (i >= n) { return; }
+    var j = i;
+    if (p.g == 0u) {
+        var h = i * 747796405u + 2891336453u;
+        h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+        j = ((h >> 22u) ^ h) & (n - 1u);
+    } else if (p.g == 0xffffffffu) {
+        j = (i % p.k) * p.k + i / p.k;
+    } else {
+        j = (i * p.g) & (n - 1u);
+    }
+    out0[i] = in0[j];
+}
+";
+
+/// A copy over a working set of `p.g` words: every invocation sweeps the set `p.k` times with a
+/// stride of the number of invocations, so the invocations together read the whole set once per
+/// pass and a word is read again only after the rest of the set (the reuse distance is the set
+/// size, which is what makes the bandwidth drop where the set leaves L2). Each invocation writes
+/// its sum to its own word of `out0` (invocations writing one word would make the CPU backend's
+/// threads fight over its line).
+const WORKING_SET: &str = "
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let t = gid.x + gid.y * nwg.x * 64u;
+    if (t >= luma.size.x) { return; }
+    let stride = luma.size.x;
+    var sum = 0.0;
+    for (var rep = 0u; rep < p.k; rep++) {
+        for (var j = t; j < p.g; j += stride) { sum += in0[j]; }
+    }
+    out0[t] = sum;
+}
+";
+
+/// One workgroup of 256 per compute unit reads a 16 KiB workgroup array `4 * p.k` times per
+/// invocation, four independent reads per step, lanes on consecutive words (no bank conflicts).
+const SHARED: &str = "
+var<workgroup> tile: array<f32, 4096>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
+    for (var j = lid.x; j < 4096u; j += 256u) { tile[j] = in0[j]; }
+    workgroupBarrier();
+    var a = 0.0; var b = 0.0; var c = 0.0; var d = 0.0;
+    for (var k = 0u; k < p.k; k++) {
+        let at = (lid.x + k * 33u) & 4095u;
+        a += tile[at];
+        b += tile[(at + 1024u) & 4095u];
+        c += tile[(at + 2048u) & 4095u];
+        d += tile[(at + 3072u) & 4095u];
+    }
+    if (i < luma.size.x) { out0[i] = a + b + c + d; }
+}
+";
+
+/// A chain of `p.k` dependent loads from the first 1024 words; `p.g` is 0 at run time, so the
+/// next index depends on the loaded word without the compiler seeing it.
+const CHAIN: &str = "
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x) { return; }
+    var idx = 0u;
+    for (var k = 0u; k < p.k; k++) { idx = (idx + 1u + (bitcast<u32>(in0[idx]) & p.g)) & 1023u; }
+    out0[gid.x] = f32(idx);
+}
+";
+
+/// A working set inside L2 moves at least this much faster than DRAM.
+const L2_FASTER: f64 = 1.5;
+/// Invocations of the L2 sweep, and the launches and measurements per working set.
+const SWEEP_THREADS: u32 = 1 << 17;
+const SWEEP_REPS: u32 = 16;
+/// Dependent loads of the latency chain.
+const CHAIN_STEPS: u32 = 4096;
+/// Reads per invocation of the workgroup-memory kernel (times 4).
+const SHARED_STEPS: u32 = 2048;
+/// The strides of [`MemoryModel::strided_factor`], in elements.
+const STRIDES: [u32; 3] = [2, 8, 32];
+
+fn with_header(body: &str) -> String {
+    format!(
+        "struct Params {{ k: u32, g: u32 }}
+@group(1) @binding(0) var<storage, read> in0: array<f32>;
+@group(1) @binding(1) var<storage, read_write> out0: array<f32>;
+@group(1) @binding(2) var<uniform> p: Params;
+{body}"
+    )
+}
+
+/// Measures how bytes move inside the device (see [`MemoryModel`]): the copy bandwidth over
+/// working sets around the L2 size, workgroup-memory bandwidth, the cost of strided, gathered and
+/// transposed reads relative to coalesced ones, and the latency of a dependent load. `dram_gbs` is
+/// the bandwidth measured over a large array and `launch_ns` the cost of an empty launch.
+fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<MemoryModel> {
+    let cpu = ctx.is_cpu();
+    let cap = u32::try_from(ctx.max_buffer_bytes() / 4).unwrap_or(u32::MAX);
+
+    // The L2 sweep: `SWEEP_THREADS` invocations read a working set of `ws` words over and over,
+    // `traffic` words in all (at least one pass).
+    let traffic: u32 = if cpu { 1 << 22 } else { 1 << 24 }.min(cap);
+    let attribute = ctx.hal().l2_cache_bytes();
+    let sizes: Vec<u64> = match attribute {
+        Some(l2) => [l2 / 4, l2 / 2, l2, l2 * 2, l2 * 4].to_vec(),
+        None => (20..=26).map(|shift| 1u64 << shift).collect(),
+    };
+    let rig = Rig::new(ctx, with_header(WORKING_SET), "CostL2", SWEEP_THREADS, traffic)?;
+    let mut curve = Vec::new();
+    let mut failed = None;
+    for bytes in sizes {
+        let words = bytes / 4;
+        if words < u64::from(SWEEP_THREADS) || words > u64::from(traffic) {
+            continue;
+        }
+        let passes = (u64::from(traffic) / words).max(1) as u32;
+        match rig.time_best_of(ctx, passes, words as u32, SWEEP_REPS, 3) {
+            Ok(t) => curve.push((bytes, 4.0 * words as f64 * f64::from(passes) / t)),
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
+        }
+    }
+    rig.release(ctx);
+    if let Some(err) = failed {
+        return Err(err);
+    }
+    let inside: Vec<usize> = (0..curve.len()).filter(|&i| curve[i].1 >= L2_FASTER * dram_gbs).collect();
+    let l2_gbs = match inside.last() {
+        Some(&i) => curve[i].1,
+        None => curve.iter().map(|(_, gbs)| *gbs).fold(0.0, f64::max),
+    };
+    // Without a device attribute the size is the knee, taken only where it is sharp: the next
+    // size up (a doubling) is at least `L2_FASTER` times slower.
+    let l2_bytes = attribute.or_else(|| {
+        let &i = inside.last()?;
+        let next = curve.get(i + 1)?;
+        (next.0 == 2 * curve[i].0 && next.1 * L2_FASTER <= curve[i].1).then_some(curve[i].0)
+    });
+
+    // Access patterns over one array of a power-of-four number of words.
+    let n_pat = 1u32 << (traffic.ilog2() & !1);
+    let side = 1u32 << (n_pat.ilog2() / 2);
+    let rig = Rig::new(ctx, with_header(PATTERN), "CostPattern", n_pat, n_pat)?;
+    let patterns = (|| -> Result<[f64; 5]> {
+        let before = rig.time_best_of(ctx, side, 1, 2, 3)?;
+        let mut times = [0.0; 5];
+        for (slot, stride) in times.iter_mut().zip(STRIDES) {
+            *slot = rig.time_best_of(ctx, side, stride, 2, 3)?;
+        }
+        times[3] = rig.time_best_of(ctx, side, 0, 2, 3)?;
+        times[4] = rig.time_best_of(ctx, side, u32::MAX, 2, 3)?;
+        // Coalesced again at the end: a device (or the CPU backend) that is still warming up at
+        // the start measures the first kernel slow.
+        let coalesced = before.min(rig.time_best_of(ctx, side, 1, 2, 3)?);
+        Ok(times.map(|t| t / coalesced))
+    })();
+    rig.release(ctx);
+    let patterns = patterns?;
+
+    // Workgroup memory: one workgroup per compute unit.
+    let shared_gbs = if cpu {
+        None
+    } else {
+        let groups = ctx.info().compute_units.unwrap_or(16).max(1);
+        let threads = groups * 256;
+        let rig = Rig::new(ctx, with_header(SHARED), "CostShared", threads, threads.max(4096))?;
+        let t = rig.time(ctx, SHARED_STEPS, 0, REPS);
+        rig.release(ctx);
+        let t = (t? - launch_ns).max(1.0);
+        Some(f64::from(threads) * f64::from(SHARED_STEPS) * 16.0 / t)
+    };
+
+    // Latency: one workgroup, one dependent chain per invocation.
+    let rig = Rig::new(ctx, with_header(CHAIN), "CostChain", 64, 1024)?;
+    let t = rig.time_best_of(ctx, CHAIN_STEPS, 0, 8, 3);
+    rig.release(ctx);
+    let latency_ns = (t? - launch_ns).max(launch_ns * 0.1) / f64::from(CHAIN_STEPS);
+
+    Ok(MemoryModel::new(l2_bytes, attribute.is_some() && l2_bytes.is_some(), l2_gbs, shared_gbs, [patterns[0], patterns[1], patterns[2]], patterns[3], patterns[4], latency_ns))
+}
+
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
-/// arithmetic relative to it, and the cost of a launch.
-pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
+/// arithmetic relative to it, and the cost of a launch; and how bytes move inside it (the
+/// memory model, `None` if its measurement failed).
+pub(crate) fn calibrate(ctx: &Context) -> Result<(CostModel, Option<MemoryModel>)> {
     let cpu = ctx.is_cpu();
     let copy = || kernel_source("", "f32", "in0[i]", "", "x");
 
@@ -292,7 +524,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let t_df = time_kernel(ctx, df, "CostDf32", n_alu, k_df, REPS)?;
     let df32_factor = t_df / (2.0 * f64::from(k_df) * f64::from(n_alu)) / per_op_f32;
 
-    let f64_factor = if ctx.features().contains(luma_core::Features::SHADER_F64) {
+    let f64_factor = if ctx.caps().contains(crate::caps::Caps::F64) {
         let wide = kernel_source("", "f64", "f64(in0[i])", "x = x * f64(1.0001) + f64(0.5);", "f32(x)");
         let t_f64 = time_kernel(ctx, wide, "CostF64", n_alu, k_f64, REPS)?;
         Some(t_f64 / (2.0 * f64::from(k_f64) * f64::from(n_alu)) / per_op_f32)
@@ -301,7 +533,14 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     };
 
     let t_launch = time_kernel(ctx, copy(), "CostLaunch", 1, 0, LAUNCHES)?;
-    Ok(CostModel { launch_us: t_launch / 1000.0, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor })
+    let memory = match measure_memory(ctx, bandwidth_gbs, t_launch) {
+        Ok(memory) => Some(memory),
+        Err(err) => {
+            log::debug!("luma: the memory hierarchy calibration failed: {err}");
+            None
+        }
+    };
+    Ok((CostModel::new(t_launch / 1000.0, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor), memory))
 }
 
 /// How much worse than the profile's numbers a measurement may be before it counts as taken
@@ -324,11 +563,11 @@ pub(crate) fn contended(measured: &CostModel, reference: &CostModel) -> bool {
 
 /// [`calibrate`], measured again once if the result looks contended (see [`contended`]):
 /// `None` if both measurements do, so that the caller neither uses nor keeps them.
-pub(crate) fn calibrate_clean(ctx: &Context, reference: &CostModel) -> Result<Option<CostModel>> {
+pub(crate) fn calibrate_clean(ctx: &Context, reference: &CostModel) -> Result<Option<(CostModel, Option<MemoryModel>)>> {
     for _ in 0..2 {
-        let model = calibrate(ctx)?;
+        let (model, memory) = calibrate(ctx)?;
         if !contended(&model, reference) {
-            return Ok(Some(model));
+            return Ok(Some((model, memory)));
         }
     }
     Ok(None)
@@ -340,12 +579,12 @@ mod tests {
 
     #[test]
     fn weights_follow_the_table() {
-        let cost = CostModel { df32_factor: 20.0, f64_factor: Some(3.0), ..CostModel::TEST };
+        let cost = CostModel::TEST.with(|m| { m.df32_factor = 20.0; m.f64_factor = Some(3.0); });
         let mul = |ty| Op::new(OpKind::Binary(BinOp::Mul), ty);
         assert_eq!(op_weight(&mul(ElemTy::F32), &cost), 1.0);
         assert_eq!(op_weight(&mul(ElemTy::Df32), &cost), 20.0);
         assert_eq!(op_weight(&mul(ElemTy::F64), &cost), 3.0);
-        assert_eq!(op_weight(&mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
+        assert_eq!(op_weight(&mul(ElemTy::F64), &cost.with(|m| { m.f64_factor = None; })), 32.0);
         assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
         assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
         assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
@@ -358,7 +597,7 @@ mod tests {
 
     #[test]
     fn kernel_time_is_launch_plus_the_slower_of_memory_and_arithmetic() {
-        let cost = CostModel { launch_us: 5.0, bandwidth_gbs: 100.0, f32_ops_per_ns: 1000.0, ..CostModel::TEST };
+        let cost = CostModel::TEST.with(|m| { m.launch_us = 5.0; m.bandwidth_gbs = 100.0; m.f32_ops_per_ns = 1000.0; });
         assert_eq!(kernel_ns(&cost, 1e6, 0.0), 5000.0 + 1e4);
         assert_eq!(kernel_ns(&cost, 1e3, 1e8), 5000.0 + 1e5);
     }
@@ -367,9 +606,9 @@ mod tests {
     fn only_a_measurement_much_worse_than_the_profile_counts_as_contended() {
         let reference = CostModel::NVIDIA;
         assert!(!contended(&reference, &reference));
-        let better = CostModel { launch_us: 1.0, bandwidth_gbs: 5000.0, f32_ops_per_ns: 1e5, df32_factor: 5.0, f64_factor: Some(2.0) };
+        let better = CostModel::new(1.0, 5000.0, 1e5, 5.0, Some(2.0));
         assert!(!contended(&better, &reference), "a faster device is no sign of contention");
-        let slightly_worse = CostModel { launch_us: reference.launch_us * 3.9, bandwidth_gbs: reference.bandwidth_gbs / 3.9, ..reference };
+        let slightly_worse = reference.with(|m| { m.launch_us = reference.launch_us * 3.9; m.bandwidth_gbs = reference.bandwidth_gbs / 3.9; });
         assert!(!contended(&slightly_worse, &reference));
         let worse = |change: fn(&mut CostModel)| {
             let mut model = reference;
@@ -383,15 +622,31 @@ mod tests {
         assert!(worse(|m| m.f64_factor = m.f64_factor.map(|f| f * 4.5)), "f64 4.5 times costlier");
         assert!(!worse(|m| m.f64_factor = None), "a device without f64 has nothing to compare");
         // The spread HangHunt saw between processes sharing one GPU.
-        let busy = CostModel { launch_us: 57.9, bandwidth_gbs: 139.0, f32_ops_per_ns: 1282.0, ..reference };
+        let busy = reference.with(|m| { m.launch_us = 57.9; m.bandwidth_gbs = 139.0; m.f32_ops_per_ns = 1282.0; });
         assert!(contended(&busy, &reference));
+    }
+
+    #[test]
+    fn the_memory_calibration_on_the_cpu_gives_sane_factors() {
+        let options = crate::ContextOptions::default().backend(luma_core::BackendKind::Cpu).calibrate(false);
+        let ctx = Context::with_options(options).unwrap();
+        let (_, memory) = calibrate(&ctx).unwrap();
+        let memory = memory.expect("the CPU backend measures the memory model");
+        assert_eq!(memory.shared_gbs, None);
+        let factors = [memory.strided_factor[0], memory.strided_factor[1], memory.strided_factor[2], memory.gather_factor, memory.transpose_factor];
+        // Ratios of two timings: a loaded machine (parallel test jobs, builds) can push one below 1, so
+        // the test only checks that they are sane, not that strided access is measurably slower.
+        for factor in factors {
+            assert!(factor.is_finite() && factor >= 0.5, "{memory}");
+        }
+        assert!(memory.l2_gbs.is_finite() && memory.l2_gbs > 0.0 && memory.latency_ns.is_finite() && memory.latency_ns > 0.0, "{memory}");
     }
 
     #[test]
     fn calibrating_a_context_with_small_chunks_leaves_it_usable() {
         let options = crate::ContextOptions::default().calibrate(false).chunk_bytes(1024);
         let ctx = Context::with_options(options).unwrap();
-        let cost = calibrate(&ctx).unwrap();
+        let (cost, _) = calibrate(&ctx).unwrap();
         for number in [cost.launch_us, cost.bandwidth_gbs, cost.f32_ops_per_ns, cost.df32_factor] {
             assert!(number.is_finite() && number > 0.0, "{cost:?}");
         }

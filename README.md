@@ -53,7 +53,7 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 
 ## Features
 
-- Arrays of `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16` (compact integers: 1 or 2 bytes per element, wrapping arithmetic, widening reductions), `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- Arrays of `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16` (compact integers: 1 or 2 bytes per element, wrapping arithmetic, widening reductions), `f16` and `bf16` (two-byte floats: storage plus `f32` compute, each result rounded to the type), `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice`, `pad`, `flip`, `transpose`, `swap_axes`, `permute_axes` (`ViewMut` `_mut` forms for writes), `take`, `put`, `concat`, `stack`, `broadcast_to`
@@ -142,7 +142,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 ### Environment variables
 
-Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, `LUMA_TF32_MATMUL=0` (exact `f32` `matmul` on CUDA; TF32 tensor cores are the default), and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
+Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_NUMERICS` (`strict`, `default`, `algebraic`, `fast`, with `+tf32-linalg` / `-tf32-matmul` style modifiers), `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
 
 ### Examples
 

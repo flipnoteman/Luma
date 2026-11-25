@@ -1,6 +1,7 @@
 //! The CUDA backend of luma: NVVM IR code generation for the kernel IR (compiled with the NVIDIA
 //! driver's NVVM, linking NVIDIA's libdevice)
-//! and a [`Backend`] that runs on one ordered stream and replays CUDA graphs.
+//! and a [`Backend`] that runs on one ordered compute stream (a second stream carries the HAL's
+//! transfer lane) and replays CUDA graphs.
 //!
 //! Licence: luma's code is MIT OR Apache-2.0. The embedded `vendor/libdevice.10.bc` (NVIDIA's
 //! libdevice) is redistributed under the NVIDIA CUDA Toolkit EULA, `vendor/NVIDIA-CUDA-EULA.txt`.

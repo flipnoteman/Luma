@@ -240,7 +240,7 @@ fn explicit_euler<const N: usize>(h: &mut Harness, z: &Z, group: &str, muscl: bo
         let mut f = || {
             build_steps(&q, muscl, n);
         };
-        h.case(&format!("{group}_build_step"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
+        h.build_case(&format!("{group}_build_step"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
     });
 }
 
@@ -1076,7 +1076,7 @@ fn fixed_costs(h: &mut Harness, z: &Z) {
         let mut f = || {
             drop(lp.compile(&starts[0], per_point));
         };
-        h.case("converge/points_compile_only", &dims_str(&dims), Work::None, &mut f);
+        h.build_case("converge/points_compile_only", &dims_str(&dims), Work::None, &mut f);
         // Chunks: 5 runs of `per_point` steps, each from the state the last one returned.
         let chunks = 5;
         let size = format!("{}:{chunks}x{per_point}st", dims_str(&dims));

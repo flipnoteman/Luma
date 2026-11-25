@@ -161,11 +161,11 @@ pub fn run(h: &mut Harness) {
             let (xa, ya) = (A::from_slice_on(&c, &xh[..n], n).unwrap(), A::from_slice_on(&c, &yh[..n], n).unwrap());
             check("compile/newctx", &apply(&fixed[0], &xa, &ya).to_vec().unwrap(), &apply_host(&fixed[0], &xh[..n], &yh[..n]), 2e-3, 2e-3);
         }
-        h.case("compile/newctx_empty", "open + 1 op", per_sec(1, "context/s"), &mut || {
+        h.transfer_case("compile/newctx_empty", "open + 1 op", per_sec(1, "context/s"), &mut || {
             let c = Context::with_options(opts).unwrap();
             force(&(&A::from_slice_on(&c, &xh[..n], n).unwrap() * 1.5 + 0.5));
         });
-        h.case("compile/newctx_kernels", &format!("open + {size_k}"), per_sec(1, "context/s"), &mut || {
+        h.transfer_case("compile/newctx_kernels", &format!("open + {size_k}"), per_sec(1, "context/s"), &mut || {
             let c = Context::with_options(opts).unwrap();
             let (xa, ya) = (A::from_slice_on(&c, &xh[..n], n).unwrap(), A::from_slice_on(&c, &yh[..n], n).unwrap());
             for steps in &fixed {

@@ -1,8 +1,11 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, Decision, DecisionSite, DeviceKind, Features, KernelTrust, MatmulSpec, MemoryModel, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
+use crate::caps::Caps;
+use crate::numerics::Reduced;
+use crate::numerics::Numerics;
 use crate::error::{LumaError, Result};
 use crate::jit::cost;
 use crate::jit::JitState;
@@ -10,7 +13,8 @@ use crate::gpu::pager::{Accounted, Pager};
 use crate::gpu::built::BuildCache;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
-use crate::gpu::pool::{self, BufferPool};
+use crate::gpu::pool::BufferPool;
+use luma_core::hal::size_class;
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
 use crate::tuning::{Tuning, TuningProfile};
 
@@ -57,10 +61,10 @@ struct Inner {
     segment_bytes: u64,
     /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
     check_finite: bool,
-    /// Whether value-changing algebraic rewrites are allowed (see [`ContextOptions::fast_math`]).
-    fast_math: bool,
-    /// Whether `matmul` runs on tensor cores where it can (see [`ContextOptions::tf32_matmul`]).
-    tf32_matmul: bool,
+    /// The numerics policy (see [`ContextOptions::numerics`]).
+    numerics: Numerics,
+    /// What the device can do, computed once when the context opens.
+    caps: Caps,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -69,6 +73,8 @@ struct Inner {
     tuning: Tuning,
     /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
     cost: OnceLock<CostModel>,
+    /// How bytes move inside the device (see [`Context::memory_model`]), set once the context exists.
+    memory: OnceLock<Option<MemoryModel>>,
     /// The one-word counter of the reductions that finish in their first launch (see
     /// [`Tuning::single_pass_reduce`]), zero between launches; made on first use.
     reduce_counter: OnceLock<Buffer>,
@@ -76,9 +82,10 @@ struct Inner {
     id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
-    /// Tests: report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
-    #[cfg(test)]
+    /// Report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     assume_busy: std::sync::atomic::AtomicBool,
+    /// Report the GPU as idle regardless of the queue (see `Context::set_assume_idle`).
+    assume_idle: std::sync::atomic::AtomicBool,
     /// Tests: bytes of device buffers created so far (see [`Context::created_bytes`]).
     #[cfg(test)]
     created_bytes: std::sync::atomic::AtomicU64,
@@ -160,6 +167,7 @@ pub fn flush() -> Result<()> {
 
 /// How a [`Context`] is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(deprecated)]
 #[non_exhaustive]
 pub struct ContextOptions {
     /// The backend to open: CUDA, Metal or wgpu; `Auto` tries them in that order and takes the
@@ -170,6 +178,12 @@ pub struct ContextOptions {
     /// Bytes of array data kept on the device. `None`: 80% of the device's memory where the
     /// backend reports it (never on CPU devices), otherwise unlimited.
     pub memory_budget: Option<u64>,
+    /// Bytes of host memory the context may use for host copies of device data: the segments it
+    /// moved off the device plus the copies it keeps of segments that were brought back (see
+    /// [`crate::PagingStats::host_copy_bytes`]). Kept copies are dropped first when it is exceeded.
+    /// `None`: half of the available host memory at open, at most half of the cgroup limit.
+    /// `LUMA_HOST_BUDGET`.
+    pub host_budget: Option<u64>,
     /// Largest buffer an array is split into: a power of two from 1024 up to the largest
     /// bindable size. `None`: that size, or less when a memory budget is set.
     pub chunk_bytes: Option<u64>,
@@ -186,25 +200,35 @@ pub struct ContextOptions {
     /// the process then uses the profile's fixed numbers and nothing is stored. `false` uses
     /// the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
-    /// Allows rewrites of expressions that are not exact: `x + 0` becomes `x` (a `-0.0`
-    /// stays `-0.0` instead of becoming `0.0`), `x * 0` becomes `0` and `x - x` becomes `0` (wrong
-    /// for NaN and infinity), `x / x` becomes `1`, `x <= x`, `x >= x`, `x == x` become true and
-    /// `x != x` false (wrong for NaN), `(x * a) * b` and `(x + a) + b` combine their constants
-    /// (different rounding), `x / a` for a constant `a` becomes `x * (1 / a)`, and `powf(x, e)`
-    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. `Df32` additions and
-    /// subtractions take the cheaper algorithm whose relative error grows with the cancellation
-    /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
-    /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
+    /// The numerics policy: which departures from exact `f32` semantics the context allows (see
+    /// [`Numerics`]). The default has `matmul` run in TF32 on tensor cores where the device has
+    /// them (compute capability 8.0 and up on CUDA; about `2^-11` of the magnitudes summed in
+    /// accuracy, up to 1.7x on large products and several times on small ones);
+    /// [`Numerics::strict`] makes every product `f32`, as does
+    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product.
+    ///
+    /// `Reduced::FAST_MATH` (in [`Numerics::fast`]) allows rewrites of expressions that are not
+    /// exact: `x + 0` becomes `x` (a `-0.0` stays `-0.0` instead of becoming `0.0`), `x * 0`
+    /// becomes `0` and `x - x` becomes `0` (wrong for NaN and infinity), `x / x` becomes `1`,
+    /// `x <= x`, `x >= x`, `x == x` become true and `x != x` false (wrong for NaN), `(x * a) * b`
+    /// and `(x + a) + b` combine their constants (different rounding), `x / a` for a constant `a`
+    /// becomes `x * (1 / a)`, and `powf(x, e)` with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or
+    /// `sqrt(x)`. `Df32` additions and subtractions take the cheaper algorithm whose relative
+    /// error grows with the cancellation (below 2^-47 of the larger operand instead of 2^-46 of
+    /// the result), except in reductions. Rewrites that keep every bit (`x * 1`, `-(-x)`,
+    /// `min(x, x)` and the like) always run. `Reduced::TF32_LINALG` runs the trailing-update
+    /// products of the factorisations in TF32 (CUDA, compute capability 8.0 and up).
+    /// `LUMA_NUMERICS` sets it from the environment (see [`Numerics::parse`]).
+    pub numerics: Numerics,
+    /// Allows the value-changing rewrites of expressions: set, it adds `Reduced::FAST_MATH` to
+    /// [`ContextOptions::numerics`] when the context opens (`LUMA_FAST_MATH` still sets it,
+    /// with a warning).
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics` with `Numerics::fast()` (`LUMA_NUMERICS=fast`); removed in 0.6")]
     pub fast_math: bool,
-    /// Runs [`Array::matmul`](crate::Array::matmul) as [`Array::matmul_tf32`](crate::Array::matmul_tf32)
-    /// does: on a device with tensor cores (the CUDA backend, compute capability 8.0 and up) the
-    /// operands of the products it can take are rounded to TF32 (a 10-bit mantissa) and the
-    /// products accumulated in `f32`, which costs about `2^-11` of the magnitudes summed in
-    /// accuracy (2e-4 of the RMS of a product of random operands) and gains up to 1.7x on large
-    /// products and several times on small ones. On by default; `false` (`LUMA_TF32_MATMUL=0`)
-    /// makes `matmul` the `f32` product on every backend, as does calling
-    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product. No effect on other
-    /// backends, whose products are `f32` anyway.
+    /// Runs [`Array::matmul`](crate::Array::matmul) in TF32 on tensor cores where it can
+    /// (default): `false` clears `Reduced::TF32_MATMUL` from [`ContextOptions::numerics`] when the
+    /// context opens (`LUMA_TF32_MATMUL=0` still sets it, with a warning).
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics` with `Numerics::strict()` (`LUMA_NUMERICS=strict`); removed in 0.6")]
     pub tf32_matmul: bool,
     /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
     /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
@@ -215,15 +239,31 @@ pub struct ContextOptions {
     pub df_fma: Option<bool>,
 }
 
+/// The value of the removed environment variable `name`, with a warning (once per variable) that
+/// it is read until 0.6 and `replacement` is the way to say it.
+fn deprecated_env(name: &'static str, replacement: &str) -> Option<String> {
+    static WARNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let value = std::env::var(name).ok()?;
+    let mut warned = lock(&WARNED);
+    if !warned.contains(&name) {
+        warned.push(name);
+        log::warn!("luma: {name} is deprecated and read until luma 0.6; use {replacement}");
+    }
+    Some(value)
+}
+
+#[allow(deprecated)]
 impl Default for ContextOptions {
     fn default() -> Self {
         ContextOptions {
             backend: BackendKind::default(),
             device: DeviceKind::default(),
             memory_budget: None,
+            host_budget: None,
             chunk_bytes: None,
             check_finite: false,
             calibrate: true,
+            numerics: Numerics::default(),
             fast_math: false,
             tf32_matmul: true,
             df_fma: None,
@@ -263,6 +303,13 @@ impl ContextOptions {
         self
     }
 
+    /// Sets the bytes of host memory for host copies of device data (see
+    /// [`ContextOptions::host_budget`]); `None` is the default.
+    pub fn host_budget(mut self, bytes: Option<u64>) -> Self {
+        self.host_budget = bytes;
+        self
+    }
+
     /// Sets the largest buffer an array is split into (a power of two from 1024 up to the
     /// largest bindable size; checked by [`Context::with_options`]).
     pub fn chunk_bytes(mut self, bytes: u64) -> Self {
@@ -276,27 +323,59 @@ impl ContextOptions {
         self
     }
 
-    /// Allows the value-changing rewrites of expressions (see [`ContextOptions::fast_math`]).
+    /// Sets the numerics policy (see [`ContextOptions::numerics`]).
+    pub fn numerics(mut self, numerics: Numerics) -> Self {
+        self.numerics = numerics;
+        self
+    }
+
+    /// Allows the value-changing rewrites of expressions (see [`Numerics::fast`]): the
+    /// `fast_math` field is applied over [`ContextOptions::numerics`] when the context opens.
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics(Numerics::fast())` (or `.with_reduced(Reduced::FAST_MATH, true)`); removed in 0.6")]
+    #[allow(deprecated)]
     pub fn fast_math(mut self, on: bool) -> Self {
         self.fast_math = on;
         self
     }
 
     /// Runs the matrix products on tensor cores in TF32 where the device has them (the default),
-    /// or with `false` always in `f32` (see [`ContextOptions::tf32_matmul`]).
+    /// or with `false` always in `f32`: the `tf32_matmul` field is applied over
+    /// [`ContextOptions::numerics`] when the context opens (`false` clears
+    /// `Reduced::TF32_MATMUL`; `true` changes nothing).
+    #[deprecated(since = "0.5.2", note = "use `ContextOptions::numerics(Numerics::strict())` (or `.with_reduced(Reduced::TF32_MATMUL, false)`); removed in 0.6")]
+    #[allow(deprecated)]
     pub fn tf32_matmul(mut self, on: bool) -> Self {
         self.tf32_matmul = on;
         self
+    }
+
+    /// The numerics policy a context opened with these options gets: [`ContextOptions::numerics`]
+    /// with the deprecated `fast_math` and `tf32_matmul` fields applied.
+    #[allow(deprecated)]
+    pub(crate) fn effective_numerics(&self) -> Numerics {
+        let mut numerics = self.numerics;
+        if self.fast_math {
+            numerics = numerics.with_reduced(Reduced::FAST_MATH, true);
+        }
+        if !self.tf32_matmul {
+            numerics = numerics.with_reduced(Reduced::TF32_MATMUL, false);
+        }
+        numerics
     }
 
     /// Options from the environment: `LUMA_BACKEND` = `cuda` | `metal` | `wgpu` | `cpu` | `auto`;
     /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
     /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
-    /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
-    /// [`ContextOptions::fast_math`], `LUMA_TF32_MATMUL` = `0` | `off` | `false` to turn
-    /// [`ContextOptions::tf32_matmul`] off, `LUMA_CALIBRATE` = `0` |
+    /// `1` | `on` | `true` for the finite check, `LUMA_NUMERICS` =
+    /// `strict` | `default` | `algebraic` | `fast` with modifiers (see [`Numerics::parse`]) for
+    /// [`ContextOptions::numerics`], `LUMA_CALIBRATE` = `0` |
     /// `off` | `false` to skip calibration.
+    ///
+    /// # Panics
+    ///
+    /// If `LUMA_NUMERICS` is set to something [`Numerics::parse`] rejects.
+    #[allow(deprecated)]
     pub fn from_env() -> ContextOptions {
         let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_ascii_lowercase());
         let backend_named = |name: &str| match name {
@@ -326,15 +405,28 @@ impl ContextOptions {
             backend,
             device,
             memory_budget: bytes("LUMA_MEMORY_BUDGET"),
+            host_budget: bytes("LUMA_HOST_BUDGET"),
             chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
             check_finite: std::env::var("LUMA_CHECK_FINITE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
             calibrate: !std::env::var("LUMA_CALIBRATE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
-            fast_math: std::env::var("LUMA_FAST_MATH")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
-            tf32_matmul: !std::env::var("LUMA_TF32_MATMUL")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
+            numerics: {
+                let numerics = match std::env::var("LUMA_NUMERICS") {
+                    Ok(text) => Numerics::parse(&text).unwrap_or_else(|why| panic!("LUMA_NUMERICS={text:?}: {why}")),
+                    Err(_) => Numerics::default(),
+                };
+                // The 0.5 name of `+tf32-linalg`, read until 0.6.
+                if deprecated_env("LUMA_LINALG_TF32", "LUMA_NUMERICS=...+tf32-linalg").is_some_and(|v| v.trim() == "1") {
+                    numerics.with_reduced(Reduced::TF32_LINALG, true)
+                } else {
+                    numerics
+                }
+            },
+            fast_math: deprecated_env("LUMA_FAST_MATH", "LUMA_NUMERICS=fast (or +fast-math)")
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            tf32_matmul: !deprecated_env("LUMA_TF32_MATMUL", "LUMA_NUMERICS=strict (or -tf32-matmul)")
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" => Some(true),
                 "0" | "off" | "false" => Some(false),
@@ -517,15 +609,25 @@ impl Context {
         &self.inner.backend.info().name
     }
 
-    /// Whether value-changing algebraic rewrites are allowed.
-    pub(crate) fn fast_math(&self) -> bool {
-        self.inner.fast_math
+    /// The numerics policy of this context (see [`ContextOptions::numerics`]); fixed when it opens.
+    pub fn numerics(&self) -> Numerics {
+        self.inner.numerics
     }
 
-    /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can
-    /// (see [`ContextOptions::tf32_matmul`]).
+    /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can.
+    #[deprecated(since = "0.5.2", note = "use `Context::numerics().tf32_matmul()`; removed in 0.6")]
     pub fn tf32_matmul(&self) -> bool {
-        self.inner.tf32_matmul
+        self.inner.numerics.tf32_matmul()
+    }
+
+    /// What the device can do.
+    pub(crate) fn caps(&self) -> Caps {
+        self.inner.caps
+    }
+
+    /// Whether value-changing algebraic rewrites are allowed.
+    pub(crate) fn fast_math(&self) -> bool {
+        self.inner.numerics.fast_math()
     }
 
     /// Whether this context runs on a software (CPU) device.
@@ -536,17 +638,23 @@ impl Context {
     /// Opens a device as `options` say, without looking at the environment. Blocks until the
     /// device is ready.
     pub fn with_options(options: ContextOptions) -> Result<Context> {
-        Context::open(options, |_| {})
+        Context::open(options, |_| {}, Caps::empty())
     }
 
     /// [`Context::with_options`] with `tune` changing the kernel parameters of the device (tests
     /// run kernels the device would not choose).
     #[cfg(test)]
     pub(crate) fn with_tuning(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
-        Context::open(options, tune)
+        Context::open(options, tune, Caps::empty())
     }
 
-    fn open(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
+    /// [`Context::with_options`] reporting the device without the capabilities of `removed`.
+    #[cfg(test)]
+    pub(crate) fn with_caps_removed(options: ContextOptions, removed: Caps) -> Result<Context> {
+        Context::open(options, |_| {}, removed)
+    }
+
+    fn open(options: ContextOptions, tune: impl FnOnce(&mut Tuning), removed: Caps) -> Result<Context> {
         let backend = open_backend(options.backend, options.device)?;
         let info = backend.info();
         let limits = info.limits;
@@ -579,10 +687,11 @@ impl Context {
                 None => device_fma(&*backend),
             },
         };
-        tuning.df_sloppy_add = options.fast_math;
+        tuning.df_sloppy_add = options.effective_numerics().fast_math();
         tuning.native_solve = Tuning::native_solve_for(backend.native_line_solve());
         tuning.native_gemm = Tuning::native_gemm_for(backend.native_matmul());
         tune(&mut tuning);
+        let caps = Caps::of(info, &*backend, &tuning).without(removed);
 
         let ctx = Context {
             inner: Arc::new(Inner {
@@ -592,6 +701,7 @@ impl Context {
                 zero_copy: info.zero_copy,
                 tuning,
                 cost: OnceLock::new(),
+                memory: OnceLock::new(),
                 reduce_counter: OnceLock::new(),
                 builtins: BuildCache::default(),
                 chirps: Mutex::new(std::collections::HashMap::new()),
@@ -603,13 +713,13 @@ impl Context {
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
                 check_finite: options.check_finite,
-                fast_math: options.fast_math,
-                tf32_matmul: options.tf32_matmul,
-                pager: Pager::new(budget),
+                numerics: options.effective_numerics(),
+                caps,
+                pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
-                #[cfg(test)]
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
+                assume_idle: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 created_bytes: std::sync::atomic::AtomicU64::new(0),
                 max_buffer_bytes,
@@ -625,28 +735,44 @@ impl Context {
                 // do the processes of the next day (see `DiskCache::recently_contended`).
                 let disk = ctx.disk_cache();
                 let fallback = CostModel::fallback(profile);
-                disk.load_cost().filter(|stored| !cost::contended(stored, &fallback)).unwrap_or_else(|| {
-                    if disk.recently_contended() {
-                        return fallback;
+                match disk.load_calibration().filter(|(stored, _)| !cost::contended(stored, &fallback)) {
+                    Some((stored, memory)) => {
+                        disk.set_memory_model(memory);
+                        stored
                     }
-                    match cost::calibrate_clean(&ctx, &fallback) {
-                        Ok(Some(measured)) => {
-                            disk.store_cost(&measured);
-                            measured
+                    None => {
+                        if disk.recently_contended() {
+                            return fallback;
                         }
-                        Ok(None) => {
-                            disk.note_contended();
-                            fallback
+                        match cost::calibrate_clean(&ctx, &fallback) {
+                            Ok(Some((measured, memory))) => {
+                                disk.store_calibration(&measured, memory.as_ref());
+                                disk.set_memory_model(memory);
+                                measured
+                            }
+                            Ok(None) => {
+                                disk.note_contended();
+                                fallback
+                            }
+                            Err(_) => fallback,
                         }
-                        Err(_) => fallback,
                     }
-                })
+                }
             })
         } else {
             CostModel::fallback(profile)
         };
         let _ = ctx.inner.cost.set(model);
+        let _ = ctx.inner.memory.set(if options.calibrate { ctx.disk_cache().memory_model() } else { None });
         Ok(ctx)
+    }
+
+    /// How bytes move inside the device (see [`MemoryModel`]): measured by the calibration that
+    /// measured the cost model (see [`ContextOptions::calibrate`]) and stored with it; `None`
+    /// where calibration is off, failed or looked contended, and where the device has no
+    /// numbers. Nothing plans with it yet.
+    pub fn memory_model(&self) -> Option<MemoryModel> {
+        self.inner.memory.get().copied().flatten()
     }
 
     /// The device's cost model: measured when the context opened (see
@@ -698,6 +824,25 @@ impl Context {
     #[doc(hidden)]
     pub fn set_plan_cache(&self, on: bool) {
         self.jit().set_plan_cache(on);
+    }
+
+    /// Switches the recording of the planner's decisions on or off (also on at open with
+    /// `LUMA_RECORD_DECISIONS=1`). It sets nothing else: host paths, deferred axis reductions, the
+    /// plan cache and graph capture stay as they are, unlike [`Context::enable_profiling`], which
+    /// records decisions too. Read them with [`Context::take_decisions`]. Switching off drops
+    /// the decisions not yet taken.
+    pub fn record_decisions(&self, on: bool) {
+        if on {
+            self.jit().start_decisions();
+        } else {
+            drop(self.jit().stop_decisions());
+        }
+    }
+
+    /// Returns the decisions recorded since the last call (or since recording began) and keeps
+    /// recording if it is on.
+    pub fn take_decisions(&self) -> Vec<Decision> {
+        self.jit().drain_decisions()
     }
 
     /// How many evaluations ran from a cached plan so far.
@@ -896,7 +1041,7 @@ impl Context {
             return Ok(buffer);
         }
         let max = self.inner.max_buffer_bytes;
-        let class = pool::size_class(bytes, max)
+        let class = size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
 
         let pooled = lock(&self.inner.pool).take(class, usage);
@@ -911,7 +1056,7 @@ impl Context {
     /// A buffer for `bytes` bytes with `usage` that this thread's recording is done with (see
     /// `Recording::reuse`), if it is recording and has one: no new memory is needed for it.
     pub(crate) fn take_recorded(&self, bytes: u64, usage: BufferUsage) -> Option<Buffer> {
-        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
+        let class = size_class(bytes, self.inner.max_buffer_bytes)?;
         self.reuse_recorded(class, usage)
     }
 
@@ -1057,7 +1202,7 @@ impl Context {
         }
         if !self.hal().is_profiling()? {
             self.hal().enable_profiling()?;
-            self.jit().start_splits();
+            self.jit().start_decisions();
         }
         Ok(())
     }
@@ -1066,7 +1211,12 @@ impl Context {
     /// [`Context::enable_profiling`], by kernel label. Submits the pending batch and waits for
     /// it, so this is also a sync point.
     ///
+    /// [`Profile::cuts`] lists where the planner cut expressions into several kernels. Every
+    /// decision the planner made in the profiled region (cuts, inlining, staging, plans) is kept
+    /// for the next [`Context::take_decisions`], which returns them.
+    ///
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
+    #[allow(deprecated)]
     pub fn finish_profiling(&self) -> Result<Profile> {
         self.abort_recording()?;
         if !self.hal().is_profiling()? {
@@ -1075,9 +1225,18 @@ impl Context {
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();
-        let splits = self.jit().take_split_notes();
+        let decisions = self.jit().stop_decisions();
         self.notify_released();
-        Ok(self.hal().finish_profiling(splits)?)
+        let splits = decisions
+            .iter()
+            .filter_map(|d| match d.site {
+                DecisionSite::Cut(reason) => Some(luma_core::FusionSplit { op: d.op, location: d.location, reason }),
+                _ => None,
+            })
+            .collect();
+        let profile = self.hal().finish_profiling(splits)?;
+        self.jit().park_decisions(decisions);
+        Ok(profile)
     }
 
     /// Runs `f` and measures the GPU time of every kernel launch recorded during it (and, since

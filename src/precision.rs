@@ -103,6 +103,48 @@ casts! { Df32 =>
     to_f64 -> f64;
 }
 
+// -- Casts to and from the half-precision floats --
+//
+// A conversion to `f16` or `bf16` rounds to nearest even (overflow gives infinity, a NaN the
+// canonical quiet NaN); one from them is exact. The casts fuse into the kernels that read or
+// write them: an `Array<f16>` read through `to_f32()` loads 2 bytes per element.
+
+macro_rules! half_casts {
+    ($($from:ty),*) => {$(
+        casts! { $from =>
+            /// The elements as `f16`, rounded to nearest even.
+            to_f16 -> half::f16;
+            /// The elements as `bf16`, rounded to nearest even.
+            to_bf16 -> half::bf16;
+        }
+    )*};
+}
+
+half_casts!(f32, f64, i32, u32);
+
+macro_rules! half_source_casts {
+    ($($from:ty, $other:ty, $to_other:ident;)*) => {$(
+        casts! { $from =>
+            /// The elements as `f32` (exact).
+            to_f32 -> f32;
+            /// The elements as `f64` (exact). Needs a device with 64-bit shader floats;
+            /// otherwise the result is poisoned with [`LumaError::Unsupported`](crate::LumaError).
+            to_f64 -> f64;
+            /// The elements as `i32`: truncates toward zero and saturates; NaN becomes 0.
+            to_i32 -> i32;
+            /// The elements as `u32`: truncates toward zero and saturates; NaN becomes 0.
+            to_u32 -> u32;
+            /// The elements in the other half-precision type, rounded to nearest even.
+            $to_other -> $other;
+        }
+    )*};
+}
+
+half_source_casts! {
+    half::f16, half::bf16, to_bf16;
+    half::bf16, half::f16, to_f16;
+}
+
 // -- Casts to and from the 8-bit and 16-bit integers --
 //
 // A conversion *to* a small integer wraps an integer (the low bits are kept, like Rust's `as`:

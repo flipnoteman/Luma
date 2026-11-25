@@ -273,6 +273,12 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_filter(&self, mask: &Array<bool>) -> Outcome<Option<Array<T>>> {
+        if T::LAYOUT.is_packed() && T::wgsl_type() == "f32" {
+            // Half-precision floats are compacted as `f32` (exact both ways).
+            let location = Location::caller();
+            let kept = self.cast_at::<f32>(location).run_filter(mask)?;
+            return Ok(kept.map(|kept| kept.cast_at::<T>(location)));
+        }
         if T::LAYOUT.is_packed() && !T::LAYOUT.is_bits() {
             // Small integers are compacted as the words they widen to and narrowed again.
             let location = Location::caller();
@@ -299,6 +305,12 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_filter_padded(&self, mask: &Array<bool>, fill: T) -> Outcome<(Array<T>, Array<u32>)> {
+        if T::LAYOUT.is_packed() && T::wgsl_type() == "f32" {
+            let location = Location::caller();
+            let fill = downcast::<T, half::f16>(fill).map(f32::from).or_else(|| downcast::<T, half::bf16>(fill).map(f32::from)).expect("only f16 and bf16 are packed floats");
+            let (kept, count) = self.cast_at::<f32>(location).run_filter_padded(mask, fill)?;
+            return Ok((kept.cast_at::<T>(location), count));
+        }
         if T::LAYOUT.is_packed() && !T::LAYOUT.is_bits() {
             let location = Location::caller();
             let (kept, count) = self.cast_at::<u32>(location).run_filter_padded(mask, bytemuck::cast::<_, u32>(fill.into_repr()))?;

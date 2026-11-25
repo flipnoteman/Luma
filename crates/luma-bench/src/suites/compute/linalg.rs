@@ -159,7 +159,7 @@ pub fn run(h: &mut Harness) {
         for &n in sizes {
             let (ad, bd) = (values(n * n, 41, -1.0, 1.0), values(n * n, 42, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [n, n]), upload(h, &bd, [n, n]));
-            verify("matmul/square", &host(&a.matmul(&b)), &ad, &bd, n, n, n, false, h.ctx.tf32_matmul());
+            verify("matmul/square", &host(&a.matmul(&b)), &ad, &bd, n, n, n, false, h.ctx.numerics().tf32_matmul());
             h.case("matmul/square", &format!("{n}"), Work::Flops(2.0 * (n as f64).powi(3)), &mut || a.matmul(&b).eval().unwrap());
         }
 
@@ -169,7 +169,7 @@ pub fn run(h: &mut Harness) {
             let (k, n) = (64usize, 64usize);
             let (ad, bd) = (values(m * k, 43, -1.0, 1.0), values(k * n, 44, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [k, m]), upload(h, &bd, [n, k]));
-            verify("matmul/skinny", &host(&a.matmul(&b)), &ad, &bd, m, k, n, false, h.ctx.tf32_matmul());
+            verify("matmul/skinny", &host(&a.matmul(&b)), &ad, &bd, m, k, n, false, h.ctx.numerics().tf32_matmul());
             h.case("matmul/skinny", &format!("{m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || a.matmul(&b).eval().unwrap());
         }
 
@@ -191,7 +191,7 @@ pub fn run(h: &mut Harness) {
         for n in sizes {
             let (ad, bd) = (values(n * n, 47, -1.0, 1.0), values(n * n, 48, -1.0, 1.0));
             let (a, b) = (upload(h, &ad, [n, n]), upload(h, &bd, [n, n]));
-            verify("matmul/transposed_rhs", &host(&a.matmul(&b.transpose())), &ad, &bd, n, n, n, true, h.ctx.tf32_matmul());
+            verify("matmul/transposed_rhs", &host(&a.matmul(&b.transpose())), &ad, &bd, n, n, n, true, h.ctx.numerics().tf32_matmul());
             h.case("matmul/transposed_rhs", &format!("{n}"), Work::Flops(2.0 * (n as f64).powi(3)), &mut || a.matmul(&b.transpose()).eval().unwrap());
         }
     });

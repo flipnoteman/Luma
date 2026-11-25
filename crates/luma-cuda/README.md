@@ -1,6 +1,6 @@
 # luma-hal-cuda
 
-The native CUDA backend of Luma. It generates NVVM IR from the kernel IR, compiles it with the NVIDIA driver's NVVM (linking NVIDIA's libdevice for math functions), runs work on one ordered stream and replays CUDA graphs.
+The native CUDA backend of Luma. It generates NVVM IR from the kernel IR, compiles it with the NVIDIA driver's NVVM (linking NVIDIA's libdevice for math functions), runs work on one ordered compute stream (the HAL's transfer lane uses a second stream and pinned staging blocks) and replays CUDA graphs.
 
 ## Usage
 

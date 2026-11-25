@@ -59,6 +59,16 @@ fn recycled_buffers_are_reused_per_size_class_and_usage() {
     assert_ne!(ctx.alloc_buffer(4100, STORAGE_USAGE).unwrap(), a);
     // ... while the recycled one is still waiting in the pool.
     assert_eq!(ctx.alloc_buffer(4000, STORAGE_USAGE).unwrap(), a);
+
+    // Above 4 KiB classes are eighths of an octave: 5000 and 5100 share 5120, 6200 is in 6656.
+    let c = ctx.alloc_buffer(5000, STORAGE_USAGE).unwrap();
+    assert_eq!(c.size(), 5120);
+    ctx.recycle(c.clone());
+    assert_eq!(ctx.alloc_buffer(5100, STORAGE_USAGE).unwrap(), c);
+    ctx.recycle(c.clone());
+    let d = ctx.alloc_buffer(6200, STORAGE_USAGE).unwrap();
+    assert_ne!(d, c);
+    assert_eq!(d.size(), 6656);
 }
 
 #[test]
@@ -243,7 +253,7 @@ fn calibration_is_measured_once_per_device() {
 #[test]
 fn the_cost_model_can_be_overridden_in_tests() {
     let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
-    let model = CostModel { launch_us: 123.0, ..CostModel::TEST };
+    let model = CostModel::TEST.with(|m| { m.launch_us = 123.0; });
     ctx.set_cost_model(model);
     assert_eq!(ctx.cost_model(), model);
 }
@@ -378,6 +388,101 @@ fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
     assert_eq!(ctx.read::<u32>(&outputs[3], 256).unwrap(), vec![42; 64]);
 }
 
+/// A kernel binds byte ranges of one buffer: it reads one range and writes another of the same
+/// buffer, the bind-group cache tells two offsets of a buffer apart, and a misaligned offset is
+/// a binding error.
+#[test]
+fn a_launch_binds_byte_ranges_of_a_buffer() {
+    let ctx = ctx();
+    let core = kernel::build_core(
+        &ctx,
+        &KernelKey::new(
+            "@group(1) @binding(0) var<storage, read_write> out0: array<u32>;
+             @group(1) @binding(1) var<storage, read> in0: array<u32>;
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                 if (gid.x >= luma.size.x) { return; }
+                 out0[gid.x] = in0[gid.x] + 1u;
+             }"
+            .to_owned(),
+            "main",
+            None,
+        ),
+        Some("ranges"),
+        luma_core::KernelTrust::Trusted,
+    )
+    .unwrap();
+    let align = ctx.hal().storage_offset_align().max(256);
+    let words = (align / 4) as usize;
+    // [A | B | C | D]: A and C hold data, B and D are written.
+    let buffer = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
+    // wgpu tracks the usage of a whole buffer within a dispatch and rejects one that binds a
+    // buffer both for reading and for writing, whatever the ranges: the written ranges go to a
+    // second buffer there (same offsets).
+    let second = ctx.alloc_buffer(4 * align, STORAGE_USAGE).unwrap();
+    let out = if ctx.backend() == BackendKind::Wgpu { &second } else { &buffer };
+    let a: Vec<u32> = (0..words as u32).collect();
+    let c: Vec<u32> = (0..words as u32).map(|i| i * 10).collect();
+    let mut data = vec![0u32; 4 * words];
+    data[..words].copy_from_slice(&a);
+    data[2 * words..3 * words].copy_from_slice(&c);
+    ctx.upload(&buffer, bytemuck::cast_slice(&data)).unwrap();
+    // Views of the ranges (`Buffer::at`), made once: a launch binds a view from its offset.
+    let read_views: Vec<Buffer> = (0..4).map(|at| buffer.at(at * align)).collect();
+    let write_views: Vec<Buffer> = (0..4).map(|at| out.at(at * align)).collect();
+    let range = |at: usize| RawArg::read(&read_views[at], align);
+    let target = |at: usize| RawArg::write(&write_views[at], align);
+    let size = [words as u32, 1, 1];
+    let groups = [(words as u32).div_ceil(64), 1, 1];
+    ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
+    ctx.launch(&core, groups, size, &[target(3), range(2)]).unwrap();
+    // The first launch again, so the cached bind group of (buffer, 0..) is hit after (buffer, 2..).
+    ctx.launch(&core, groups, size, &[target(1), range(0)]).unwrap();
+    let got = ctx.read::<u32>(&buffer, 4 * align).unwrap();
+    let written = ctx.read::<u32>(out, 4 * align).unwrap();
+    assert_eq!(&got[..words], &a[..], "A is untouched");
+    assert_eq!(written[words..2 * words], a.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+    assert_eq!(&got[2 * words..3 * words], &c[..], "C is untouched");
+    assert_eq!(written[3 * words..], c.iter().map(|x| x + 1).collect::<Vec<_>>()[..]);
+
+    let (m, o, w1, w01) = (buffer.at(2 * align + 4), buffer.at(3 * align), buffer.at(align), buffer.at(0));
+    let misaligned = [RawArg::write(&m, 4), range(0)];
+    let result = ctx.launch(&core, [1, 1, 1], [1, 1, 1], &misaligned);
+    assert!(matches!(result, Err(LumaError::KernelBinding(_))), "{result:?}");
+    let outside = [RawArg::write(&o, 2 * align), range(0)];
+    assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &outside), Err(LumaError::KernelBinding(_))));
+    // Overlapping ranges of one buffer still alias.
+    let alias = [RawArg::write(&w01, 2 * align), RawArg::read(&w1, align)];
+    assert!(matches!(ctx.launch(&core, [1, 1, 1], [1, 1, 1], &alias), Err(LumaError::KernelArgAlias { .. })));
+}
+
+/// The device reports its free memory on CUDA and Metal, and it drops after an allocation.
+#[test]
+fn memory_now_follows_allocations() {
+    let ctx = ctx();
+    let Some(before) = ctx.hal().memory_now() else {
+        assert!(matches!(ctx.backend(), BackendKind::Wgpu | BackendKind::Cpu));
+        assert_eq!(ctx.paging_stats().device_free_bytes, None);
+        return;
+    };
+    assert!(before.free <= before.total);
+    // Other processes may use the device meanwhile: one run in which free memory fell is enough.
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let before = ctx.paging_stats().device_free_bytes.unwrap();
+        let held = ctx.alloc_buffer(256 << 20, STORAGE_USAGE).unwrap();
+        ctx.upload(&held, &vec![1u8; 256 << 20]).unwrap();
+        ctx.sync().unwrap();
+        let after = ctx.paging_stats().device_free_bytes.unwrap();
+        drop(held);
+        if after + (128 << 20) <= before {
+            return;
+        }
+        seen.push((before, after));
+    }
+    panic!("free memory never dropped by an allocation of 256 MiB: {seen:?}");
+}
+
 /// Slots for the live intervals of transient buffers: intervals that overlap, even at one
 /// command, never share a slot, and as few slots are used as the greatest number of intervals
 /// live at once.
@@ -475,4 +580,72 @@ fn a_context_that_ran_linear_algebra_is_freed_with_its_last_handle() {
     drop((a, lu));
     drop(ctx);
     assert!(weak.upgrade().is_none(), "something outlives its context");
+}
+
+#[test]
+fn the_context_reports_the_numerics_it_was_opened_with() {
+    for numerics in [Numerics::strict(), Numerics::default(), Numerics::algebraic(), Numerics::fast()] {
+        let ctx = Context::with_options(ContextOptions::from_env().calibrate(false).numerics(numerics)).unwrap();
+        assert_eq!(ctx.numerics(), numerics);
+        assert_eq!(ctx.fast_math(), numerics.fast_math());
+    }
+}
+
+#[test]
+fn caps_match_what_the_device_reports() {
+    let ctx = ctx();
+    let (caps, info) = (ctx.caps(), ctx.info());
+    assert_eq!(caps.contains(Caps::F64), info.features.contains(Features::SHADER_F64));
+    assert_eq!(caps.contains(Caps::F16), info.features.contains(Features::SHADER_F16));
+    assert_eq!(caps.contains(Caps::SUBGROUP), info.features.contains(Features::SUBGROUP));
+    assert_eq!(caps.contains(Caps::TEXTURE), ctx.hal().texture_caps().is_some());
+    assert_eq!(caps.contains(Caps::TEXTURE_PROFITABLE), caps.contains(Caps::TEXTURE) && ctx.tuning().profile == TuningProfile::Nvidia);
+    assert_eq!(caps.contains(Caps::TF32), !ctx.hal().gemm_tiles(false).is_empty());
+    assert_eq!(caps.contains(Caps::UNIFIED_MEMORY), info.zero_copy);
+    assert_eq!(caps.contains(Caps::HOST_PATH), !info.cpu && info.zero_copy);
+    assert_eq!(caps.contains(Caps::NATIVE_GEMM), ctx.hal().native_matmul().is_some());
+    assert_eq!(caps.contains(Caps::NATIVE_LINE_SOLVE), ctx.hal().native_line_solve());
+    assert_eq!(caps.contains(Caps::LOOKBACK), ctx.tuning().lookback_scan);
+    assert_eq!(caps.contains(Caps::SUBGROUP32), ctx.tuning().subgroup32);
+}
+
+#[test]
+fn without_tf32_the_default_matmul_is_exact_and_matmul_tf32_falls_back() {
+    let options = || ContextOptions::from_env().calibrate(false);
+    let plain = Context::with_options(options()).unwrap();
+    let forced = Context::with_caps_removed(options(), Caps::TF32).unwrap();
+    assert!(!forced.caps().contains(Caps::TF32));
+    let n = 256;
+    let a: Vec<f32> = (0..n * n).map(|i| ((i * 7 % 101) as f32) * 0.0137 + 0.1).collect();
+    let b: Vec<f32> = (0..n * n).map(|i| ((i * 13 % 89) as f32) * 0.0211 - 0.3).collect();
+    let run = |ctx: &Context, tf32: Option<bool>| {
+        let (x, y) = (Array::from_slice_on(ctx, &a, [n, n]).unwrap(), Array::from_slice_on(ctx, &b, [n, n]).unwrap());
+        match tf32 {
+            None => x.matmul(&y),
+            Some(true) => x.matmul_tf32(&y),
+            Some(false) => x.matmul_f32(&y),
+        }
+        .to_vec()
+        .unwrap()
+    };
+    let exact = run(&plain, Some(false));
+    assert_eq!(run(&forced, None), exact);
+    assert_eq!(run(&forced, Some(true)), exact);
+}
+
+/// The 0.5.2 options still work: the deprecated fields are applied over `numerics` when the
+/// context opens, and `Context::tf32_matmul` still reports.
+#[test]
+#[allow(deprecated)]
+fn the_deprecated_numerics_options_apply_over_numerics() {
+    use crate::numerics::Reduced;
+    let fast = ContextOptions::default().fast_math(true);
+    assert_eq!(fast.effective_numerics(), Numerics::default().with_reduced(Reduced::FAST_MATH, true));
+    let exact = ContextOptions::default().tf32_matmul(false);
+    assert_eq!(exact.effective_numerics(), Numerics::strict());
+    assert_eq!(ContextOptions::default().numerics(Numerics::fast()).effective_numerics(), Numerics::fast());
+    let ctx = Context::with_options(exact.backend(BackendKind::Cpu).calibrate(false)).unwrap();
+    assert!(!ctx.tf32_matmul() && !ctx.numerics().tf32_matmul());
+    let ctx = Context::with_options(fast.backend(BackendKind::Cpu).calibrate(false)).unwrap();
+    assert!(ctx.tf32_matmul() && ctx.numerics().fast_math());
 }

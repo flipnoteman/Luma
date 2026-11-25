@@ -1216,7 +1216,7 @@ impl Arr {
 
 /// The context of a program under its configuration; `None` if the device refuses it.
 fn engine(config: &Config) -> Option<Context> {
-    let mut options = ContextOptions::from_env().calibrate(false).fast_math(config.fast_math);
+    let mut options = ContextOptions::from_env().calibrate(false).numerics(if config.fast_math { crate::Numerics::fast() } else { crate::Numerics::default() });
     if config.df_split {
         options = options.df_fma(false);
     }
@@ -1227,6 +1227,10 @@ fn engine(config: &Config) -> Option<Context> {
         options = options.memory_budget(bytes);
     }
     let ctx = Context::with_options(options).ok()?;
+    if config.memory_budget.is_some() {
+        // The arrays are too small for recomputing to beat a transfer: evict by lineage whenever it is allowed.
+        ctx.pager().force_lineage();
+    }
     let jit = ctx.jit();
     jit.set_max_nodes(config.max_nodes);
     if let Some(n) = config.max_inlined {
@@ -1244,8 +1248,8 @@ fn engine(config: &Config) -> Option<Context> {
     jit.set_staging(config.staging);
     ctx.set_cost_model(match config.cost {
         CostChoice::Test => CostModel::TEST,
-        CostChoice::SlowLaunch => CostModel { launch_us: 1e6, ..CostModel::TEST },
-        CostChoice::SlowArithmetic => CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST },
+        CostChoice::SlowLaunch => CostModel::TEST.with(|m| { m.launch_us = 1e6; }),
+        CostChoice::SlowArithmetic => CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; }),
     });
     Some(ctx)
 }

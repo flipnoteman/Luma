@@ -47,7 +47,7 @@ pub fn run(h: &mut Harness) {
             let y = A::from_slice_on(&ctx, &mh, m).unwrap();
             force(&y);
             check("readback/to_vec", &y.to_vec().unwrap(), &mh, 0.0, 0.0);
-            h.case(&format!("readback/to_vec_evald_{m}"), &format!("n={m} x{reads}"), per_sec(reads, "read/s"), &mut || {
+            h.transfer_case(&format!("readback/to_vec_evald_{m}"), &format!("n={m} x{reads}"), per_sec(reads, "read/s"), &mut || {
                 for _ in 0..reads {
                     std::hint::black_box(y.to_vec().unwrap());
                 }
@@ -67,7 +67,7 @@ pub fn run(h: &mut Harness) {
 
         // Small uploads: a host array becomes a device array, one after another.
         let up = &xh[..256];
-        h.case("readback/upload_256", &format!("n=256 x{reads}"), per_sec(reads, "upload/s"), &mut || {
+        h.transfer_case("readback/upload_256", &format!("n=256 x{reads}"), per_sec(reads, "upload/s"), &mut || {
             for _ in 0..reads {
                 force(&A::from_slice_on(&ctx, up, 256).unwrap());
             }
@@ -79,10 +79,10 @@ pub fn run(h: &mut Harness) {
         let t = A::from_slice_on(&ctx, &th, nt).unwrap();
         force(&t);
         check("readback/to_vec_big", &t.to_vec().unwrap(), &th, 0.0, 0.0);
-        h.case("readback/to_vec_big", &format!("n={nt}"), Work::Bytes(4.0 * nt as f64), &mut || {
+        h.transfer_case("readback/to_vec_big", &format!("n={nt}"), Work::Bytes(4.0 * nt as f64), &mut || {
             std::hint::black_box(t.to_vec().unwrap());
         });
-        h.case("readback/upload_big", &format!("n={nt}"), Work::Bytes(4.0 * nt as f64), &mut || {
+        h.transfer_case("readback/upload_big", &format!("n={nt}"), Work::Bytes(4.0 * nt as f64), &mut || {
             force(&A::from_slice_on(&ctx, &th, nt).unwrap());
         });
     });

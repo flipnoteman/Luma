@@ -1,5 +1,5 @@
 //! Reductions forced together. A pending reduction is recorded when its value is first used or read
-//! (see [`Reduced`]); programs compute many of them over the same data (the pressure that several
+//! (see [`Structured`]); programs compute many of them over the same data (the pressure that several
 //! masked sums gather, the columns that a mean, a minimum and a maximum each traverse), and
 //! recording each alone costs a launch and a pass over the inputs per reduction.
 //!
@@ -14,7 +14,7 @@
 //! dependencies have run.
 //!
 //! Reductions along an axis (`Array::sum_axis` and the methods built on `reduce_axis`, `f32` on a GPU
-//! backend outside a recording) are left pending the same way, one `Reduced` per op, and recorded
+//! backend outside a recording) are left pending the same way, one `Structured` per op, and recorded
 //! together when they reduce the same lines (`AxisGeom`): at most `scan::AXIS_MULTI` ops in one
 //! kernel, whose first pass computes the distinct operands together (`jit::axis_plan`) and whose
 //! ops each combine their line in the order a reduction alone does, so every result is the same
@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use super::{lock, overlap, union_into, IdSet, JitState, Node, Src, COMPUTING, FLATTENING};
-use crate::reduce::Reduced;
+use super::structured::Structured;
 
 /// Most nodes walked looking for the reductions an operand depends on.
 const WALK_BUDGET: usize = 4096;
@@ -79,8 +79,8 @@ pub(crate) fn unresolved_leaves(root: &Arc<Node>) -> Option<Vec<Arc<Node>>> {
 
 impl JitState {
     /// Notes the reduction `reduced`, which is not recorded yet, as one that may be recorded together with another.
-    pub(crate) fn register_reduction(&self, reduced: &Arc<Reduced>) {
-        let mut list = lock(&self.reductions);
+    pub(crate) fn register_reduction(&self, reduced: &Arc<Structured>) {
+        let mut list = lock(&self.structured);
         // Dead or recorded ones are dropped as the list doubles.
         if list.len() >= 32 && list.len().is_power_of_two() {
             list.retain(|weak| weak.upgrade().is_some_and(|reduced| reduced.is_unforced()));
@@ -103,23 +103,23 @@ impl JitState {
 
     /// Whether some registered reduction could be recorded together with `seed`: what is cheap to tell, before the
     /// expressions are walked (see [`JitState::reduction_partners`]).
-    pub(crate) fn may_have_partners(&self, seed: &Reduced) -> bool {
-        lock(&self.reductions).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
+    pub(crate) fn may_have_partners(&self, seed: &Structured) -> bool {
+        lock(&self.structured).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
     }
 
     /// The registered reductions to record together with `seed` (see the module documentation), oldest first, leaving out
     /// the ones in `taken` (reductions already assigned to a kernel that is not recorded yet).
     /// Nothing for a `seed` that cannot be merged.
-    pub(crate) fn reduction_partners(&self, ctx: &crate::context::Context, seed: &Reduced, taken: &[*const Reduced]) -> Vec<Arc<Reduced>> {
+    pub(crate) fn reduction_partners(&self, ctx: &crate::context::Context, seed: &Structured, taken: &[*const Structured]) -> Vec<Arc<Structured>> {
         let axis = seed.is_axis();
         let cap = if axis { ctx.tuning().reduce_multi.min(crate::scan::AXIS_MULTI) } else { ctx.tuning().reduce_multi };
         let mut accs = seed.ops().as_slice().len();
         if accs >= cap || !(if axis { seed.axis_mergeable(ctx) } else { seed.mergeable(ctx) }) {
             return Vec::new();
         }
-        let list: Vec<Arc<Reduced>> = {
-            let mut list = lock(&self.reductions);
-            list.retain(|weak: &Weak<Reduced>| weak.strong_count() > 0);
+        let list: Vec<Arc<Structured>> = {
+            let mut list = lock(&self.structured);
+            list.retain(|weak: &Weak<Structured>| weak.strong_count() > 0);
             list.iter().filter_map(Weak::upgrade).collect()
         };
         let node = seed.operand();
@@ -167,8 +167,8 @@ impl JitState {
 
     /// The oldest registered reduction (not one of `taken`) that would be the seed of the next kernel after the one of `first`,
     /// if the reductions are used in the order they were made: one that nothing is waited for to compute.
-    pub(crate) fn next_seed(&self, ctx: &crate::context::Context, first: &Reduced, taken: &[*const Reduced]) -> Option<Arc<Reduced>> {
-        let list: Vec<Arc<Reduced>> = lock(&self.reductions).iter().filter_map(Weak::upgrade).collect();
+    pub(crate) fn next_seed(&self, ctx: &crate::context::Context, first: &Structured, taken: &[*const Structured]) -> Option<Arc<Structured>> {
+        let list: Vec<Arc<Structured>> = lock(&self.structured).iter().filter_map(Weak::upgrade).collect();
         let flying = FLATTENING.with_borrow(Clone::clone);
         let computing = COMPUTING.with_borrow(Clone::clone);
         list.into_iter().take(EXAMINED).find(|candidate| {

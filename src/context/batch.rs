@@ -30,12 +30,16 @@ pub(super) const BATCH_LIMIT: u32 = 256;
 /// buffer through `reshape` make that reachable.
 fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     for (second, arg) in args.iter().enumerate() {
-        let RawArg::Storage { buffer, writable, .. } = arg else { continue };
+        let RawArg::Storage { buffer, bytes, writable } = arg else { continue };
+        let offset = buffer.offset();
         for (first, earlier) in args.iter().enumerate().take(second) {
-            let RawArg::Storage { buffer: other, writable: other_writable, .. } = earlier else {
+            let RawArg::Storage { buffer: other, bytes: other_bytes, writable: other_writable } = earlier else {
                 continue;
             };
-            if buffer == other && (*writable || *other_writable) {
+            let other_offset = other.offset();
+            // Disjoint ranges of one buffer do not alias.
+            let overlap = offset < other_offset + other_bytes && other_offset < offset + bytes;
+            if buffer == other && overlap && (*writable || *other_writable) {
                 return Err(LumaError::KernelArgAlias { first, second });
             }
         }
@@ -47,19 +51,37 @@ impl Context {
     /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
     /// idle, so that the submission goes ahead and the waiting paths report the error.
     fn gpu_busy(&self) -> bool {
-        #[cfg(test)]
         if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
+        }
+        if self.inner.assume_idle.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
         }
         self.hal().gpu_busy()
     }
 
-    /// Makes [`Context::submit`] and [`Context::submit_requested`] behave as if earlier
-    /// submissions were still running, so that tests of postponed evaluation do not depend on
-    /// how fast the GPU is.
-    #[cfg(test)]
-    pub(crate) fn set_assume_busy(&self, on: bool) {
+    /// Whether [`Context::set_assume_busy`] or [`Context::set_assume_idle`] is on: the GPU's state
+    /// is pinned, so what runs does not depend on timing.
+    pub(crate) fn gpu_state_pinned(&self) -> bool {
+        self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) || self.inner.assume_idle.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Makes `eval` and the fusion-limit cuts behave as if earlier submissions were still
+    /// running, whatever the GPU is doing: pending work is held until `SUBMIT_HOLD` dispatches,
+    /// a sync point or the batch limit, so the batches (and the fused kernels they make) follow the
+    /// program instead of the GPU's speed. For tests of postponed evaluation.
+    #[doc(hidden)]
+    pub fn set_assume_busy(&self, on: bool) {
         self.inner.assume_busy.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Makes `eval` and the fusion-limit cuts behave as if the GPU were always idle: every `eval`
+    /// computes its array and every cut submits, so which kernels run follows the program and not the
+    /// GPU's speed, and no array an `eval` requested is dropped uncomputed. For the luma-bench
+    /// decision log, whose runs of one binary must agree. [`Context::set_assume_busy`] wins if both are on.
+    #[doc(hidden)]
+    pub fn set_assume_idle(&self, on: bool) {
+        self.inner.assume_idle.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Submits the pending batch without waiting for it, like [`Context::flush`] but without

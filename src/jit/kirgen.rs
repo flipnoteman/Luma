@@ -30,7 +30,7 @@ use crate::tuning::Tuning;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
+use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math, uses_half};
 use super::staging::Staging;
 use super::stencil::WORKGROUP;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -48,7 +48,7 @@ const NARROW_DIV: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
 /// The IR type of a register holding `ty`: a `bool` is a `u32` of 0 or 1 there.
 pub(super) fn reg(ty: ElemTy) -> KirType {
     match ty {
-        ElemTy::F32 => KirType::F32,
+        ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 => KirType::F32,
         ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => KirType::U32,
         ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => KirType::I32,
         ElemTy::F64 => KirType::Scalar(ScalarTy::F64),
@@ -62,7 +62,7 @@ pub(super) fn reg(ty: ElemTy) -> KirType {
 /// different invocations.
 pub(super) fn write_elem(ty: ElemTy) -> KirType {
     match ty {
-        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => KirType::Atomic(ScalarTy::U32),
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => KirType::Atomic(ScalarTy::U32),
         other => reg(other),
     }
 }
@@ -304,7 +304,7 @@ impl<'a> Lower<'a> {
                     (wide(0) + wide(1)) + wide(2)
                 }
                 ElemTy::Df32 | ElemTy::C32 => fb.compose(reg(ty), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
-                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => self.scalar(fb, k),
+                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => self.scalar(fb, k),
             },
             Ref::Tmp(k) => match f.t(k as usize) {
                 Some(v) => v,
@@ -480,7 +480,7 @@ impl<'a> Lower<'a> {
         // A shift or rotation amount is taken modulo 32 (modulo the width of a small integer).
         let amount = |fb: &FnBuilder<'_>| {
             let word = if matches!(ty, ElemTy::I32 | ElemTy::I8 | ElemTy::I16) { fb.bitcast(y, KirType::U32) } else { y };
-            word & lu(fb, if ty.is_small() { ty.small_bits() - 1 } else { 31 })
+            word & lu(fb, if ty.is_small_int() { ty.small_bits() - 1 } else { 31 })
         };
         match op {
             BinOp::Add => x + y,
@@ -598,6 +598,8 @@ impl<'a> Lower<'a> {
     /// value that a reassociating compiler could fold away through the optimisation barrier (see
     /// `builtin::df_library`), so that `x - to_df32(to_f32(x))` keeps the low word of `x`.
     fn cast(&self, fb: &mut FnBuilder<'_>, from: ElemTy, to: ElemTy, x: Val) -> Val {
+        // A half is an `f32` in a register; the rounding to the type is `Lower::round_half`.
+        let (from, to) = (from.compute(), to.compute());
         let f64t = KirType::Scalar(ScalarTy::F64);
         let df = reg(ElemTy::Df32);
         match (from, to) {
@@ -704,7 +706,7 @@ impl<'a> Lower<'a> {
         match ty {
             ElemTy::U32 => coord,
             ElemTy::I32 => fb.bitcast(coord, KirType::I32),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => fb.convert(coord, KirType::F32),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::F16 | ElemTy::BF16 => fb.convert(coord, KirType::F32),
             ElemTy::U8 | ElemTy::U16 => self.narrow(fb, ty, coord),
             ElemTy::I8 | ElemTy::I16 => self.narrow(fb, ty, fb.bitcast(coord, KirType::I32)),
             ElemTy::Bool => self.fail(fb, "a generator of bools"),
@@ -767,7 +769,14 @@ impl<'a> Lower<'a> {
     /// The operation `op` (anything but a shift) on the operands `x`, `y` and `z`; `index` is the
     /// element it is computed at. `None` for a shift.
     pub(super) fn operation(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
-        let ty = op.ty;
+        let value = self.operation_unrounded(fb, op, x, y, z, index)?;
+        Some(if op.rounds_half() { self.round_half(fb, op.out_ty(), value) } else { value })
+    }
+
+    /// [`Lower::operation`] before the result is rounded to a half-precision element type.
+    fn operation_unrounded(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
+        // The arithmetic of a half is that of `f32`.
+        let ty = op.ty.compute();
         Some(match op.kind {
             OpKind::Unary(u) if ty.is_small() => {
                 let v = self.unary(fb, u, ty, x);
@@ -795,10 +804,32 @@ impl<'a> Lower<'a> {
                 let cond = fb.ne(x, lu(fb, 0));
                 fb.select(cond, y, z)
             }
-            OpKind::Cast(to) => self.cast(fb, ty, to, x),
+            OpKind::Cast(to) => self.cast(fb, op.ty, to, x),
             OpKind::Generate(kind) => self.generate(fb, kind, op.out_ty(), index, x, y),
             OpKind::Shift(_) => return None,
         })
+    }
+
+    // ---- half-precision floats ----
+
+    /// The 16 bits `bits` of an element of the half type `ty`, as the `f32` they hold.
+    fn half_to_f32(&self, fb: &FnBuilder<'_>, ty: ElemTy, bits: Val) -> Val {
+        self.call(fb, if ty == ElemTy::F16 { "luma_half_f16_to_f32" } else { "luma_half_bf16_to_f32" }, &[bits])
+    }
+
+    /// The 16 bits (in a `u32`) of the `f32` `x` rounded to the half type `ty`: to nearest even,
+    /// a NaN as the canonical quiet one (see `builtin::HALF_WGSL`).
+    fn f32_to_half(&self, fb: &FnBuilder<'_>, ty: ElemTy, x: Val) -> Val {
+        self.call(fb, if ty == ElemTy::F16 { "luma_half_f32_to_f16" } else { "luma_half_f32_to_bf16" }, &[x])
+    }
+
+    /// `x` rounded to the half type `ty`, as an `f32`.
+    fn round_half(&self, fb: &FnBuilder<'_>, ty: ElemTy, x: Val) -> Val {
+        if ty == ElemTy::F16 {
+            return self.call(fb, "luma_half_round_f16", &[x]);
+        }
+        let bits = self.f32_to_half(fb, ty, x);
+        self.half_to_f32(fb, ty, bits)
     }
 
     // ---- loads and stores ----
@@ -828,6 +859,7 @@ impl<'a> Lower<'a> {
         let at = (j & lu(fb, 32 / bits - 1)) * lu(fb, bits);
         match ty {
             ElemTy::U8 | ElemTy::U16 => (word >> at) & lu(fb, (1 << bits) - 1),
+            ElemTy::F16 | ElemTy::BF16 => self.half_to_f32(fb, ty, (word >> at) & lu(fb, 0xffff)),
             _ => {
                 let up = fb.shl(word, lu(fb, 32 - bits) - at);
                 fb.shr(fb.bitcast(up, KirType::I32), lu(fb, 32 - bits))
@@ -905,6 +937,9 @@ impl<'a> Lower<'a> {
     /// The low bits of the register value `value` of the small integer type `ty`, as a `u32`: the
     /// field it takes in a word of a buffer.
     pub(super) fn field_bits(&self, fb: &FnBuilder<'_>, ty: ElemTy, value: Val) -> Val {
+        if ty.is_half() {
+            return self.f32_to_half(fb, ty, value);
+        }
         let word = if ty.is_small_signed() { fb.bitcast(value, KirType::U32) } else { value };
         word & lu(fb, (1 << ty.small_bits()) - 1)
     }
@@ -1921,21 +1956,24 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
     if narrow_div {
         text.push_str(NARROW_DIV);
     }
-    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Unary(UnOp::Log1p)) && instr.op.ty == ElemTy::F32) {
+    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Unary(UnOp::Log1p)) && instr.op.ty.compute() == ElemTy::F32) {
         text.push_str(&format!("fn luma_log1p(x: f32) -> f32 {{ return {}; }}\n", UnOp::Log1p.expr()));
     }
-    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Unary(UnOp::Expm1)) && instr.op.ty == ElemTy::F32) {
+    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Unary(UnOp::Expm1)) && instr.op.ty.compute() == ElemTy::F32) {
         text.push_str(&format!("fn luma_expm1(x: f32) -> f32 {{ return {}; }}\n", UnOp::Expm1.expr()));
     }
-    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Binary(BinOp::Hypot)) && instr.op.ty == ElemTy::F32) {
+    if instrs().any(|instr| matches!(instr.op.kind, OpKind::Binary(BinOp::Hypot)) && instr.op.ty.compute() == ElemTy::F32) {
         text.push_str(&format!("fn luma_hypot(x: f32, y: f32) -> f32 {{ return {}; }}\n", BinOp::Hypot.expr()));
     }
     // The expressions of the operations name the helpers they call (`luma_erf(x)`); `f64` ones
     // are built in place.
     text.push_str(&special_helpers(|needle| {
+        if needle == "luma_half_" {
+            return instrs().any(uses_half);
+        }
         needle != "luma_ir_"
             && instrs().any(|instr| match instr.op.kind {
-                OpKind::Powf => needle == "luma_powf(" && instr.op.ty == ElemTy::F32,
+                OpKind::Powf => needle == "luma_powf(" && instr.op.ty.compute() == ElemTy::F32,
                 OpKind::Unary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
                 OpKind::Binary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
                 _ => false,

@@ -481,3 +481,34 @@ fn the_environment_variable_switches_the_cache_off() {
         assert!(!enabled_by(Some(off)), "{off}");
     }
 }
+
+#[test]
+fn recording_decisions_without_profiling_logs_the_replay_and_launches_the_same_kernels() {
+    use crate::profile::DecisionSite;
+    let ctx = ctx();
+    let start = data(W * H, 11);
+    let run = |record: bool| {
+        ctx.set_plan_cache(true);
+        ctx.record_decisions(record);
+        let before = ctx.jit().stats();
+        let mut u = A::from_slice_on(&ctx, &start, [W, H]).unwrap();
+        for _ in 0..6 {
+            u = heat(&u, 0.1);
+            u.eval().unwrap();
+        }
+        ctx.sync().unwrap();
+        let launches = ctx.jit().stats().elementwise_launches - before.elementwise_launches;
+        let decisions = ctx.take_decisions();
+        ctx.record_decisions(false);
+        (launches, decisions, bits(&u.to_vec().unwrap()))
+    };
+    let (off, none, want) = run(false);
+    assert!(none.is_empty());
+    let (on, decisions, got) = run(true);
+    assert_eq!(on, off, "recording must not change the kernels launched");
+    assert_eq!(got, want);
+    let replays = decisions.iter().filter(|d| d.site == DecisionSite::PlanReplay).count();
+    assert!(replays >= 1, "the plan was replayed after the first evaluations: {decisions:?}");
+    assert!(decisions.iter().all(|d| !d.chosen.is_empty()));
+    assert!(ctx.jit().plan_stats().hits >= 1);
+}

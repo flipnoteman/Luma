@@ -66,20 +66,20 @@ fn transfer_cases(h: &mut Harness) {
     let ctx = h.ctx.clone();
     if h.want("transfer/upload_i16") {
         assert_eq!(Array::from_slice_on(&ctx, &hi, n).unwrap().to_vec().unwrap(), hi);
-        h.case("transfer/upload_i16", &sz, Work::Bytes(2.0 * n as f64), &mut || {
+        h.transfer_case("transfer/upload_i16", &sz, Work::Bytes(2.0 * n as f64), &mut || {
             Array::from_slice_on(&ctx, &hi, n).unwrap().eval().unwrap();
         });
     }
     if h.want("transfer/upload_f32") {
-        h.case("transfer/upload_f32", &sz, Work::Bytes(4.0 * n as f64), &mut || {
+        h.transfer_case("transfer/upload_f32", &sz, Work::Bytes(4.0 * n as f64), &mut || {
             Array::from_slice_on(&ctx, &hf, n).unwrap().eval().unwrap();
         });
     }
     let (xi, xf) = (Array::from_slice_on(&ctx, &hi, n).unwrap(), Array::from_slice_on(&ctx, &hf, n).unwrap());
     let mut out_i = vec![0i16; n];
     let mut out_f = vec![0f32; n];
-    h.case("transfer/download_i16", &sz, Work::Bytes(2.0 * n as f64), &mut || xi.read_into(&mut out_i).unwrap());
-    h.case("transfer/download_f32", &sz, Work::Bytes(4.0 * n as f64), &mut || xf.read_into(&mut out_f).unwrap());
+    h.transfer_case("transfer/download_i16", &sz, Work::Bytes(2.0 * n as f64), &mut || xi.read_into(&mut out_i).unwrap());
+    h.transfer_case("transfer/download_f32", &sz, Work::Bytes(4.0 * n as f64), &mut || xf.read_into(&mut out_f).unwrap());
 }
 
 fn cast_cases(h: &mut Harness) {

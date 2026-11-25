@@ -117,7 +117,7 @@ high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every qu
 **`x.ne(&x)` does not find the NaNs.** Comparisons with a NaN are the GPU's. `lt`, `le`, `gt`,
 `ge` and `eq` give false for a NaN operand, and `ne` gave false as well on NVIDIA and on
 llvmpipe (the tests that ran), where IEEE says true. Use `x.is_nan()`, and `select(&x.is_nan(), a, b)`
-to replace them. `LUMA_FAST_MATH` additionally folds a comparison of an array with itself.
+to replace them. `LUMA_NUMERICS=fast` additionally folds a comparison of an array with itself.
 
 **What does a float-to-integer cast give out of range?** `to_u32` and `to_i32` truncate toward
 zero and saturate at the largest `f32` inside the range, and NaN becomes 0:
@@ -150,8 +150,8 @@ its terms).** On a CUDA device of compute capability 8.0 or higher (Ampere and l
 TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in `f32`, so
 each entry is within 1.5e-3 of the sum of the absolute values of its terms of the `f32` product (the
 precision of PyTorch's `allow_tf32`). `a.matmul_f32(&b)` is the exact product of one call;
-`ContextOptions::tf32_matmul(false)` or `LUMA_TF32_MATMUL=0` makes every `matmul` of a context exact, and
-`Context::tf32_matmul()` says which a context does. `matmul_batched` and the other backends (wgpu, Metal,
+`ContextOptions::numerics(Numerics::strict())` or `LUMA_NUMERICS=strict` makes every `matmul` of a context exact, and
+`Context::numerics()` says which a context does. `matmul_batched` and the other backends (wgpu, Metal,
 the CPU) compute `f32` products, so results also differ between a CUDA run and one on another backend
 ([Tensor cores](data.md#tensor-cores-tf32)). The dense linear algebra (`lu`, `qr`, `cholesky`, `svd`, ...)
 uses `f32` products only.

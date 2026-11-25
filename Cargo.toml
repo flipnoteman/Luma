@@ -42,6 +42,7 @@ cranelift-frontend = "0.137.2"
 cranelift-native = "0.137.2"
 target-lexicon = "0.13.6"
 bytemuck = { version = "1.21.0", features = ["derive"] }
+half = { version = "2.7.1", features = ["bytemuck"] }
 log = "0.4.25"
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 encase = "0.13.0"
@@ -70,6 +71,7 @@ luma-metal = { workspace = true, optional = true }
 luma-cuda = { workspace = true, optional = true }
 luma-cpu.workspace = true
 bytemuck.workspace = true
+half.workspace = true
 log.workspace = true
 encase.workspace = true
 [dev-dependencies]

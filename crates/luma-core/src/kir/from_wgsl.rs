@@ -108,7 +108,8 @@ pub fn used_bindings(module: &KernelModule) -> (usize, Option<Box<[bool]>>) {
 /// What naga may accept in a kernel: the shader features the device was opened with.
 fn shader_capabilities(features: Features) -> naga::valid::Capabilities {
     use naga::valid::Capabilities as Caps;
-    let mut caps = Caps::empty();
+    // `pack2x16float` / `unpack2x16float` (the half-float conversions) need no device feature on a GPU.
+    let mut caps = Caps::SHADER_FLOAT16_IN_FLOAT32;
     if features.contains(Features::SUBGROUP) {
         caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
     }
@@ -409,6 +410,10 @@ struct FnCtx<'m> {
 /// The operation a stub function named `luma_ir_<op>` of a WGSL module stands for: calls of it
 /// lower to the operation, whatever the stub's body says.
 fn intrinsic_of(name: Option<&str>) -> Option<IrUnOp> {
+    if name? == "luma_half_round_f16" {
+        // The helper of the half-float library has a body (for the sources that are not lowered); the operation is the same.
+        return Some(IrUnOp::RoundF16);
+    }
     Some(match name?.strip_prefix("luma_ir_")? {
         "erf" => IrUnOp::Erf,
         "erfc" => IrUnOp::Erfc,
@@ -1627,6 +1632,25 @@ impl<'m> Lowerer<'m> {
             M::Round => Ok(un(IrUnOp::Round, a, &ta)),
             M::Sign => Ok(un(IrUnOp::Sign, a, &ta)),
             M::CountOneBits => Ok(un(IrUnOp::CountOneBits, a, &ta)),
+            // Only the half-float conversions of the helper library are met: the pair is the
+            // scalar conversion of lane 0 and lane 1.
+            M::Pack2x16float => {
+                let lane = |k: u8| Expr::Swizzle { base: a.clone().boxed(), indices: [k, 0, 0, 0], len: 1, ty: KirType::Scalar(ScalarTy::F32) };
+                let u = KirType::Scalar(ScalarTy::U32);
+                let low = Expr::Unary { op: IrUnOp::F32ToF16Bits, arg: lane(0).boxed(), ty: u.clone() };
+                let high = Expr::Unary { op: IrUnOp::F32ToF16Bits, arg: lane(1).boxed(), ty: u.clone() };
+                let shifted = Expr::Binary { op: IrBinOp::Shl, lhs: high.boxed(), rhs: Expr::LitU32(16).boxed(), ty: u.clone() };
+                Ok((Expr::Binary { op: IrBinOp::BitOr, lhs: low.boxed(), rhs: shifted.boxed(), ty: u.clone() }, u))
+            }
+            M::Unpack2x16float => {
+                let f = KirType::Scalar(ScalarTy::F32);
+                let u = KirType::Scalar(ScalarTy::U32);
+                let low = Expr::Unary { op: IrUnOp::F16BitsToF32, arg: a.clone().boxed(), ty: f.clone() };
+                let high_bits = Expr::Binary { op: IrBinOp::Shr, lhs: a.boxed(), rhs: Expr::LitU32(16).boxed(), ty: u };
+                let high = Expr::Unary { op: IrUnOp::F16BitsToF32, arg: high_bits.boxed(), ty: f };
+                let ty = KirType::Vec { elem: ScalarTy::F32, lanes: 2 };
+                Ok((Expr::Compose { ty: ty.clone(), comps: vec![low, high] }, ty))
+            }
             M::FirstTrailingBit => Ok(un(IrUnOp::FirstTrailingBit, a, &ta)),
             M::FirstLeadingBit => Ok(un(IrUnOp::FirstLeadingBit, a, &ta)),
             M::CountLeadingZeros => Ok(un(IrUnOp::CountLeadingZeros, a, &ta)),

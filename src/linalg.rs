@@ -20,6 +20,7 @@
 use std::panic::Location;
 use std::sync::Arc;
 
+use crate::profile::{Decision, DecisionSite};
 use crate::array::{Array, Failure};
 use crate::builtin::{thomas_plan, thomas_scratch_floats, thomas_workgroups, Builtin, UNROLLED_BLOCK};
 use crate::cyclic;
@@ -370,7 +371,15 @@ fn run(
     let mut scratch = Scratch::new(ctx);
     let params = [n, stride, lines32];
     let tuning = tuning.unwrap_or(*ctx.tuning());
-    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, false, ctx.max_buffer_bytes()) {
+    let line_plan = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, false, ctx.max_buffer_bytes());
+    ctx.jit().note_with(|loc| {
+        let chosen = match &line_plan {
+            Some(plan) => format!("cyclic block={b} workgroup={} shift={}", plan.workgroup, plan.shift),
+            None => format!("thomas block={b}"),
+        };
+        Decision::new("tridiagonal", loc, DecisionSite::LineSolvePlan, chosen)
+    });
+    let (core, groups, scratch_bytes) = if let Some(plan) = line_plan {
         let core = ctx.builtin(
             Builtin::CyclicTridiagonal {
                 block: b as u8,
@@ -470,7 +479,15 @@ fn run_parts(
     let tuning = tuning.unwrap_or(*ctx.tuning());
     let b32 = block as u32;
     let fused = sides.iter().any(|s| matches!(s, PartSide::Pending(_)));
-    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes()) {
+    let line_plan = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes());
+    ctx.jit().note_with(|loc| {
+        let chosen = match &line_plan {
+            Some(plan) => format!("cyclic parts block={block} workgroup={} shift={}", plan.workgroup, plan.shift),
+            None => format!("thomas parts block={block}"),
+        };
+        Decision::new("tridiagonal", loc, DecisionSite::LineSolvePlan, chosen)
+    });
+    let algo = if let Some(plan) = line_plan {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
     } else if (block <= UNROLLED_BLOCK as usize || tuning.native_solve)
         && let thomas = thomas_plan(&tuning, b32, total, stride32, true)

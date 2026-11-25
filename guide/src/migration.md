@@ -4,8 +4,47 @@
 
 0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
 algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
-reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
-behaviour changes without a compile error: `matmul` runs in TF32 on CUDA devices with tensor cores.
+reads, `f16` / `bf16`) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they
+are. One behaviour changes without a compile error: `matmul` runs in TF32 on CUDA devices with tensor cores.
+Some items are deprecated (removed in 0.6) and have replacements already.
+
+### `Numerics` replaces `fast_math`, `tf32_matmul` and the TF32 variables
+
+| Before | Now |
+| --- | --- |
+| `ContextOptions::fast_math(true)` | `ContextOptions::numerics(Numerics::fast())` |
+| `ContextOptions::tf32_matmul(false)` | `ContextOptions::numerics(Numerics::strict())` |
+| `Context::tf32_matmul()` | `Context::numerics().tf32_matmul()` |
+| `LUMA_FAST_MATH=1` | `LUMA_NUMERICS=fast` (or `+fast-math`) |
+| `LUMA_TF32_MATMUL=0` | `LUMA_NUMERICS=strict` (or `-tf32-matmul`) |
+| `LUMA_LINALG_TF32=1` | `LUMA_NUMERICS=default+tf32-linalg` |
+
+The old fields, builders and variables still work (the variables with a one-time warning) and are applied over
+`numerics`. `LUMA_NUMERICS` panics on an unknown value in `ContextOptions::from_env`; the linear-algebra
+TF32 switch is read per context now, not once per process. See [Environment variables](environment.md).
+
+### `Profile::splits` and `FusionSplit` are deprecated
+
+Use `Profile::cuts()` for the cuts (an iterator of operation, location and `SplitReason`) and
+`Context::take_decisions()` right after `finish_profiling` / `profile` for every planner decision
+([Why was it cut](performance.md#why-was-it-cut-cuts-and-decisions)). `Backend::finish_profiling` keeps its
+`splits` argument until 0.6.
+
+### New
+
+- `Array<f16>` and `Array<bf16>` ([Half-precision floats](half.md)).
+- `ContextOptions::host_budget` / `LUMA_HOST_BUDGET`, `Context::paging_stats()` and `Context::memory_model()`
+  ([Transfers](performance.md#transfers)); evicting an array the host holds a copy of, or a cheap result of
+  arrays that stay on the device, transfers nothing.
+- `Context::record_decisions(true)` / `LUMA_RECORD_DECISIONS=1` and `Context::take_decisions()`.
+- Buffers are sized in eighth-octave classes instead of powers of two, so up to 1.4x more data stays on the
+  device before paging on a mix of odd sizes.
+
+### For backend implementors
+
+`kir::ir::IrUnOp` gained `F32ToF16Bits`, `F16BitsToF32` and `RoundF16`: a backend that matches it exhaustively
+needs three more arms. Everything else the HAL gained (the transfer lane: `stage_alloc`, `transfer_in`,
+`transfer_out`, `barrier`, tickets; `memory_now`, `l2_cache_bytes`, `storage_offset_align`) has a default.
 
 ### `matmul` is TF32 by default on CUDA
 
@@ -18,8 +57,8 @@ off for a context:
 ```rust
 use luma::*;
 
-let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
-assert!(!exact.tf32_matmul());
+let exact = Context::with_options(ContextOptions::default().numerics(Numerics::strict()))?;  // or LUMA_NUMERICS=strict
+assert!(!exact.numerics().tf32_matmul());
 let a = Array::from_slice_on(&exact, &[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
 let b = Array::from_slice_on(&exact, &[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
 assert_eq!(a.matmul_f32(&b).to_vec()?, a.to_vec()?);   // the exact product of one call
@@ -90,7 +129,7 @@ implementations.
 - `matmul_nt`, `matmul_tn`, `matmul_tt` and `dot`; `prod` / `product` and the `*_by_key` reductions;
   `sort_by_key`, `set_unique`, `set_union` and `set_intersect`; the elementwise functions of ArrayFire's
   `arith.h`.
-- `ContextOptions::tf32_matmul`, `Context::tf32_matmul()`, `matmul_f32`, `matmul_tf32`
+- `ContextOptions::numerics`, `Context::numerics()`, `matmul_f32`, `matmul_tf32`
   ([Performance guide](performance.md#matrix-products)).
 - The plan cache of eager evaluation (`LUMA_PLAN_CACHE`), compile worker threads (`LUMA_COMPILE_THREADS`)
   and the CPU backend's native matrix products ([Performance guide](performance.md)).

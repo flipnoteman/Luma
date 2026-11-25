@@ -89,6 +89,8 @@ impl_value_operand!(i8);
 impl_value_operand!(u16);
 impl_value_operand!(i16);
 impl_value_operand!(Df32);
+impl_value_operand!(half::f16);
+impl_value_operand!(half::bf16);
 impl_value_operand!(C32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
@@ -773,7 +775,7 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
         // step is summed, and is also what the update of the state reads) is computed once, by
         // their kernel, and not by the reduction alone with every intermediate evaluated on its
         // own.
-        if array.reduced().is_some_and(|reduced| reduced.is_unforced()) {
+        if array.structured().is_some_and(|value| value.is_unforced()) {
             ctx.jit().evaluate_requested();
         }
         array.request()?;
@@ -931,7 +933,7 @@ macro_rules! impl_float_classes {
     )*};
 }
 
-impl_float_classes!(f32, f64, Df32);
+impl_float_classes!(f32, f64, Df32, half::f16, half::bf16);
 
 impl Array<f32> {
     /// Elementwise `atan2(self, x)`: the angle of the point `(x, self)`, `self` being `y`.
@@ -991,6 +993,85 @@ impl Neg for Array<f32> {
         -&self
     }
 }
+
+// -- Half-precision floats --
+//
+// `Array<f16>` and `Array<bf16>` store two bytes per element. Every elementwise operation widens
+// its operands to `f32`, computes in `f32` and rounds the result to the element type, to nearest
+// even (`Op::rounds_half`), so a fused chain gives the bits of the same operations run one by
+// one. The reductions are in `half.rs`.
+
+macro_rules! impl_half_math {
+    ($($t:ty),*) => {$(
+        impl Array<$t> {
+            /// Elementwise square root, computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn sqrt(&self) -> Array<$t> { self.math(UnOp::Sqrt) }
+            /// Elementwise `e^x`, computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn exp(&self) -> Array<$t> { self.math(UnOp::Exp) }
+            /// Elementwise natural logarithm, computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn ln(&self) -> Array<$t> { self.math(UnOp::Ln) }
+            /// Elementwise absolute value.
+            #[track_caller]
+            pub fn abs(&self) -> Array<$t> { self.math(UnOp::Abs) }
+            /// Elementwise sine (radians), computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn sin(&self) -> Array<$t> { self.math(UnOp::Sin) }
+            /// Elementwise cosine (radians), computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn cos(&self) -> Array<$t> { self.math(UnOp::Cos) }
+            /// Elementwise tangent (radians), computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn tan(&self) -> Array<$t> { self.math(UnOp::Tan) }
+            /// Elementwise hyperbolic tangent, computed in `f32` and rounded to the element type.
+            #[track_caller]
+            pub fn tanh(&self) -> Array<$t> { self.math(UnOp::Tanh) }
+            /// Elementwise sign: `-1`, `0` or `1`.
+            #[track_caller]
+            pub fn sign(&self) -> Array<$t> { self.math(UnOp::Sign) }
+            /// Elementwise largest integer not above `x`.
+            #[track_caller]
+            pub fn floor(&self) -> Array<$t> { self.math(UnOp::Floor) }
+            /// Elementwise smallest integer not below `x`.
+            #[track_caller]
+            pub fn ceil(&self) -> Array<$t> { self.math(UnOp::Ceil) }
+            /// Elementwise integer part: `x` rounded toward zero.
+            #[track_caller]
+            pub fn trunc(&self) -> Array<$t> { self.math(UnOp::Trunc) }
+            /// Elementwise nearest integer, halves to the even one.
+            #[track_caller]
+            pub fn round(&self) -> Array<$t> { self.math(UnOp::Round) }
+            /// Elementwise `ln(1 + x)` (see [`Array::log1p`] of an `f32` array), computed in `f32`.
+            #[track_caller]
+            pub fn log1p(&self) -> Array<$t> { self.math(UnOp::Log1p) }
+            /// Elementwise `e^x - 1` (see [`Array::expm1`] of an `f32` array), computed in `f32`.
+            #[track_caller]
+            pub fn expm1(&self) -> Array<$t> { self.math(UnOp::Expm1) }
+        }
+
+        impl Neg for &Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                self.neg_at(Location::caller())
+            }
+        }
+
+        impl Neg for Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                self.neg_at(Location::caller())
+            }
+        }
+    )*};
+}
+
+impl_half_math!(half::f16, half::bf16);
 
 macro_rules! impl_float_math {
     ($($t:ty),*) => {$(
@@ -1055,7 +1136,7 @@ macro_rules! impl_float_math {
     )*};
 }
 
-impl_float_math!(f32, f64);
+impl_float_math!(f32, f64, half::f16, half::bf16);
 
 impl<T: ScalarType> Array<T> {
     #[track_caller]
@@ -1449,6 +1530,8 @@ impl_operators!(u32);
 impl_operators!(i32);
 impl_operators!(f64);
 impl_operators!(Df32);
+impl_operators!(half::f16);
+impl_operators!(half::bf16);
 impl_operators!(C32);
 impl_scalar_operators!(f32);
 impl_scalar_operators!(u32);

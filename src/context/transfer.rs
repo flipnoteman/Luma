@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytemuck::Pod;
-use luma_core::hal::advise_huge_pages;
+use luma_core::hal::{advise_huge_pages, HostBytes};
 use luma_core::{BackendError, Buffer};
 
 use crate::array::Storage;
 use crate::error::{LumaError, Result};
-use crate::gpu::pool;
+use luma_core::hal::size_class;
 
 use super::Context;
 
@@ -101,7 +101,7 @@ impl Context {
         self.abort_recording()?;
         let bytes = data.len() as u64;
         let max = self.max_buffer_bytes();
-        pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
         self.relieving(bytes, || match self.hal().record_upload(dst, data, max) {
             Ok(()) => Ok(Some(())),
             Err(BackendError::OutOfMemory { .. }) => Ok(None),
@@ -121,7 +121,7 @@ impl Context {
     pub(crate) fn alloc_filled(&self, data: &[u8]) -> Result<Buffer> {
         let bytes = data.len() as u64;
         let max = self.max_buffer_bytes();
-        let class = pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        let class = size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
         #[cfg(test)]
         self.inner.created_bytes.fetch_add(class, std::sync::atomic::Ordering::Relaxed);
         self.relieving(class, || match self.hal().alloc_filled(data, max) {
@@ -140,7 +140,7 @@ impl Context {
     /// without the data. Only with [`Context::zero_copy`].
     pub(crate) fn alloc_host_buffer(&self, bytes: u64) -> Result<Buffer> {
         let max = self.max_buffer_bytes();
-        let class = pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        let class = size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
         #[cfg(test)]
         self.inner.created_bytes.fetch_add(class, std::sync::atomic::Ordering::Relaxed);
         let buffer = self.relieving(class, || match self.hal().alloc_host_buffer(bytes, max) {
@@ -218,9 +218,10 @@ impl Context {
     /// Reads the first `bytes` bytes of `buffer` like [`Context::read`], but through one staging
     /// buffer of a bounded size and without noting the waits in [`WaitHistory`].
     /// For readbacks made while the device is full.
-    pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<HostBytes> {
         self.abort_recording()?;
-        self.read_vec(bytes, |dst| {
+        let len = usize::try_from(bytes).map_err(|_| LumaError::InvalidShape(format!("{bytes} bytes do not fit in host memory")))?;
+        HostBytes::filled_by::<LumaError>(len, |dst| {
             self.notify_released();
             self.hal().read_into(buffer, dst, true, self.inner.waits.budget())?;
             Ok(())

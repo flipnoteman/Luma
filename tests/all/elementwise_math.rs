@@ -160,7 +160,7 @@ fn df32_log1p_and_expm1_are_accurate_to_43_bits_in_every_form() {
     for (form, options) in [
         ("default", ContextOptions::from_env()),
         ("dekker", ContextOptions::from_env().df_fma(false)),
-        ("fast_math", ContextOptions::from_env().fast_math(true)),
+        ("fast_math", ContextOptions::from_env().numerics(luma::Numerics::fast())),
     ] {
         let ctx = context(options);
         let mut random = Random(9);

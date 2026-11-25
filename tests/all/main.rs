@@ -5,6 +5,7 @@
 #![allow(clippy::duplicate_mod)]
 
 mod common;
+mod decisions;
 mod dense_host;
 
 mod argmax;
@@ -35,6 +36,7 @@ mod filter;
 mod fusion;
 mod generators;
 mod group;
+mod half;
 mod integers_i32;
 mod iterate_all;
 mod iterate_until;
@@ -67,6 +69,7 @@ mod sparse;
 mod spill;
 mod threads;
 mod transfer;
+mod transfer_lanes;
 mod tridiagonal;
 mod vector_reductions;
 mod views;

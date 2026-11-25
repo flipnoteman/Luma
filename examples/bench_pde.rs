@@ -36,7 +36,7 @@ struct Bench {
     ctx: Context,
     quick: bool,
     only: Option<String>,
-    profiles: Vec<(String, String, Profile)>,
+    profiles: Vec<(String, String, Profile, Vec<luma::Decision>)>,
     skipped: Vec<(String, String)>,
 }
 
@@ -103,7 +103,7 @@ impl Bench {
             match self.ctx.profile(f) {
                 Ok(((), p)) => {
                     let row = (p.launches().to_string(), format!("{:.3}", p.total().as_secs_f64() * 1e3));
-                    self.profiles.push((name.to_string(), size.to_string(), p));
+                    self.profiles.push((name.to_string(), size.to_string(), p, self.ctx.take_decisions()));
                     row
                 }
                 Err(e) => ("err".to_string(), format!("{e}")),
@@ -1714,7 +1714,7 @@ fn converge(b: &mut Bench) {
 // =================================================================================================
 
 fn print_profiles(b: &Bench) {
-    for (name, size, p) in &b.profiles {
+    for (name, size, p, decisions) in &b.profiles {
         println!("\n== {name} [{size}]: {} launches, {:.3} ms GPU", p.launches(), p.total().as_secs_f64() * 1e3);
         println!("   {:<100} {:>8} {:>10}", "kernel", "launches", "total ms");
         let mut kernels: Vec<_> = p.kernels.iter().collect();
@@ -1727,7 +1727,7 @@ fn print_profiles(b: &Bench) {
             println!("   ... {} more labels", p.kernels.len() - 12);
         }
         let mut notes: BTreeMap<String, usize> = BTreeMap::new();
-        for s in &p.splits {
+        for s in decisions.iter().filter(|d| matches!(d.site, luma::DecisionSite::Cut(_))) {
             *notes.entry(s.to_string()).or_default() += 1;
         }
         for (note, count) in notes {

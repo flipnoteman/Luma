@@ -1,5 +1,5 @@
 //! The suites, in the order they run. Each `run` verifies its cases against host references and
-//! times them through the [`Harness`](crate::harness::Harness).
+//! times them through the [`Harness`].
 
 pub mod accum;
 pub mod cfd;

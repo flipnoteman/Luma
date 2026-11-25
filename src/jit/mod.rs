@@ -30,7 +30,7 @@
 //!   buffers as the device can bind (the evaluated arrays beyond that are first copied into one
 //!   buffer that they are windows of, see `pack`, which a kernel binds once). A new node that would exceed one of them evaluates its
 //!   biggest (for the depth: its deepest) operand first, which splits long chains into several
-//!   kernels. Profiles list every such cut with its reason ([`FusionSplit`]).
+//!   kernels. Profiles list every such cut with its reason ([`Decision`]).
 //!   The biggest operand is not evaluated alone if other live arrays *of the same length* share pending operations with
 //!   it (they read nodes that its expression contains): those are computed in the same
 //!   multi-output kernel, as far as the limits allow. Arrays that advance in lock step (`x`, `y`,
@@ -161,9 +161,11 @@ pub(crate) mod cost;
 mod inline;
 mod kirgen;
 mod launch;
+pub(crate) mod lineage;
 mod looped;
 mod operator;
 mod multireduce;
+pub(crate) mod structured;
 mod pack;
 mod params;
 mod plancache;
@@ -177,6 +179,7 @@ mod readers;
 mod rerun;
 mod replay;
 mod simplify;
+mod rules;
 pub(crate) mod speculate;
 pub(crate) mod stack;
 mod staging;
@@ -201,7 +204,7 @@ use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
 use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::kernel::{self, KernelCore, KernelKey};
-use crate::profile::{FusionSplit, SplitReason};
+use crate::profile::{Decision, DecisionSite, SplitReason, Verdict as DecisionVerdict};
 use luma_core::kir::KernelModule;
 
 use inline::{inline, Judgement, Lowered, Verdict};
@@ -305,6 +308,13 @@ pub(crate) enum ElemTy {
     I8,
     U16,
     I16,
+    /// Half-precision floats: [`half::f16`] and [`half::bf16`]. An `f32` register holding a value
+    /// that is always exactly representable in the type (every operation computes in `f32` and
+    /// rounds its result to the type again, to nearest even: `kirgen::Lower::round`), two
+    /// elements to a `u32` word in buffers (`ElemLayout::HALF`, the bits of the host slice). The
+    /// accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` convert at the buffer.
+    F16,
+    BF16,
     /// 64-bit float (needs `luma_core::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
@@ -336,6 +346,10 @@ impl ElemTy {
             Some(ElemTy::U16)
         } else if id == TypeId::of::<i16>() {
             Some(ElemTy::I16)
+        } else if id == TypeId::of::<half::f16>() {
+            Some(ElemTy::F16)
+        } else if id == TypeId::of::<half::bf16>() {
+            Some(ElemTy::BF16)
         } else if id == TypeId::of::<f64>() {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
@@ -353,7 +367,7 @@ impl ElemTy {
 
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
-            ElemTy::F32 => "f32",
+            ElemTy::F32 | ElemTy::F16 | ElemTy::BF16 => "f32",
             ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => "u32",
             ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => "i32",
             ElemTy::F64 => "f64",
@@ -361,9 +375,27 @@ impl ElemTy {
         }
     }
 
+    /// Whether this is a half-precision float (see [`ElemTy::F16`]).
+    pub(crate) fn is_half(self) -> bool {
+        matches!(self, ElemTy::F16 | ElemTy::BF16)
+    }
+
     /// Whether this is an 8-bit or 16-bit integer.
-    pub(crate) fn is_small(self) -> bool {
+    pub(crate) fn is_small_int(self) -> bool {
         matches!(self, ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16)
+    }
+
+    /// Whether elements of this type are narrower than a word: the 8-bit and 16-bit integers
+    /// and the half-precision floats, which share words in buffers. Only the integers narrow
+    /// their results ([`ElemTy::is_small_int`]); a float half never goes through the sign
+    /// extension of [`ElemTy::is_small_signed`].
+    pub(crate) fn is_small(self) -> bool {
+        self.is_small_int() || self.is_half()
+    }
+
+    /// The type the arithmetic on elements of this type is done in: `F32` for the halves.
+    pub(crate) fn compute(self) -> ElemTy {
+        if self.is_half() { ElemTy::F32 } else { self }
     }
 
     /// Whether elements of this type share words in buffers: the bits of a `bool`, the small integers.
@@ -375,7 +407,7 @@ impl ElemTy {
     pub(crate) fn small_bits(self) -> u32 {
         match self {
             ElemTy::U8 | ElemTy::I8 => 8,
-            ElemTy::U16 | ElemTy::I16 => 16,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 16,
             _ => 0,
         }
     }
@@ -401,7 +433,7 @@ impl ElemTy {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
             ElemTy::Bool => ElemLayout::PACKED,
             ElemTy::U8 | ElemTy::I8 => ElemLayout::BYTE,
-            ElemTy::U16 | ElemTy::I16 => ElemLayout::HALF,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => ElemLayout::HALF,
             ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
@@ -416,7 +448,7 @@ impl ElemTy {
         match self {
             ElemTy::Bool => 0.125,
             ElemTy::U8 | ElemTy::I8 => 1.0,
-            ElemTy::U16 | ElemTy::I16 => 2.0,
+            ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 2.0,
             other => other.layout().stride() as f64,
         }
     }
@@ -424,7 +456,7 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => 1,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => 1,
             ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
@@ -441,6 +473,8 @@ impl ElemTy {
             ElemTy::I8 => "i8",
             ElemTy::U16 => "u16",
             ElemTy::I16 => "i16",
+            ElemTy::F16 => "f16",
+            ElemTy::BF16 => "bf16",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
             ElemTy::C32 => "C32",
@@ -739,6 +773,27 @@ impl Op {
         }
     }
 
+    /// Whether the value of this operation, computed in `f32`, is rounded to its half-precision
+    /// element type (to nearest even) before anything reads it: every operation that can give a
+    /// value the type does not hold. Not the ones whose result is one of their operands or an
+    /// integer no larger than them (negation, absolute value, minimum, maximum, selection, the
+    /// roundings to integers, ...), nor a cast that keeps the type.
+    pub(crate) fn rounds_half(&self) -> bool {
+        if !self.out_ty().is_half() {
+            return false;
+        }
+        match self.kind {
+            OpKind::Unary(op) => !matches!(
+                op,
+                UnOp::Neg | UnOp::Abs | UnOp::Id | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::Conj
+            ),
+            OpKind::Binary(op) => !matches!(op, BinOp::Min | BinOp::Max | BinOp::Copysign),
+            OpKind::Select | OpKind::Clamp | OpKind::Shift(_) => false,
+            OpKind::Cast(to) => self.ty != to,
+            _ => true,
+        }
+    }
+
     /// The element type operand `index` must have.
     pub(crate) fn operand_ty(&self, index: usize) -> ElemTy {
         match (&self.kind, index) {
@@ -780,7 +835,15 @@ impl Scalar {
     pub(crate) fn of<T: ScalarType>(value: T) -> std::result::Result<Self, LumaError> {
         let ty = ElemTy::of::<T>()?;
         let bits = match ty.slots() {
-            1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
+            1 => {
+                let word = bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()));
+                match ty {
+                    // The register of a half holds the value widened to `f32`.
+                    ElemTy::F16 => u64::from(half::f16::from_bits(word as u16).to_f32().to_bits()),
+                    ElemTy::BF16 => u64::from(half::bf16::from_bits(word as u16).to_f32().to_bits()),
+                    _ => u64::from(word),
+                }
+            }
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
         // The register of a signed small integer holds the sign-extended value.
@@ -797,7 +860,7 @@ impl Scalar {
     /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => [self.bits as u32, 0, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 | ElemTy::F16 | ElemTy::BF16 => [self.bits as u32, 0, 0],
             ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
@@ -898,9 +961,9 @@ pub(crate) struct Node {
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     ctx: Context,
-    /// Set when the node stands for a reduction that is recorded when the node is evaluated (see
-    /// [`deferred`]).
-    deferred: OnceLock<Arc<crate::reduce::Reduced>>,
+    /// Set when the node stands for a structured value that is recorded when the node is evaluated (see
+    /// [`deferred_value`]).
+    deferred: OnceLock<Arc<structured::Structured>>,
     /// What failures of this node are reported as.
     name: &'static str,
     location: &'static Location<'static>,
@@ -1217,8 +1280,8 @@ impl Node {
         self.id
     }
 
-    /// The reduction this node stands for the value of, if it is such a node.
-    pub(crate) fn deferred_reduced(&self) -> Option<&Arc<crate::reduce::Reduced>> {
+    /// The structured value this node stands for the value of, if it is such a node.
+    pub(crate) fn deferred_value(&self) -> Option<&Arc<structured::Structured>> {
         self.deferred.get()
     }
 
@@ -1241,7 +1304,7 @@ impl Node {
             Some(args) => evaluate(self, args).map(Arc::new),
             None => match (self.looped.get(), self.deferred.get()) {
                 (Some((plan, j)), _) => plan.output(&self.ctx, *j, self.name, self.location),
-                (None, Some(reduced)) => reduced.record_once(&self.ctx).clone().map_err(Failure::Inherited),
+                (None, Some(value)) => value.record_once(&self.ctx).clone().map_err(Failure::Inherited),
                 (None, None) => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
             },
         };
@@ -1927,20 +1990,17 @@ fn pending_depth(args: &[Src]) -> Option<u16> {
             memo.insert(node.id, node.depth());
             continue;
         };
-        let inner: Vec<Arc<Node>> = operands
-            .into_iter()
-            .take(node.op.kind.arity())
-            .filter_map(|operand| match operand {
-                Src::Node(inner) if inner.evaluated().is_none() => Some(inner),
-                _ => None,
-            })
-            .collect();
+        // The operands that are still pending (an iterator over the copy: no allocation per node).
+        let inner = operands.into_iter().take(node.op.kind.arity()).filter_map(|operand| match operand {
+            Src::Node(inner) if inner.evaluated().is_none() => Some(inner),
+            _ => None,
+        });
         if !expanded {
-            stack.push((Arc::clone(&node), true));
-            stack.extend(inner.into_iter().filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
+            stack.push((node, true));
+            stack.extend(inner.filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
             continue;
         }
-        let depth = inner.iter().filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
+        let depth = inner.filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
         memo.insert(node.id, depth);
     }
     roots.iter().filter_map(|node| memo.get(&node.id).copied()).max()
@@ -1995,14 +2055,14 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
         OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
         OpKind::Clamp => op.ty != ElemTy::C32,
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
-        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
+        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::F16 | ElemTy::BF16),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };
     if !exists {
         return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
     }
-    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
+    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.caps().contains(crate::caps::Caps::F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
     }
     // WGSL has no `f64` math functions: they exist where the backend lowers them itself.
@@ -2087,13 +2147,6 @@ fn create_with(
     }
     let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
     check_supported(ctx, op, name).map_err(Failure::New)?;
-    // A shift reads its source at other elements than the one it computes, which a window cannot
-    // (see `pack`): the source gets the buffer of its own.
-    if matches!(op.kind, OpKind::Shift(_))
-        && let Some(Src::Buffer(source)) = args.first()
-    {
-        source.detach().map_err(Failure::New)?;
-    }
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
@@ -2320,7 +2373,7 @@ fn settle(
             } else {
                 SplitReason::Depth { limit: usize::from(MAX_DEPTH) }
             };
-            jit.note_split(name, location, reason);
+            jit.note_cut(name, location, reason);
         }
         if !too_big {
             // Only the nesting: evaluating the deepest operand cuts the chain.
@@ -2385,12 +2438,12 @@ fn settle(
     }
 }
 
-/// A node of `len` elements of type `ty` that stands for the value of `reduced`: evaluating it
-/// records the reduction. Operations on a reduction that cannot extend its last pass (any on a
+/// A node of `len` elements of type `ty` that stands for the value of `value`: evaluating it
+/// records the value. Operations on a reduction that cannot extend its last pass (any on a
 /// `Df32` sum) read this node, so that building them evaluates nothing; the reduction is
 /// recorded when something that needs the value is, after the arrays it shares work with. It has
 /// no operands: expressions that read it find it evaluated first, like a loop leaf.
-pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate::reduce::Reduced>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
+pub(crate) fn deferred_value(ctx: &Context, len: usize, ty: ElemTy, value: Arc<structured::Structured>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
     let measured = measure(&[]);
     let node = Arc::new(Node {
         trace: 0,
@@ -2421,7 +2474,7 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
     });
-    let _ = node.deferred.set(reduced);
+    let _ = node.deferred.set(value);
     ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
     ctx.jit().pending_nodes.fetch_add(1, Ordering::Relaxed);
     node
@@ -2905,8 +2958,8 @@ pub(crate) struct JitState {
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
-    /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
-    reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
+    /// The structured values made and not yet recorded (see [`multireduce`]), oldest first.
+    structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
     merged_seen: Mutex<FxMap<u64, u32>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
@@ -2944,8 +2997,8 @@ pub(crate) struct JitState {
     recipe_hits: AtomicU64,
     /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
     write_epoch: AtomicU64,
-    /// The cuts of expressions made while profiling (or recording them in tests), if on.
-    splits: Mutex<Option<Vec<FusionSplit>>>,
+    /// The planner's decisions made while profiling or after `record_decisions`, if on.
+    decisions: Mutex<Option<Vec<Decision>>>,
     /// Instructions of the program of the last kernel looked up (tests).
     #[cfg(test)]
     last_program_len: AtomicUsize,
@@ -2981,8 +3034,8 @@ pub(crate) struct JitState {
     plan_stats: plancache::Stats,
     /// Evaluations the plan cache still sits out (see [`plancache`]).
     plan_skip: AtomicU32,
-    /// Whether [`JitState::splits`] is recording (kept apart so that looking is a load).
-    splits_on: AtomicBool,
+    /// Whether [`JitState::decisions`] is recording (kept apart so that looking is a load).
+    decisions_on: AtomicBool,
     /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
     /// replays only if the graph it walked is all of them.
     pending_nodes: std::sync::atomic::AtomicI64,
@@ -3050,7 +3103,7 @@ impl JitState {
             scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
-            reductions: Mutex::new(Vec::new()),
+            structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
@@ -3073,7 +3126,7 @@ impl JitState {
             #[cfg(test)]
             recipe_hits: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
-            splits: Mutex::new(None),
+            decisions: Mutex::new(env_records_decisions().then(Vec::new)),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
             #[cfg(test)]
@@ -3095,7 +3148,7 @@ impl JitState {
             plan_epoch: AtomicU64::new(0),
             plan_stats: plancache::Stats::default(),
             plan_skip: AtomicU32::new(0),
-            splits_on: AtomicBool::new(false),
+            decisions_on: AtomicBool::new(env_records_decisions()),
             pending_nodes: std::sync::atomic::AtomicI64::new(0),
         }
     }
@@ -3150,7 +3203,7 @@ impl JitState {
 
     /// How to run `key` (which [`inlines`](program::FusedKey::inlines)) over about `len`
     /// elements, found once per program structure and length class (see [`inline::judge`]).
-    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize) -> Arc<Judgement> {
+    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize, op: &'static str, location: &'static Location<'static>) -> Arc<Judgement> {
         use std::hash::{Hash, Hasher};
         let cap = self.max_inlined(ctx.tuning());
         let class = len.next_power_of_two();
@@ -3171,9 +3224,11 @@ impl JitState {
                 && entry.outputs == key.outputs
                 && entry.tail == key.tail
         };
-        let (judgement, _estimates) = match entries.iter().find(|entry| same(entry)) {
+        let mut cached = true;
+        let (judgement, estimates) = match entries.iter().find(|entry| same(entry)) {
             Some(entry) => (Arc::clone(&entry.judgement), entry.estimates),
             None => {
+                cached = false;
                 let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model(), ctx.tuning(), ctx.tuning().staging && self.staging_enabled());
                 let judgement = Arc::new(judgement);
                 entries.push(JudgementEntry {
@@ -3190,11 +3245,53 @@ impl JitState {
                 (judgement, estimates)
             }
         };
+        drop(judgements);
+        if self.recording_decisions() {
+            self.note_judgement(&judgement, estimates, cached, op, location);
+        }
         #[cfg(test)]
         {
-            *lock(&self.last_judgement) = Some(format!("{judgement:?} {_estimates:?}"));
+            *lock(&self.last_judgement) = Some(format!("{judgement:?} {estimates:?}"));
         }
         judgement
+    }
+
+    /// Records what the inliner decided (and, when it ran the program in one kernel, whether the
+    /// stencil staging was used).
+    fn note_judgement(&self, judgement: &Judgement, estimates: inline::Estimates, cached: bool, op: &'static str, location: &'static Location<'static>) {
+        let ns = |ns: f64| DecisionVerdict::Estimate { ns };
+        let mut decision;
+        match judgement {
+            Judgement::Run { staging } => {
+                decision = Decision::new(op, location, DecisionSite::Inline, "inline").cached(cached);
+                if let Some(&(sub, t)) = estimates.best_sub.as_ref() {
+                    decision = decision.candidate(format!("materialise sub={sub}"), ns(t));
+                }
+                self.note_decision(decision);
+                let staged = match staging {
+                    Some(staging) => Decision::new(op, location, DecisionSite::Staging, format!("staged tile={}x{} subs={}", staging.tile[0], staging.tile[1], staging.subs.len())),
+                    None => Decision::new(op, location, DecisionSite::Staging, "direct"),
+                };
+                let mut staged = staged.cached(cached);
+                if staging.is_none()
+                    && let Some(t) = estimates.staged_ns
+                {
+                    staged = staged.candidate("staged", ns(t));
+                }
+                if staging.is_some() {
+                    staged = staged.candidate("direct", ns(estimates.inline_ns));
+                }
+                self.note_decision(staged);
+            }
+            Judgement::Materialise { subs, .. } => {
+                decision = Decision::new(op, location, DecisionSite::Inline, format!("materialise subs={}", subs.len())).cached(cached);
+                decision = decision.candidate("inline", ns(estimates.inline_ns));
+                if let Some(t) = estimates.staged_ns {
+                    decision = decision.candidate("staged", ns(t));
+                }
+                self.note_decision(decision);
+            }
+        }
     }
 
     /// Counts a reduction pass other than the fused first one (see [`Stats`]).
@@ -3290,33 +3387,79 @@ impl JitState {
         LIVE.with_borrow_mut(|slots| f(slots.of(self)))
     }
 
-    /// Starts recording the cuts of expressions (see [`FusionSplit`]).
-    pub(crate) fn start_splits(&self) {
-        *lock(&self.splits) = Some(Vec::new());
-        self.splits_on.store(true, Ordering::Relaxed);
+    /// Starts recording decisions (see [`Decision`]); an earlier list is kept.
+    pub(crate) fn start_decisions(&self) {
+        lock(&self.decisions).get_or_insert_with(Vec::new);
+        self.decisions_on.store(true, Ordering::Relaxed);
     }
 
-    /// Stops recording cuts and returns them.
-    pub(crate) fn take_split_notes(&self) -> Vec<FusionSplit> {
-        self.splits_on.store(false, Ordering::Relaxed);
-        lock(&self.splits).take().unwrap_or_default()
+    /// Whether decisions are recorded: call sites build a [`Decision`] only if so.
+    #[inline]
+    pub(crate) fn recording_decisions(&self) -> bool {
+        self.decisions_on.load(Ordering::Relaxed)
     }
 
-    /// Notes that an expression was cut into several kernels, if anyone listens.
-    pub(crate) fn note_split(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
-        if let Some(splits) = lock(&self.splits).as_mut() {
-            splits.push(FusionSplit { op, location, reason });
+    /// Mutes (or unmutes) the recording without dropping the list: for a replay, whose launches
+    /// would re-derive decisions the plan already holds.
+    pub(crate) fn pause_decisions(&self, paused: bool) {
+        self.decisions_on.store(!paused, Ordering::Relaxed);
+    }
+
+    /// Stops recording decisions and returns them.
+    pub(crate) fn stop_decisions(&self) -> Vec<Decision> {
+        self.decisions_on.store(false, Ordering::Relaxed);
+        lock(&self.decisions).take().unwrap_or_default()
+    }
+
+    /// Keeps `decisions` (those of a profiled region) for the next [`JitState::drain_decisions`]
+    /// without recording more.
+    pub(crate) fn park_decisions(&self, decisions: Vec<Decision>) {
+        *lock(&self.decisions) = Some(decisions);
+    }
+
+    /// Returns the decisions recorded so far and goes on recording (if it was on).
+    pub(crate) fn drain_decisions(&self) -> Vec<Decision> {
+        lock(&self.decisions).as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Records a decision, if anyone listens.
+    pub(crate) fn note_decision(&self, decision: Decision) {
+        if let Some(list) = lock(&self.decisions).as_mut() {
+            list.push(decision);
+        }
+    }
+
+    /// Records the decision `build` makes, if anyone listens; `build` gets the caller's location
+    /// (for sites that have no operation of the user's to point at).
+    #[track_caller]
+    pub(crate) fn note_with(&self, build: impl FnOnce(&'static Location<'static>) -> Decision) {
+        if self.recording_decisions() {
+            self.note_decision(build(Location::caller()));
+        }
+    }
+
+    /// Records that an expression was cut into several kernels, if anyone listens.
+    pub(crate) fn note_cut(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
+        if self.recording_decisions() {
+            self.note_decision(Decision::new(op, location, DecisionSite::Cut(reason), cut_label(reason)));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn record_splits(&self) {
-        self.start_splits();
+        self.start_decisions();
     }
 
+    /// The `Cut` decisions recorded since `record_splits` (what `Profile::cuts` gives).
     #[cfg(test)]
-    pub(crate) fn take_splits(&self) -> Vec<FusionSplit> {
-        self.take_split_notes()
+    pub(crate) fn take_splits(&self) -> Vec<TestCut> {
+        self.stop_decisions()
+            .into_iter()
+            .filter_map(|d| match d.site {
+                DecisionSite::Cut(reason) => Some(TestCut { op: d.op, location: d.location, reason, decision: d }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Overrides the most input buffers of a kernel (tests, to behave like a device with fewer bindings).
@@ -4021,6 +4164,45 @@ impl FastKernel {
             && self.tile == key.tile
             && self.guard == key.guard
             && self.coarsen == key.coarsen
+    }
+}
+
+/// A cut as the tests read it.
+#[cfg(test)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct TestCut {
+    pub(crate) op: &'static str,
+    pub(crate) location: &'static Location<'static>,
+    pub(crate) reason: SplitReason,
+    decision: Decision,
+}
+
+#[cfg(test)]
+impl std::fmt::Display for TestCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.decision.fmt(f)
+    }
+}
+
+/// `LUMA_RECORD_DECISIONS=1`: contexts start with decision recording on.
+fn env_records_decisions() -> bool {
+    std::env::var("LUMA_RECORD_DECISIONS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+}
+
+/// The stable label of a cut: its values are counts and limits, never addresses.
+fn cut_label(reason: SplitReason) -> String {
+    match reason {
+        SplitReason::Nodes { nodes, limit } => format!("nodes {nodes}>{limit}"),
+        SplitReason::Depth { limit } => format!("depth >{limit}"),
+        SplitReason::Inputs { inputs, limit } => format!("inputs {inputs}>{limit}"),
+        SplitReason::Live { live, limit } => format!("live {live}>{limit}"),
+        SplitReason::Scalars { words, limit } => format!("scalars {words}>{limit}"),
+        SplitReason::Inlined { instructions, limit } => format!("inlined {instructions}>{limit}"),
+        SplitReason::Materialised { instances } => format!("materialised x{instances}"),
+        SplitReason::Shared { weight } => format!("shared weight {weight}"),
+        #[allow(unreachable_patterns)]
+        _ => format!("{reason:?}"),
     }
 }
 

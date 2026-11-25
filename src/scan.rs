@@ -1114,7 +1114,7 @@ impl<'a> Lines<'a> {
                     return Ok(());
                 }
                 let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
-                evaluated = storage.pin_single()?;
+                evaluated = storage.pin_single_read()?;
                 Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() }
             }
         };

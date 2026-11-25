@@ -272,6 +272,7 @@ impl Context {
                 .iter()
                 .map(|arg| match *arg {
                     RawArg::Storage { buffer, bytes, writable } => {
+                        debug_assert_eq!(buffer.offset(), 0, "a recording captures whole buffers");
                         CmdArg::Storage { buffer: buffer.clone(), bytes, writable }
                     }
                     RawArg::Uniform(data) => CmdArg::Uniform(data.into()),

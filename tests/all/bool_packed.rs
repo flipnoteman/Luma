@@ -12,7 +12,7 @@ const SIZES: [usize; 10] = [1, 31, 32, 33, 63, 64, 65, 1000, 1 << 20, (1 << 20) 
 
 /// A context whose buffers hold 1024 bytes: 256 elements per segment, 8 words of bits.
 fn chunked() -> Context {
-    Context::with_options(ContextOptions::default().chunk_bytes(1024)).expect("a device is available")
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).expect("a device is available")
 }
 
 fn floats(n: usize, seed: u64) -> Vec<f32> {
@@ -585,7 +585,7 @@ fn chunked_arrays_split_on_word_boundaries() {
 
 #[test]
 fn spilled_boolean_arrays_come_back() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1 << 16).memory_budget(1 << 20)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(1 << 20)).unwrap();
     let n = (1 << 20) + 7;
     let arrays: Vec<(Vec<bool>, Array<bool>)> = (0..24)
         .map(|k| {

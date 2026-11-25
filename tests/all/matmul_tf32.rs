@@ -1,7 +1,7 @@
 //! `matmul_tf32` and the default `matmul` against a host product in `f64`: on tensor cores (CUDA)
 //! the operands are rounded to TF32, so every entry is within 1.5e-3 of the sum of the absolute
 //! products of its `f32` operands; elsewhere (and for shapes the tensor-core kernels do not take)
-//! it is the `f32` product. `matmul_f32` and a context with `tf32_matmul(false)` are always `f32`.
+//! it is the `f32` product. `matmul_f32` and a context with `Numerics::strict()` are always `f32`.
 
 use crate::common;
 
@@ -117,8 +117,8 @@ fn the_f32_product_does_not_round_its_operands() {
     check(&lhs.matmul_f32(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32");
     check(&luma::matmul_f32(&lhs, &rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "f32 function");
     // A context with the tensor cores turned off: `matmul` is the same product.
-    let off = Context::with_options(ContextOptions::from_env().tf32_matmul(false)).unwrap();
-    assert!(!off.tf32_matmul());
+    let off = Context::with_options(ContextOptions::from_env().numerics(luma::Numerics::strict())).unwrap();
+    assert!(!off.numerics().tf32_matmul());
     let (_, _, lhs, rhs) = operands(&off, k, m, n);
     check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, 5e-5, 1e-6, "tf32 off");
 }

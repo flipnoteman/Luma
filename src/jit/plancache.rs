@@ -32,6 +32,7 @@ use crate::array::Storage;
 use crate::context::Context;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
+use crate::profile::{Decision, DecisionSite};
 
 use super::launch;
 use super::program::{Fused, FusedKey};
@@ -415,7 +416,6 @@ fn stamp(jit: &JitState, ctx: &Context) -> u64 {
 fn usable(jit: &JitState, ctx: &Context) -> bool {
     jit.plan_cache.load(Ordering::Relaxed)
         && !ACTIVE.with(Cell::get)
-        && !jit.splits_on.load(Ordering::Relaxed)
         && !ctx.check_finite()
         && !ctx.recording_here()
         && !ctx.is_profiling()
@@ -649,7 +649,21 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
         }
         Some((_, Some(Some(plan)))) if plan.nodes == walk.nodes.len() && plan.leaves == walk.leaves.len() && plan.classes == walk.classes.len() => {
             lock(&jit.plans).misses = 0;
-            if replay(&ctx, &plan, &walk).is_ok() {
+            // A replay makes no planning decisions (the launches re-derive what the plan holds): it
+            // records one `PlanReplay` instead.
+            let recording = jit.recording_decisions();
+            if recording {
+                jit.pause_decisions(true);
+            }
+            let replayed = replay(&ctx, &plan, &walk);
+            if recording {
+                jit.pause_decisions(false);
+                let first = &pending[0];
+                if replayed.is_ok() {
+                    jit.note_decision(Decision::new(first.name, first.location, DecisionSite::PlanReplay, "replay"));
+                }
+            }
+            if replayed.is_ok() {
                 jit.plan_stats.hits.fetch_add(1, Ordering::Relaxed);
             } else {
                 // Whatever the plan finished is finished; the rest is evaluated as ever.

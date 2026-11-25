@@ -7,6 +7,7 @@
 
 use std::fmt::Debug;
 
+mod half;
 mod stats;
 
 use crate::harness::*;
@@ -36,6 +37,8 @@ pub fn run(h: &mut Harness) {
     h.guarded("rolling", rolling_cases);
     h.guarded("pipeline", pipeline_cases);
     h.guarded("small", small_cases);
+    h.guarded("half", half::run);
+    h.guarded("spill", spill_cases);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1199,14 +1202,25 @@ fn table_cases(h: &mut Harness) {
         let got = run().to_vec().unwrap();
         let mean = |f: usize| hx[f * rows..(f + 1) * rows].iter().map(|&v| f64::from(v)).sum::<f64>() / rows as f64;
         let pairs = ints(120, 133, (feats * feats) as u32);
+        // The default product is TF32 where the context has it (as in launchcost/matmul): the operands are
+        // rounded to 10 mantissa bits, so the error of an entry follows the spread of its two columns
+        // (their standard deviations) and not the size of the entry, which is
+        // near zero for unrelated columns. The check is scaled by that spread then; in f32 it stays tight.
+        let tf32 = h.ctx.numerics().tf32_matmul();
+        let mut worst = 0.0f64;
         for p in pairs {
             let (i, j) = (p as usize / feats, p as usize % feats);
             let (a, b) = (&hx[i * rows..(i + 1) * rows], &hx[j * rows..(j + 1) * rows]);
             let (ma, mb) = (mean(i), mean(j));
             let cov = a.iter().zip(b).map(|(&p, &q)| (f64::from(p) - ma) * (f64::from(q) - mb)).sum::<f64>() / (rows as f64 - 1.0);
+            let var = |x: &[f32], m: f64| x.iter().map(|&v| (f64::from(v) - m).powi(2)).sum::<f64>() / (rows as f64 - 1.0);
+            let spread = (var(a, ma) * var(b, mb)).sqrt();
             let g = f64::from(got[i + feats * j]);
-            assert!((g - cov).abs() <= 2e-3 * cov.abs().max(1.0), "table/cov_wide: ({i},{j}): got {g}, want {cov}");
+            worst = worst.max((g - cov).abs() / spread);
+            let tol = if tf32 { 1e-4 * spread } else { 2e-3 * cov.abs().max(1.0) };
+            assert!((g - cov).abs() <= tol, "table/cov_wide: ({i},{j}): got {g}, want {cov} (tol {tol}, tf32 {tf32})");
         }
+        println!("  table/cov_wide: worst error / (sigma_i sigma_j) {worst:.2e} (tf32 {tf32})");
         case_trim(h, "table/cov_wide", &format!("{rows}x{feats}"), Work::Flops(2.0 * (feats * feats * rows) as f64), &mut || run().eval().unwrap());
     }
 
@@ -1830,4 +1844,87 @@ fn small_cases(h: &mut Harness) {
         check("small/corr_1kx16", &run().to_vec().unwrap(), &as_f32(&host_corr(&hx, rows, feats)), 0.0, 2e-3);
         case_trim(h, "small/corr_1kx16", "1000x16", Work::None, &mut || run().eval().unwrap());
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Paging
+// -------------------------------------------------------------------------------------------------
+
+/// Twelve columns of which a quarter fit the device budget, each read by a reduction per sweep:
+/// every sweep pages the columns through the budget.
+fn spill_cases(h: &mut Harness) {
+    column_sweep(h);
+    recompute_sweep(h);
+}
+
+fn column_sweep(h: &mut Harness) {
+    if !h.want("spill/column_sweep") {
+        return;
+    }
+    let n: usize = if h.quick { 1 << 20 } else { 1 << 22 };
+    let columns = 12;
+    let budget = (n * 4 * columns / 4) as u64;
+    let ctx = Context::with_options(ContextOptions::from_env().memory_budget(budget)).expect("no device");
+    let cols: Vec<Array<f32>> = (0..columns).map(|k| Array::from_slice_on(&ctx, &values(n, 300 + k as u64, -1.0, 1.0), n).unwrap()).collect();
+    let sweep = || {
+        let sums: Vec<f32> = cols.iter().map(|c| (c * 2.0).sum().item().unwrap()).collect();
+        sums.iter().sum::<f32>()
+    };
+    let want = sweep();
+    let size = format!("{columns}x{}", label(n));
+    h.transfer_case("spill/column_sweep", &size, Work::Bytes((n * 4 * columns) as f64), &mut || {
+        assert_eq!(sweep().to_bits(), want.to_bits());
+    });
+    println!("  spill/column_sweep: {} MiB spilled", ctx.spilled_bytes() >> 20);
+}
+
+/// Twelve cheap intermediates of two inputs that stay hot, `a * s + b`, held by the program: the
+/// arrays together are one and a half times the device budget, so every sweep that reads them all
+/// pages the intermediates. Each is a function of resident inputs: evicting one is free of
+/// transfers when the pager recomputes it at the next read instead of reading it back.
+fn recompute_sweep(h: &mut Harness) {
+    if !h.want("spill/recompute_sweep") {
+        return;
+    }
+    let n: usize = if h.quick { 1 << 20 } else { 1 << 22 };
+    let steps = 12;
+    let total = n * 4 * (steps + 2);
+    let ctx = Context::with_options(ContextOptions::from_env().memory_budget((total * 2 / 3) as u64)).expect("no device");
+    let a = Array::from_slice_on(&ctx, &values(n, 400, -1.0, 1.0), n).unwrap();
+    let b = Array::from_slice_on(&ctx, &values(n, 401, -1.0, 1.0), n).unwrap();
+    let held: Vec<Array<f32>> = (0..steps)
+        .map(|k| {
+            let t = &a * (k as f32 + 1.0) + &b;
+            t.eval().unwrap();
+            // One kernel each: evaluations that are pending together fuse into one multi-output kernel, which has no lineage.
+            ctx.flush().unwrap();
+            t
+        })
+        .collect();
+    ctx.flush().unwrap();
+    // The inputs are read at every step, so they stay resident (the least recently used segments
+    // are the intermediates) while the intermediates page.
+    let sweep = || {
+        let sums: Vec<f32> = held
+            .iter()
+            .map(|t| {
+                std::hint::black_box((&a + &b).sum().item().unwrap());
+                t.sum().item().unwrap()
+            })
+            .collect();
+        sums.iter().sum::<f32>()
+    };
+    let want = sweep();
+    let size = format!("{steps}x{}", label(n));
+    let before = ctx.paging_stats();
+    h.transfer_case("spill/recompute_sweep", &size, Work::Bytes((n * 4 * steps) as f64), &mut || {
+        assert_eq!(sweep().to_bits(), want.to_bits());
+    });
+    let after = ctx.paging_stats();
+    println!(
+        "  spill/recompute_sweep: {} MiB spilled, {} readback evictions, {} recompute evictions",
+        ctx.spilled_bytes() >> 20,
+        after.readback_evictions - before.readback_evictions,
+        after.recompute_evictions - before.recompute_evictions
+    );
 }

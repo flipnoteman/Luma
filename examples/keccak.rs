@@ -1,4 +1,4 @@
-//! Keccak-f[1600], SHA3-256 and SHAKE128 over a batch of independent inputs, written only with
+//! Keccak-f\[1600\], SHA3-256 and SHAKE128 over a batch of independent inputs, written only with
 //! lazy array operations: no custom kernel, no WGSL. A 64-bit lane is a `(lo, hi)` pair of `u32`
 //! arrays with one element per instance, the permutation is a Rust loop over 24 rounds of
 //! `^ & | ! << >>` on those arrays, and luma fuses it into kernels.
@@ -122,7 +122,7 @@ fn keccak_round(a: &State, rc: u64) -> State {
     keccak_round_with(a, Iota::Constant(rc))
 }
 
-/// One round of Keccak-f[1600] on every instance.
+/// One round of Keccak-f\[1600\] on every instance.
 pub fn keccak_round_with(a: &State, iota: Iota) -> State {
     // Word `h` (0: low, 1: high) of lane `i`.
     let word = |i: usize, h: usize| &a[2 * i + h];
@@ -172,7 +172,7 @@ pub fn keccak_round_with(a: &State, iota: Iota) -> State {
     out.try_into().unwrap_or_else(|_| unreachable!("25 lanes of two words"))
 }
 
-/// Keccak-f[1600] on every instance: 24 rounds, about 10 000 elementwise operations.
+/// Keccak-f\[1600\] on every instance: 24 rounds, about 10 000 elementwise operations.
 pub fn keccak_f(a: &State) -> State {
     let mut state = keccak_round(a, RC[0]);
     for rc in &RC[1..] {
@@ -465,15 +465,20 @@ fn main() -> Result<()> {
         assert!(matches_host(&out)?, "{name}: result differs from the reference");
         let seconds = best_of(&ctx, 5, || run(&state, reps).map(drop))?;
         let (_, profile) = ctx.profile(|| run(&state, reps).and_then(|_| ctx.sync()))?;
+        let decisions = ctx.take_decisions();
         row(name, n, reps, seconds, &profile);
-        profiles.push((name, profile));
+        profiles.push((name, profile, decisions));
     }
     println!("{}", "=".repeat(90));
-    for (name, profile) in &profiles {
-        println!("\n{name}: {} launches, {} splits", profile.launches(), profile.splits.len());
-        print!("{}", Profile { splits: Vec::new(), ..profile.clone() });
+    for (name, profile, decisions) in &profiles {
+        let cuts: Vec<&Decision> = decisions.iter().filter(|d| matches!(d.site, DecisionSite::Cut(_))).collect();
+        println!("\n{name}: {} launches, {} splits", profile.launches(), cuts.len());
+        // The kernel table without the cut lines (listed below with their reasons).
+        #[allow(deprecated)]
+        let bare = Profile { splits: Vec::new(), ..profile.clone() };
+        print!("{bare}");
         let mut reasons: Vec<(String, usize)> = Vec::new();
-        for split in &profile.splits {
+        for split in cuts {
             let text = split.to_string();
             let reason = text.split("): ").nth(1).unwrap_or("").trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
             match reasons.iter_mut().find(|(r, _)| r == reason) {

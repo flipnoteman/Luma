@@ -9,7 +9,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType};
 use crate::builtin::UnOp;
 use crate::jit::{ElemTy, Held, Node, Op, OpKind, Readers, Src};
-use crate::reduce::Reduced;
+use crate::jit::structured::Structured;
 use crate::shape::Shape;
 use crate::view::ViewOf;
 
@@ -111,15 +111,6 @@ impl Storage {
         self.segments.len() == 1 && !self.layout.is_packed() && self.owner.is_none() && self.segments[0].can_adopt()
     }
 
-    /// Gives a window a buffer of its own, holding a copy of its range (see
-    /// [`Storage::window_of`]); nothing for any other storage.
-    pub(crate) fn detach(&self) -> Result<()> {
-        if self.is_window() {
-            self.pin_quiet(0)?;
-        }
-        Ok(())
-    }
-
     /// Makes this storage the elements `offset..offset + len` of `pack`, which hold its data
     /// (see [`Storage::window_of`]), and gives its buffer back. `false` if it cannot (see
     /// [`Storage::can_adopt`]).
@@ -213,6 +204,10 @@ impl Storage {
         self.len
     }
 
+    pub(crate) fn ctx(&self) -> &Context {
+        &self.ctx
+    }
+
     /// How the elements sit in the buffers.
     pub(crate) fn layout(&self) -> ElemLayout {
         self.layout
@@ -250,16 +245,40 @@ impl Storage {
         &self.segments[j]
     }
 
+    /// The one segment of a storage that fits a single buffer, without marking the storage as
+    /// materialized: the pager's lineage bookkeeping (see [`crate::jit::lineage`]) looks at the
+    /// segments of arrays it does not hand out.
+    pub(crate) fn only_segment(&self) -> &Arc<Segment> {
+        debug_assert!(self.segments.len() == 1);
+        &self.segments[0]
+    }
+
     /// Pins segment `j` on the device (allocating its buffer if needed); marks the storage as
     /// materialized.
     pub(crate) fn pin(&self, j: usize) -> Result<Pin> {
         self.segment(j).pin()
     }
 
+    /// [`Storage::pin`] for a command that only reads the buffer: a kept host copy stays valid,
+    /// so evicting the segment later moves no data. Use it only where nothing writes through
+    /// the pin; an unconverted site calling [`Storage::pin`] costs a readback, never a wrong
+    /// result.
+    pub(crate) fn pin_read(&self, j: usize) -> Result<Pin> {
+        self.segment(j).pin_read()
+    }
+
+    /// [`Storage::pin_single`] for a command that only reads the buffer.
+    pub(crate) fn pin_single_read(&self) -> Result<Pin> {
+        if self.segments.len() > 1 {
+            return Err(LumaError::Chunked("this operation needs an array that fits one buffer"));
+        }
+        self.pin_read(0)
+    }
+
     /// [`Storage::pin`] without marking the storage as materialized: the tracers of `iterate` take
     /// a materialized probe for one that was used eagerly.
     pub(crate) fn pin_quiet(&self, j: usize) -> Result<Pin> {
-        self.segments[j].pin()
+        self.segments[j].pin_quiet()
     }
 
     /// Pins the only segment of a storage that fits one buffer; operations that cannot run
@@ -323,7 +342,7 @@ enum Repr {
     Poisoned(Arc<LumaError>),
     /// A reduction of a pending expression: recorded into a buffer when the GPU needs it, read
     /// from the expression when the host does. See [`crate::reduce`].
-    Reduced(Arc<Reduced>),
+    Structured(Arc<Structured>),
 }
 
 /// GPU-resident array of up to four dimensions.
@@ -396,7 +415,7 @@ impl<T: GpuType> Clone for Array<T> {
             Repr::Valid(storage) => Repr::Valid(Arc::clone(storage)),
             Repr::Lazy(node) => Repr::Lazy(node.share()),
             Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
-            Repr::Reduced(reduced) => Repr::Reduced(Arc::clone(reduced)),
+            Repr::Structured(value) => Repr::Structured(Arc::clone(value)),
         };
         Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, _marker: PhantomData }
     }
@@ -424,9 +443,9 @@ impl<T: GpuType> Array<T> {
         Self::new(ctx, shape, Repr::Lazy(Held::new(node)))
     }
 
-    /// The (not yet recorded) reduction `reduced` as an array of `shape`.
-    pub(crate) fn from_reduced(ctx: &Context, shape: Shape, reduced: Arc<Reduced>) -> Self {
-        Self::new(ctx, shape, Repr::Reduced(reduced))
+    /// The (not yet recorded) structured value `value` as an array of `shape`.
+    pub(crate) fn from_structured(ctx: &Context, shape: Shape, value: Arc<Structured>) -> Self {
+        Self::new(ctx, shape, Repr::Structured(value))
     }
 
     /// Placeholder sharing this array's buffer under a fresh [`Storage`] id, for [`Array::iterate`].
@@ -560,7 +579,7 @@ impl<T: GpuType> Array<T> {
             Repr::Valid(_) => None,
             Repr::Lazy(held) => held.latest().failure(),
             Repr::Poisoned(error) => Some(error),
-            Repr::Reduced(reduced) => reduced.failure(),
+            Repr::Structured(value) => value.failure(),
         }
     }
 
@@ -590,8 +609,8 @@ impl<T: GpuType> Array<T> {
                 held.latest().force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
             }
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
-            Repr::Reduced(reduced) => {
-                reduced.force(&self.ctx).as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
+            Repr::Structured(value) => {
+                value.force(&self.ctx).as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
             }
         }
     }
@@ -621,10 +640,10 @@ impl<T: GpuType> Array<T> {
             Repr::Valid(storage) => Ok(Src::Buffer(Arc::clone(storage))),
             Repr::Lazy(held) => held.latest().as_src(),
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
-            Repr::Reduced(reduced) => match reduced.result_if_recorded() {
+            Repr::Structured(value) => match value.result_if_recorded() {
                 Some(result) => result.as_ref().map(|storage| Src::Buffer(Arc::clone(storage))).map_err(|error| Failure::Inherited(Arc::clone(error))),
                 // Not recorded yet: an operation on it is built without recording it.
-                None => Ok(Src::Node(reduced.leaf(&self.ctx, self.len()))),
+                None => Ok(Src::Node(value.leaf(&self.ctx, self.len()))),
             },
         }
     }
@@ -679,10 +698,10 @@ impl<T: GpuType> Array<T> {
         }
     }
 
-    /// The reduction this array is (recorded into a buffer or not), if it is one.
-    pub(crate) fn reduced(&self) -> Option<&Arc<Reduced>> {
+    /// The structured value this array is (recorded into a buffer or not), if it is one.
+    pub(crate) fn structured(&self) -> Option<&Arc<Structured>> {
         match &self.repr {
-            Repr::Reduced(reduced) => Some(reduced),
+            Repr::Structured(value) => Some(value),
             _ => None,
         }
     }
@@ -744,11 +763,11 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        if let Repr::Reduced(reduced) = &self.repr {
-            if reduced.is_unforced() {
-                return reduced.read::<T>(&self.ctx);
+        if let Repr::Structured(value) = &self.repr {
+            if value.is_unforced() {
+                return value.read::<T>(&self.ctx);
             }
-            if let Some(values) = reduced.packed_values::<T>(&self.ctx) {
+            if let Some(values) = value.packed_values::<T>(&self.ctx) {
                 return values;
             }
         }
@@ -761,8 +780,8 @@ impl<T: GpuType> Array<T> {
     /// which cost about as much as the transfer itself on large arrays: prefer this when
     /// reading results back repeatedly.
     pub fn read_into(&self, out: &mut [T]) -> Result<()> {
-        if let Repr::Reduced(reduced) = &self.repr {
-            let values = if reduced.is_unforced() { Some(reduced.read::<T>(&self.ctx)) } else { reduced.packed_values::<T>(&self.ctx) };
+        if let Repr::Structured(value) = &self.repr {
+            let values = if value.is_unforced() { Some(value.read::<T>(&self.ctx)) } else { value.packed_values::<T>(&self.ctx) };
             if let Some(values) = values {
                 if out.len() != self.len() {
                     return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
@@ -876,7 +895,7 @@ impl<T: GpuType> Array<T> {
         let out = Self::alloc(&self.ctx, self.shape)?;
         let to = out.storage()?;
         for j in 0..from.segments() {
-            let (source, target) = (from.pin(j)?, to.pin(j)?);
+            let (source, target) = (from.pin_read(j)?, to.pin(j)?);
             self.ctx.copy(source.buffer(), 0, target.buffer(), 0, from.segment_byte_len(j))?;
         }
         Ok(out)
@@ -939,13 +958,13 @@ impl<T: GpuType> Array<T> {
         }
         // A reduction that has not been recorded is the same pending reduction in the new shape: recorded
         // when either is used, together with the others that are pending (see `jit::multireduce`).
-        if let Repr::Reduced(reduced) = &self.repr
-            && reduced.is_unforced()
+        if let Repr::Structured(value) = &self.repr
+            && value.is_unforced()
         {
             return Ok(Array {
                 ctx: self.ctx.clone(),
                 shape,
-                repr: Repr::Reduced(Arc::clone(reduced)),
+                repr: Repr::Structured(Arc::clone(value)),
                 view: None,
                 read_view: self.read_view,
                 _marker: PhantomData,

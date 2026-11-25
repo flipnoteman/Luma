@@ -190,7 +190,7 @@ static POOL: LazyLock<Arc<Pool>> = LazyLock::new(|| {
 
 /// `dst.copy_from_slice(src)` split over several threads for large copies: one core cannot
 /// saturate unified memory, and the page faults of a fresh destination spread out too. The
-/// threads store past the cache (see [`copy_streaming`]). At most [`STAGING_THREADS`] threads
+/// threads store past the cache (see [`copy_streaming`]). At most `STAGING_THREADS` threads
 /// take part, each with one share of the copy: the transfers of a GPU backend through host
 /// memory are bound by the bus, and the copy overlaps the device's work.
 pub fn copy_parallel(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
@@ -198,8 +198,8 @@ pub fn copy_parallel(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
 }
 
 /// [`copy_parallel`] for a copy between two host buffers, which nothing but the host's memory
-/// bandwidth limits: spread over one thread per physical core (at most [`MAX_THREADS`]), which
-/// take chunks of [`CHUNK`] bytes as they get to them instead of a share each, so that a thread
+/// bandwidth limits: spread over one thread per physical core (at most `MAX_THREADS`), which
+/// take chunks of `CHUNK` bytes as they get to them instead of a share each, so that a thread
 /// the scheduler has put on a busy core, or on the same core as another copy thread, costs a
 /// chunk and not a share.
 pub fn copy_parallel_host(src: &[u8], dst: &mut [MaybeUninit<u8>]) {

@@ -1624,20 +1624,20 @@ mod tests {
         let key = long_difference_key();
         let len = 1 << 20;
         let tuning = Tuning::for_tests();
-        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST }, &tuning, true);
+        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel::TEST.with(|m| { m.launch_us = 1e6; }), &tuning, true);
         assert!(matches!(cheap_launch, Judgement::Run { .. }), "{cheap_launch:?}");
-        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
+        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; }), &tuning, false);
         let Judgement::Materialise { subs, reason: SplitReason::Materialised { instances: 2 } } = &cheap_memory else { panic!("{cheap_memory:?} {estimates:?}") };
         assert_eq!(subs, &[0], "{cheap_memory:?}");
         assert!(estimates.best_sub.is_some_and(|(_, t)| t < estimates.inline_ns), "{estimates:?}");
         // A short expression costs less to recompute than its two reads through views.
-        let (short, estimates) = judge(&difference_key(), len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
+        let (short, estimates) = judge(&difference_key(), len, 1000, &CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; }), &tuning, false);
         assert!(matches!(short, Judgement::Run { staging: None }), "{short:?} {estimates:?}");
     }
 
     #[test]
     fn a_program_over_the_cap_is_cut_whatever_the_model_says() {
-        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
+        let slow = CostModel::TEST.with(|m| { m.launch_us = 1e6; });
         let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), false);
         assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 4, .. }, .. }), "{judgement:?}");
         assert!(estimates.inline_ns.is_infinite());
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn a_program_over_the_cap_is_staged_when_staging_makes_it_fit() {
-        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
+        let slow = CostModel::TEST.with(|m| { m.launch_us = 1e6; });
         let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), true);
         assert!(matches!(judgement, Judgement::Run { staging: Some(_) }), "{judgement:?} {estimates:?}");
         assert!(estimates.staged_ns.is_some() && estimates.inline_ns.is_infinite(), "{estimates:?}");

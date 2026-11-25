@@ -119,7 +119,7 @@ fn a_difference_of_slices_is_one_kernel_result() {
 
 #[test]
 fn views_of_chunked_arrays() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
     let a = values(1000, 6, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &a, 1000).unwrap();
 
@@ -145,7 +145,7 @@ fn views_of_chunked_arrays() {
 
 #[test]
 fn slice_difference_of_a_lazy_expression_on_chunked_arrays() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
     let a = values(1000, 14, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &a, 1000).unwrap();
     let e = (&x * 2.0 + 1.0).abs().sqrt();
@@ -307,7 +307,7 @@ fn take_gathers_by_flat_index() {
 
 #[test]
 fn views_are_copies_across_small_chunks() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
     let a = values(1000, 13, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &a, 1000).unwrap();
     let want: Vec<f32> = (0..1000).map(|i: i32| a[(i - 3).clamp(0, 999) as usize]).collect();

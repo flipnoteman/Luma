@@ -48,10 +48,11 @@
 //!   ([`ColorSpace`]), and feature detection and matching (`fast`, `harris`, `orb`, `sift`, `canny`,
 //!   `match_template`, connected components; points come back as [`Keypoints`]).
 //! * **Element types**: `f32`, `u32`, `i32`, `bool`, compact integers (`u8`, `i8`, `u16`, `i16`),
-//!   [`Df32`] (double-float) and `f64` where the device has it.
+//!   two-byte floats (`f16`, `bf16`: storage plus `f32` compute), [`Df32`] (double-float) and `f64`
+//!   where the device has it.
 //! * **Matrix products**: [`Array::matmul`] runs on tensor cores in TF32 on CUDA devices of compute
 //!   capability 8.0 and up (results differ from the exact product by TF32 rounding);
-//!   [`ContextOptions::tf32_matmul`] or `LUMA_TF32_MATMUL=0` turns that off for a context and
+//!   [`ContextOptions::numerics`] with [`Numerics::strict`] or `LUMA_NUMERICS=strict` turns that off for a context and
 //!   [`Array::matmul_f32`] is the exact product of one call.
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
@@ -94,6 +95,8 @@ mod guide {
     pub mod integers {}
     #[doc = include_str!("../guide/src/compact.md")]
     pub mod compact {}
+    #[doc = include_str!("../guide/src/half.md")]
+    pub mod half_floats {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
     pub mod custom_kernels {}
     #[doc = include_str!("../guide/src/performance.md")]
@@ -131,6 +134,7 @@ mod accum;
 mod arg;
 mod array;
 mod builtin;
+mod caps;
 mod bykey;
 mod context;
 mod conv;
@@ -151,6 +155,7 @@ mod complex;
 mod dft_kernel;
 mod gpu_type;
 mod group;
+mod halves;
 mod host;
 mod image;
 mod interp;
@@ -161,6 +166,7 @@ mod linalg;
 mod bmm;
 mod matmul;
 mod nan;
+mod numerics;
 mod ops;
 mod precision;
 mod profile;
@@ -192,13 +198,17 @@ mod vision;
 pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
-pub use gpu::pager::MemoryStats;
-pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
+pub use gpu::pager::{MemoryStats, PagingStats};
+pub use numerics::{Numerics, Reduced};
+#[allow(deprecated)]
+pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
+pub use luma_core::hal::HostBytes;
 pub use error::{LumaError, Result};
 pub use fields::Fields;
 pub use complex::C32;
 pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
+pub use half::{bf16, f16};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use image::{transform_coordinates, transform_coordinates_on, TransformMatrix};

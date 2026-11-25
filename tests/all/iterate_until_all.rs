@@ -207,7 +207,7 @@ fn the_host_fallback_agrees_with_the_gated_loop() {
 
 #[test]
 fn states_split_over_several_buffers_run_on_the_host() {
-    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
     let x = Array::from_slice_on(&ctx, &vec![1.0f32; 1000], 1000).unwrap();
     let run = iterate_until_all(
         (x,),
@@ -416,7 +416,7 @@ fn blocks_replayed_as_graphs_match_the_host_loop_and_the_launches_replayed_one_b
     assert_eq!((want[4].0, want[4].1), (100, StopReason::MaxSteps));
     let mut ran = 0;
     for kind in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Cpu, BackendKind::Wgpu] {
-        let ctx = match Context::with_options(ContextOptions::default().backend(kind).calibrate(false)) {
+        let ctx = match Context::with_options(ContextOptions::from_env().backend(kind).calibrate(false)) {
             Ok(ctx) => ctx,
             Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => {
                 println!("[iterate_until_all] {kind:?}: not available on this host");

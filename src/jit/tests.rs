@@ -7,6 +7,7 @@ use crate::array::Array;
 use crate::context::{Context, ContextOptions};
 use crate::jit::cost::CostModel;
 use crate::ops::select;
+use luma_core::hal::size_class;
 
 /// A context with the calibration off and the cost model pinned, so that kernel counts do not
 /// depend on the machine.
@@ -673,7 +674,7 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
 /// Where arithmetic costs more than a launch and a pass over the buffers, so that every pending
 /// node that two expressions read is worth evaluating first (see `worth_storing`).
 fn costly_arithmetic() -> CostModel {
-    CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }
+    CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; })
 }
 
 #[test]
@@ -2234,7 +2235,7 @@ fn entries_that_share_a_large_expression_are_stored_together() {
     let ctx = ctx();
     // Arithmetic that costs about as much per element as a launch plus a pass over the bytes
     // does for an expression of a hundred operations.
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel::TEST.with(|m| { m.f32_ops_per_ns = 40.0; }));
     let n = 4000;
     let count = 8;
     let xs = values(n, 111, 0.5, 2.0);
@@ -2286,7 +2287,7 @@ fn entries_that_share_a_large_expression_are_stored_together() {
 #[test]
 fn what_a_stored_group_reads_below_it_and_others_read_too_is_stored_with_it() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel::TEST.with(|m| { m.f32_ops_per_ns = 40.0; }));
     let n = 4000;
     let count = 8;
     let xs = values(n, 112, 0.5, 2.0);
@@ -2464,7 +2465,7 @@ fn long_expression(x: &Array<f32>, xs: &[f32]) -> (Array<f32>, Vec<f32>) {
 #[test]
 fn prohibitive_launches_keep_a_view_read_at_three_offsets_in_one_kernel() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel::TEST.with(|m| { m.launch_us = 1e6; }));
     let n = 1 << 16;
     let xs = values(n, 101, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -2481,7 +2482,7 @@ fn prohibitive_launches_keep_a_view_read_at_three_offsets_in_one_kernel() {
 #[test]
 fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel::TEST.with(|m| { m.f32_ops_per_ns = 1e-6; }));
     // Staging the expression once per cell would win on this model too; this is about the
     // choice between recomputing and storing.
     ctx.jit().set_staging(false);
@@ -2505,7 +2506,7 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
 /// twice: devices with small tiles, like the CPU's, would otherwise evaluate the padded
 /// expression first instead of staging it.
 fn halo_bound() -> CostModel {
-    CostModel { launch_us: 1000.0, ..arithmetic_bound() }
+    arithmetic_bound().with(|m| { m.launch_us = 1000.0; })
 }
 
 /// A cost model on which arithmetic is slow enough for computing an expression once per cell to
@@ -2514,7 +2515,7 @@ fn halo_bound() -> CostModel {
 /// computes its region in whole rounds of the workgroup, which on a few tiles costs about as
 /// much as the recomputation (the estimate is right; a 1000-element array is at the margin).
 fn arithmetic_bound() -> CostModel {
-    CostModel { f32_ops_per_ns: 10.0, ..CostModel::TEST }
+    CostModel::TEST.with(|m| { m.f32_ops_per_ns = 10.0; })
 }
 
 /// `e` read through an edge pad at the five offsets of the five-point stencil of an
@@ -3719,7 +3720,7 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
     // Launches prohibitively expensive: the expression stays one kernel, which staging may lay out.
     for staging in [true, false] {
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel::TEST.with(|m| { m.launch_us = 1e6; }));
         ctx.jit().set_staging(staging);
         ctx.jit().set_max_inlined(1536);
         ctx.jit().record_splits();
@@ -3768,7 +3769,7 @@ fn a_record_assigned_over_a_region_computes_what_its_fields_share_only_there() {
             a
         };
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel::TEST.with(|m| { m.launch_us = 1e6; }));
         ctx.jit().set_staging(staging);
         ctx.jit().set_max_inlined(1536);
         let data: Vec<Vec<f32>> = (0..N).map(|k| values(ni * nj, 120 + k as u64, 0.5, 1.5)).collect();
@@ -3826,7 +3827,7 @@ fn a_record_assigned_over_two_regions_in_a_row_branches_for_both() {
             a
         };
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel::TEST.with(|m| { m.launch_us = 1e6; }));
         ctx.jit().set_staging(staging);
         ctx.jit().set_max_inlined(1536);
         let data: Vec<Vec<f32>> = (0..N).map(|k| values(ni * nj, 130 + k as u64, 0.5, 1.5)).collect();
@@ -4141,7 +4142,7 @@ mod reruns {
     #[test]
     fn the_steps_per_launch_follow_the_cost_model() {
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { f32_ops_per_ns: 0.05, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel::TEST.with(|m| { m.f32_ops_per_ns = 0.05; }));
         let n = 1000;
         let xs = values(n, 9, 0.0, 1.0);
         let x = f32s(&ctx, &xs);
@@ -4675,6 +4676,32 @@ fn many_buffers_are_packed_and_read_through_one_binding() {
     assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
 }
 
+/// A window read through a shift or a view is bound as its range of the pack's buffer, not copied
+/// out of it: no window gets a buffer of its own, and the results are those of a copy.
+#[test]
+fn windows_read_through_shifts_and_views_are_bound_by_offset() {
+    let ctx = ctx();
+    ctx.jit().set_max_inputs(4);
+    // 256-byte windows start where every backend allows a binding to.
+    let n = 64;
+    let data: Vec<Vec<u32>> = (0..20u32).map(|k| (0..n as u32).map(|i| (i * 7 + k * 1013) ^ (k << 3)).collect()).collect();
+    let arrays: Vec<Array<u32>> = data.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+    let mut total = &arrays[0] * 1u32;
+    for a in &arrays[1..] {
+        total = &total + a;
+    }
+    let want: Vec<u32> = (0..n).map(|i| data.iter().fold(0u32, |sum, d| sum.wrapping_add(d[i]))).collect();
+    assert_eq!(total.to_vec().unwrap(), want);
+    let before = ctx.pager().window_copies();
+    for k in [9, 10, 15] {
+        let rolled = arrays[k].shift(1).to_vec().unwrap();
+        assert_eq!(rolled, (0..n).map(|i| data[k][(i + n - 1) % n]).collect::<Vec<_>>(), "shift of {k}");
+        assert_eq!(arrays[k].slice(0, 5..50).to_vec().unwrap(), data[k][5..50].to_vec(), "view of {k}");
+    }
+    assert_eq!(ctx.pager().window_copies(), before, "no window was copied out of its pack");
+    assert_eq!(total.to_vec().unwrap(), want);
+}
+
 /// The outputs of a group that has more of them than a kernel binds are written into one buffer.
 #[test]
 fn outputs_beyond_the_bindings_of_a_kernel_share_one_buffer() {
@@ -4988,7 +5015,7 @@ fn staged_reference(x: &Array<f32>, stages: usize, late: bool, steps: usize) -> 
 fn recording_a_chain_of_intermediates_creates_few_buffers() {
     let ctx = ctx();
     let x = f32s(&ctx, &values(1000, 34, 0.0, 1.0));
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let stages = 16;
     let before = ctx.created_bytes();
     let (stepper, held) = trace_staged(&x, stages, false);
@@ -5008,7 +5035,7 @@ fn recording_a_chain_of_intermediates_creates_few_buffers() {
 fn a_stepper_does_not_keep_its_probes() {
     let ctx = ctx();
     let x = f32s(&ctx, &values(1000, 36, 0.0, 1.0));
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = ctx.pager().resident_bytes();
     let (stepper, _) = trace_staged(&x, 8, false);
     let held = ctx.pager().resident_bytes() - before;
@@ -5064,7 +5091,7 @@ fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
     let x = f32s(&ctx, &values(1000, 33, 0.0, 1.0));
     let resident = || ctx.pager().resident_bytes();
     // Every buffer here is of the one size class of 1000 floats.
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = resident();
     let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
     let probe = probes.pop().unwrap();
@@ -5097,7 +5124,7 @@ fn the_buffers_a_step_released_stay_counted_while_the_plan_holds_them() {
     spare.eval().unwrap();
     ctx.sync().unwrap();
     let resident = || ctx.pager().resident_bytes();
-    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let class = size_class(4000, u64::MAX).unwrap();
     let before = resident();
     let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
     let probe = probes.pop().unwrap();

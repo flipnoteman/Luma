@@ -36,7 +36,7 @@ use super::{stack, Edge, ElemTy, JitState, Op, OpKind, ShiftKind, Src, ViewMap};
 ///
 /// A window that a shift reads (a view of it, a circular shift) stays an input of its own, as does
 /// every window of a program with sub-programs (the judgement of its staging refers to the
-/// instructions that are there); pinned for the launch it is a plain buffer. The same goes for
+/// instructions that are there); launched, it is bound as its range of the pack's buffer where the device allows that offset, and copied out otherwise. The same goes for
 /// windows of a type other than the pack's first window.
 pub(super) fn read_packs(jit: &JitState, fused: &mut Fused) {
     if !fused.inputs.iter().any(|input| input.is_window()) || !fused.key.subs.is_empty() {
@@ -64,10 +64,6 @@ pub(super) fn read_packs(jit: &JitState, fused: &mut Fused) {
     let mut places: Vec<Place> = Vec::with_capacity(n);
     let mut windows = 0;
     for ((input, &ty), &read_shifted) in fused.inputs.iter().zip(&key.input_tys).zip(&shifted) {
-        if read_shifted {
-            // Read through a view or shift, which cannot be told to read the pack instead.
-            let _ = input.detach();
-        }
         let window = if read_shifted || ty.is_packed() { None } else { input.window() };
         let Some((pack, offset)) = window else {
             inputs.push(Arc::clone(input));
