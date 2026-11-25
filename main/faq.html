@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -284,7 +284,7 @@ high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every qu
 <p><strong><code>x.ne(&amp;x)</code> does not find the NaNs.</strong> Comparisons with a NaN are the GPU’s. <code>lt</code>, <code>le</code>, <code>gt</code>,
 <code>ge</code> and <code>eq</code> give false for a NaN operand, and <code>ne</code> gave false as well on NVIDIA and on
 llvmpipe (the tests that ran), where IEEE says true. Use <code>x.is_nan()</code>, and <code>select(&amp;x.is_nan(), a, b)</code>
-to replace them. <code>LUMA_FAST_MATH</code> additionally folds a comparison of an array with itself.</p>
+to replace them. <code>LUMA_NUMERICS=fast</code> additionally folds a comparison of an array with itself.</p>
 <p><strong>What does a float-to-integer cast give out of range?</strong> <code>to_u32</code> and <code>to_i32</code> truncate toward
 zero and saturate at the largest <code>f32</code> inside the range, and NaN becomes 0:</p>
 <div class="table-wrapper">
@@ -316,8 +316,8 @@ its terms).</strong> On a CUDA device of compute capability 8.0 or higher (Amper
 TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so
 each entry is within 1.5e-3 of the sum of the absolute values of its terms of the <code>f32</code> product (the
 precision of PyTorch’s <code>allow_tf32</code>). <code>a.matmul_f32(&amp;b)</code> is the exact product of one call;
-<code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context exact, and
-<code>Context::tf32_matmul()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
+<code>ContextOptions::numerics(Numerics::strict())</code> or <code>LUMA_NUMERICS=strict</code> makes every <code>matmul</code> of a context exact, and
+<code>Context::numerics()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
 the CPU) compute <code>f32</code> products, so results also differ between a CUDA run and one on another backend
 (<a href="data.html#tensor-cores-tf32">Tensor cores</a>). The dense linear algebra (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, <code>svd</code>, …)
 uses <code>f32</code> products only.</p>

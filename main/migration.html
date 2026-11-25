@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -185,8 +185,47 @@
 <h2 id="from-051-to-052"><a class="header" href="#from-051-to-052">From 0.5.1 to 0.5.2</a></h2>
 <p>0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
 algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
-reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
-behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.</p>
+reads, <code>f16</code> / <code>bf16</code>) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they
+are. One behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.
+Some items are deprecated (removed in 0.6) and have replacements already.</p>
+<h3 id="numerics-replaces-fast_math-tf32_matmul-and-the-tf32-variables"><a class="header" href="#numerics-replaces-fast_math-tf32_matmul-and-the-tf32-variables"><code>Numerics</code> replaces <code>fast_math</code>, <code>tf32_matmul</code> and the TF32 variables</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>Now</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ContextOptions::fast_math(true)</code></td><td><code>ContextOptions::numerics(Numerics::fast())</code></td></tr>
+<tr><td><code>ContextOptions::tf32_matmul(false)</code></td><td><code>ContextOptions::numerics(Numerics::strict())</code></td></tr>
+<tr><td><code>Context::tf32_matmul()</code></td><td><code>Context::numerics().tf32_matmul()</code></td></tr>
+<tr><td><code>LUMA_FAST_MATH=1</code></td><td><code>LUMA_NUMERICS=fast</code> (or <code>+fast-math</code>)</td></tr>
+<tr><td><code>LUMA_TF32_MATMUL=0</code></td><td><code>LUMA_NUMERICS=strict</code> (or <code>-tf32-matmul</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_TF32=1</code></td><td><code>LUMA_NUMERICS=default+tf32-linalg</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The old fields, builders and variables still work (the variables with a one-time warning) and are applied over
+<code>numerics</code>. <code>LUMA_NUMERICS</code> panics on an unknown value in <code>ContextOptions::from_env</code>; the linear-algebra
+TF32 switch is read per context now, not once per process. See <a href="environment.html">Environment variables</a>.</p>
+<h3 id="profilesplits-and-fusionsplit-are-deprecated"><a class="header" href="#profilesplits-and-fusionsplit-are-deprecated"><code>Profile::splits</code> and <code>FusionSplit</code> are deprecated</a></h3>
+<p>Use <code>Profile::cuts()</code> for the cuts (an iterator of operation, location and <code>SplitReason</code>) and
+<code>Context::take_decisions()</code> right after <code>finish_profiling</code> / <code>profile</code> for every planner decision
+(<a href="performance.html#why-was-it-cut-cuts-and-decisions">Why was it cut</a>). <code>Backend::finish_profiling</code> keeps its
+<code>splits</code> argument until 0.6.</p>
+<h3 id="new"><a class="header" href="#new">New</a></h3>
+<ul>
+<li><code>Array&lt;f16&gt;</code> and <code>Array&lt;bf16&gt;</code> (<a href="half.html">Half-precision floats</a>).</li>
+<li><code>ContextOptions::host_budget</code> / <code>LUMA_HOST_BUDGET</code>, <code>Context::paging_stats()</code> and <code>Context::memory_model()</code>
+(<a href="performance.html#transfers">Transfers</a>); evicting an array the host holds a copy of, or a cheap result of
+arrays that stay on the device, transfers nothing.</li>
+<li><code>Context::record_decisions(true)</code> / <code>LUMA_RECORD_DECISIONS=1</code> and <code>Context::take_decisions()</code>.</li>
+<li>Buffers are sized in eighth-octave classes instead of powers of two, so up to 1.4x more data stays on the
+device before paging on a mix of odd sizes.</li>
+</ul>
+<h3 id="for-backend-implementors"><a class="header" href="#for-backend-implementors">For backend implementors</a></h3>
+<p><code>kir::ir::IrUnOp</code> gained <code>F32ToF16Bits</code>, <code>F16BitsToF32</code> and <code>RoundF16</code>: a backend that matches it exhaustively
+needs three more arms. Everything else the HAL gained (the transfer lane: <code>stage_alloc</code>, <code>transfer_in</code>,
+<code>transfer_out</code>, <code>barrier</code>, tickets; <code>memory_now</code>, <code>l2_cache_bytes</code>, <code>storage_offset_align</code>) has a default.</p>
 <h3 id="matmul-is-tf32-by-default-on-cuda"><a class="header" href="#matmul-is-tf32-by-default-on-cuda"><code>matmul</code> is TF32 by default on CUDA</a></h3>
 <p>On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> rounds its operands to TF32
 (10 bits of mantissa) and accumulates in <code>f32</code>, so results differ from the exact <code>f32</code> product (each entry
@@ -195,8 +234,8 @@ is within 1.5e-3 of the sum of the absolute values of its terms). Other backends
 off for a context:</p>
 <pre><code class="language-rust">use luma::*;
 
-let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
-assert!(!exact.tf32_matmul());
+let exact = Context::with_options(ContextOptions::default().numerics(Numerics::strict()))?;  // or LUMA_NUMERICS=strict
+assert!(!exact.numerics().tf32_matmul());
 let a = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
 let b = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
 assert_eq!(a.matmul_f32(&amp;b).to_vec()?, a.to_vec()?);   // the exact product of one call
@@ -265,7 +304,7 @@ opt-in <code>Interp::LinearHardware</code>), <a href="accumulators.html">increme
 <li><code>matmul_nt</code>, <code>matmul_tn</code>, <code>matmul_tt</code> and <code>dot</code>; <code>prod</code> / <code>product</code> and the <code>*_by_key</code> reductions;
 <code>sort_by_key</code>, <code>set_unique</code>, <code>set_union</code> and <code>set_intersect</code>; the elementwise functions of ArrayFire’s
 <code>arith.h</code>.</li>
-<li><code>ContextOptions::tf32_matmul</code>, <code>Context::tf32_matmul()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
+<li><code>ContextOptions::numerics</code>, <code>Context::numerics()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
 (<a href="performance.html#matrix-products">Performance guide</a>).</li>
 <li>The plan cache of eager evaluation (<code>LUMA_PLAN_CACHE</code>), compile worker threads (<code>LUMA_COMPILE_THREADS</code>)
 and the CPU backend’s native matrix products (<a href="performance.html">Performance guide</a>).</li>

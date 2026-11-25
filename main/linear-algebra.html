@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -256,9 +256,9 @@ small correction per block, one workgroup that factors the diagonal block and on
 warps that solve the rows below, about 100 launches at 4096 rows. <code>LUMA_CHOL_NB</code> and
 <code>LUMA_CHOL_WIDE</code> pick the block sizes.</li>
 <li>The update products of Cholesky and of the blocked triangular solves are exact <code>f32</code> too;
-<code>LUMA_LINALG_TF32=1</code> runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
+<code>LUMA_NUMERICS=default+tf32-linalg</code> (<code>Reduced::TF32_LINALG</code>) runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
 backward error of about 1e-3 of the entries of the updates instead of 1e-7. It is off by
-default and is independent of <code>ContextOptions::tf32_matmul</code>, which governs <code>matmul</code> only.</li>
+default and is independent of the <code>TF32_MATMUL</code> bit of <code>ContextOptions::numerics</code>, which governs <code>matmul</code> only.</li>
 </ul>
 </li>
 <li>A triangular solve with up to 32 right-hand sides (<code>solve_triangular</code>, and the two solves inside

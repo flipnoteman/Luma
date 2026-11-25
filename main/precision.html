@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -294,14 +294,14 @@ values of its terms of the <code>f32</code> product (the precision of PyTorch’
 <ul>
 <li><code>a.matmul_f32(&amp;b)</code> is the exact <code>f32</code> product of one call (fused multiply-adds over <code>k</code> in a
 fixed order, so results are reproducible);</li>
-<li><code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context
-that product (<code>Context::tf32_matmul()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
+<li><code>ContextOptions::numerics(Numerics::strict())</code> or <code>LUMA_NUMERICS=strict</code> makes every <code>matmul</code> of a context
+that product (<code>Context::numerics()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
 whatever the context says.</li>
 </ul>
 <p>The dense factorisations and solves (<a href="linear-algebra.html">Dense linear algebra</a>) do not follow the
 context setting: their update products are <code>matmul_f32</code>. Only the update products of Cholesky and
 the blocked triangular solves can take tensor cores, with the opt-in environment variable
-<code>LUMA_LINALG_TF32=1</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
+<code>LUMA_NUMERICS=default+tf32-linalg</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
 <code>f32</code>, never TF32 (<a href="accumulators.html">Incremental accumulation</a>).</p>
 <h2 id="casts"><a class="header" href="#casts">Casts</a></h2>
 <pre><code class="language-rust">use luma::*;
@@ -374,9 +374,9 @@ assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="fast-math"><a class="header" href="#fast-math">Fast math</a></h2>
 <p>By default Luma rewrites expressions only where the result is bit-identical (<code>x * 1</code>, <code>-(-x)</code>,
-<code>min(x, x)</code>, <code>abs(abs(x))</code>, <code>select</code> with two equal branches, <code>x * 0</code> on integers, …). <code>fast_math</code> (a
-<a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a> field,
-<code>LUMA_FAST_MATH=1</code>) also allows rewrites that change values, which can make a kernel shorter:</p>
+<code>min(x, x)</code>, <code>abs(abs(x))</code>, <code>select</code> with two equal branches, <code>x * 0</code> on integers, …). <code>Numerics::fast()</code> (the <code>numerics</code> field of
+<a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a>,
+<code>LUMA_NUMERICS=fast</code>) also allows rewrites that change values, which can make a kernel shorter:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -396,7 +396,7 @@ assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this
 </div>
 <pre><code class="language-rust">use luma::*;
 
-let ctx = Context::with_options(ContextOptions::default().fast_math(true))?;
+let ctx = Context::with_options(ContextOptions::default().numerics(Numerics::fast()))?;
 let x = Array::from_slice_on(&amp;ctx, &amp;[0.0f32, f32::INFINITY, 3.0], 3)?;
 assert_eq!((&amp;x / &amp;x).to_vec()?, vec![1.0, 1.0, 1.0]);   // x / x is 1, NaNs ignored
 assert_eq!((&amp;x * 0.0).to_vec()?, vec![0.0, 0.0, 0.0]);

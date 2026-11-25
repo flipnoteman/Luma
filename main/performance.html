@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -206,14 +206,21 @@ if ctx.profiling_supported() {
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>A <a href="https://docs.rs/luma/latest/luma/struct.Profile.html"><code>Profile</code></a> has <code>kernels</code> (one
 <a href="https://docs.rs/luma/latest/luma/struct.KernelTiming.html"><code>KernelTiming</code></a> per label, the most
-expensive first: label, launches, total, min, max, and a <code>mean()</code> method), <code>splits</code>, <code>launches()</code> and <code>total()</code>.
+expensive first: label, launches, total, min, max, and a <code>mean()</code> method), <code>decisions</code>, <code>cuts()</code>, <code>launches()</code> and <code>total()</code>.
 Fused kernels are labelled by what they hold (<code>Fused(Mul, Add, Sqrt) f32</code>, <code>FusedReduce(Sum: Mul) f32</code>); your own kernels by <code>.label(..)</code> or their entry point.</p>
 <p>While profiling, every launch gets a compute pass of its own so that it can be timed. Use it to find
 where the GPU time goes, not to measure throughput. For the host’s time, time the calls themselves.</p>
-<h3 id="why-was-it-cut-splits"><a class="header" href="#why-was-it-cut-splits">Why was it cut: <code>splits</code></a></h3>
-<p>Each <a href="https://docs.rs/luma/latest/luma/struct.FusionSplit.html"><code>FusionSplit</code></a> names the operation
-and source line where an expression was cut, and the
-<a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>:</p>
+<h3 id="why-was-it-cut-cuts-and-decisions"><a class="header" href="#why-was-it-cut-cuts-and-decisions">Why was it cut: <code>cuts()</code> and <code>decisions</code></a></h3>
+<p><code>Profile::cuts()</code> gives the cuts of expressions in a profiled region: the operation and
+source line where an expression was cut, and the
+<a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>. Every choice the planner made
+while profiling
+(<a href="https://docs.rs/luma/latest/luma/struct.Decision.html"><code>Decision</code></a>: the operation, its source line,
+the <a href="https://docs.rs/luma/latest/luma/enum.DecisionSite.html"><code>DecisionSite</code></a>, the chosen label and the
+alternatives that lost) is returned by <code>Context::take_decisions()</code> right after
+<code>Context::finish_profiling()</code> (or <code>Context::profile</code>). To record decisions without
+profiling (host paths, the plan cache and graph capture stay on), use <code>Context::record_decisions(true)</code>
+(or <code>LUMA_RECORD_DECISIONS=1</code>) and <code>Context::take_decisions()</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -244,10 +251,10 @@ if ctx.profiling_supported() {
     })?;
     r?;
     assert!(profile.launches() &gt; 1);
-    for split in &amp;profile.splits {
-        println!("{split}");                            // split at file:line:col (`op`): N operations &gt; 2
+    for (op, location, reason) in profile.cuts() {
+        println!("{op} at {location}: {reason:?}");     // add at file:line:col: Nodes { nodes: 3, limit: 2 }
     }
-    assert!(profile.splits.iter().any(|s| matches!(s.reason, SplitReason::Nodes { .. })));
+    assert!(profile.cuts().any(|(_, _, reason)| matches!(reason, SplitReason::Nodes { .. })));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Counting <code>profile.launches()</code> before and after a change is the quickest check that something
@@ -437,8 +444,8 @@ loop primitives, which trace the step once, are the cheaper form where they fit.
 <p>On a CUDA device with tensor cores (compute capability 8.0 and up) <code>matmul</code> runs in TF32 by default: the
 operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so results differ from
 the exact <code>f32</code> product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
-RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::tf32_matmul(false)</code>
-or <code>LUMA_TF32_MATMUL=0</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::numerics(Numerics::strict())</code>
+or <code>LUMA_NUMERICS=strict</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
 <code>matmul_tf32</code> forces TF32 (<a href="data.html#tensor-cores-tf32">Tensor cores</a>). <code>matmul_batched</code> is always <code>f32</code>.
 Other backends compute <code>f32</code> products as before. A product whose output is small and whose <code>K</code> is long (a
 Gram matrix, a gradient <code>Xᵀr</code>) runs as a kernel family with no workgroup staging, and <code>matmul_nt</code>,
@@ -463,10 +470,24 @@ once). Its kernels compile on a pool of threads (<code>LUMA_COMPILE_THREADS</cod
 <li>On unified memory, <code>from_slice</code> uploads into mappable buffers that are reused (zero-copy).</li>
 <li>Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
 <code>LUMA_MEMORY_BUDGET</code> to something your machine can keep on the device. Arrays split over several
-buffers are never staged and cannot be passed to custom kernels.</li>
-<li><code>ctx.memory_stats()</code> reports the bytes in use, idle in the pool and spilled to host memory, and the
-budget; <code>ctx.trim()</code> gives the idle pool back to the device, for example after a phase whose
+buffers are never staged and cannot be passed to custom kernels. A moved array that the host
+already holds a copy of (it came back and was only read since) moves nothing, and a cheap
+elementwise result of arrays that stay on the device (at least 16 KiB, in one buffer) is
+dropped and recomputed at its next use, which costs a kernel instead of a transfer; writing
+to one of its inputs computes it first.</li>
+<li><code>ctx.memory_stats()</code> reports the bytes in use, idle in the pool and spilled to host memory and the
+budget, <code>ctx.paging_stats()</code> the evictions by kind (<code>clean_evictions</code>, <code>readback_evictions</code>,
+<code>recompute_evictions</code>), the host copies kept (<code>host_copy_bytes</code>) and, where the device says, its free
+memory (<code>device_free_bytes</code>); <code>ctx.trim()</code> gives the idle pool back to the device, for example after a phase whose
 temporaries the next one cannot reuse.</li>
+<li>Host memory for spilled arrays and for kept copies is limited by <code>ContextOptions::host_budget</code> /
+<code>LUMA_HOST_BUDGET</code> (default half of the available host memory). Over it, kept copies go first; arrays
+that exist only in host memory stay, with a warning once.</li>
+<li>Buffers are sized in eighth-octave classes (a multiple of a sixteenth of the next power of two above
+4 KiB, so at most 12.5% padding): arrays of odd sizes keep more data resident than power-of-two sizes would.</li>
+<li><code>ctx.memory_model()</code> is the calibrated memory hierarchy of the device (L2 size and bandwidth, workgroup-memory
+bandwidth, the cost of strided, gathered and transposed reads relative to coalesced, dependent-load latency);
+<code>examples/device_info</code> prints it. The planner does not read it yet.</li>
 </ul>
 <h2 id="a-checklist-for-a-slow-program"><a class="header" href="#a-checklist-for-a-slow-program">A checklist for a slow program</a></h2>
 <ol>
@@ -474,7 +495,7 @@ temporaries the next one cannot reuse.</li>
 dominates? Is the time in kernels at all, or in the host (then it is <code>eval</code>, readbacks, or
 array construction)?</li>
 <li><strong>Count launches</strong> per step. A step that should be one fused kernel and is ten means a cut:
-print <code>profile.splits</code> and read the reason.</li>
+print <code>profile.cuts()</code> and read the reason.</li>
 <li><strong>Look for readbacks</strong> inside loops: <code>item()</code>, <code>to_vec()</code>, <code>max().item()?</code> per iteration. Move
 them out of the loop or use <code>iterate_until_all</code>.</li>
 <li><strong>Use the loop primitives</strong> where the step fits; check that the step is elementwise (register

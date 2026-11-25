@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -597,7 +597,7 @@ evaluated when the call returns, so what reads it is another kernel
 those forced together are recorded in one kernel (up to 16 accumulators; <code>LUMA_MULTI_REDUCE</code>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
-cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
+cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#method.cuts"><code>Profile::cuts</code></a> tells you where
 and why.</p>
 <h2 id="cache"><a class="header" href="#cache"><code>cache()</code></a></h2>
 <p><code>x.cache()</code> evaluates an expression now (it is recorded as a kernel, without waiting for the GPU)
@@ -1153,7 +1153,7 @@ at 21 instead of 13, and the small and skinny products of a network (a 256-row b
 1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.</p>
 <p>Where the precision matters, ask for <code>f32</code>: <code>a.matmul_f32(&amp;b)</code> is the full-precision product of
 one call (a chain of fused multiply-adds in a fixed order per entry), and
-<code>ContextOptions::tf32_matmul(false)</code> (<code>LUMA_TF32_MATMUL=0</code>) makes every <code>matmul</code> of a context
+<code>ContextOptions::numerics(Numerics::strict())</code> (<code>LUMA_NUMERICS=strict</code>) makes every <code>matmul</code> of a context
 that product. <code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always
 <code>f32</code>. On CUDA the <code>f32</code> product has kernels of its own for the shapes above (an RTX 3090: 23
 TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
@@ -2043,9 +2043,9 @@ small correction per block, one workgroup that factors the diagonal block and on
 warps that solve the rows below, about 100 launches at 4096 rows. <code>LUMA_CHOL_NB</code> and
 <code>LUMA_CHOL_WIDE</code> pick the block sizes.</li>
 <li>The update products of Cholesky and of the blocked triangular solves are exact <code>f32</code> too;
-<code>LUMA_LINALG_TF32=1</code> runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
+<code>LUMA_NUMERICS=default+tf32-linalg</code> (<code>Reduced::TF32_LINALG</code>) runs them on tensor cores (CUDA, compute capability 8.0 and up), with a
 backward error of about 1e-3 of the entries of the updates instead of 1e-7. It is off by
-default and is independent of <code>ContextOptions::tf32_matmul</code>, which governs <code>matmul</code> only.</li>
+default and is independent of the <code>TF32_MATMUL</code> bit of <code>ContextOptions::numerics</code>, which governs <code>matmul</code> only.</li>
 </ul>
 </li>
 <li>A triangular solve with up to 32 right-hand sides (<code>solve_triangular</code>, and the two solves inside
@@ -2957,14 +2957,14 @@ values of its terms of the <code>f32</code> product (the precision of PyTorch’
 <ul>
 <li><code>a.matmul_f32(&amp;b)</code> is the exact <code>f32</code> product of one call (fused multiply-adds over <code>k</code> in a
 fixed order, so results are reproducible);</li>
-<li><code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context
-that product (<code>Context::tf32_matmul()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
+<li><code>ContextOptions::numerics(Numerics::strict())</code> or <code>LUMA_NUMERICS=strict</code> makes every <code>matmul</code> of a context
+that product (<code>Context::numerics()</code> reports the setting), and <code>a.matmul_tf32(&amp;b)</code> forces TF32
 whatever the context says.</li>
 </ul>
 <p>The dense factorisations and solves (<a href="#dense-linear-algebra">Dense linear algebra</a>) do not follow the
 context setting: their update products are <code>matmul_f32</code>. Only the update products of Cholesky and
 the blocked triangular solves can take tensor cores, with the opt-in environment variable
-<code>LUMA_LINALG_TF32=1</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
+<code>LUMA_NUMERICS=default+tf32-linalg</code> (off by default). Accumulators’ <code>Covariance</code> also forms its products in
 <code>f32</code>, never TF32 (<a href="#incremental-accumulation">Incremental accumulation</a>).</p>
 <h2 id="casts-1"><a class="header" href="#casts-1">Casts</a></h2>
 <pre><code class="language-rust">use luma::*;
@@ -3037,9 +3037,9 @@ assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="fast-math"><a class="header" href="#fast-math">Fast math</a></h2>
 <p>By default Luma rewrites expressions only where the result is bit-identical (<code>x * 1</code>, <code>-(-x)</code>,
-<code>min(x, x)</code>, <code>abs(abs(x))</code>, <code>select</code> with two equal branches, <code>x * 0</code> on integers, …). <code>fast_math</code> (a
-<a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a> field,
-<code>LUMA_FAST_MATH=1</code>) also allows rewrites that change values, which can make a kernel shorter:</p>
+<code>min(x, x)</code>, <code>abs(abs(x))</code>, <code>select</code> with two equal branches, <code>x * 0</code> on integers, …). <code>Numerics::fast()</code> (the <code>numerics</code> field of
+<a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a>,
+<code>LUMA_NUMERICS=fast</code>) also allows rewrites that change values, which can make a kernel shorter:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3059,7 +3059,7 @@ assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this
 </div>
 <pre><code class="language-rust">use luma::*;
 
-let ctx = Context::with_options(ContextOptions::default().fast_math(true))?;
+let ctx = Context::with_options(ContextOptions::default().numerics(Numerics::fast()))?;
 let x = Array::from_slice_on(&amp;ctx, &amp;[0.0f32, f32::INFINITY, 3.0], 3)?;
 assert_eq!((&amp;x / &amp;x).to_vec()?, vec![1.0, 1.0, 1.0]);   // x / x is 1, NaNs ignored
 assert_eq!((&amp;x * 0.0).to_vec()?, vec![0.0, 0.0, 0.0]);
@@ -3464,6 +3464,96 @@ ratios of ArrayFire’s time to luma’s): upload 0.80x (bound by the host trans
 cast and sum 4.7x, per-column mean and variance 7.4x, <code>u8</code> histogram (38M elements) 2.3x, <code>u16</code>
 histogram of 16384 bins 1.0x.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="half-precision-floats-f16-and-bf16"><a class="header" href="#half-precision-floats-f16-and-bf16">Half-precision floats: <code>f16</code> and <code>bf16</code></a></h1>
+<p>Neural-network weights and activations, image data and anything that is bound by memory traffic
+rather than by arithmetic can use two-byte floats. <code>Array&lt;f16&gt;</code> and <code>Array&lt;bf16&gt;</code> (the types of
+the <a href="https://docs.rs/half"><code>half</code></a> crate, re-exported as <code>luma::f16</code> and <code>luma::bf16</code>) take two
+bytes per element in device memory and on the host (<code>from_slice(&amp;[f16])</code>, <code>to_vec()</code> and
+<code>read_into</code> copy the bytes), and a kernel that reads one loads two bytes per element. Like the
+<a href="#compact-integers-u8-i8-u16-i16">compact integers</a>, elements share <code>u32</code> words in buffers (two to a word, little
+endian, byte-identical to the host slice).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Bytes</th><th>Mantissa bits</th><th>Largest finite</th><th>Smallest normal</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f16</code></td><td>2</td><td>11</td><td>65504</td><td>6.1e-5 (subnormals down to 6.0e-8)</td></tr>
+<tr><td><code>bf16</code></td><td>2</td><td>8</td><td>3.4e38</td><td>1.2e-38</td></tr>
+</tbody>
+</table>
+</div>
+<p>This is <strong>storage plus <code>f32</code> compute</strong>: every elementwise operation widens its operands to <code>f32</code>,
+computes in <code>f32</code> and rounds the result to the element type, to nearest even. There is no native
+half-precision arithmetic and no half-precision matrix unit in this release (the matrix units that
+consume these types are later work).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[f16::from_f32(1.5), f16::from_f32(-2.0), f16::from_f32(0.1)], 3)?;
+
+// Every operation rounds its result to f16, fused or not: this is
+// round((round(x * x) + 1)) per element, computed in one kernel that reads 2 bytes per element.
+let y = &amp;x * &amp;x + f16::from_f32(1.0);
+assert_eq!(y.to_vec()?, vec![f16::from_f32(3.25), f16::from_f32(5.0), f16::from_f32(1.01)]);
+
+// Casts fuse into their neighbours.
+let wide: Array&lt;f32&gt; = x.to_f32();
+assert_eq!(wide.to_vec()?, vec![1.5, -2.0, f16::from_f32(0.1).to_f32()]);
+let narrow: Array&lt;bf16&gt; = wide.to_bf16();
+assert_eq!(narrow.to_vec()?[0], bf16::from_f32(1.5));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="rounding"><a class="header" href="#rounding">Rounding</a></h2>
+<p>Every conversion from a wider type (<code>f32</code>, <code>f64</code>, <code>i32</code>, <code>u32</code>, the other half type) and the
+result of every arithmetic operation round to nearest, ties to even. A value too large for the type
+becomes infinity (<code>f16</code> above 65519.99…, so <code>60000.0 * 2.0</code> is <code>inf</code>), subnormals are kept, and
+every NaN becomes the canonical quiet NaN (<code>0x7e00</code> for <code>f16</code>, <code>0x7fc0</code> for <code>bf16</code>); the sign and
+payload of a NaN are not preserved. All backends produce the same bits: the conversions are
+written with integer arithmetic (<code>builtin::HALF_WGSL</code>) and <code>tests/all/half.rs</code> compares them with
+the <code>half</code> crate for every <code>f16</code> and <code>bf16</code> pattern, for the halfway points between neighbours and
+for a million random <code>f32</code>.</p>
+<p>A fused chain gives the bits of the same operations evaluated one at a time: fusion rounds after
+every operation. Operations that cannot produce a value the type does not hold (negation, <code>abs</code>,
+<code>minimum</code>, <code>maximum</code>, <code>select</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>sign</code>) skip the rounding.</p>
+<h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
+<ul>
+<li>Operators <code>+ - * /</code> (and the assigning forms) with arrays and with values of the type, <code>-x</code>,
+comparisons, <code>select</code>, <code>minimum</code>, <code>maximum</code>, <code>modulo</code>, <code>pow</code>, <code>is_nan</code>, <code>is_finite</code>, <code>is_inf</code>.</li>
+<li><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>,
+<code>round</code>, <code>log1p</code>, <code>expm1</code>, <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>sinh</code>, <code>cosh</code>, <code>asinh</code>, <code>acosh</code>, <code>atanh</code>,
+<code>pow2</code>, <code>log2</code>, <code>log10</code>, <code>rsqrt</code>, <code>cbrt</code>, <code>erf</code>, <code>erfc</code>, <code>lgamma</code>, <code>tgamma</code>, <code>sigmoid</code>: the <code>f32</code>
+function, then rounded.</li>
+<li><a href="#views-and-writes">Views</a>, <code>concat</code>, <code>filter</code>, <code>take</code>, <code>full</code>, <code>zeros</code>, writes through views, arrays of
+several buffers.</li>
+<li>Casts: <code>to_f32</code>, <code>to_f64</code> (where the device has 64-bit floats), <code>to_i32</code>, <code>to_u32</code> and the other
+half type from either; <code>to_f16</code> and <code>to_bf16</code> from <code>f32</code>, <code>f64</code>, <code>i32</code> and <code>u32</code>.</li>
+</ul>
+<h2 id="reductions-accumulate-in-f32"><a class="header" href="#reductions-accumulate-in-f32">Reductions accumulate in <code>f32</code></a></h2>
+<p><code>sum</code>, <code>prod</code>, <code>mean</code>, <code>norm</code>, <code>sum_axis</code>, <code>prod_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>
+widen the elements (the cast fuses into the first kernel), accumulate in <code>f32</code> and round <strong>once</strong>,
+at the end. That is more accurate than rounding after every addition, as a half-precision
+accumulator would: the sum of a hundred thousand ones is exactly 100000 (an <code>f16</code> accumulator stalls
+at 2048, a <code>bf16</code> one at 256), but it is then rounded to the type (<code>100000</code> is <code>inf</code> in <code>f16</code>).
+<code>min</code>, <code>max</code>, <code>min_axis</code>, <code>max_axis</code>, <code>argmax</code> and <code>argmin</code> are exact. Widen explicitly
+(<code>x.to_f32().sum()</code>) to keep the sum in <code>f32</code>.</p>
+<h2 id="matrix-products-1"><a class="header" href="#matrix-products-1">Matrix products</a></h2>
+<p><code>matmul</code>, <code>matmul_nt</code>, <code>matmul_tn</code>, <code>matmul_tt</code> and <code>dot</code> widen the operands where the kernel loads
+them (an operand that is a lazy expression is fused as for <code>f32</code>), run the <code>f32</code> kernels (so the
+context’s TF32 setting applies, and the sums are <code>f32</code>) and round the result to the element type.
+It saves memory and the bandwidth of loading the operands; it is not faster arithmetic.</p>
+<h2 id="not-supported"><a class="header" href="#not-supported">Not supported</a></h2>
+<p><code>sort</code>, <code>sort_descending</code>, <code>sort_axis</code>, <code>argsort</code>, <code>argsort_descending</code>, <code>unique</code>, the set
+operations, <code>cumsum</code> and other scans, <code>searchsorted</code>, <code>topk</code>, scatter-add and the other atomics,
+the by-key operations, and the image and vision kernels are not defined for half-precision arrays.
+The ones that have a method on <code>Array&lt;f16&gt;</code> / <code>Array&lt;bf16&gt;</code> return an array poisoned with
+<code>LumaError::Unsupported</code> when called; the rest do not compile (the element type does
+not implement their trait). Convert with <code>to_f32()</code> first: it fuses into the first kernel, so
+<code>x.to_f32().sort()</code> reads two bytes per element.</p>
+<h2 id="performance-1"><a class="header" href="#performance-1">Performance</a></h2>
+<p>Memory-bound work moves half the bytes: see the <code>datasci/half</code> cases of <code>luma-bench</code> (a fused
+elementwise chain stored to memory and a sum, in <code>f16</code> and in <code>f32</code>). Each half-precision load
+and store runs the conversion (a few integer operations), and each rounded operation two more, so
+a chain of transcendental functions is no faster than in <code>f32</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="custom-kernels"><a class="header" href="#custom-kernels">Custom kernels</a></h1>
 <p>When an algorithm does not fit array operations (a scatter with atomics, a tuned stencil, an
 existing shader), write the kernel in WGSL and run it on Luma arrays. A custom kernel joins the same
@@ -3842,14 +3932,21 @@ if ctx.profiling_supported() {
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>A <a href="https://docs.rs/luma/latest/luma/struct.Profile.html"><code>Profile</code></a> has <code>kernels</code> (one
 <a href="https://docs.rs/luma/latest/luma/struct.KernelTiming.html"><code>KernelTiming</code></a> per label, the most
-expensive first: label, launches, total, min, max, and a <code>mean()</code> method), <code>splits</code>, <code>launches()</code> and <code>total()</code>.
+expensive first: label, launches, total, min, max, and a <code>mean()</code> method), <code>decisions</code>, <code>cuts()</code>, <code>launches()</code> and <code>total()</code>.
 Fused kernels are labelled by what they hold (<code>Fused(Mul, Add, Sqrt) f32</code>, <code>FusedReduce(Sum: Mul) f32</code>); your own kernels by <code>.label(..)</code> or their entry point.</p>
 <p>While profiling, every launch gets a compute pass of its own so that it can be timed. Use it to find
 where the GPU time goes, not to measure throughput. For the host’s time, time the calls themselves.</p>
-<h3 id="why-was-it-cut-splits"><a class="header" href="#why-was-it-cut-splits">Why was it cut: <code>splits</code></a></h3>
-<p>Each <a href="https://docs.rs/luma/latest/luma/struct.FusionSplit.html"><code>FusionSplit</code></a> names the operation
-and source line where an expression was cut, and the
-<a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>:</p>
+<h3 id="why-was-it-cut-cuts-and-decisions"><a class="header" href="#why-was-it-cut-cuts-and-decisions">Why was it cut: <code>cuts()</code> and <code>decisions</code></a></h3>
+<p><code>Profile::cuts()</code> gives the cuts of expressions in a profiled region: the operation and
+source line where an expression was cut, and the
+<a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>. Every choice the planner made
+while profiling
+(<a href="https://docs.rs/luma/latest/luma/struct.Decision.html"><code>Decision</code></a>: the operation, its source line,
+the <a href="https://docs.rs/luma/latest/luma/enum.DecisionSite.html"><code>DecisionSite</code></a>, the chosen label and the
+alternatives that lost) is returned by <code>Context::take_decisions()</code> right after
+<code>Context::finish_profiling()</code> (or <code>Context::profile</code>). To record decisions without
+profiling (host paths, the plan cache and graph capture stay on), use <code>Context::record_decisions(true)</code>
+(or <code>LUMA_RECORD_DECISIONS=1</code>) and <code>Context::take_decisions()</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3880,10 +3977,10 @@ if ctx.profiling_supported() {
     })?;
     r?;
     assert!(profile.launches() &gt; 1);
-    for split in &amp;profile.splits {
-        println!("{split}");                            // split at file:line:col (`op`): N operations &gt; 2
+    for (op, location, reason) in profile.cuts() {
+        println!("{op} at {location}: {reason:?}");     // add at file:line:col: Nodes { nodes: 3, limit: 2 }
     }
-    assert!(profile.splits.iter().any(|s| matches!(s.reason, SplitReason::Nodes { .. })));
+    assert!(profile.cuts().any(|(_, _, reason)| matches!(reason, SplitReason::Nodes { .. })));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Counting <code>profile.launches()</code> before and after a change is the quickest check that something
@@ -4069,12 +4166,12 @@ loops chosen at run time, and the buffer of that set is reused by the next node.
 of about 10 000 operations (24 Keccak rounds written out) takes 3.4 ms of host time to record for 4096
 messages on an RTX 3090. A step of thousands of operations still pays for each of them every step, so the
 loop primitives, which trace the step once, are the cheaper form where they fit.</p>
-<h3 id="matrix-products-1"><a class="header" href="#matrix-products-1">Matrix products</a></h3>
+<h3 id="matrix-products-2"><a class="header" href="#matrix-products-2">Matrix products</a></h3>
 <p>On a CUDA device with tensor cores (compute capability 8.0 and up) <code>matmul</code> runs in TF32 by default: the
 operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so results differ from
 the exact <code>f32</code> product (each entry within 1.5e-3 of the sum of the absolute values of its terms). On an
-RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::tf32_matmul(false)</code>
-or <code>LUMA_TF32_MATMUL=0</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
+RTX 3090 a 4096 x 4096 x 4096 product runs at 34 TFLOP/s instead of 20. <code>ContextOptions::numerics(Numerics::strict())</code>
+or <code>LUMA_NUMERICS=strict</code> turns it off for a context, <code>matmul_f32</code> is the exact product of one call, and
 <code>matmul_tf32</code> forces TF32 (<a href="#tensor-cores-tf32">Tensor cores</a>). <code>matmul_batched</code> is always <code>f32</code>.
 Other backends compute <code>f32</code> products as before. A product whose output is small and whose <code>K</code> is long (a
 Gram matrix, a gradient <code>Xᵀr</code>) runs as a kernel family with no workgroup staging, and <code>matmul_nt</code>,
@@ -4099,10 +4196,24 @@ once). Its kernels compile on a pool of threads (<code>LUMA_COMPILE_THREADS</cod
 <li>On unified memory, <code>from_slice</code> uploads into mappable buffers that are reused (zero-copy).</li>
 <li>Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
 <code>LUMA_MEMORY_BUDGET</code> to something your machine can keep on the device. Arrays split over several
-buffers are never staged and cannot be passed to custom kernels.</li>
-<li><code>ctx.memory_stats()</code> reports the bytes in use, idle in the pool and spilled to host memory, and the
-budget; <code>ctx.trim()</code> gives the idle pool back to the device, for example after a phase whose
+buffers are never staged and cannot be passed to custom kernels. A moved array that the host
+already holds a copy of (it came back and was only read since) moves nothing, and a cheap
+elementwise result of arrays that stay on the device (at least 16 KiB, in one buffer) is
+dropped and recomputed at its next use, which costs a kernel instead of a transfer; writing
+to one of its inputs computes it first.</li>
+<li><code>ctx.memory_stats()</code> reports the bytes in use, idle in the pool and spilled to host memory and the
+budget, <code>ctx.paging_stats()</code> the evictions by kind (<code>clean_evictions</code>, <code>readback_evictions</code>,
+<code>recompute_evictions</code>), the host copies kept (<code>host_copy_bytes</code>) and, where the device says, its free
+memory (<code>device_free_bytes</code>); <code>ctx.trim()</code> gives the idle pool back to the device, for example after a phase whose
 temporaries the next one cannot reuse.</li>
+<li>Host memory for spilled arrays and for kept copies is limited by <code>ContextOptions::host_budget</code> /
+<code>LUMA_HOST_BUDGET</code> (default half of the available host memory). Over it, kept copies go first; arrays
+that exist only in host memory stay, with a warning once.</li>
+<li>Buffers are sized in eighth-octave classes (a multiple of a sixteenth of the next power of two above
+4 KiB, so at most 12.5% padding): arrays of odd sizes keep more data resident than power-of-two sizes would.</li>
+<li><code>ctx.memory_model()</code> is the calibrated memory hierarchy of the device (L2 size and bandwidth, workgroup-memory
+bandwidth, the cost of strided, gathered and transposed reads relative to coalesced, dependent-load latency);
+<code>examples/device_info</code> prints it. The planner does not read it yet.</li>
 </ul>
 <h2 id="a-checklist-for-a-slow-program"><a class="header" href="#a-checklist-for-a-slow-program">A checklist for a slow program</a></h2>
 <ol>
@@ -4110,7 +4221,7 @@ temporaries the next one cannot reuse.</li>
 dominates? Is the time in kernels at all, or in the host (then it is <code>eval</code>, readbacks, or
 array construction)?</li>
 <li><strong>Count launches</strong> per step. A step that should be one fused kernel and is ten means a cut:
-print <code>profile.splits</code> and read the reason.</li>
+print <code>profile.cuts()</code> and read the reason.</li>
 <li><strong>Look for readbacks</strong> inside loops: <code>item()</code>, <code>to_vec()</code>, <code>max().item()?</code> per iteration. Move
 them out of the loop or use <code>iterate_until_all</code>.</li>
 <li><strong>Use the loop primitives</strong> where the step fits; check that the step is elementwise (register
@@ -5247,7 +5358,7 @@ batches are exact in counts, sums and extrema while <code>|x - pivot|</code> and
 stay below <code>2^24</code> (a <code>precise</code> pass is exact for all of <code>u32</code> and <code>i32</code>).</p>
 <p>A state of data whose mean drifts far during the stream keeps its accuracy: the pivot follows the
 mean at every merge of the recorded pushes.</p>
-<h2 id="performance-1"><a class="header" href="#performance-1">Performance</a></h2>
+<h2 id="performance-2"><a class="header" href="#performance-2">Performance</a></h2>
 <p><code>push</code> records one reduction kernel over the batch; the reductions of up to
 <code>flush_every(n)</code> pushes (default 16) are then merged into the state in one more small kernel,
 so a push is about 1.6 launches. The cost is the batch’s memory traffic, and the batches never
@@ -5278,20 +5389,19 @@ builder methods override them:</p>
 <tr><td><code>LUMA_BACKEND</code></td><td><code>backend</code> / <code>.backend(kind)</code></td></tr>
 <tr><td><code>LUMA_DEVICE</code></td><td><code>device</code> / <code>.device(kind)</code></td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td><code>memory_budget</code> / <code>.memory_budget(bytes)</code></td></tr>
+<tr><td><code>LUMA_HOST_BUDGET</code></td><td><code>host_budget</code> / <code>.host_budget(Some(bytes))</code></td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td><code>chunk_bytes</code> / <code>.chunk_bytes(bytes)</code></td></tr>
 <tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>check_finite</code> / <code>.check_finite(on)</code></td></tr>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>calibrate</code> / <code>.calibrate(on)</code></td></tr>
-<tr><td><code>LUMA_FAST_MATH</code></td><td><code>fast_math</code> / <code>.fast_math(on)</code></td></tr>
-<tr><td><code>LUMA_DF_FMA</code></td><td><code>df_fma</code> / <code>.df_fma(fused)</code></td></tr>
-<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
+<tr><td><code>LUMA_NUMERICS</code></td><td><code>numerics</code> / <code>.numerics(Numerics)</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_MULTI_REDUCE*</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_NATIVE_*</code>, <code>LUMA_OWN_GEMM</code>, <code>LUMA_HOST_FAST</code>,
-<code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_WGPU_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>, the
-dense linear algebra variables <code>LUMA_LINALG_*</code>, <code>LUMA_CHOL_*</code>, <code>LUMA_TRSV*</code>, <code>LUMA_SVD_PRECOND</code>, <code>LUMA_QR_TSQR</code>, and <code>LUMA_SAMPLER_*</code>) are
-read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>luma-bench</code> crate (last section).</p>
+<p>The others (<code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_WGPU_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>,
+<code>LUMA_EXIT_WAIT</code>, <code>LUMA_RECORD_DECISIONS</code>) are read from the environment only. The <em>Development switches</em> at the end of the table
+(<code>LUMA_TUNING</code>, <code>LUMA_FUSION_*</code>, <code>LUMA_LINALG_*</code>, <code>LUMA_CHOL_*</code>, <code>LUMA_NATIVE_*</code>, <code>LUMA_SAMPLER_*</code> and the rest) are not part of the supported interface: they exist to bisect and
+tune the library, may change meaning, and are removed before 0.6; programs should not depend on them. <code>LUMA_BENCH_*</code> belong to the
+<code>luma-bench</code> crate (last section).</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -5303,6 +5413,32 @@ read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>lu
 <tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback; <code>cpu</code> is the native <code>cpu</code> backend, software Vulkan adapters are never used); also accepts a backend name (<code>cuda</code>, <code>metal</code>, <code>wgpu</code>) when <code>LUMA_BACKEND</code> is not set</td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device’s memory where the backend reports it, never on CPU devices, otherwise unlimited</td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with <code>InvalidShape</code>; a value that is not a number is ignored</td></tr>
+<tr><td><code>LUMA_HOST_BUDGET</code></td><td>Bytes of host memory for host copies of device data: the segments moved off the device when <code>LUMA_MEMORY_BUDGET</code> is exceeded plus the copies kept of segments brought back (a segment whose bytes the host still holds is evicted without a transfer). Default: half of the available host memory, at most half of the cgroup limit. Over budget, kept copies are dropped first (least recently used first); segments that exist only in host memory stay, with a warning once. <code>Context::paging_stats()</code> reports the use</td></tr>
+<tr><td><code>LUMA_RECORD_DECISIONS</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: contexts start recording the planner’s decisions (<code>Context::record_decisions(true)</code>; read them with <code>Context::take_decisions()</code>); nothing else about evaluation changes</td></tr>
+<tr><td><code>LUMA_NUMERICS</code></td><td><code>strict</code>, <code>default</code>, <code>algebraic</code> or <code>fast</code>, optionally followed by modifiers <code>+name</code> / <code>-name</code> (<code>tf32-matmul</code>, <code>tf32-linalg</code>, <code>fast-math</code>, <code>reassociate</code>, <code>reformulate</code>, <code>exact-finite</code>), e.g. <code>strict+tf32-linalg</code>; an unknown value panics in <code>ContextOptions::from_env</code>. <code>default</code> is TF32 <code>matmul</code> and nothing else; <code>strict</code> is exact <code>f32</code> everywhere (what <code>LUMA_TF32_MATMUL=0</code> was); <code>fast</code> adds <code>fast-math</code> (what <code>LUMA_FAST_MATH=1</code> was): allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
+<tr><td><code>LUMA_FAST_MATH</code>, <code>LUMA_TF32_MATMUL</code>, <code>LUMA_LINALG_TF32</code></td><td>deprecated aliases of <code>LUMA_NUMERICS</code>, read by <code>ContextOptions::from_env</code> until 0.6 with a one-time warning: <code>LUMA_FAST_MATH=1</code> adds <code>fast-math</code>, <code>LUMA_TF32_MATMUL=0</code> removes <code>tf32-matmul</code>, <code>LUMA_LINALG_TF32=1</code> adds <code>tf32-linalg</code>; they apply over <code>LUMA_NUMERICS</code></td></tr>
+<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
+<tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile’s numbers for a day before measuring again) and use the tuning profile’s fixed cost model</td></tr>
+<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture), the machine code that the native <code>cpu</code> backend compiles (keyed by the host’s instruction set) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
+<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>%LOCALAPPDATA%\luma</code> on Windows, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again</td></tr>
+<tr><td><code>LUMA_CPU_THREADS</code></td><td>Number of worker threads of the native <code>cpu</code> backend (default: the machine’s available parallelism; a value that is not a positive number is ignored)</td></tr>
+<tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
+<tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
+<tr><td><code>LUMA_WGPU_DUMP</code></td><td>a directory: the wgpu backend writes the WGSL of every kernel it builds from luma’s kernel IR there, as <code>&lt;label&gt;-&lt;hash&gt;.wgsl</code>. For inspecting generated code (the counterpart of <code>LUMA_CUDA_DUMP</code>)</td></tr>
+<tr><td>(<code>+tf32-linalg</code> of <code>LUMA_NUMERICS</code>)</td><td>the trailing-update products of the factorisations (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, …) run in TF32 on CUDA with compute capability 8.0 and up; the factors then carry a backward error of about 1e-3 of the updates’ entries instead of 1e-7. Default: off (exact <code>f32</code> products); other backends ignore it. Replaces <code>LUMA_LINALG_TF32=1</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="development-switches"><a class="header" href="#development-switches">Development switches</a></h2>
+<p>Unsupported: for bisecting and tuning luma itself. Each is removed before 0.6, so do not depend on them in programs.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
 <tr><td><code>LUMA_SINGLE_PASS_REDUCE</code></td><td><code>off</code> makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction); <code>on</code> does the same single-pass reduction on the native CPU backend (other backends ignore it: WGSL does not order memory across workgroups)</td></tr>
@@ -5316,26 +5452,13 @@ read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>lu
 <tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there)</td></tr>
 <tr><td><code>LUMA_PLAN_CACHE</code></td><td><code>off</code>, <code>0</code>, <code>false</code> or <code>no</code> switches off the plan cache of eager evaluation: an <code>eval</code> whose pending graph has the structure of an earlier one (the loop <code>x = step(&amp;x); x.eval()?</code>) normally runs that evaluation’s recorded launches over the new buffers and scalars instead of planning it again; results are bit-identical either way. <code>trace</code> prints what the cache records and why it gives up on a structure</td></tr>
 <tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
-<tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
-<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
-<tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile’s numbers for a day before measuring again) and use the tuning profile’s fixed cost model</td></tr>
-<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture), the machine code that the native <code>cpu</code> backend compiles (keyed by the host’s instruction set) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
-<tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
-<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>%LOCALAPPDATA%\luma</code> on Windows, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again</td></tr>
-<tr><td><code>LUMA_CPU_THREADS</code></td><td>Number of worker threads of the native <code>cpu</code> backend (default: the machine’s available parallelism; a value that is not a positive number is ignored)</td></tr>
-<tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
-<tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
-<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
-<tr><td><code>LUMA_TF32_MATMUL</code></td><td><code>tf32_matmul</code> / <code>.tf32_matmul(on)</code></td></tr>
 <tr><td><code>LUMA_MULTI_REDUCE</code></td><td><code>off</code> (or <code>1</code>) keeps every pending reduction in a kernel of its own; a number sets the most accumulators one kernel computes when several reductions of the same length are forced together (clamped to what a kernel can hold; default 16)</td></tr>
 <tr><td><code>LUMA_MULTI_REDUCE_AFTER</code></td><td>How many times a group of pending reductions is recorded one by one before the kernel that computes the group together is compiled in the background (default 4 on CUDA, 0 elsewhere: the group’s kernel is compiled at once)</td></tr>
 <tr><td><code>LUMA_NATIVE_SOLVE</code></td><td><code>off</code> runs the line solves (<code>solve_tridiagonal</code> and relatives) of a backend that has native ones (the CPU backend) as compiled shaders, like the GPU backends</td></tr>
 <tr><td><code>LUMA_NATIVE_GEMM</code></td><td><code>off</code> runs the matrix products of a backend that has native ones (the CPU backend) as compiled tile kernels, like the GPU backends</td></tr>
 <tr><td><code>LUMA_OWN_GEMM</code></td><td><code>off</code> keeps the <code>f32</code> matrix products on the shader kernels even where the backend has its own (the PTX kernels of the CUDA backend)</td></tr>
 <tr><td><code>LUMA_HOST_FAST</code></td><td><code>off</code> never runs small operations on the host; <code>on</code> is only read by the crate’s own tests. Default: operations on small arrays may run on the host on devices with zero-copy memory (never on CPU devices, while recording a loop, with <code>LUMA_CHECK_FINITE</code> or while profiling)</td></tr>
-<tr><td><code>LUMA_WGPU_DUMP</code></td><td>a directory: the wgpu backend writes the WGSL of every kernel it builds from luma’s kernel IR there, as <code>&lt;label&gt;-&lt;hash&gt;.wgsl</code>. For inspecting generated code (the counterpart of <code>LUMA_CUDA_DUMP</code>)</td></tr>
-<tr><td><code>LUMA_LINALG_TF32</code></td><td><code>1</code>: the trailing-update products of the factorisations (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, …) run in TF32 on CUDA with compute capability 8.0 and up; the factors then carry a backward error of about 1e-3 of the updates’ entries instead of 1e-7. Default: off (exact <code>f32</code> products); other backends ignore it</td></tr>
 <tr><td><code>LUMA_CHOL_NB</code></td><td><code>32</code>, <code>64</code>, <code>96</code> or <code>128</code>: rows of the diagonal blocks of the blocked Cholesky and triangular solves. Default: the largest of 128, 64 and 32 whose kernels fit in a workgroup’s memory</td></tr>
 <tr><td><code>LUMA_CHOL_WIDE</code></td><td>Columns of a blocked Cholesky that one outer step brings up to date with one product: a multiple of the block size (<code>LUMA_CHOL_NB</code>), at least the block size; default four blocks</td></tr>
 <tr><td><code>LUMA_TRSV</code></td><td><code>0</code> keeps triangular solves with up to 32 right-hand sides off the single-launch solve kernel (one matrix, on backends that run the look-back scan, see <code>LUMA_LOOKBACK_SCAN</code>); default on</td></tr>
@@ -5380,6 +5503,7 @@ read from the environment only. <code>LUMA_BENCH_*</code> belong to the <code>lu
 <tr><td><code>LUMA_BENCH_REF</code></td><td>Text recorded as the <code>ref</code> of every JSON result line (<code>tools/benchref.sh</code> sets it to the commit)</td></tr>
 <tr><td><code>LUMA_BENCH_SHAPES</code></td><td>Set (not on the CPU): the <code>matmul</code> suite runs its per-shape cases; <code>small</code> runs a shorter list</td></tr>
 <tr><td><code>LUMA_BENCH_TF32</code></td><td>Set (not on the CPU): the <code>matmul</code> suite compares TF32 with <code>f32</code> products; <code>small</code> runs a shorter list</td></tr>
+<tr><td><code>LUMA_BENCH_DECISIONS</code></td><td>A file path: write the planner’s decisions of every case as JSONL, cold (plan cache emptied) and then warm (replay), plus the launches per kernel; compare two logs with <code>tools/decisiondiff OLD NEW</code>. The harness treats the GPU as idle while it records, so two runs of one binary agree</td></tr>
 </tbody>
 </table>
 </div>
@@ -5487,7 +5611,7 @@ high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every qu
 <p><strong><code>x.ne(&amp;x)</code> does not find the NaNs.</strong> Comparisons with a NaN are the GPU’s. <code>lt</code>, <code>le</code>, <code>gt</code>,
 <code>ge</code> and <code>eq</code> give false for a NaN operand, and <code>ne</code> gave false as well on NVIDIA and on
 llvmpipe (the tests that ran), where IEEE says true. Use <code>x.is_nan()</code>, and <code>select(&amp;x.is_nan(), a, b)</code>
-to replace them. <code>LUMA_FAST_MATH</code> additionally folds a comparison of an array with itself.</p>
+to replace them. <code>LUMA_NUMERICS=fast</code> additionally folds a comparison of an array with itself.</p>
 <p><strong>What does a float-to-integer cast give out of range?</strong> <code>to_u32</code> and <code>to_i32</code> truncate toward
 zero and saturate at the largest <code>f32</code> inside the range, and NaN becomes 0:</p>
 <div class="table-wrapper">
@@ -5519,12 +5643,12 @@ its terms).</strong> On a CUDA device of compute capability 8.0 or higher (Amper
 TF32 by default: the operands are rounded to 10 bits of mantissa and the products accumulated in <code>f32</code>, so
 each entry is within 1.5e-3 of the sum of the absolute values of its terms of the <code>f32</code> product (the
 precision of PyTorch’s <code>allow_tf32</code>). <code>a.matmul_f32(&amp;b)</code> is the exact product of one call;
-<code>ContextOptions::tf32_matmul(false)</code> or <code>LUMA_TF32_MATMUL=0</code> makes every <code>matmul</code> of a context exact, and
-<code>Context::tf32_matmul()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
+<code>ContextOptions::numerics(Numerics::strict())</code> or <code>LUMA_NUMERICS=strict</code> makes every <code>matmul</code> of a context exact, and
+<code>Context::numerics()</code> says which a context does. <code>matmul_batched</code> and the other backends (wgpu, Metal,
 the CPU) compute <code>f32</code> products, so results also differ between a CUDA run and one on another backend
 (<a href="#tensor-cores-tf32">Tensor cores</a>). The dense linear algebra (<code>lu</code>, <code>qr</code>, <code>cholesky</code>, <code>svd</code>, …)
 uses <code>f32</code> products only.</p>
-<h2 id="performance-2"><a class="header" href="#performance-2">Performance</a></h2>
+<h2 id="performance-3"><a class="header" href="#performance-3">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines (wgpu), the CUDA PTX, the CPU backend’s machine code and the measured cost
 model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set
@@ -5543,8 +5667,47 @@ result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers
 <h2 id="from-051-to-052"><a class="header" href="#from-051-to-052">From 0.5.1 to 0.5.2</a></h2>
 <p>0.5.2 is a patch release that adds a great deal (complex arrays and FFTs, sparse matrices, dense linear
 algebra, image and filter operations, feature detection, interpolation and warps, accumulators, texture
-reads) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they are. One
-behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.</p>
+reads, <code>f16</code> / <code>bf16</code>) and keeps the 0.5.1 API, with the few exceptions below. Most programs compile as they
+are. One behaviour changes without a compile error: <code>matmul</code> runs in TF32 on CUDA devices with tensor cores.
+Some items are deprecated (removed in 0.6) and have replacements already.</p>
+<h3 id="numerics-replaces-fast_math-tf32_matmul-and-the-tf32-variables"><a class="header" href="#numerics-replaces-fast_math-tf32_matmul-and-the-tf32-variables"><code>Numerics</code> replaces <code>fast_math</code>, <code>tf32_matmul</code> and the TF32 variables</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>Now</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ContextOptions::fast_math(true)</code></td><td><code>ContextOptions::numerics(Numerics::fast())</code></td></tr>
+<tr><td><code>ContextOptions::tf32_matmul(false)</code></td><td><code>ContextOptions::numerics(Numerics::strict())</code></td></tr>
+<tr><td><code>Context::tf32_matmul()</code></td><td><code>Context::numerics().tf32_matmul()</code></td></tr>
+<tr><td><code>LUMA_FAST_MATH=1</code></td><td><code>LUMA_NUMERICS=fast</code> (or <code>+fast-math</code>)</td></tr>
+<tr><td><code>LUMA_TF32_MATMUL=0</code></td><td><code>LUMA_NUMERICS=strict</code> (or <code>-tf32-matmul</code>)</td></tr>
+<tr><td><code>LUMA_LINALG_TF32=1</code></td><td><code>LUMA_NUMERICS=default+tf32-linalg</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The old fields, builders and variables still work (the variables with a one-time warning) and are applied over
+<code>numerics</code>. <code>LUMA_NUMERICS</code> panics on an unknown value in <code>ContextOptions::from_env</code>; the linear-algebra
+TF32 switch is read per context now, not once per process. See <a href="#environment-variables">Environment variables</a>.</p>
+<h3 id="profilesplits-and-fusionsplit-are-deprecated"><a class="header" href="#profilesplits-and-fusionsplit-are-deprecated"><code>Profile::splits</code> and <code>FusionSplit</code> are deprecated</a></h3>
+<p>Use <code>Profile::cuts()</code> for the cuts (an iterator of operation, location and <code>SplitReason</code>) and
+<code>Context::take_decisions()</code> right after <code>finish_profiling</code> / <code>profile</code> for every planner decision
+(<a href="#why-was-it-cut-cuts-and-decisions">Why was it cut</a>). <code>Backend::finish_profiling</code> keeps its
+<code>splits</code> argument until 0.6.</p>
+<h3 id="new"><a class="header" href="#new">New</a></h3>
+<ul>
+<li><code>Array&lt;f16&gt;</code> and <code>Array&lt;bf16&gt;</code> (<a href="#half-precision-floats-f16-and-bf16">Half-precision floats</a>).</li>
+<li><code>ContextOptions::host_budget</code> / <code>LUMA_HOST_BUDGET</code>, <code>Context::paging_stats()</code> and <code>Context::memory_model()</code>
+(<a href="#transfers">Transfers</a>); evicting an array the host holds a copy of, or a cheap result of
+arrays that stay on the device, transfers nothing.</li>
+<li><code>Context::record_decisions(true)</code> / <code>LUMA_RECORD_DECISIONS=1</code> and <code>Context::take_decisions()</code>.</li>
+<li>Buffers are sized in eighth-octave classes instead of powers of two, so up to 1.4x more data stays on the
+device before paging on a mix of odd sizes.</li>
+</ul>
+<h3 id="for-backend-implementors"><a class="header" href="#for-backend-implementors">For backend implementors</a></h3>
+<p><code>kir::ir::IrUnOp</code> gained <code>F32ToF16Bits</code>, <code>F16BitsToF32</code> and <code>RoundF16</code>: a backend that matches it exhaustively
+needs three more arms. Everything else the HAL gained (the transfer lane: <code>stage_alloc</code>, <code>transfer_in</code>,
+<code>transfer_out</code>, <code>barrier</code>, tickets; <code>memory_now</code>, <code>l2_cache_bytes</code>, <code>storage_offset_align</code>) has a default.</p>
 <h3 id="matmul-is-tf32-by-default-on-cuda"><a class="header" href="#matmul-is-tf32-by-default-on-cuda"><code>matmul</code> is TF32 by default on CUDA</a></h3>
 <p>On a CUDA device of compute capability 8.0 or higher (Ampere and later) <code>matmul</code> rounds its operands to TF32
 (10 bits of mantissa) and accumulates in <code>f32</code>, so results differ from the exact <code>f32</code> product (each entry
@@ -5553,8 +5716,8 @@ is within 1.5e-3 of the sum of the absolute values of its terms). Other backends
 off for a context:</p>
 <pre><code class="language-rust">use luma::*;
 
-let exact = Context::with_options(ContextOptions::default().tf32_matmul(false))?;  // or LUMA_TF32_MATMUL=0
-assert!(!exact.tf32_matmul());
+let exact = Context::with_options(ContextOptions::default().numerics(Numerics::strict()))?;  // or LUMA_NUMERICS=strict
+assert!(!exact.numerics().tf32_matmul());
 let a = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 2.0, 3.0, 4.0], [2, 2])?;
 let b = Array::from_slice_on(&amp;exact, &amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?;
 assert_eq!(a.matmul_f32(&amp;b).to_vec()?, a.to_vec()?);   // the exact product of one call
@@ -5623,12 +5786,12 @@ opt-in <code>Interp::LinearHardware</code>), <a href="#incremental-accumulation"
 <li><code>matmul_nt</code>, <code>matmul_tn</code>, <code>matmul_tt</code> and <code>dot</code>; <code>prod</code> / <code>product</code> and the <code>*_by_key</code> reductions;
 <code>sort_by_key</code>, <code>set_unique</code>, <code>set_union</code> and <code>set_intersect</code>; the elementwise functions of ArrayFire’s
 <code>arith.h</code>.</li>
-<li><code>ContextOptions::tf32_matmul</code>, <code>Context::tf32_matmul()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
-(<a href="#matrix-products-1">Performance guide</a>).</li>
+<li><code>ContextOptions::numerics</code>, <code>Context::numerics()</code>, <code>matmul_f32</code>, <code>matmul_tf32</code>
+(<a href="#matrix-products-2">Performance guide</a>).</li>
 <li>The plan cache of eager evaluation (<code>LUMA_PLAN_CACHE</code>), compile worker threads (<code>LUMA_COMPILE_THREADS</code>)
 and the CPU backend’s native matrix products (<a href="#performance-guide">Performance guide</a>).</li>
 <li>A disk cache keyed by a hash of the sources that generate the code: the first run after the upgrade
-compiles every kernel again (<a href="#performance-2">FAQ</a>).</li>
+compiles every kernel again (<a href="#performance-3">FAQ</a>).</li>
 <li><code>KernelBuilder::unchecked_bounds</code> (<code>unsafe</code>) for custom kernels
 (<a href="#bounds-checks">Custom kernels</a>).</li>
 </ul>

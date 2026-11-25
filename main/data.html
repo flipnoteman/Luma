@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -264,7 +264,7 @@ at 21 instead of 13, and the small and skinny products of a network (a 256-row b
 1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.</p>
 <p>Where the precision matters, ask for <code>f32</code>: <code>a.matmul_f32(&amp;b)</code> is the full-precision product of
 one call (a chain of fused multiply-adds in a fixed order per entry), and
-<code>ContextOptions::tf32_matmul(false)</code> (<code>LUMA_TF32_MATMUL=0</code>) makes every <code>matmul</code> of a context
+<code>ContextOptions::numerics(Numerics::strict())</code> (<code>LUMA_NUMERICS=strict</code>) makes every <code>matmul</code> of a context
 that product. <code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always
 <code>f32</code>. On CUDA the <code>f32</code> product has kernels of its own for the shapes above (an RTX 3090: 23
 TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions

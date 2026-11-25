@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-233ab6f2.js";
+            window.path_to_searchindex_js = "searchindex-a020ef23.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-732ff444.js"></script>
+        <script src="toc-d68a3527.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -288,7 +288,7 @@ evaluated when the call returns, so what reads it is another kernel
 those forced together are recorded in one kernel (up to 16 accumulators; <code>LUMA_MULTI_REDUCE</code>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
-cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
+cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#method.cuts"><code>Profile::cuts</code></a> tells you where
 and why.</p>
 <h2 id="cache"><a class="header" href="#cache"><code>cache()</code></a></h2>
 <p><code>x.cache()</code> evaluates an expression now (it is recorded as a kernel, without waiting for the GPU)
