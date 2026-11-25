@@ -113,5 +113,5 @@ fn fits_by_key_single(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Op
 fn fits_by_key_chunked(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<Params> {
     let (n, _, _, a) = shape(subject);
     let nb = n.div_ceil(BY_KEY_CHUNK);
-    (a.by_key && nb > 1).then(|| Params::Scan(ScanParams { vec: 0, nb, k: BY_KEY_CHUNK, fused: false }))
+    (a.by_key && nb > 1).then_some(Params::Scan(ScanParams { vec: 0, nb, k: BY_KEY_CHUNK, fused: false }))
 }

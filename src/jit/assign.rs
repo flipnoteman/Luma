@@ -30,7 +30,7 @@ use crate::gpu::hash::FxMap;
 
 use super::program::{flatten, AtomicOp, Tail};
 use super::structured::boundary::{dim, ScatterAttrs, ScatterOp};
-use super::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
+use super::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use super::{launch, lock, Args, Edge, ElemTy, Held, Node, Op, OpKind, ShiftKind, Src, ViewMap};
 
 /// One region of an array that `assign` overwrites.
@@ -553,7 +553,7 @@ pub(crate) fn scatter(
         [dim(base.len()), dim(count), 0, 0],
         BoundaryAttrs::Scatter(ScatterAttrs { atomic: ScatterOp::of(atomic), base_len: base.len() as u64, count: count as u64, base_is_view: false, base_is_read_view: false, host_site: false }),
     );
-    let (chosen, params) = candidates(ctx, &boundary).next().expect("a scatter strategy always fits");
+    let (chosen, params) = first_candidate(ctx, &boundary).expect("a scatter strategy always fits");
     note(ctx, &boundary, chosen, &params, &[]);
     let tail = match (chosen, atomic) {
         (StrategyId::SCATTER_PLAIN, _) => Tail::Scatter { len },

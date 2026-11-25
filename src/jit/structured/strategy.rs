@@ -396,13 +396,47 @@ pub(crate) fn candidates_in<'a>(entries: &'static [Strategy], ctx: &'a Context, 
     })
 }
 
+/// The parameters of the strategy `id` for `boundary` if it applies (capabilities, numerics, `fits`): for the host paths a boundary op
+/// tries first, which are the only strategy that applies at their site.
+#[inline]
+pub(crate) fn admit_one(ctx: &Context, boundary: &Boundary<'_>, id: StrategyId) -> Option<Params> {
+    // A strategy's id is its place in its family's table.
+    let strategy = &table(boundary.family)[usize::from(id.1)];
+    debug_assert_eq!(strategy.id, id);
+    super::select::admit(strategy, &Subject::Boundary(boundary), ctx, &Residencies::DEVICE).ok()
+}
+
+/// Whether the device has the capabilities strategy `id` needs: a boundary op tries a host path only where this holds, and builds
+/// no descriptor otherwise (the capabilities are fixed when the context opens; `fits` still decides the rest).
+#[inline]
+pub(crate) fn has_caps_for(ctx: &Context, family: FamilyTag, id: StrategyId) -> bool {
+    ctx.caps().contains(table(family)[usize::from(id.1)].needs)
+}
+
+/// The first of [`candidates`]: the strategy a boundary op without a host path to try runs, without the iterator (one scan of the table
+/// in order, the forced strategy of `LUMA_STRATEGY` first where it fits).
+#[inline]
+pub(crate) fn first_candidate(ctx: &Context, boundary: &Boundary<'_>) -> Option<(StrategyId, Params)> {
+    if ctx.strategy_override(boundary.family).is_some() {
+        return candidates(ctx, boundary).next();
+    }
+    let subject = Subject::Boundary(boundary);
+    table(boundary.family).iter().find_map(|strategy| super::select::admit(strategy, &subject, ctx, &Residencies::DEVICE).ok().map(|params| (strategy.id, params)))
+}
+
 /// Records the Decision of a boundary op that chose `chosen` (with `params`) after `declined` ones gave up, while decisions are
 /// recorded (profiling or `Context::record_decisions`): one relaxed load otherwise.
 #[allow(dead_code)]
+#[inline(always)]
 pub(crate) fn note(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
-    if !ctx.jit().recording_decisions() {
-        return;
+    if ctx.jit().recording_decisions() {
+        note_recorded(ctx, boundary, chosen, params, declined);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn note_recorded(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
     let subject = Subject::Boundary(boundary);
     let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen));
     for strategy in table(boundary.family) {

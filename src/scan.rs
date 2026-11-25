@@ -30,7 +30,7 @@ use luma_core::Buffer;
 
 use crate::jit::structured::boundary::{ScanAttrs, ScanOperand};
 use crate::jit::structured::emit::Emit;
-use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
+use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 
 use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
@@ -928,6 +928,24 @@ pub(crate) struct Lines<'a> {
     emit: Emit<'a>,
 }
 
+/// A pending operand evaluated into a buffer for the scans that read it more than once, or that cannot compute it.
+struct Evaluated {
+    pin: crate::gpu::pager::Pin,
+    bytes: u64,
+}
+
+impl Evaluated {
+    fn bound(&self) -> Bound<'_> {
+        Bound { buffer: self.pin.buffer(), bytes: self.bytes }
+    }
+}
+
+#[inline(never)]
+fn evaluate_operand(node: &Arc<Node>) -> Outcome<Evaluated> {
+    let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+    Ok(Evaluated { pin: storage.pin_single_read()?, bytes: storage.byte_len() })
+}
+
 /// A buffer and the bytes bound of it.
 #[derive(Clone, Copy)]
 pub(crate) struct Bound<'b> {
@@ -1145,24 +1163,26 @@ impl<'a> Lines<'a> {
     /// blocks before (seeded passes) or the statuses of a look-back. Only `+` of a pending operand is fused: that is the only
     /// operator the fused kernels know, and the only one `run_scan` leaves pending.
     fn launch_scan(&mut self, pass: Pass, geometry: [u32; 5], out: Bound<'_>, input: Input<'_>, pre: Option<Bound<'_>>) -> Outcome<()> {
-        let evaluated;
-        let input = match input {
-            Input::Buffer(input) => input,
+        match input {
+            Input::Buffer(input) => Ok(self.launch(pass, geometry, out, input, pre)?),
+            Input::Pending(node) => self.launch_pending(pass, geometry, out, node, pre),
             Input::Plan(_) => unreachable!("scans have no planned operands"),
-            Input::Pending(node) => {
-                let (workgroups, size) = self.grid(pass, geometry)?;
-                let scan = AxisPass { pass, ops: ReduceList::new(&[ReduceOp::Sum]), partial: false, split: false, line_major: false, scan: true };
-                let writes = [RawArg::write(out.buffer, out.bytes)];
-                let reads: Vec<RawArg<'_>> = pre.iter().map(|pre| if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) }).collect();
-                if jit::axis_reduce(&mut self.emit, node, scan, geometry, workgroups, size, &writes, &reads)? {
-                    return Ok(());
-                }
-                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
-                evaluated = storage.pin_single_read()?;
-                Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() }
-            }
-        };
-        Ok(self.launch(pass, geometry, out, input, pre)?)
+        }
+    }
+
+    /// [`Lines::launch_scan`] of a pending operand (kept out of the path of buffers, which a scan of a few cells makes hot).
+    #[inline(never)]
+    fn launch_pending(&mut self, pass: Pass, geometry: [u32; 5], out: Bound<'_>, node: &Arc<Node>, pre: Option<Bound<'_>>) -> Outcome<()> {
+        let (workgroups, size) = self.grid(pass, geometry)?;
+        let scan = AxisPass { pass, ops: ReduceList::new(&[ReduceOp::Sum]), partial: false, split: false, line_major: false, scan: true };
+        let writes = [RawArg::write(out.buffer, out.bytes)];
+        let reads: Vec<RawArg<'_>> = pre.iter().map(|pre| if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) }).collect();
+        if jit::axis_reduce(&mut self.emit, node, scan, geometry, workgroups, size, &writes, &reads)? {
+            return Ok(());
+        }
+        let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+        let evaluated = storage.pin_single_read()?;
+        Ok(self.launch(pass, geometry, out, Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() }, pre)?)
     }
 
     /// One reducing pass of `ops` over `input` into `outs`: a buffer for every op if there are
@@ -1225,16 +1245,15 @@ impl<'a> Lines<'a> {
             Input::Buffer(_) | Input::Plan(_) => ScanOperand::Buffer,
         };
         let boundary = Boundary::new(FamilyTag::Scan, "scan", Location::caller(), [n, stride, lines, 0], BoundaryAttrs::Scan(ScanAttrs { grouping_free: self.grouping_free(), by_key: false, operand }));
-        let (id, params) = candidates(self.ctx, &boundary).next().expect("a scan strategy always fits");
+        let (id, params) = first_candidate(self.ctx, &boundary).expect("a scan strategy always fits");
         note(self.ctx, &boundary, id, &params, &[]);
         let Params::Scan(params) = params else { unreachable!("a scan strategy runs with scan parameters") };
         // The operand the kernels read: the pending expression where they compute it, else its buffer (evaluated once for all of them).
         let evaluated;
         let input = match input {
             Input::Pending(node) if !params.fused => {
-                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
-                evaluated = storage.pin_single_read()?;
-                Input::Buffer(Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() })
+                evaluated = evaluate_operand(node)?;
+                Input::Buffer(evaluated.bound())
             }
             other => other,
         };

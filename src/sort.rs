@@ -63,7 +63,7 @@ use std::sync::Arc;
 use luma_core::Buffer;
 
 use crate::jit::structured::boundary::{dim, SortAttrs, SortParams, SortPayload, SortStage};
-use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
+use crate::jit::structured::strategy::{admit_one, first_candidate, has_caps_for, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
@@ -909,6 +909,9 @@ impl Keys<'_> {
 /// The boundary of the selection at the entry of a sort of `len` elements, and the host path's parameters if the registry has it
 /// apply (it may still decline: `try_*` answers `None` and the sort goes on to the radix kernels).
 fn host_candidate(ctx: &Context, op: &'static str, location: &'static Location<'static>, len: usize, errored: bool) -> Option<(Boundary<'static>, Params)> {
+    if !has_caps_for(ctx, FamilyTag::Sort, StrategyId::SORT_HOST) {
+        return None;
+    }
     let boundary = Boundary::new(
         FamilyTag::Sort,
         op,
@@ -916,7 +919,7 @@ fn host_candidate(ctx: &Context, op: &'static str, location: &'static Location<'
         [dim(len), 1, 1, 0],
         BoundaryAttrs::Sort(SortAttrs { stage: SortStage::Entry, payload: SortPayload::None, errored, value4: false, key_bits: 32, len: len as u64 }),
     );
-    let params = candidates(ctx, &boundary).find_map(|(id, params)| (id == StrategyId::SORT_HOST).then_some(params))?;
+    let params = admit_one(ctx, &boundary, StrategyId::SORT_HOST)?;
     Some((boundary, params))
 }
 
@@ -944,7 +947,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
             len: n as u64,
         }),
     );
-    let (chosen, params) = candidates(ctx, &boundary).next().expect("the count/scan/scatter radix sort always fits");
+    let (chosen, params) = first_candidate(ctx, &boundary).expect("the count/scan/scatter radix sort always fits");
     note(ctx, &boundary, chosen, &params, &[]);
     let Params::Sort(params) = params else { unreachable!("a sort strategy runs with sort parameters") };
     if chosen == StrategyId::SORT_RADIX_SWEEP {
@@ -1473,7 +1476,7 @@ impl<T: SortKey> Array<T> {
             [dim(self.len()), 1, 1, 0],
             BoundaryAttrs::Sort(SortAttrs { stage: SortStage::ByKey, payload: SortPayload::Buffer, errored: false, value4: V::LAYOUT == ElemLayout::plain(4), key_bits: key_bits.clamp(1, 32) as u8, len: self.len() as u64 }),
         );
-        let (chosen, params) = candidates(ctx, &boundary).next().expect("the permutation sort always fits");
+        let (chosen, params) = first_candidate(ctx, &boundary).expect("the permutation sort always fits");
         note(ctx, &boundary, chosen, &params, &[]);
         if chosen == StrategyId::SORT_BY_KEY_PAYLOAD {
             let spec = Spec { transform: T::TRANSFORM, descending, key_bits, want_keys: true };
@@ -1516,7 +1519,7 @@ impl<T: SortKey> Array<T> {
             BoundaryAttrs::Sort(SortAttrs { stage: SortStage::ByKeyAxis, payload: SortPayload::None, errored: false, value4: false, key_bits: 32, len: len as u64 }),
         );
         // One line is the flat by-key sort, which selects for itself.
-        let Some((chosen, params)) = candidates(ctx, &boundary).next() else {
+        let Some((chosen, params)) = first_candidate(ctx, &boundary) else {
             let (keys, moved) = flat.run_sort_by_key(&flat_values, descending)?;
             return Ok((keys.reshape(shape), moved.reshape(shape)));
         };
@@ -1565,7 +1568,7 @@ impl<T: SortKey> Array<T> {
             [dim(n), dim(stride), dim(self.len() / n), 0],
             BoundaryAttrs::Sort(SortAttrs { stage: SortStage::Axis, payload: SortPayload::None, errored: false, value4: false, key_bits: 32, len: self.len() as u64 }),
         );
-        let (chosen, params) = candidates(self.context(), &boundary).next().expect("a sort along an axis always fits");
+        let (chosen, params) = first_candidate(self.context(), &boundary).expect("a sort along an axis always fits");
         note(self.context(), &boundary, chosen, &params, &[]);
         if chosen == StrategyId::SORT_LINES {
             return self.sort_short_lines(stride, n);

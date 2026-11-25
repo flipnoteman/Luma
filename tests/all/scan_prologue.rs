@@ -85,7 +85,7 @@ fn check<T: Numeric + Copy + std::fmt::Debug>(ctx: &Context, name: &str, dims: [
         got = operand.cumsum(axis).to_vec().unwrap();
     });
     assert_eq!(bits(&got, &to_bits), bits(want, &to_bits), "{name} {dims:?} axis {axis}");
-    assert!(launched.iter().all(|label| label.starts_with("Scan") || label.starts_with("FusedAxisReduce") || label == "Fill"), "{name} {dims:?} axis {axis}: {launched:?}");
+    assert!(launched.iter().all(|label| label.starts_with("Scan") || label.starts_with("FusedAxisReduce") || label.starts_with("Fill")), "{name} {dims:?} axis {axis}: {launched:?}");
     assert!(launched.iter().any(|label| label.starts_with("FusedAxisReduce")), "{name} {dims:?} axis {axis}: {launched:?}");
 }
 

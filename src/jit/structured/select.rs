@@ -115,7 +115,7 @@ pub(crate) fn admit(strategy: &Strategy, subject: &Subject<'_>, ctx: &Context, r
     if !ctx.caps().contains(strategy.needs) {
         return Err(Skip::Caps);
     }
-    if !numerics_allowed(strategy.numerics, &ctx.numerics()) {
+    if strategy.numerics != NumClass::Exact && !numerics_allowed(strategy.numerics, &ctx.numerics()) {
         return Err(Skip::Numerics);
     }
     (strategy.fits)(subject, ctx, res).ok_or(Skip::Shape)

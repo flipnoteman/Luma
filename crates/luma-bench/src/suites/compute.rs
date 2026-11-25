@@ -23,6 +23,7 @@
 //! timed. Sizes shrink under `--quick` and on the CPU backend.
 
 mod bandwidth;
+mod boundary;
 mod imageops;
 mod visionops;
 mod crypto;
@@ -106,6 +107,7 @@ pub fn run(h: &mut Harness) {
     bandwidth::run(h);
     linalg::run(h);
     scans::run(h);
+    boundary::run(h);
     physics::run(h);
     signal::run(h);
     imageops::run(h);

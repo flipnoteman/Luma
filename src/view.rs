@@ -22,7 +22,7 @@ use crate::gpu::pager::Pin;
 use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::assign::Region;
 use crate::jit::structured::boundary::{dim, ScatterAttrs, ScatterOp};
-use crate::jit::structured::strategy::{candidates, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
+use crate::jit::structured::strategy::{admit_one, has_caps_for, note, Boundary, BoundaryAttrs, FamilyTag, StrategyId};
 use crate::jit::{self, AxisMap, Edge, ElemTy, Held, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 use crate::ops::{run_select, Operand, Outcome, Rhs};
 use crate::shape::{Offsets, Shape};
@@ -881,27 +881,28 @@ impl<T: ScalarType> Array<T> {
         location: &'static Location<'static>,
     ) -> Result<()> {
         let ctx = self.context();
-        let boundary = Boundary::new(
-            FamilyTag::Scatter,
-            name,
-            location,
-            [dim(self.len()), dim(indices.len()), 0, 0],
-            BoundaryAttrs::Scatter(ScatterAttrs {
-                atomic: ScatterOp::of(atomic),
-                base_len: self.len() as u64,
-                count: indices.len() as u64,
-                base_is_view: self.view().is_some(),
-                base_is_read_view: self.is_read_view(),
-                host_site: true,
-            }),
-        );
-        for (id, params) in candidates(ctx, &boundary) {
-            // Only the host path applies at this site; the kernel's tail is chosen where it is built (`jit::assign::scatter`).
-            if id == StrategyId::SCATTER_HOST {
-                if crate::host::try_put(self, indices, &values.rhs()) {
-                    note(ctx, &boundary, id, &params, &[]);
-                    return Ok(());
-                }
+        // Only the host path applies at this site (on a device that has one); the kernel's tail is chosen where it is built
+        // (`jit::assign::scatter`).
+        if has_caps_for(ctx, FamilyTag::Scatter, StrategyId::SCATTER_HOST) {
+            let boundary = Boundary::new(
+                FamilyTag::Scatter,
+                name,
+                location,
+                [dim(self.len()), dim(indices.len()), 0, 0],
+                BoundaryAttrs::Scatter(ScatterAttrs {
+                    atomic: ScatterOp::of(atomic),
+                    base_len: self.len() as u64,
+                    count: indices.len() as u64,
+                    base_is_view: self.view().is_some(),
+                    base_is_read_view: self.is_read_view(),
+                    host_site: true,
+                }),
+            );
+            if let Some(params) = admit_one(ctx, &boundary, StrategyId::SCATTER_HOST)
+                && crate::host::try_put(self, indices, &values.rhs())
+            {
+                note(ctx, &boundary, StrategyId::SCATTER_HOST, &params, &[]);
+                return Ok(());
             }
         }
         let prepared = self.scatter_args(indices, values.rhs());

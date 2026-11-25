@@ -237,7 +237,7 @@ fn sort_fits_on_both_sides_of_every_threshold() {
         t.lookback_scan = true;
         t.workgroup_storage = storage - 1;
     });
-    assert_eq!(radix(&short, 1 << 20, SortPayload::None), if ballot_bytes() <= storage - 1 { StrategyId::SORT_RADIX_BALLOTS } else { StrategyId::SORT_RADIX_COUNT_SCAN });
+    assert_eq!(radix(&short, 1 << 20, SortPayload::None), if ballot_bytes() < storage { StrategyId::SORT_RADIX_BALLOTS } else { StrategyId::SORT_RADIX_COUNT_SCAN });
     let ballots = cpu_with(|t| {
         t.subgroup32 = true;
         t.lookback_scan = false;
@@ -384,7 +384,7 @@ fn strategies_of_sort_scan_and_scatter_are_forced_by_name() {
     // The light ports have no strategies to force.
     for family in ["search", "compact", "merge"] {
         let text: &'static str = Box::leak(format!("{family}:anything").into_boxed_str());
-        let error = Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).calibrate(false).strategy(text)).err().expect("the family is not ported");
+        let error = Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).calibrate(false).strategy(text)).map(drop).expect_err("the family is not ported");
         assert!(matches!(&error, crate::error::LumaError::InvalidOption(message) if message.contains("family not ported")), "{error}");
     }
 }

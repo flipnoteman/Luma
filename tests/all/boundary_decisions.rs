@@ -89,7 +89,7 @@ fn every_boundary_family_logs_its_choice() {
 #[test]
 fn light_ports_refuse_strategy_names() {
     for text in ["search:unrolled", "compact:count_scatter", "merge:wide"] {
-        let error = Context::with_options(ContextOptions::from_env().calibrate(false).strategy(text)).err().expect("not ported");
+        let error = Context::with_options(ContextOptions::from_env().calibrate(false).strategy(text)).map(drop).expect_err("not ported");
         assert!(matches!(&error, LumaError::InvalidOption(message) if message.contains("family not ported")), "{error}");
     }
 }
