@@ -7,6 +7,7 @@
 
 use std::fmt::Debug;
 
+mod file;
 mod half;
 mod stats;
 
@@ -39,6 +40,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("small", small_cases);
     h.guarded("half", half::run);
     h.guarded("spill", spill_cases);
+    h.guarded("file", file::run);
 }
 
 // -------------------------------------------------------------------------------------------------

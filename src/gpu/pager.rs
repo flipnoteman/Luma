@@ -796,6 +796,10 @@ impl Segment {
                 self.ctx.abort_recording_for("recompute of an evicted segment")?;
             } else if away {
                 self.ctx.abort_recording_for("file segment upload")?;
+                // Aborting runs recorded commands, which may have pinned (and written) this very segment.
+                if !matches!(&*lock(&self.state), State::Away) {
+                    continue;
+                }
             } else if matches!(&*lock(&self.state), State::Host(_)) {
                 self.ctx.abort_recording_for("host segment upload")?;
             }

@@ -279,6 +279,8 @@ type Env = Vec<Option<Arr>>;
 struct Cx {
     ctx: Context,
     math: bool,
+    /// Inputs are file arrays (see `Config::file_leaves`).
+    files: bool,
 }
 
 fn get<T: Num>(env: &Env, i: usize) -> &Array<T> {
@@ -550,7 +552,12 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
     match stmt {
         Stmt::Input { dims, ty, seed } => by_ty!(*ty, T => {
             let data: Vec<T> = generator::values(*seed, *ty, oracle::len_of(*dims), cx.math).into_iter().map(T::from_f32).collect();
-            push(env, T::wrap(Array::<T>::from_slice_on(ctx, &data, Shape::new(*dims))?))
+            let array = if cx.files && matches!(*ty, Ty::F32 | Ty::U32 | Ty::I32) {
+                file_leaf(ctx, &data, Shape::new(*dims))?
+            } else {
+                Array::<T>::from_slice_on(ctx, &data, Shape::new(*dims))?
+            };
+            push(env, T::wrap(array))
         }),
         Stmt::Full { dims, ty, value } => by_ty!(*ty, T => {
             push(env, T::wrap(Array::<T>::full_on(ctx, Shape::new(*dims), T::from_f32(*value))?))
@@ -1045,6 +1052,17 @@ fn limit_or_fail(error: &LumaError, what: &str) -> Fail {
     }
 }
 
+/// `data` as a writable file array (programs write to their inputs): written to a temporary file, which is unlinked as soon as it is open.
+fn file_leaf<T: crate::GpuType>(ctx: &Context, data: &[T], shape: Shape) -> Result<Array<T>, LumaError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!("luma-fuzz-{}-{}.f", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let repr = T::to_repr(data);
+    std::fs::write(&path, bytemuck::cast_slice::<_, u8>(&repr)).map_err(|e| LumaError::Gpu(format!("fuzz file: {e}")))?;
+    let array = Array::<T>::open_on(ctx, &path, crate::FileOptions::raw().shape(shape).writable());
+    let _ = std::fs::remove_file(&path);
+    array
+}
+
 // -- The machine --
 
 struct Machine {
@@ -1054,8 +1072,8 @@ struct Machine {
 }
 
 impl Machine {
-    fn new(ctx: Context, math: bool) -> Machine {
-        Machine { cx: Cx { ctx, math }, luma: Vec::new(), host: Vec::new() }
+    fn new(ctx: Context, math: bool, files: bool) -> Machine {
+        Machine { cx: Cx { ctx, math, files }, luma: Vec::new(), host: Vec::new() }
     }
 
     fn truncate(&mut self, len: usize) {
@@ -1242,14 +1260,20 @@ impl Arr {
 
 /// The context of a program under its configuration; `None` if the device refuses it.
 fn engine(config: &Config) -> Option<Context> {
+    // File leaves page in small segments through a small budget, so that they are read, dropped and read again.
+    let (chunk_bytes, memory_budget) = if config.file_leaves {
+        (Some(config.chunk_bytes.unwrap_or(1024)), Some(config.memory_budget.unwrap_or(1 << 14)))
+    } else {
+        (config.chunk_bytes, config.memory_budget)
+    };
     let mut options = ContextOptions::from_env().calibrate(false).numerics(if config.fast_math { crate::Numerics::fast() } else { crate::Numerics::default() });
     if config.df_split {
         options = options.df_fma(false);
     }
-    if let Some(bytes) = config.chunk_bytes {
+    if let Some(bytes) = chunk_bytes {
         options = options.chunk_bytes(bytes);
     }
-    if let Some(bytes) = config.memory_budget {
+    if let Some(bytes) = memory_budget {
         options = options.memory_budget(bytes);
     }
     let ctx = Context::with_options(options).ok()?;
@@ -1319,7 +1343,7 @@ enum Filter {
 
 /// Runs `program` on `ctx` and the oracle; `Err` describes the first difference.
 fn run_on(ctx: Context, program: &Program, filter: Filter) -> Result<(), String> {
-    let mut machine = Machine::new(ctx, program.math);
+    let mut machine = Machine::new(ctx, program.math, program.config.file_leaves);
     let created = created_counts(program);
     let outcome = program
         .stmts
@@ -1426,7 +1450,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             return best;
         }
         let default = Config::default_engine();
-        let resets: [fn(&mut Config, &Config); 12] = [
+        let resets: [fn(&mut Config, &Config); 13] = [
             |c, d| c.max_nodes = d.max_nodes,
             |c, d| c.max_inlined = d.max_inlined,
             |c, d| c.max_live = d.max_live,
@@ -1438,6 +1462,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             |c, d| c.df_split = d.df_split,
             |c, d| c.chunk_bytes = d.chunk_bytes,
             |c, d| c.memory_budget = d.memory_budget,
+            |c, d| c.file_leaves = d.file_leaves,
             |c, d| c.cost = d.cost,
         ];
         for reset in resets {

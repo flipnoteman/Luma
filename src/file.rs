@@ -558,7 +558,7 @@ fn locate<T: GpuType>(engine: &dyn TileIo, file: &Arc<IoFile>, path: &Arc<Path>,
             if writing && !opts.recover {
                 return Err(format_error(path, "the file was being written (its marker file is still there); open it with recover() to use it as it is"));
             }
-            let completion = writing.then(|| Completion::Marker(marker));
+            let completion = writing.then_some(Completion::Marker(marker));
             Ok(Located { dtype: Some(header.dtype), shape, data_offset: header.data_offset, completion })
         }
         Format::Raw => {
@@ -626,10 +626,11 @@ fn attach<T: GpuType>(
     for store in stores.iter().filter_map(Weak::upgrade) {
         let overlaps = store.data.start < data.end && data.start < store.data.end;
         let identical = store.data == data && store.shape == located.shape && store.writable == writable && store.ctx.same_as(ctx) && store.dtype == located.dtype;
-        if overlaps && identical {
-            if let Some(storage) = lock(&store.storage).upgrade() {
-                return Ok(Array::from_storage(ctx, located.shape, storage));
-            }
+        if overlaps
+            && identical
+            && let Some(storage) = lock(&store.storage).upgrade()
+        {
+            return Ok(Array::from_storage(ctx, located.shape, storage));
         }
         if overlaps && (writable || store.writable) && !identical {
             return Err(busy(path, "the extent overlaps an open file array that is not read-only"));

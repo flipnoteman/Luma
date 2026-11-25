@@ -140,6 +140,8 @@ pub struct Config {
     pub df_split: bool,
     pub chunk_bytes: Option<u64>,
     pub memory_budget: Option<u64>,
+    /// The `f32`, `u32` and `i32` inputs are written to a temporary file and opened read-only as file arrays (with small segments and budget, see `engine`).
+    pub file_leaves: bool,
     pub cost: CostChoice,
 }
 
@@ -167,6 +169,7 @@ impl Config {
             df_split: false,
             chunk_bytes: None,
             memory_budget: None,
+            file_leaves: false,
             cost: CostChoice::Test,
         }
     }
@@ -2138,6 +2141,7 @@ fn config_strategy() -> impl Strategy<Value = Config> {
     let memory = (
         prop::sample::select(vec![None, None, Some(1024u64)]),
         prop::sample::select(vec![None, None, Some(1u64 << 20)]),
+        prop::bool::weighted(0.15),
         prop::sample::select(vec![CostChoice::Test, CostChoice::SlowLaunch, CostChoice::SlowArithmetic]),
     );
     (limits, flags, memory).prop_map(|(limits, flags, memory)| Config {
@@ -2153,7 +2157,8 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         df_split: flags.5,
         chunk_bytes: memory.0,
         memory_budget: memory.1,
-        cost: memory.2,
+        file_leaves: memory.2,
+        cost: memory.3,
     })
 }
 

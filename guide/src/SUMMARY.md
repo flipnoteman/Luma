@@ -29,6 +29,7 @@
   - [Connected-component labelling, confidence connected components, deconvolution](vision-regions.md)
   - [ORB, SIFT and GLOH](vision-descriptors.md)
 - [Incremental accumulation](accumulators.md)
+- [File-backed arrays](files.md)
 
 # Reference
 

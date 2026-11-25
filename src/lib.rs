@@ -29,6 +29,10 @@
 //!   beyond the device's memory budget moves to host memory and back on demand
 //!   ([`ContextOptions`], [`Context::spilled_bytes`]). Custom kernels need arrays that fit one
 //!   buffer ([`LumaError::Chunked`]).
+//! * **Arrays larger than a buffer, or than memory**: [`Array::open`] and [`Array::create`] make an
+//!   array whose data is a file (raw, with a sidecar, or `.npy`): parts are read when a kernel
+//!   needs them and dropped or written back when the device needs the room ([`FileOptions`],
+//!   [`Array::store`], [`Array::write_to`], [`Array::flush`]); see the guide chapter "File-backed arrays".
 //! * **Errors do not panic**: operators and math methods return poisoned arrays on failure; the
 //!   error (with the source location of the failed operation) comes out as `Err` at
 //!   [`Array::to_vec`], [`Array::item`], [`Array::eval`], ... See [`Array`].
@@ -119,6 +123,8 @@ mod guide {
     pub mod vision_descriptors {}
     #[doc = include_str!("../guide/src/accumulators.md")]
     pub mod accumulators {}
+    #[doc = include_str!("../guide/src/files.md")]
+    pub mod files {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]

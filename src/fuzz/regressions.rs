@@ -458,6 +458,7 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
             df_split: false,
             chunk_bytes: None,
             memory_budget: None,
+            file_leaves: false,
             cost: Test,
         },
         math: true,
@@ -764,7 +765,7 @@ fn i32_and_with_a_saturating_constant_is_not_the_identity() {
 #[test]
 fn bool_xor_reduce_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
@@ -780,7 +781,7 @@ fn bool_xor_reduce_promote_df32() {
 #[test]
 fn bool_loop_state_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [300, 1, 1, 1], ty: Bool, seed: 0 },
@@ -853,6 +854,33 @@ fn slice_of_a_difference_then_trunc_then_assign_binds_an_unread_uniform() {
             View { src: 4, view: Slice { axis: 0, lo: 0, hi: 1 } },
             Unary { src: 5, op: Trunc },
             Assign { target: 6, path: vec![], rhs: Const(-2.0) },
+        ],
+    });
+}
+
+/// Fuzz finding of the file-backed leaves: a scan loop over a leaf that is a file array: its segment was written by a pin
+/// that `abort_recording` ran inside the pin of the same segment, which then found the segment in memory.
+#[test]
+fn a_loop_over_a_file_leaf() {
+    check(Program {
+        config: Config { file_leaves: true, ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Loop { kind: IterateUntilAll, steps: 1, states: vec![0], body: vec![Scan { src: 0, axis: 0, op: CumSum }], next: vec![2] },
+        ],
+    });
+}
+
+/// The file-backed leaves are writable: a program's `assign` into its input goes to the file.
+#[test]
+fn assigning_into_a_file_leaf() {
+    check(Program {
+        config: Config { file_leaves: true, ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 0 },
+            Assign { target: 0, path: vec![], rhs: Const(0.0) },
         ],
     });
 }

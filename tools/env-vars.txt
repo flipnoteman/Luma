@@ -85,3 +85,4 @@ LUMA_FAST_MATH	dev	W1-U0b	before-release	off (read with a warning until 0.6; the
 LUMA_LINALG_TF32	dev	W1-U0b	before-release	off (read with a warning until 0.6; the deprecated alias of LUMA_NUMERICS=...+tf32-linalg)
 LUMA_TF32_MATMUL	dev	W1-U0b	before-release	on (read with a warning until 0.6; the deprecated alias of LUMA_NUMERICS=strict / -tf32-matmul)
 LUMA_TRACE_FOLLOW	dev	W1-U1b	before-release	on (on | off, optional +verify: check every replay against a walk of the graph, +trace: print why a step was not followed, +stats: print the counters at the end of each profiled bench case)
+LUMA_TEST_WIDE	test	W2-P5a	never	unset
