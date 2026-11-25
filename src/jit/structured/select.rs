@@ -622,14 +622,13 @@ mod tests {
     use crate::context::ContextOptions;
     use crate::gpu_type::ElemLayout;
     use crate::jit::structured::emit::Emit;
-    use crate::jit::structured::strategy::{Boundary, BoundaryAttrs, Estimate, Lowered, ReduceParams, SplitClass, Warm};
+    use crate::jit::structured::strategy::{Boundary, BoundaryAttrs, CostFn, Estimate, FitsFn, Lowered, LowerFn, ReduceParams, SplitClass, Warm, WarmFn};
     use crate::kernel::KernelCore;
     use crate::profile::DecisionSite;
 
-    type Fits = fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>;
-    type Cost = fn(&Subject<'_>, &Params, &Context, &Residencies) -> Estimate;
-    type WarmFn = fn(&Subject<'_>, &Params, &Context) -> Result<Warm, Failure>;
-    type Lower = fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>;
+    type Fits = FitsFn;
+    type Cost = CostFn;
+    type Lower = LowerFn;
 
     fn cpu() -> Context {
         Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).calibrate(false)).unwrap()
@@ -676,6 +675,7 @@ mod tests {
         Ok(Lowered::Declined)
     }
 
+    #[allow(clippy::too_many_arguments)]
     const fn strat(id: u8, name: &'static str, bits: u16, baseline: bool, fits: Fits, cost: Option<Cost>, warm: WarmFn, lower: Lower) -> Strategy {
         Strategy {
             id: StrategyId(FamilyTag::Reduce, id),

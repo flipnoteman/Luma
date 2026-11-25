@@ -1325,6 +1325,7 @@ pub(crate) fn reduce_first_pass(
 /// applying `finish` if the pass is the last. With [`Tuning::single_pass_reduce`], one segment
 /// and more than one group, the pass finishes the reduction itself (see
 /// [`ReduceList::single_pass`]) and the one partial result it returns is the final value.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reduce_fused(
     emit: &mut Emit<'_>,
     mode: PassMode,

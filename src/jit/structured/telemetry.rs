@@ -260,7 +260,7 @@ impl Telemetry {
     /// [`Telemetry::drain`] while samples are outstanding, every 16th call (from `Context::launch`).
     #[inline]
     pub(crate) fn drain_some(&self, ctx: &Context) {
-        if self.pending.load(Ordering::Relaxed) != 0 && self.tick.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+        if self.pending.load(Ordering::Relaxed) != 0 && self.tick.fetch_add(1, Ordering::Relaxed).is_multiple_of(16) {
             self.drain(ctx);
         }
     }
@@ -288,7 +288,7 @@ impl Telemetry {
     /// Whether this is an execution that runs a rival instead of the chosen strategy (`Tuning::explore_every`): the counter of the
     /// family's executions, so that one in `every` explores.
     pub(crate) fn explore_due(&self, family: FamilyTag, every: u32) -> bool {
-        every != 0 && self.explores[family.index()].fetch_add(1, Ordering::Relaxed).wrapping_add(1) % every == 0
+        every != 0 && self.explores[family.index()].fetch_add(1, Ordering::Relaxed).wrapping_add(1).is_multiple_of(every)
     }
 }
 

@@ -57,12 +57,13 @@ fn battery(ctx: &Context) -> Run {
     force((&x * 0.5).min());
     force((&x * 0.5).max());
     force((&x * &x).sum());
-    let mut int_bits = Vec::new();
     // Integer and boolean reductions are exact whichever strategy runs.
-    int_bits.push(u32_of(ctx, &(&u + 3u32).sum()));
-    int_bits.push(u32::from(bool_of(ctx, &x.gt(0.5).any())));
-    int_bits.push(u32::from(bool_of(ctx, &x.gt(-5.0).all())));
-    int_bits.push(u32_of(ctx, &x.gt(0.0).count()));
+    let int_bits = vec![
+        u32_of(ctx, &(&u + 3u32).sum()),
+        u32::from(bool_of(ctx, &x.gt(0.5).any())),
+        u32::from(bool_of(ctx, &x.gt(-5.0).all())),
+        u32_of(ctx, &x.gt(0.0).count()),
+    ];
     ctx.sync().unwrap();
     let decisions = ctx.take_decisions();
     ctx.record_decisions(false);
@@ -145,7 +146,7 @@ fn a_strategy_that_does_not_fit_leaves_the_default_selection_and_says_so() {
 #[test]
 fn an_unknown_strategy_in_the_options_fails_the_context() {
     for text in ["reduce:fast", "scan:two-pass", "reduce"] {
-        let error = Context::with_options(ContextOptions::from_env().calibrate(false).strategy(text)).err().expect("fails");
+        let error = Context::with_options(ContextOptions::from_env().calibrate(false).strategy(text)).expect_err("fails");
         assert!(matches!(error, LumaError::InvalidOption(_)), "{text}: {error}");
     }
 }

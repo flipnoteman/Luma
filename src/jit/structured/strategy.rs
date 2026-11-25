@@ -123,15 +123,20 @@ pub(crate) struct Strategy {
     /// Can take an absorbed epilogue (false for every wave-2 strategy).
     pub(crate) epilogue: bool,
     /// Today's plan and gate functions, pure: the parameters of the run, or `None` where the strategy does not apply.
-    pub(crate) fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
+    pub(crate) fits: FitsFn,
     /// `None`: table order decides.
-    pub(crate) cost: Option<fn(&Subject<'_>, &Params, &Context, &Residencies) -> Estimate>,
+    pub(crate) cost: Option<CostFn>,
     pub(crate) split: fn(&Subject<'_>, &Params) -> SplitClass,
     /// Builds (starts compiling) the kernels the strategy needs and launches nothing.
-    pub(crate) warm: fn(&Subject<'_>, &Params, &Context) -> Result<Warm, Failure>,
+    pub(crate) warm: WarmFn,
     /// `None` for eager-boundary families: the op matches on the id.
-    pub(crate) lower: Option<fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>>,
+    pub(crate) lower: Option<LowerFn>,
 }
+
+pub(crate) type FitsFn = fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>;
+pub(crate) type CostFn = fn(&Subject<'_>, &Params, &Context, &Residencies) -> Estimate;
+pub(crate) type WarmFn = fn(&Subject<'_>, &Params, &Context) -> Result<Warm, Failure>;
+pub(crate) type LowerFn = fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>;
 
 /// The strategy table of `family`, in preference order.
 pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {

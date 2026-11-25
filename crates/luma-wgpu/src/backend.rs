@@ -1528,13 +1528,13 @@ impl Backend for WgpuBackend {
         // A launch armed for timing gets a slot of the ring, unless the profiler times it anyway
         // or the ring is full: then the tag is dropped.
         let mut timer = None;
-        if let Some((thread, tag)) = *armed {
-            if thread == std::thread::current().id() {
-                *armed = None;
-                if profiler.is_none() {
-                    timer = lock(&self.timers).begin(device, tag);
-                    *timed |= timer.is_some();
-                }
+        if let Some((thread, tag)) = *armed
+            && thread == std::thread::current().id()
+        {
+            *armed = None;
+            if profiler.is_none() {
+                timer = lock(&self.timers).begin(device, tag);
+                *timed |= timer.is_some();
             }
         }
         let own_pass = profiler.is_some() || timer.is_some();
@@ -1664,10 +1664,10 @@ impl Backend for WgpuBackend {
     }
 
     fn time_next_launch(&self, tag: u64) {
-        if self.timestamps {
-            if let Ok(mut batch) = self.batch() {
-                batch.armed = Some((std::thread::current().id(), tag));
-            }
+        if self.timestamps
+            && let Ok(mut batch) = self.batch()
+        {
+            batch.armed = Some((std::thread::current().id(), tag));
         }
     }
 
