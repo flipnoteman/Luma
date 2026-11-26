@@ -189,7 +189,7 @@ impl Harness {
         self.only.as_deref().is_none_or(|only| {
             only.split(',').any(|f| {
                 let f = f.trim_end_matches('$');
-                full.contains(f) || f.starts_with(&full) || f.strip_prefix(group).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                full.contains(f) || f.strip_prefix(full.as_str()).is_some_and(|rest| rest.starts_with('/')) || f.strip_prefix(group).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             })
         })
     }

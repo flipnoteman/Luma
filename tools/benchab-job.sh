@@ -11,6 +11,7 @@ mkdir -p out
 A=$(cd "$(dirname "$A")" && pwd)/$(basename "$A") B=$(cd "$(dirname "$B")" && pwd)/$(basename "$B")
 CA=$(mktemp -d) CB=$(mktemp -d)   # a kernel/pipeline cache per side, empty at the start of the job (a shared one near its size cap
                                   # makes context creation cost ~1 ms per cached MB and vary with whatever runs left in it)
+pin=(); [ -n "${PIN:-}" ] && pin=(taskset -c "$PIN")
 extra=(); [ -n "${QUICK:-}" ] && extra+=(--quick); [ -n "${ONLY:-}" ] && extra+=(--only "$ONLY")
 total_units=0 ran=0 failed=0
 
@@ -35,7 +36,7 @@ sample_run() {
   in_time || { echo "benchab: $side $be $suite sample $n not started: deadline"; return 0; }
   tmp=$(mktemp -d)
   [ -n "$units" ] && sel=(--group "$units" --warm)
-  LUMA_BACKEND=$be LUMA_CACHE_DIR=$(cache_of "$side") LUMA_BENCH_REF=$lab "$(bin_of "$side")" --suite "$suite" "${extra[@]}" "${sel[@]}" \
+  LUMA_BACKEND=$be LUMA_CACHE_DIR=$(cache_of "$side") LUMA_BENCH_REF=$lab "${pin[@]}" "$(bin_of "$side")" --suite "$suite" "${extra[@]}" "${sel[@]}" \
     --json "$tmp/j" > "$tmp/t" 2>> out/stderr-"$side".log
   rc=$?
   if [ $rc -eq 3 ]; then rm -rf "$tmp"; return 0; fi   # no case in this unit on this side (the other side has it)
