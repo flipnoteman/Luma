@@ -418,7 +418,7 @@ fn first_fit_slow(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strat
     let generation = state.generation.load(Ordering::Acquire);
     let words = match subject {
         Subject::Boundary(boundary) => Words::new(entries, boundary.dims, boundary.key),
-        Subject::Contraction(_) | Subject::Reduce(_) => return first_fit_live(ctx, subject, entries),
+        Subject::Contraction(_) | Subject::Comp(_) => return first_fit_live(ctx, subject, entries),
     };
     if state.mode == CacheMode::Verify
         && let Some(found) = probe(generation, &words)
