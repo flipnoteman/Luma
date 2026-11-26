@@ -29,12 +29,19 @@ use crate::jit::{Edge, ElemTy, Scalar, Src};
 
 pub(crate) mod build;
 mod combiner;
+pub(crate) mod inline;
 mod map;
+#[cfg(test)]
+mod recognition_tests;
+#[cfg(test)]
+mod reference;
+pub(crate) mod roles;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use combiner::{CombineOp, CombinePart, Combiner};
 pub(crate) use map::{AffineMap, MapRef};
+pub(crate) use roles::classify;
 
 /// 07 open question 8, resolved: six dims, four inputs, four source rows (luma arrays have four axes).
 pub(crate) const MAX_DIMS: usize = 6;
@@ -255,11 +262,18 @@ fn lcm(a: u32, b: u32) -> Option<u32> {
 }
 
 /// Where a form came from. `Api(tag)`: made for an API call, so the strategy of the tag runs (today's code, the same arguments).
-/// W2-R1 adds `Recognised(Form)` and W2-R3 `Rewritten(RuleId)`.
+/// `Recognised(form)`: found in a hand-written pattern (W2-R1); `Rewritten(rule)`: made by a rewrite rule (W2-R3). Neither has an
+/// API strategy: only the generic lowering takes them when the recogniser declines.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Origin {
     Api(OpTag),
+    Recognised(Form),
+    Rewritten(RuleId),
 }
+
+/// Which rewrite rule made a form. The rule table is W2-R3's; the generic lowering only needs to tell the origin from an API tag.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct RuleId(pub(crate) u16);
 
 /// Which API operation a value or form is. Not `Copy`: the convolution's spec is boxed, so that the tag every reduction carries is
 /// the size of its op list and not of the largest spec.
@@ -309,6 +323,40 @@ impl OpTag {
     }
 }
 
+/// The class of a form (W2-R1 §1): what [`classify`] says it is, which sets the strategy of a form without a tag.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Form {
+    /// `sum_k lhs * rhs` with parallel dims on each side.
+    Gemm,
+    /// A contraction with parallel dims on one side only.
+    Gemv,
+    /// A contraction with no parallel dim of its own on either side (batched or not).
+    Dot,
+    /// A product of two operands with disjoint parallel dims and nothing reduced.
+    Outer,
+    /// A reduction of identity-mapped accesses.
+    Reduce,
+    /// A row of some access reads two or more dims: a convolution or a filter.
+    Window,
+    Elementwise,
+    /// Anything else: only the generic lowering takes it.
+    Generic,
+}
+
+impl OpTag {
+    /// The classes an API form of this tag may have. A degenerate extent (a dim of extent 1 has no role) moves a form to a simpler
+    /// class: a product with `K = 1` is an outer product, a reduction of one element is elementwise, a `dot` is a reduction of one
+    /// access (its form has no second operand), a convolution with one output or one tap has no window left.
+    pub(crate) fn expected_forms(&self) -> &'static [Form] {
+        match self {
+            OpTag::Reduce(_) | OpTag::ReduceAxis(_) | OpTag::Arg { .. } | OpTag::Segments(_) => &[Form::Reduce, Form::Elementwise],
+            OpTag::Dot => &[Form::Dot, Form::Reduce, Form::Elementwise],
+            OpTag::Matmul { .. } | OpTag::MatmulBatched => &[Form::Gemm, Form::Gemv, Form::Dot, Form::Outer, Form::Elementwise],
+            OpTag::Conv1d | OpTag::Conv(..) | OpTag::ConvSep | OpTag::Window(_) => &[Form::Window, Form::Elementwise, Form::Outer, Form::Dot, Form::Gemv, Form::Reduce],
+        }
+    }
+}
+
 /// Why a form is not well formed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum FormError {
@@ -334,6 +382,8 @@ pub(crate) enum FormError {
     Indirect(usize),
     /// A coefficient or extent that does not fit the form's integers.
     Coefficient,
+    /// An API form whose class is not one its tag expects (`OpTag::expected_forms`): the builder and the op disagree.
+    Class(Form),
     /// A window operation that is not a form of the kind asked for, or whose geometry the builder does not cover.
     Window(WindowOp),
 }
@@ -440,6 +490,13 @@ impl Comprehension {
             }
             if access.indirect.as_ref().is_some_and(|indirect| usize::from(indirect.row) >= MAX_ROWS) {
                 return Err(FormError::Indirect(j));
+            }
+        }
+        // The guarantee of 07 §4.1: an API form is of the class its tag says.
+        if let Origin::Api(tag) = &self.origin {
+            let class = classify(self);
+            if !tag.expected_forms().contains(&class) {
+                return Err(FormError::Class(class));
             }
         }
         Ok(())
