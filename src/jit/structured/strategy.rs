@@ -180,7 +180,7 @@ impl FitsInputs {
     /// any thread has a recording open on it; and whether the device is profiling (a change of it bumps the generation).
     pub(crate) const HOST: FitsInputs = FitsInputs(1);
     /// The state of the operand arrays behind the subject (a contraction's: pending, over a segment, stored along `K`,
-    /// recomputed by a skinny kernel): the family packs it into the key.
+    /// recomputed by a skinny kernel): no key holds it, so a family that reads it is not cached (products).
     pub(crate) const OPERANDS: FitsInputs = FitsInputs(2);
     /// State of other values on the context or of the value's own life (a reduction's partners, whether it was forced or failed):
     /// the key cannot hold it, so the family is never cached.

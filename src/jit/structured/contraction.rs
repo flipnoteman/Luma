@@ -115,7 +115,7 @@ pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, l
     let view = ContractionView { lhs, rhs, attrs, location };
     let geom = view.check()?;
     let ctx = lhs.context();
-    match select::execute_cacheable(ctx, &Subject::Contraction(&view))? {
+    match select::execute(ctx, &Subject::Contraction(&view))? {
         Output::Storage(storage) => Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage)),
         Output::Array(array) => Ok(*array),
     }
@@ -182,36 +182,6 @@ fn tensor_tiles<'c>(view: &ContractionView<'_>, ctx: &'c Context) -> &'c [(u32, 
     if view.wants_tf32(ctx) && ctx.caps().contains(Caps::TF32) && gemm_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(false) } else { &[] }
 }
 
-/// What the table's `fits` read of the operands besides the shapes (`FitsInputs::OPERANDS`), packed for the selection cache's key:
-/// per side whether it is a pending expression (`gemm_operand`) and whether that is longer than a segment; and, only for a shape a
-/// skinny kernel can take at all (a long `K` over few outputs, see [`skinny_plan`]), whether the left operand is read along `K`
-/// and whether either side is an expression the kernel would recompute at every read (`fits_skinny`).
-pub(crate) fn operand_state(view: &ContractionView<'_>, ctx: &Context) -> u32 {
-    let mut bits = 0;
-    for (side, array) in [view.lhs, view.rhs].into_iter().enumerate() {
-        if let Some(node) = array.pending() {
-            bits |= 1 << side;
-            if node.len() as u64 * 4 > ctx.segment_bytes() {
-                bits |= 4 << side;
-            }
-        }
-    }
-    if bits & 3 != 0 {
-        let [n, m, k, _] = view.dims();
-        if k >= SKINNY_MIN_K && u64::from(m) * u64::from(n) <= u64::from(SKINNY_MAX_OUTPUTS_ALONG_K) {
-            if !along_k(view.lhs, Geometry { m, n, k }) {
-                bits |= 16;
-            }
-            for (side, array) in [view.lhs, view.rhs].into_iter().enumerate() {
-                if array.pending().is_some_and(jit::is_recomputed) {
-                    bits |= 32 << side;
-                }
-            }
-        }
-    }
-    bits
-}
-
 // -- the table --
 
 impl StrategyId {
@@ -227,7 +197,7 @@ impl StrategyId {
 /// The products' table, in preference order.
 pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 7] = [
     // The host's sums differ from the device's: its own bit class. The backend's own `f32` kernels and the skinny ones read the
-    // operands' state (see `operand_state`); the others only the shape, the numerics and the device.
+    // operands' state (`FitsInputs::OPERANDS`); the others only the shape, the numerics and the device.
     entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, NumClass::Exact, 1, fits_host, lower_host),
     entry(StrategyId::GEMM_NARROW_N, "gemm-narrow-n", Caps::GEMM_TILES, FitsInputs::NONE, NumClass::Exact, 2, fits_narrow_n, lower_narrow_n),
     entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, FitsInputs::NONE, NumClass::Reduced(Reduced::TF32_MATMUL), 3, fits_gemm_tf32, lower_gemm),

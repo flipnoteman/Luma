@@ -15,7 +15,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::contraction::ContractionView;
 use super::strategy::{table, BitClass, Boundary, FamilyTag, FitsInputs, NumClass, Output, Params, PassMode, ReduceParams, Residencies, ResClass, Strategy, StrategyId, Subject, FAMILY_COUNT, MAX_PER_FAMILY};
 use super::telemetry::{CellKey, ShapeClass};
 use crate::array::Failure;
@@ -163,7 +162,8 @@ fn signature(subject: &Subject<'_>) -> u64 {
 // A call whose inputs to `fits` are the ones of an earlier call reuses that call's answer: the first strategy of the entries that
 // fits, with its parameters. Everything a `fits` reads is one of
 //
-// * the subject: its shape and attributes (in the key), and for a contraction the state of its operands (`operand_state`, in the key);
+// * the subject: its shape and attributes (in the key); a contraction also reads the state of its operands (`FitsInputs::OPERANDS`),
+//   which no key holds today: products are not cached (`CACHED`);
 // * what is fixed when the context opens (capabilities, limits, tuning, numerics, budgets, `LUMA_STRATEGY`, the environment): not in
 //   the key, but every key names the context it was made on (the generation below), so a context that forced another strategy
 //   never shares an answer;
@@ -272,10 +272,16 @@ static READS: [FitsInputs; FAMILY_COUNT] = [
     FitsInputs::union(&super::families::opaque::OPAQUE_STRATEGIES),
 ];
 
-/// Whether `family`'s selections may be cached at all (no `fits` of its table reads [`FitsInputs::LIVE`]).
+/// Whether `family`'s selections are cached: its table is a priority chain whose `fits` are all keyed (none reads
+/// [`FitsInputs::LIVE`]) and a lookup costs less than the live walk. Measured with `tools/hosttime` (CPU, `luma_self`, per call):
+/// every boundary family gains from the cache (`cumsum_small` 5433 to 5330, `medfilt_small` 5492 to 5246); a product's live walk is
+/// short on the CPU (one `fits` of the native product) and the cache cost more than it saved (`launchcost/matmul32` +0.84%), so
+/// products are not cached. Reductions read `LIVE`.
+static CACHED: [bool; FAMILY_COUNT] = [false, true, true, true, false, false, false, false, true, true, false, false, true, true, true];
+
 #[inline(always)]
 pub(crate) fn cacheable(family: FamilyTag) -> bool {
-    !READS[family.index()].contains(FitsInputs::LIVE)
+    CACHED[family.index()] && !READS[family.index()].contains(FitsInputs::LIVE)
 }
 
 const SLOTS: usize = 64;
@@ -373,19 +379,7 @@ pub(crate) fn last_was_hit() -> bool {
     LAST_HIT.with(Cell::get)
 }
 
-/// The first strategy of `entries` (a table or a stage of one) that applies to `subject`, with its parameters; the forced strategy
-/// of `LUMA_STRATEGY` first where it fits. Where `subject` is a boundary this is what the op runs, and a contraction's `lower` is
-/// asked for in the same order (a table of a family with a `lower` skips the entries without). Answered from the cache where the key
-/// matches.
-pub(crate) fn first_fit(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
-    match subject {
-        Subject::Boundary(boundary) => first_fit_boundary(ctx, boundary, entries),
-        Subject::Contraction(view) => first_fit_view(ctx, view, entries),
-        Subject::Reduce(_) => first_fit_live(ctx, subject, entries),
-    }
-}
-
-/// [`first_fit`] of a boundary: the hit path, linear and short and inlined into the op (where the stage, the family's attributes and
+/// The first strategy of `entries` (a table or a stage of one) that applies to `boundary`, with its parameters; the forced strategy of `LUMA_STRATEGY` first where it fits. The hit path, linear and short and inlined into the op (where the stage, the family's attributes and
 /// often the shape are constants); every other case (a miss, a mode, a recording open) is the slow one, out of line.
 #[inline(always)]
 pub(crate) fn first_fit_boundary(ctx: &Context, boundary: &Boundary<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
@@ -406,31 +400,6 @@ pub(crate) fn first_fit_boundary(ctx: &Context, boundary: &Boundary<'_>, entries
     first_fit_slow(ctx, &Subject::Boundary(boundary), entries)
 }
 
-/// [`first_fit`] of a contraction: its key also holds the precision asked for and the state of the operands.
-#[inline(never)]
-fn first_fit_view(ctx: &Context, view: &ContractionView<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
-    let state = &ctx.jit().selcache;
-    if state.gate.load(Ordering::Relaxed) == 0 {
-        let words = view_words(ctx, view, entries);
-        if let Some(found) = probe(state.generation.load(Ordering::Acquire), &words) {
-            #[cfg(test)]
-            LAST_HIT.with(|hit| hit.set(true));
-            if cfg!(debug_assertions) && sampled() {
-                verify(ctx, &Subject::Contraction(view), entries, found);
-            }
-            return Some(found);
-        }
-    }
-    first_fit_slow(ctx, &Subject::Contraction(view), entries)
-}
-
-/// The key of a contraction: its shape, and in the fourth extent (always 1) the precision it asks for and its operands' state.
-#[inline(always)]
-fn view_words(ctx: &Context, view: &ContractionView<'_>, entries: &[Strategy]) -> Words {
-    let [n, m, k, _] = view.dims();
-    Words::new(entries, [n, m, k, 1 + (view.attrs.tf32 as u32 | super::contraction::operand_state(view, ctx) << 2)], [0; 4])
-}
-
 /// Everything but the hit: the full `fits` where the cache is not to be used (the mode is `off`, a recording is open, the family is
 /// not cacheable), the check of a hit under `verify`, and the full `fits` of a miss, kept for the next call that asks the same.
 #[inline(never)]
@@ -449,8 +418,7 @@ fn first_fit_slow(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strat
     let generation = state.generation.load(Ordering::Acquire);
     let words = match subject {
         Subject::Boundary(boundary) => Words::new(entries, boundary.dims, boundary.key),
-        Subject::Contraction(view) => view_words(ctx, view, entries),
-        Subject::Reduce(_) => return first_fit_live(ctx, subject, entries),
+        Subject::Contraction(_) | Subject::Reduce(_) => return first_fit_live(ctx, subject, entries),
     };
     if state.mode == CacheMode::Verify
         && let Some(found) = probe(generation, &words)
@@ -830,18 +798,6 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
     execute_with(table(family), PLAIN[family.index()], ctx, subject, ctx.strategy_override(family))
 }
 
-/// [`execute`] for a family whose selections are cached (see [`cacheable`]: the products). A separate entry, not a branch of
-/// `execute`: the reductions recurse through that one, and in debug builds every call site in it is stack that deep expressions use.
-pub(crate) fn execute_cacheable(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
-    let family = subject.family();
-    debug_assert!(cacheable(family), "{} is not a cacheable family", family.name());
-    let forced = ctx.strategy_override(family);
-    if forced.is_none() && PLAIN[family.index()] && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
-        return execute_cached(table(family), ctx, subject);
-    }
-    execute_ranked(table(family), ctx, subject, forced)
-}
-
 /// [`plain`] of every family's table, worked out once.
 static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES), true, true, plain(&super::families::conv::CONV_STRATEGIES), plain(&super::families::window::WINDOW_STRATEGIES), plain(&super::families::opaque::OPAQUE_STRATEGIES)];
 
@@ -859,7 +815,7 @@ const fn plain(entries: &[Strategy]) -> bool {
 
 /// [`execute_in`] for a table that is a priority chain (see [`plain`]), when no one listens to the Decision: the entries are
 /// tried in table order, each one's `fits` evaluated when it is its turn, which is what the `if` chains it replaces did. Nothing
-/// is ranked or cached (the families that cannot be cached: see [`execute_cached`]).
+/// is ranked or cached (a product's live `fits` walk costs no more than a lookup: see [`CACHED`]).
 fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
     use super::strategy::Lowered;
     let res = &Residencies::DEVICE;
@@ -867,41 +823,6 @@ fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>) -> 
     for strategy in entries {
         let Some(lower) = strategy.lower else { continue };
         let Ok(params) = admit(strategy, subject, ctx, res) else { continue };
-        let mut begun = telemetry.begin(ctx, subject, strategy.id, strategy.needs.contains(Caps::HOST_PATH));
-        let result = lower(subject, &params, &mut begun.emit);
-        telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
-        if let Lowered::Done(output) = result? {
-            return Ok(output);
-        }
-    }
-    Err(LumaError::Unsupported(format!("no {} strategy ran {}", subject.family().name(), subject.site().0)).into())
-}
-
-/// [`execute_plain`] for a family whose selections can be cached: the first entry that fits comes from [`first_fit`] (the cache, or
-/// the scan it caches), and only the entries after it, where it declines, are evaluated in their turn. Kept out of line, as the
-/// reductions' frame (recursive, see [`execute_ranked`]) must not carry its locals.
-#[inline(never)]
-fn execute_cached(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
-    use super::strategy::Lowered;
-    let res = &Residencies::DEVICE;
-    let telemetry = &ctx.jit().telemetry;
-    let Some((first, first_params)) = first_fit(ctx, subject, entries) else {
-        return Err(LumaError::Unsupported(format!("no {} strategy ran {}", subject.family().name(), subject.site().0)).into());
-    };
-    let mut skipping = true;
-    for strategy in entries {
-        let Some(lower) = strategy.lower else { continue };
-        let params = if skipping {
-            if strategy.id != first {
-                continue;
-            }
-            skipping = false;
-            first_params
-        } else if let Ok(params) = admit(strategy, subject, ctx, res) {
-            params
-        } else {
-            continue;
-        };
         let mut begun = telemetry.begin(ctx, subject, strategy.id, strategy.needs.contains(Caps::HOST_PATH));
         let result = lower(subject, &params, &mut begun.emit);
         telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));

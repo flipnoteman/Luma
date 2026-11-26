@@ -6,16 +6,14 @@ use std::panic::Location;
 
 use luma_core::BackendKind;
 
-use crate::array::Array;
 use crate::context::{Context, ContextOptions};
 use crate::image::window::{Edge, Op, Pixel};
 use crate::jit::structured::boundary::{
     dim, ConvAttrs, ConvStage, FactorAttrs, FactorKind, LineSolveAttrs, OpaqueAttrs, ScanAttrs, ScanOperand, ScatterAttrs, ScatterOp, SortAttrs, SortPayload, SortStage, WindowAttrs,
     WindowStage,
 };
-use crate::jit::structured::contraction::{ContractionAttrs, ContractionView, Tf32Request, CONTRACTION_STRATEGIES};
 use crate::jit::structured::families::factor::{boundary_of, refined_stage};
-use crate::jit::structured::select::{cacheable, first_fit, first_fit_live, last_was_hit, CacheMode};
+use crate::jit::structured::select::{cacheable, first_fit_live, last_was_hit, CacheMode};
 use crate::jit::structured::strategy::{first_candidate, first_candidate_in, note, table, Boundary, BoundaryAttrs, FamilyTag, FitsInputs, Subject};
 use crate::dense::Dims;
 
@@ -264,60 +262,17 @@ fn the_decision_of_a_hit_says_cached_and_is_otherwise_the_same() {
 
 #[test]
 fn the_tables_declare_what_their_fits_read() {
-    for family in [FamilyTag::Sort, FamilyTag::Scan, FamilyTag::Scatter, FamilyTag::Contraction, FamilyTag::LineSolve, FamilyTag::Factor, FamilyTag::Conv, FamilyTag::Window, FamilyTag::Opaque] {
+    for family in [FamilyTag::Sort, FamilyTag::Scan, FamilyTag::Scatter, FamilyTag::LineSolve, FamilyTag::Factor, FamilyTag::Conv, FamilyTag::Window, FamilyTag::Opaque] {
         assert!(cacheable(family), "{}", family.name());
     }
     assert!(!cacheable(FamilyTag::Reduce), "a reduction's fits read its partners and its own life");
+    assert!(!cacheable(FamilyTag::Contraction), "a product's live walk is cheaper than a lookup on the CPU");
     let reads = |family: FamilyTag| table(family).iter().fold(FitsInputs::NONE, |all, strategy| all.with(strategy.reads));
     assert!(reads(FamilyTag::Sort).contains(FitsInputs::HOST));
     assert!(reads(FamilyTag::Scatter).contains(FitsInputs::HOST));
     assert!(reads(FamilyTag::Factor).contains(FitsInputs::HOST));
     assert!(reads(FamilyTag::Contraction).contains(FitsInputs::HOST.with(FitsInputs::OPERANDS)));
     assert!(!reads(FamilyTag::Scan).contains(FitsInputs::HOST));
-}
-
-// -- contractions --
-
-fn product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request) -> (bool, Option<(crate::jit::structured::strategy::StrategyId, crate::jit::structured::strategy::Params)>) {
-    let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32 }, location: here() };
-    let subject = Subject::Contraction(&view);
-    let found = first_fit(ctx, &subject, &CONTRACTION_STRATEGIES);
-    let hit = last_was_hit();
-    assert_eq!(found, first_fit_live(ctx, &subject, &CONTRACTION_STRATEGIES));
-    (hit, found)
-}
-
-#[test]
-fn a_contraction_hits_until_the_state_of_an_operand_or_the_request_changes() {
-    for cores in [0, 4] {
-        let ctx = Context::with_tuning(ContextOptions::default().backend(BackendKind::Cpu).calibrate(false), |tuning| tuning.native_gemm = cores).unwrap();
-        if !caching(&ctx) {
-            return;
-        }
-        // 16 x 16 by a K of 4096: a shape a skinny kernel takes where the product is not the CPU's native one.
-        let (m, n, k) = (16usize, 16usize, 4096usize);
-        let lhs = Array::<f32>::zeros_on(&ctx, [k, m]).unwrap();
-        let rhs = Array::<f32>::zeros_on(&ctx, [n, k]).unwrap();
-        let (hit, first) = product(&ctx, &lhs, &rhs, Tf32Request::Default);
-        assert!(!hit);
-        let (hit, again) = product(&ctx, &lhs, &rhs, Tf32Request::Default);
-        assert!(hit && again == first);
-        // Another precision request is another key.
-        assert!(!product(&ctx, &lhs, &rhs, Tf32Request::Exact).0);
-        // An operand that is a pending expression of two buffers, then a view of the transpose of a stored array.
-        let other = Array::<f32>::zeros_on(&ctx, [k, m]).unwrap();
-        let pending = &lhs + &other;
-        assert!(pending.pending().is_some());
-        let (hit, _) = product(&ctx, &pending, &rhs, Tf32Request::Default);
-        assert!(!hit, "a pending operand is another key");
-        assert!(product(&ctx, &pending, &rhs, Tf32Request::Default).0);
-        let transposed = Array::<f32>::zeros_on(&ctx, [m, k]).unwrap().transpose();
-        assert!(!product(&ctx, &transposed, &rhs, Tf32Request::Default).0, "a transposed view is read against K: another key");
-        assert!(product(&ctx, &transposed, &rhs, Tf32Request::Default).0);
-        // A shape of its own.
-        let wide = Array::<f32>::zeros_on(&ctx, [k, m + 1]).unwrap();
-        assert!(!product(&ctx, &wide, &rhs, Tf32Request::Default).0);
-    }
 }
 
 // -- the packed attributes --
