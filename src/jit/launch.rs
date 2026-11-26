@@ -1717,6 +1717,8 @@ pub(crate) struct MatmulKernel {
     pub(crate) tile: MatmulTile,
     pub(crate) aligned: bool,
     pub(crate) split: bool,
+    /// The generic contraction the kernel computes (`matmul::ContractForm`); 0 is the product the library makes.
+    pub(crate) form: u16,
 }
 
 /// Whether the product kernel can run `fused`, the program of the operands that are expressions,
@@ -1785,7 +1787,7 @@ fn flatten_operands(
             (true, false) => MatmulOperand::Fused,
             (true, true) => MatmulOperand::Transposed,
         };
-        let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, lhs: operand(0), rhs: operand(1) };
+        let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, lhs: operand(0), rhs: operand(1), form: kernel.form };
         let fused = flatten(&roots, tail)?;
         drop(roots);
         Ok(fusable(ctx, &fused, 2 - sides.len()).then_some(fused))
@@ -1866,6 +1868,19 @@ pub(crate) fn matmul(
     groups: [u32; 3],
     out: RawArg<'_>,
 ) -> Result<(), Failure> {
+    matmul_with(ctx, sides, kernel, words, &[], groups, out)
+}
+
+/// [`matmul`] with `extra` uniform words after `words`: the batch strides of a generic contraction (`nb, sa, sb, sc`).
+pub(crate) fn matmul_with(
+    ctx: &crate::context::Context,
+    sides: [MatmulSide; 2],
+    kernel: MatmulKernel,
+    words: [u32; 4],
+    extra: &[u32],
+    groups: [u32; 3],
+    out: RawArg<'_>,
+) -> Result<(), Failure> {
     let mut slots: [Option<Arc<Node>>; 2] = [None, None];
     let mut ready: [Option<(Pin, u64)>; 2] = [None, None];
     for (s, side) in sides.into_iter().enumerate() {
@@ -1880,6 +1895,9 @@ pub(crate) fn matmul(
     let transposed = [0, 1].map(|s| slots[s].as_ref().is_some_and(|node| stored_transposed(node, dims[s])));
     let fused = flatten_operands(ctx, kernel, transposed, &mut slots, &mut ready)?;
     let Some(fused) = fused else {
+        if kernel.form != 0 {
+            return Err(Failure::New(LumaError::Unsupported("a generic contraction needs its operands fused into the kernel".into())));
+        }
         let core = ctx.builtin(Builtin::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split }, "f32")?;
         let (Some((a, a_bytes)), Some((b, b_bytes))) = (&ready[0], &ready[1]) else {
             return Err(Failure::New(LumaError::Gpu("matrix product operand neither evaluated nor fused".into())));
@@ -1892,8 +1910,9 @@ pub(crate) fn matmul(
     drop((fused_nodes, instr_nodes, sub_roots));
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
-    let mut uniform = Vec::with_capacity(words.len() + scalars.len());
+    let mut uniform = Vec::with_capacity(words.len() + extra.len() + scalars.len());
     uniform.extend_from_slice(&words);
+    uniform.extend_from_slice(extra);
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
     raw.push(out);

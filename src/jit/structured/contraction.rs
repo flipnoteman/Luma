@@ -427,7 +427,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry) -> 
         Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
         None => (out_pin.buffer(), out_bytes),
     };
-    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: 0 };
     jit::matmul(ctx, sides, kernel, [m32, n32, k32, plan.kc], plan.groups, RawArg::write(target, target_bytes))?;
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;

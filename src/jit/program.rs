@@ -129,7 +129,8 @@ pub(crate) enum Tail {
     /// the left one if `lhs` is fused, then the right one if `rhs` is; an operand that is not one
     /// is the buffer `a` / `b`. The program becomes `luma_lhs(i)` / `luma_rhs(i)`, the loads of
     /// the GEMM kernel of `matmul::body` (see `launch::matmul`).
-    Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand },
+    /// `form` names a generic contraction (see `matmul::ContractForm`); 0 is the product the library makes.
+    Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand, form: u16 },
     /// The last instruction is the operand of a reducing pass along an axis (`scan::AxisPass`):
     /// the program becomes `luma_eval(q)`, the load of the pass (see `launch::axis_reduce`).
     AxisReduce(AxisPass),

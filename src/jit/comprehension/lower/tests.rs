@@ -40,6 +40,7 @@ pub(super) fn row(terms: &[(usize, i32)], offset: i64) -> AffineRow {
 }
 
 /// One access: its source of `shape` (with its values) read through `rows`.
+#[derive(Clone)]
 pub(super) struct Read {
     pub(super) shape: [u32; 4],
     pub(super) rows: Vec<AffineRow>,
@@ -414,4 +415,127 @@ fn a_compensated_dot_product_multiplies_exactly() {
     assert!((got - truth).abs() <= ulp(truth), "Dot2: {got} vs {truth}");
     let neumaier = dot(Compensation::Neumaier);
     assert!((neumaier - truth).abs() <= 4.0 * ulp(truth), "Neumaier of f32 products: {neumaier} vs {truth}");
+}
+
+// -- G-A: the contraction tail --
+
+use crate::jit::structured::emit::Emit;
+use std::panic::Location;
+
+/// Runs G-A directly (the registry would take the reduction tail for a product this small) and compares with the reference.
+#[track_caller]
+fn check_contract(ctx: &Context, form: &Comprehension, data: &[Vec<f64>], what: &str) {
+    let plan = super::contract::prepare(form).unwrap_or_else(|| panic!("{what}: the form has a contraction lowering"));
+    let mut emit = Emit::now(ctx);
+    let storage = plan.run(&mut emit, Location::caller()).unwrap_or_else(|f| panic!("{what}: {}", f.into_error()));
+    let dims = super::output_dims(form);
+    let got = Array::<f32>::from_storage(ctx, crate::shape::Shape::from(dims), storage).to_vec().unwrap();
+    let expected = reference(form, data);
+    assert_eq!(got.len(), expected.len(), "{what}");
+    for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(f64::from(*g), *e, "{what}: element {i}");
+    }
+}
+
+fn product_reads(n: u64, m: u64, k: u64) -> [Read; 2] {
+    [
+        Read::plain([k as u32, m as u32, 1, 1], vec![row(&[(2, 1)], 0), row(&[(1, 1)], 0)]),
+        Read::plain([n as u32, k as u32, 1, 1], vec![row(&[(0, 1)], 0), row(&[(2, 1)], 0)]),
+    ]
+}
+
+#[test]
+fn contractions_of_other_bodies_and_combiners() {
+    let ctx = cpu();
+    // Aligned (32, 32, 32) and every kind of unaligned shape (the k guard: K = 17 pads the last slice).
+    for (n, m, k) in [(32u64, 32u64, 32u64), (33, 35, 17), (5, 3, 9), (64, 1, 40), (1, 7, 3)] {
+        let dims = [(n, false), (m, false), (k, true)];
+        let reads = product_reads(n, m, k);
+        let cases: Vec<(&str, Vec<Instr>, CombinePart)> = vec![
+            ("sum of products", mul01(), CombinePart::Add),
+            ("min plus", vec![binary(BinOp::Add, Ref::Input(0), Ref::Input(1))], CombinePart::Min),
+            ("max plus", vec![binary(BinOp::Add, Ref::Input(0), Ref::Input(1))], CombinePart::Max),
+            ("max times", mul01(), CombinePart::Max),
+            ("min times", mul01(), CombinePart::Min),
+            ("distance", vec![binary(BinOp::Sub, Ref::Input(0), Ref::Input(1)), binary(BinOp::Mul, Ref::Tmp(0), Ref::Tmp(0))], CombinePart::Add),
+            ("asymmetric", vec![binary(BinOp::Sub, Ref::Input(0), Ref::Input(1)), binary(BinOp::Max, Ref::Tmp(0), Ref::Input(1))], CombinePart::Add),
+        ];
+        for (name, instrs, part) in cases {
+            let (f, data) = form(&ctx, &dims, &[0, 1], &reads, instrs, part);
+            check_contract(&ctx, &f, &data, &format!("{name} n={n} m={m} k={k}"));
+        }
+    }
+}
+
+#[test]
+fn contractions_with_the_operands_exchanged() {
+    // The output has `m` faster than `n`: the sides are exchanged, and an asymmetric body reads its arguments in the right order.
+    let ctx = cpu();
+    let (n, m, k) = (6u64, 5u64, 19u64);
+    let dims = [(n, false), (m, false), (k, true)];
+    let reads = product_reads(n, m, k);
+    for body in [mul01(), vec![binary(BinOp::Sub, Ref::Input(0), Ref::Input(1)), binary(BinOp::Max, Ref::Tmp(0), Ref::Input(1))]] {
+        let (f, data) = form(&ctx, &dims, &[1, 0], &reads, body, CombinePart::Add);
+        check_contract(&ctx, &f, &data, "m before n");
+    }
+}
+
+#[test]
+fn batched_contractions_share_or_do_not_share_operands() {
+    let ctx = cpu();
+    let (n, m, k, b) = (7u64, 5u64, 18u64, 3u64);
+    // dims: n, m, b, k.
+    let dims = [(n, false), (m, false), (b, false), (k, true)];
+    let both = [
+        Read::plain([k as u32, m as u32, b as u32, 1], vec![row(&[(3, 1)], 0), row(&[(1, 1)], 0), row(&[(2, 1)], 0)]),
+        Read::plain([n as u32, k as u32, b as u32, 1], vec![row(&[(0, 1)], 0), row(&[(3, 1)], 0), row(&[(2, 1)], 0)]),
+    ];
+    for (name, body, part) in [("sum", mul01(), CombinePart::Add), ("min plus", vec![binary(BinOp::Add, Ref::Input(0), Ref::Input(1))], CombinePart::Min)] {
+        let (f, data) = form(&ctx, &dims, &[0, 1, 2], &both, body.clone(), part);
+        check_contract(&ctx, &f, &data, &format!("batched {name}"));
+        // A shared rhs (no batch row): the batch of the lhs is more rows.
+        let shared = [both[0].clone(), Read::plain([n as u32, k as u32, 1, 1], vec![row(&[(0, 1)], 0), row(&[(3, 1)], 0)])];
+        let (f, data) = form(&ctx, &dims, &[0, 1, 2], &shared, body, part);
+        check_contract(&ctx, &f, &data, &format!("shared rhs {name}"));
+    }
+    // Two batch dims.
+    let dims = [(4u64, false), (3, false), (2, false), (3, false), (9, true)];
+    let reads = [
+        Read::plain([9, 3, 2, 3], vec![row(&[(4, 1)], 0), row(&[(1, 1)], 0), row(&[(2, 1)], 0), row(&[(3, 1)], 0)]),
+        Read::plain([4, 9, 2, 3], vec![row(&[(0, 1)], 0), row(&[(4, 1)], 0), row(&[(2, 1)], 0), row(&[(3, 1)], 0)]),
+    ];
+    let (f, data) = form(&ctx, &dims, &[0, 1, 2, 3], &reads, mul01(), CombinePart::Add);
+    check_contract(&ctx, &f, &data, "two batch dims");
+}
+
+#[test]
+fn a_body_of_three_inputs_is_two_operand_expressions() {
+    // sum_k (a(k, m) * s(k)) * b(n, k): the scale rides with one side.
+    let ctx = cpu();
+    let (n, m, k) = (5u64, 4u64, 21u64);
+    let dims = [(n, false), (m, false), (k, true)];
+    let reads = [
+        Read::plain([k as u32, m as u32, 1, 1], vec![row(&[(2, 1)], 0), row(&[(1, 1)], 0)]),
+        Read::plain([k as u32, 1, 1, 1], vec![row(&[(2, 1)], 0)]),
+        Read::plain([n as u32, k as u32, 1, 1], vec![row(&[(0, 1)], 0), row(&[(2, 1)], 0)]),
+    ];
+    let (f, data) = form(&ctx, &dims, &[0, 1], &reads, vec![binary(BinOp::Mul, Ref::Input(0), Ref::Input(1)), binary(BinOp::Mul, Ref::Tmp(0), Ref::Input(2))], CombinePart::Add);
+    check_contract(&ctx, &f, &data, "scaled product");
+    let (f, data) = form(&ctx, &dims, &[0, 1], &reads, vec![binary(BinOp::Mul, Ref::Input(0), Ref::Input(1)), binary(BinOp::Mul, Ref::Tmp(0), Ref::Input(2))], CombinePart::Max);
+    check_contract(&ctx, &f, &data, "scaled product, max");
+}
+
+#[test]
+fn the_registry_picks_the_contraction_tail_for_a_big_product() {
+    let ctx = cpu();
+    ctx.record_decisions(true);
+    let (n, m, k) = (64u64, 64u64, 64u64);
+    let dims = [(n, false), (m, false), (k, true)];
+    let reads = product_reads(n, m, k);
+    let (f, data) = form(&ctx, &dims, &[0, 1], &reads, vec![binary(BinOp::Add, Ref::Input(0), Ref::Input(1))], CombinePart::Min);
+    let got = values(&build(&ctx, &f));
+    assert_eq!(got, reference(&f, &data));
+    let decisions: Vec<_> = ctx.take_decisions().into_iter().filter(|d| d.site == DecisionSite::Comprehension).collect();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].chosen, "generic-contract", "{:?}", decisions[0]);
 }

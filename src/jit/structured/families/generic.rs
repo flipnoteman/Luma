@@ -108,7 +108,7 @@ fn cost_reduce(subject: &Subject<'_>, params: &Params, _: &Context, _: &Residenc
 
 /// The GEMM tail does `2` flops per point at a high rate and reads each operand element once per tile.
 fn cost_contract(subject: &Subject<'_>, _: &Params, _: &Context, _: &Residencies) -> Estimate {
-    Estimate { ns: points(subject) * 0.002 + 50_000.0, measured: false }
+    Estimate { ns: points(subject) * 0.0005 + 30_000.0, measured: false }
 }
 
 fn lower_reduce(subject: &Subject<'_>, _: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
@@ -120,5 +120,10 @@ fn lower_reduce(subject: &Subject<'_>, _: &Params, emit: &mut Emit<'_>) -> Resul
 fn lower_contract(subject: &Subject<'_>, _: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
     let Some((form, location)) = form(subject) else { return Ok(Lowered::Declined) };
     let Some(plan) = contract::prepare(form) else { return Ok(Lowered::Declined) };
-    Ok(Lowered::Done(Output::Storage(plan.run(emit, location)?)))
+    match plan.run(emit, location) {
+        Ok(storage) => Ok(Lowered::Done(Output::Storage(storage))),
+        // The operands do not fuse into one kernel: the reduction tail takes the form.
+        Err(Failure::New(crate::error::LumaError::Unsupported(message))) if message == contract::NOT_FUSED => Ok(Lowered::Declined),
+        Err(failure) => Err(failure),
+    }
 }

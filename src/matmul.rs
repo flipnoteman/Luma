@@ -33,6 +33,7 @@
 use std::panic::Location;
 
 use crate::array::Array;
+use crate::jit::comprehension::lower::contract::ContractForm;
 use crate::jit::comprehension::OpTag;
 use crate::jit::structured::contraction::{self, ContractionAttrs, Tf32Request};
 use crate::view::PadMode;
@@ -80,6 +81,7 @@ impl MatmulTile {
 
 /// K elements of each operand a workgroup stages at a time.
 pub(crate) const SLICE: u32 = 16;
+
 
 impl Array<f32> {
     /// The matrix product with `rhs`. `self` has shape `[K, M]`, `rhs` `[N, K]` and the result
@@ -299,7 +301,7 @@ pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool) -> St
 @group(1) @binding(2) var<storage, read> b: array<f32>;
 @group(1) @binding(3) var<uniform> p: Params;
 {}",
-        body(tile, aligned, split, MatmulOperand::Buffer, MatmulOperand::Buffer)
+        body(tile, aligned, split, MatmulOperand::Buffer, MatmulOperand::Buffer, &ContractForm::DEFAULT)
     )
 }
 
@@ -372,16 +374,18 @@ impl Lanes {
 /// `select(0.0, load, in_bounds)` of an index clamped into the operand and every store is
 /// guarded. With `split` the workgroup of grid layer `z` covers `K` from `z * kc` to
 /// `min(K, (z + 1) * kc)`.
-pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand) -> String {
+pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand, form: &ContractForm) -> String {
     let loads = Loads {
         lhs: Load { fused: lhs.fused(), lanes: if lhs == MatmulOperand::Transposed { Lanes::AlongRows } else { Lanes::AlongK } },
         rhs: Load { fused: rhs.fused(), lanes: if rhs == MatmulOperand::Transposed { Lanes::AlongK } else { Lanes::AlongRows } },
+        batch: form.batch,
     };
+    debug_assert!(form.is_default() || matches!(tile, MatmulTile::T32), "a generic contraction runs on the T32 tile");
     match tile {
         MatmulTile::T128 => t128(aligned, split, &loads),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
-        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Gemm { .. } => t32(aligned, split, &loads),
+        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Gemm { .. } => t32(aligned, split, &loads, form),
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
     }
 }
@@ -396,15 +400,19 @@ struct Load {
 struct Loads {
     lhs: Load,
     rhs: Load,
+    /// The matrices of a batch: the loads add `zi * p.sa` (`p.sb`) to the flat index, `zi` being the grid layer of the workgroup.
+    batch: bool,
 }
 
 impl Loads {
     /// The expression loading element `index` (of the flat matrix) of the left operand.
     fn lhs(&self, index: &str) -> String {
+        let index = if self.batch { format!("zi * p.sa + {index}") } else { index.to_owned() };
         if self.lhs.fused { format!("luma_lhs({index})") } else { format!("a[{index}]") }
     }
 
     fn rhs(&self, index: &str) -> String {
+        let index = if self.batch { format!("zi * p.sb + {index}") } else { index.to_owned() };
         if self.rhs.fused { format!("luma_rhs({index})") } else { format!("b[{index}]") }
     }
 
@@ -595,11 +603,13 @@ fn t32_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Stri
     }
 }
 
-fn t32(aligned: bool, split: bool, loads: &Loads) -> String {
+fn t32(aligned: bool, split: bool, loads: &Loads, form: &ContractForm) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
     let Range { declare, k_begin, k_end, out } = range(aligned, split);
     let end = if aligned { "" } else { ", ke" };
+    // A batch writes its layer at `zi * p.sc`.
+    let out = if loads.batch { "zi * p.sc + " } else { out };
     // Rows `lid.y` and `lid.y + 16`, columns `lid.x` and `lid.x + 16` of the tile.
     let store = |acc: &str, row: &str, col: &str| {
         if aligned {
@@ -608,15 +618,22 @@ fn t32(aligned: bool, split: bool, loads: &Loads) -> String {
             format!("{{ let r = row0 + {row}; let col = col0 + {col}; if (r < p.m && col < p.n) {{ c[{out}r * p.n + col] = {acc}; }} }}\n    ")
         }
     };
+    // A product that is not a sum of multiplications must not combine the zeros that pad the last slice of K.
+    let steps = if form.is_default() || aligned { "16u".to_owned() } else { format!("min(16u, {k_end} - k0)") };
+    let init = form.identity();
+    let (u00, u01, u10, u11) = (form.update("c00", "a0", "b0"), form.update("c01", "a0", "b1"), form.update("c10", "a1", "b0"), form.update("c11", "a1", "b1"));
+    let private = if loads.batch { "var<private> zi: u32 = 0u;\n" } else { "" };
+    let set_zi = if loads.batch { "    zi = wid.z;\n" } else { "" };
+    let mac = form.mac_function();
     let stores = [("c00", "lid.y", "lid.x"), ("c01", "lid.y", "lid.x + 16u"), ("c10", "lid.y + 16u", "lid.x"), ("c11", "lid.y + 16u", "lid.x + 16u")]
         .iter()
         .map(|&(acc, row, col)| store(acc, row, col))
         .collect::<String>();
     let stage = loads.stage(end);
     format!(
-        "var<workgroup> at: array<f32, 512>;
+        "{private}var<workgroup> at: array<f32, 512>;
 var<workgroup> bt: array<f32, 512>;
-
+{mac}
 // Slot `e` of a slice stored k-major: k `e % 16`, row `e / 16`.
 fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
 {load_a}
@@ -628,26 +645,26 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let columns = (p.n + 31u) / 32u;
     let tile = wid.x + wid.y * nwg.x;
     if (tile >= columns * ((p.m + 31u) / 32u)) {{ return; }}
-    let row0 = (tile / columns) * 32u;
+{set_zi}    let row0 = (tile / columns) * 32u;
     let col0 = (tile % columns) * 32u;
     let t = lid.y * 16u + lid.x;
-{declare}    var c00 = 0.0;
-    var c01 = 0.0;
-    var c10 = 0.0;
-    var c11 = 0.0;
+{declare}    var c00 = {init};
+    var c01 = {init};
+    var c10 = {init};
+    var c11 = {init};
     for (var k0 = {k_begin}; k0 < {k_end}; k0 = k0 + 16u) {{
         {stage}
         workgroupBarrier();
-        for (var kk = 0u; kk < 16u; kk = kk + 1u) {{
+        for (var kk = 0u; kk < {steps}; kk = kk + 1u) {{
             let o = kk * 32u;
             let a0 = at[o + lid.y];
             let a1 = at[o + lid.y + 16u];
             let b0 = bt[o + lid.x];
             let b1 = bt[o + lid.x + 16u];
-            c00 = fma(a0, b0, c00);
-            c01 = fma(a0, b1, c01);
-            c10 = fma(a1, b0, c10);
-            c11 = fma(a1, b1, c11);
+            {u00}
+            {u01}
+            {u10}
+            {u11}
         }}
         workgroupBarrier();
     }}

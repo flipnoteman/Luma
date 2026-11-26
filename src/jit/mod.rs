@@ -216,7 +216,7 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, ManyMode, MatmulKernel, MatmulSide, Member, PartSide};
+pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, matmul_with, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, ManyMode, MatmulKernel, MatmulSide, Member, PartSide};
 pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;

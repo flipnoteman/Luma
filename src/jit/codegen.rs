@@ -746,8 +746,11 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         if reduce {
             src.push_str("n: u32, ");
         }
-        if matmul {
+        if let Tail::Matmul { form, .. } = key.tail {
             src.push_str("m: u32, n: u32, k: u32, kc: u32, ");
+            if crate::jit::comprehension::lower::contract::form(form).batch {
+                src.push_str("nb: u32, sa: u32, sb: u32, sc: u32, ");
+            }
         }
         if axis {
             src.push_str(crate::scan::AXIS_PARAMS);
@@ -1006,7 +1009,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let elem_at = if pass.ops.roots().is_some() { key.outputs.first().map_or(last, |&at| at as usize) } else { last };
             src.push_str(&crate::scan::reduce_body(pass, out_ty(elem_at), "luma_eval", wg));
         }
-        Tail::Matmul { tile, aligned, split, lhs, rhs } => {
+        Tail::Matmul { tile, aligned, split, lhs, rhs, form } => {
             let names = Names { views: &views, in_place: &[] };
             let mut roots = key.outputs.iter().map(|&at| at as usize);
             for (operand, function) in [(lhs, "luma_lhs"), (rhs, "luma_rhs")] {
@@ -1014,7 +1017,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                     src.push_str(&load_function(function, key, root, inlined, &names, index, segmented));
                 }
             }
-            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs));
+            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs, &crate::jit::comprehension::lower::contract::form(form)));
         }
         Tail::Solve(spec) => {
             let names = Names { views: &views, in_place: &[] };
@@ -1060,6 +1063,21 @@ pub(super) fn load_function(
     let ty = key.instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let (computed, values) = computed_values(key, &[out], inlined, names, index, segmented);
     format!("\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{};\n}}\n", values[0])
+}
+
+/// `fn {name}(a0: T0, a1: T1, ..) -> T { ...; return t{out}; }`: the instructions `instrs` over `inputs` parameters (`Ref::Input(k)` is the
+/// parameter `a{k}`, of the type the instructions that read it say), for a program that has no loads, views or scalars: the
+/// multiply-add of a generic contraction.
+pub(crate) fn scalar_function(name: &str, instrs: &[Instr], out: usize, inputs: usize) -> String {
+    let params: Vec<String> = (0..inputs)
+        .map(|k| {
+            let ty = instrs.iter().find_map(|instr| (0..3).find(|&i| instr.args[i] == Ref::Input(k as u32)).map(|i| instr.op.operand_ty(i))).unwrap_or(ElemTy::F32);
+            format!("a{k}: {}", ty.wgsl())
+        })
+        .collect();
+    let computed = body_with(instrs, &[], &NO_NAMES, "i", false, Some(&needed(instrs, &[out])), &|_, _| None);
+    let ty = instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+    format!("\nfn {name}({}) -> {ty} {{\n{computed}    return t{out};\n}}\n", params.join(", "))
 }
 
 /// One value a line solve reads at a cell: the root `at` of the program, or the buffer `pr{k}`.

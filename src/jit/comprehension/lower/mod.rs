@@ -72,7 +72,7 @@ pub(crate) fn dims(form: &Comprehension) -> [u32; 4] {
 }
 
 /// The part of a combiner as the binary op that combines two partial values, and the reduction that folds a line of them.
-fn combine_of(part: CombinePart) -> Option<(BinOp, ReduceOp)> {
+pub(super) fn combine_of(part: CombinePart) -> Option<(BinOp, ReduceOp)> {
     match part {
         CombinePart::Add => Some((BinOp::Add, ReduceOp::Sum)),
         CombinePart::Mul => Some((BinOp::Mul, ReduceOp::Prod)),
@@ -168,7 +168,7 @@ impl Prepared {
 
 /// Merges dims that follow each other in every access (and, for parallel dims, in the output): the coordinate `c_slow * s +
 /// c_fast * f` of every row is `c_fast * (f + e_fast * s)` for the merged dim. Maps keep their rows, so every edge is exact.
-fn coalesce(form: &Comprehension) -> Comprehension {
+pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
     let mut form = form.clone();
     loop {
         let live: SmallVec<[usize; 6]> = (0..form.space.len()).filter(|&d| form.space[d].extent > 1).collect();
@@ -280,34 +280,41 @@ pub(crate) fn lowerable(form: &Comprehension) -> bool {
 
 /// The values the dims of a tile start at.
 #[derive(Clone, Copy)]
-struct Origin6([i64; MAX_DIMS]);
+pub(super) struct Origin6(pub(super) [i64; MAX_DIMS]);
+
+/// The node of access `j` of `form` over a tile: a view of the source whose axis `o` follows dim `axes[o]` for `extent[o]` points,
+/// the dims off the axes held at their value in `origin` (so are the dims on them, plus their coordinate in the tile). The access's
+/// edge and fill are the view's. The rows must read at most one dim of the axes each.
+pub(super) fn view_node(ctx: &Context, form: &Comprehension, j: usize, axes_of: &[usize], origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
+    let access: &Access = &form.inputs[j];
+    let mut map = AffineMap::ZERO;
+    for (row, source) in map.rows.iter_mut().zip(&access.map.rows) {
+        let mut offset = source.offset;
+        for (d, &c) in source.coeff.iter().enumerate().take(form.space.len()) {
+            offset += i64::from(c) * origin.0[d];
+            if axes_of.contains(&d) {
+                row.coeff[d] = c;
+            }
+        }
+        row.offset = offset;
+    }
+    let mut axes = [None; 4];
+    let mut out = [1u32; 4];
+    for (o, &d) in axes_of.iter().enumerate() {
+        axes[o] = Some(d as u8);
+        out[o] = u32::try_from(extent[o]).map_err(|_| Failure::from(LumaError::InvalidShape("a tile of a form has more points than the budget".into())))?;
+    }
+    let view = map.to_view(axes, access.shape, out).ok_or_else(|| Failure::from(LumaError::Unsupported("a form's access is not a view of its source".into())))?;
+    let len: usize = out.iter().map(|&e| e as usize).product();
+    let fill = access.fill.map_or_else(Src::unused, Src::Scalar);
+    let op = Op::new(OpKind::Shift(ShiftKind::View { map: view, edge: access.edge }), access.ty);
+    jit::create(ctx, len, op, [access.src.clone(), fill, Src::unused()], "comprehension", location)
+}
 
 impl Prepared {
     /// The node of access `j` over the tile at `origin` with the extents `extent` per axis: the view of the source.
     fn view(&self, ctx: &Context, j: usize, origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
-        let access: &Access = &self.form.inputs[j];
-        let mut map = AffineMap::ZERO;
-        for (row, source) in map.rows.iter_mut().zip(&access.map.rows) {
-            let mut offset = source.offset;
-            for (d, &c) in source.coeff.iter().enumerate().take(self.form.space.len()) {
-                offset += i64::from(c) * origin.0[d];
-                if self.axes.contains(&d) {
-                    row.coeff[d] = c;
-                }
-            }
-            row.offset = offset;
-        }
-        let mut axes = [None; 4];
-        let mut out = [1u32; 4];
-        for (o, &d) in self.axes.iter().enumerate() {
-            axes[o] = Some(d as u8);
-            out[o] = u32::try_from(extent[o]).map_err(|_| Failure::from(LumaError::InvalidShape("a tile of a form has more points than the budget".into())))?;
-        }
-        let view = map.to_view(axes, access.shape, out).ok_or_else(|| Failure::from(LumaError::Unsupported("a form's access is not a view of its source".into())))?;
-        let len: usize = out.iter().map(|&e| e as usize).product();
-        let fill = access.fill.map_or_else(Src::unused, Src::Scalar);
-        let op = Op::new(OpKind::Shift(ShiftKind::View { map: view, edge: access.edge }), access.ty);
-        jit::create(ctx, len, op, [access.src.clone(), fill, Src::unused()], "comprehension", location)
+        view_node(ctx, &self.form, j, &self.axes, origin, extent, location)
     }
 
     /// The body of the form over the tile as elementwise nodes: the node of the out.
