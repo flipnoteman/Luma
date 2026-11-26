@@ -21,9 +21,16 @@ tools/benchref.sh v0.4.0 local - "cuda wgpu"
 tools/benchref.sh wt local ml cuda --quick
 
 tools/benchcmp.py BASE.jsonl NEW.jsonl [--threshold 0.05] [--metric median_ms|min_ms|gpu_ms|first_ms|mem_mib] [--all]
-tools/benchcmp.py --base base-a.jsonl base-b.jsonl --new 'new-*.jsonl'   # best (min) of repeats per side
+tools/benchcmp.py --base base-a.jsonl base-b.jsonl --new 'new-*.jsonl'   # median of the files of a side (--agg min: the best)
 ```
 
-`benchcmp.py` flags REGRESSION / IMPROVED (median AND min beyond the threshold), first-call
+A/B of two refs: `tools/benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--only PATTERN] [--chunk N]` builds both
+binaries and alternates them group by group (`--list-groups`, `--group`; `--warm` warms the GPU first) in one queue job: A B B A for
+one group, B A A B for the next, so power-state and clock drift hits both sides alike. Sample n of a side lands in
+`<label>-<backend>-<suite>-<side><n>.jsonl`; `benchcmp.py` pairs sample n of both sides.
+`--only` picks a group by `suite/group`, a case by `suite/group/case` or `group/case`; a run that selects no case exits 3.
+
+`benchcmp.py` flags REGRESSION / IMPROVED (median AND min beyond the threshold; with several samples per side also every
+pair of samples agreeing in direction and the change exceeding the spread of a side's samples, else NOISY), first-call
 slowdowns >25%, memory growth >10% and launch-count increases; prints per-suite geometric-mean
 ratios and exits 1 on any REGRESSION.

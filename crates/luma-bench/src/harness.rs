@@ -64,6 +64,17 @@ pub struct Harness {
     pub skipped: Vec<(String, String)>,
     /// `--iters N`: every case runs exactly N timed calls, no calibration or profile run.
     pub iters: Option<usize>,
+    /// `--group suite/group,...`: run only these units (see [`Harness::unit_of`]); `tools/benchab.sh` runs one unit per process.
+    pub groups: Option<Vec<String>>,
+    /// `--list-groups`: run nothing, collect the units of the selected suites in [`Harness::listed`].
+    pub list: bool,
+    /// The units seen in list mode, in order, without repeats.
+    pub listed: std::cell::RefCell<Vec<String>>,
+    /// Cases timed (or skipped) so far: a run whose `--only` / `--group` selected none is an error (see `main`).
+    pub selected: usize,
+    /// Inside a [`Harness::guarded`] group that was selected.
+    in_group: bool,
+    warmed: bool,
     json: Option<std::io::BufWriter<std::fs::File>>,
     /// `LUMA_BENCH_DECISIONS`: the decision log (see [`Harness::log_decisions`]).
     decisions: Option<std::io::BufWriter<std::fs::File>>,
@@ -78,7 +89,7 @@ impl Harness {
             let loc = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
             *PANIC.lock().unwrap() = format!("{msg}{loc}");
         }));
-        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), iters: None, json, decisions: None, header_printed: false }
+        Harness { ctx, quick, only, suite: String::new(), records: Vec::new(), skipped: Vec::new(), iters: None, groups: None, list: false, listed: Default::default(), selected: 0, in_group: false, warmed: false, json, decisions: None, header_printed: false }
     }
 
     /// Writes the decision log of every case that runs from now on to `path` (see
@@ -135,14 +146,49 @@ impl Harness {
         format!("{}/{}", self.suite, case)
     }
 
-    /// Whether `case` (of the current suite) is selected by `--only`: a substring match, or an exact
-    /// match of the full name when the filter ends in `$` (what `tools/hosttime` passes).
+    /// The unit `tools/benchab.sh` alternates between the two binaries: the `suite/group` of a [`Harness::guarded`] group, and for a
+    /// case outside any group its full name without the last `/` component.
+    fn unit_of(full: &str) -> &str {
+        full.rsplit_once('/').map_or(full, |(unit, _)| unit)
+    }
+
+    fn note_unit(&self, unit: &str) {
+        let mut listed = self.listed.borrow_mut();
+        if !listed.iter().any(|u| u == unit) {
+            listed.push(unit.to_string());
+        }
+    }
+
+    /// Whether `case` (of the current suite) is selected by `--only` (a substring match, or an exact
+    /// match of the full name when the filter ends in `$`, what `tools/hosttime` passes) and `--group`.
+    /// In list mode nothing is selected: a case outside a group registers its unit instead.
     pub fn want(&self, case: &str) -> bool {
         let full = self.full(case);
-        self.only.as_deref().is_none_or(|f| {
+        let by_only = self.only.as_deref().is_none_or(|f| {
             f.split(',').any(|f| match f.strip_suffix('$') {
                 Some(exact) => full == exact,
                 None => full.contains(f),
+            })
+        });
+        if !by_only {
+            return false;
+        }
+        if self.list {
+            self.note_unit(Self::unit_of(&full));
+            return false;
+        }
+        self.in_group || self.groups.as_ref().is_none_or(|g| g.iter().any(|g| g == Self::unit_of(&full)))
+    }
+
+    /// Whether `--only` selects the group `group` of the current suite. A filter selects a group by (a substring of) its
+    /// `suite/group` name, by a name that starts with it (`compute/matmul/square`, a case of the group), or by the short
+    /// `group/case` form (`matmul/square`), since the cases of a group are named `group/...`.
+    fn group_wanted(&self, group: &str) -> bool {
+        let full = self.full(group);
+        self.only.as_deref().is_none_or(|only| {
+            only.split(',').any(|f| {
+                let f = f.trim_end_matches('$');
+                full.contains(f) || f.starts_with(&full) || f.strip_prefix(group).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             })
         })
     }
@@ -150,18 +196,24 @@ impl Harness {
     /// Runs `f` (which verifies and times one or more cases) if `group` is selected; a panic is
     /// reported as a `SKIPPED` line and the run goes on. Case names inside a group should start
     /// with the group name (`"attention/forward"` in group `"attention"`), so that `--only`
-    /// picks a group by `suite/group` or one case by its full name; `--only a,b` takes several.
+    /// picks a group by `suite/group` or one case by `suite/group/case` or `group/case`; `--only a,b` takes several.
     pub fn guarded(&mut self, group: &str, f: impl FnOnce(&mut Harness)) {
-        if let Some(only) = self.only.as_deref() {
-            let full = self.full(group);
-            if !only.split(',').any(|only| full.contains(only.trim_end_matches('$')) || only.starts_with(&full)) {
-                return;
-            }
+        if !self.group_wanted(group) {
+            return;
         }
+        let name = self.full(group);
+        if self.list {
+            self.note_unit(&name);
+            return;
+        }
+        if self.groups.as_ref().is_some_and(|g| !g.contains(&name)) {
+            return;
+        }
+        let outer = std::mem::replace(&mut self.in_group, true);
         let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+        self.in_group = outer;
         if result.is_err() {
             let msg = PANIC.lock().unwrap().clone().replace('\n', " | ");
-            let name = self.full(group);
             println!("SKIPPED: {name}: {msg}");
             self.skipped.push((name, msg));
             let _ = self.ctx.finish_profiling();
@@ -169,9 +221,29 @@ impl Harness {
         }
     }
 
+    /// Keeps the GPU busy for a moment (once per process) so that the first cases do not time its clock ramp-up. The
+    /// kernel shares nothing with the cases (so their first-call costs stay theirs).
+    pub fn warm_up(&mut self) {
+        if self.warmed || self.list || self.ctx.is_cpu() {
+            return;
+        }
+        self.warmed = true;
+        let x = Array::<f32>::linspace_on(&self.ctx, 0.0, 1.0, 1 << 24).unwrap();
+        let start = Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(400) {
+            let mut z = x.clone();
+            for _ in 0..6 {
+                z = (z * 1.0001 + 0.1).tan().cos();
+            }
+            z.eval().unwrap();
+            self.ctx.sync().unwrap();
+        }
+    }
+
     /// Records that `case` was not run, and why.
     pub fn skip(&mut self, case: &str, why: &str) {
         if self.want(case) {
+            self.selected += 1;
             let name = self.full(case);
             println!("SKIPPED: {name}: {why}");
             self.skipped.push((name, why.to_string()));
@@ -213,6 +285,7 @@ impl Harness {
         if !self.want(case) {
             return;
         }
+        self.selected += 1;
         self.header();
         let ctx = self.ctx.clone();
         // (the call and its sync, the call alone: what the host spent recording and submitting)

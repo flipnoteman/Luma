@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
-# Interleaved A/B of two luma refs in one GPU-queue job (or locally on the CPU backend): both
-# binaries are built first, then every suite runs A B B A (round 1), B A A B (round 2), ..., so
-# clock, thermal and host-load drift hit both sides alike.
-# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR]
+# Interleaved A/B of two luma refs in one GPU-queue job (or locally on the CPU backend): both binaries are built first, then
+# the two alternate unit by unit (a unit is a luma-bench group of cases, `luma-bench --list-groups`): A B B A for one unit, B A A B
+# for the next, ..., each run after a 400 ms GPU warm-up, so the clock, thermal and host-load drift of a long job hits both sides
+# alike (alternating whole suites let it hit whichever side ran in the slow state: 10-30 unrelated 1.05-1.5x "regressions").
+# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR] [--chunk N]
 #   BASE/NEW  git refs of this repo or paths to luma trees
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
 #   SUITES    comma list (default: ml,cfd,datasci,compute,jit,sparse)   BACKENDS  default "cuda wgpu"
-#   --rounds  A/B pairs per side and suite (default 1: A B B A, two samples per side)
-#   --only    luma-bench --only SUBSTR (cases whose full name `suite/case` contains it)
+#   --rounds  A/B pairs per side and unit (default 1: A B B A, two samples per side); benchcmp.py takes the median over the samples
+#   --only    luma-bench --only PATTERN: a group by `suite/group`, a case by `suite/group/case` or the short `group/case`
+#             (`matmul/square`), several with commas, `X$` exact; a job that selects no case fails loudly
+#   --chunk   units per alternation step (default: auto, at most 48 steps per suite; 1 = every group alternates on its own)
 #   --timeout gpuq timeout of the job (default 7200). gpuq copies out/ back only when the job ends by itself, so the
 #             job stops starting runs 300 s before the timeout and ends normally (the results so far are kept).
 # luma-bench exits 1 when a case is skipped (its check failed) or failed; that round still has the JSON of every case
 # that ran. The runs' stdout is kept next to it (out/<label>-<backend>-<suite>-<side><n>.txt) and the job log ends with
 # a count of the SKIPPED / FAILED lines per side, backend and suite.
-# Results: out/<label>-<backend>-<suite>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir);
-# compare with tools/benchcmp.py --base 'DIR/<base>-cuda-*' --new 'DIR/<new>-cuda-*'.
+# Results: out/<label>-<backend>-<suite>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir), sample n (1 .. 2 x rounds)
+# of every unit of the suite; compare with tools/benchcmp.py --base 'DIR/<base>-cuda-*' --new 'DIR/<new>-cuda-*'.
 set -euo pipefail
-pos=() quick="" rounds=1 timeout=7200
+pos=() quick="" only="" chunk=0 rounds=1 timeout=7200
 while [ $# -gt 0 ]; do
-  case $1 in --quick) quick="$quick --quick" ;; --only) quick="$quick --only $2"; shift ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
+  case $1 in --quick) quick=1 ;; --only) only=$2; shift ;; --chunk) chunk=$2; shift ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
   shift
 done
-[ ${#pos[@]} -ge 3 ] || { sed -n 2,17p "$0"; exit 2; }
+[ ${#pos[@]} -ge 3 ] || { sed -n 2,22p "$0"; exit 2; }
 base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,compute,jit,sparse} backends=${pos[4]:-cuda wgpu}
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
@@ -53,42 +56,23 @@ for s in a b; do
   cp "$T/ab-$s/release/luma-bench" "$snap/bin/$s"
   rm -rf "${snap:?}/$s"
 done
+# The job: tools/benchab-job.sh (shipped in the snapshot) alternates the two binaries unit by unit; its input is the environment.
+cp "$here/tools/benchab-job.sh" "$snap/job.sh"
 git -C "$snap" init -q && git -C "$snap" add -A >/dev/null && git -C "$snap" -c user.name=b -c user.email=b@b commit -qm "ab $la $lb" >/dev/null
 
-run="mkdir -p out
-A=\$PWD/bin/a B=\$PWD/bin/b
-# Each side gets its own kernel/pipeline cache, empty at the start of the job: a shared cache near its size cap
-# makes context creation cost ~1 ms per cached MB and varies with whatever other runs left in it.
-CA=\$(mktemp -d) CB=\$(mktemp -d)
-one() { # side backend suite round
-  local bin=\$A lab=$la cache=\$CA; [ \$1 = b ] && bin=\$B lab=$lb cache=\$CB
-  [ \$SECONDS -lt $((timeout - 300)) ] || { echo \"benchab: \$1 \$2 \$3 round \$4 not started: deadline\"; return 0; }
-  LUMA_CACHE_DIR=\$cache LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > out/\$lab-\$2-\$3-\$1\$4.txt 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
-}"
-loop="for be in BACKENDS; do
-  for suite in ${suites//,/ }; do
-    for r in \$(seq 1 $rounds); do
-      if [ \$((r % 2)) = 1 ]; then o='a b b a'; else o='b a a b'; fi
-      n=0; for side in \$o; do n=\$((n + 1)); one \$side \$be \$suite \$r\$n; done
-      echo \"\$(date +%T) \$be \$suite round \$r done\"
-    done
-  done
-done
-echo \"benchab: SKIPPED / FAILED cases, runs per side-backend-suite:\"
-grep -H -E '^(SKIPPED|FAILED): ' out/*.txt | sed -E 's|^out/(.*)-[ab][0-9]+[.]txt:|\\1 |' | sort | uniq -c | cut -c1-400 || true"
+if [ -n "$only" ]; then
+  n=$(LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent "$snap/bin/b" --suite "$suites" --only "$only" --list-groups 2>/dev/null | grep -c -E '^[a-z0-9_]+/' || true)
+  [ "${n:-0}" -gt 0 ] || echo "benchab: warning: --only '$only' selects no group of $suites on the CPU backend (the job fails if it selects none on the GPU either)" >&2
+fi
 if [ "$host" = cpu ]; then
-  cmd="$run
-export LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent
-${loop/BACKENDS/cpu}"
   echo "benchab: cpu A/B of $la vs $lb in $snap"
-  (cd "$snap" && env -u LUMA_BACKEND -u LUMA_CACHE_DIR CARGO_TARGET_DIR="${BENCHREF_TARGET:-$HOME/.cache/luma-benchref/target}" bash -c "$cmd")
+  (cd "$snap" && env -u LUMA_BACKEND -u LUMA_CACHE_DIR LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent \
+    A="$PWD/bin/a" B="$PWD/bin/b" LA="$la" LB="$lb" BACKENDS=cpu SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" DEADLINE=$((timeout - 300)) bash job.sh)
   echo "results: $snap/out/"
   exit 0
 fi
-cmd="$run
-${loop/BACKENDS/$backends}"
-cmd=${cmd//'$bin --suite'/'LUMA_BACKEND=$2 $bin --suite'}
 cd "$snap"
-id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout "$timeout" -- bash -c "$cmd")
+id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout "$timeout" -- \
+  env A='bin/a' B='bin/b' LA="$la" LB="$lb" BACKENDS="$backends" SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" DEADLINE=$((timeout - 300)) bash job.sh)
 echo "job: $id  (A $la vs B $lb, host $host, suites $suites, backends: $backends, rounds $rounds)"
 echo "results: ${GPUQ_DIR:-$HOME/.cache/bowshock-gpuq}/done/$id/out/ ; compare: tools/benchcmp.py --base 'OUT/$la-cuda-*' --new 'OUT/$lb-cuda-*'"

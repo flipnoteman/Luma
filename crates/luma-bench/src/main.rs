@@ -2,7 +2,14 @@
 //!
 //! ```text
 //! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>|<case>$] [--json out.jsonl] [--iters N]
+//!                                      [--list-groups] [--group suite/group,...] [--warm]
 //! ```
+//!
+//! `--only` picks a group by `suite/group` and a case by `suite/group/case` or `group/case` (any substring of the full name
+//! picks cases inside a group that is selected); a run whose `--only` / `--group` selects no case exits 3.
+//! `--list-groups` prints the units (`suite/group`, or the `suite/prefix` of a case outside any group) of the selected suites,
+//! one per line, and runs nothing; `--group` runs only those units; `--warm` keeps the GPU busy for 400 ms first.
+//! `tools/benchab.sh` uses them to alternate two binaries unit by unit.
 //!
 //! `--iters N` times every selected case with exactly N calls (no calibration, no profile run); it is for
 //! `tools/hosttime`, which counts instructions under callgrind.
@@ -27,6 +34,9 @@ fn main() {
     let mut json = None;
     let mut suites: Option<Vec<String>> = None;
     let mut iters: Option<usize> = None;
+    let mut groups: Option<Vec<String>> = None;
+    let mut list_groups = false;
+    let mut warm = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -35,6 +45,9 @@ fn main() {
             "--json" => json = args.next(),
             "--suite" => suites = args.next().map(|s| s.split(',').map(str::to_string).collect()),
             "--iters" => iters = Some(args.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).expect("--iters takes a positive integer")),
+            "--list-groups" => list_groups = true,
+            "--warm" => warm = true,
+            "--group" => groups = args.next().map(|s| s.split(',').map(str::to_string).collect()),
             "--list" => {
                 for (name, _) in suites::ALL {
                     println!("{name}");
@@ -57,15 +70,27 @@ fn main() {
         }
     }
     let ctx = Context::with_options(ContextOptions::from_env()).expect("no device");
-    println!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());
+    let banner = format!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());
+    if list_groups {
+        eprintln!("{banner}");
+    } else {
+        println!("{banner}");
+    }
     if decisions.is_some() {
         // Whether `eval` postpones follows how busy the GPU is, so which steps fuse into one kernel
         // would follow its timing: treat the GPU as idle, whatever it does (a busy GPU would leave
         // the arrays the cases drop uncomputed).
         ctx.set_assume_idle(true);
     }
+    let filtered = only.is_some() || groups.is_some();
+    let only_text = only.clone().unwrap_or_default();
     let mut h = harness::Harness::new(ctx, quick, only, json.as_deref());
     h.iters = iters;
+    h.groups = groups;
+    h.list = list_groups;
+    if warm {
+        h.warm_up();
+    }
     if let Some(path) = decisions {
         h.log_decisions(&path);
     }
@@ -75,6 +100,18 @@ fn main() {
         }
         h.suite = name.to_string();
         run(&mut h);
+    }
+    if list_groups {
+        for unit in h.listed.borrow().iter() {
+            println!("{unit}");
+        }
+        return;
+    }
+    if filtered && h.selected == 0 && h.skipped.is_empty() {
+        eprintln!(
+            "luma-bench: --only '{only_text}' / --group selected no case (a group is picked by `suite/group`, a case by `suite/group/case` or `group/case`; --list-groups shows the groups)"
+        );
+        std::process::exit(3);
     }
     if !h.skipped.is_empty() {
         println!("\n{} case(s) skipped:", h.skipped.len());
