@@ -72,12 +72,12 @@ fi
 if [ "$host" = cpu ]; then
   echo "benchab: cpu A/B of $la vs $lb in $snap"
   (cd "$snap" && env -u LUMA_BACKEND -u LUMA_CACHE_DIR LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent \
-    A="$PWD/bin/a" B="$PWD/bin/b" LA="$la" LB="$lb" BACKENDS=cpu SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" PIN="${BENCHAB_PIN:-}" DEADLINE=$((timeout - 300)) bash job.sh)
+    A="$PWD/bin/a" B="$PWD/bin/b" LA="$la" LB="$lb" BACKENDS=cpu SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" PIN="${BENCHAB_PIN:-}" CACHE="${BENCHAB_CACHE:-}" DEADLINE=$((timeout - 300)) bash job.sh)
   echo "results: $snap/out/"
   exit 0
 fi
 cd "$snap"
 id=$("$GPUQ" submit --host "$host" --prio "$PRIO" --name "ab-$la-$lb-$host" --timeout "$timeout" -- \
-  env A='bin/a' B='bin/b' LA="$la" LB="$lb" BACKENDS="$backends" SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" PIN="${BENCHAB_PIN:-}" DEADLINE=$((timeout - 300)) bash job.sh)
+  env A='bin/a' B='bin/b' LA="$la" LB="$lb" BACKENDS="$backends" SUITES="$suites" ROUNDS="$rounds" CHUNK="$chunk" QUICK="$quick" ONLY="$only" PIN="${BENCHAB_PIN:-}" CACHE="${BENCHAB_CACHE:-}" DEADLINE=$((timeout - 300)) bash job.sh)
 echo "job: $id  (A $la vs B $lb, host $host, suites $suites, backends: $backends, rounds $rounds)"
 echo "results: ${GPUQ_DIR:-$HOME/.cache/bowshock-gpuq}/done/$id/out/ ; compare: tools/benchcmp.py --base 'OUT/$la-cuda-*' --new 'OUT/$lb-cuda-*'"

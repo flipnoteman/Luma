@@ -18,6 +18,8 @@ if [ -z "${PIN:-}" ] && command -v taskset >/dev/null && command -v lscpu >/dev/
   PIN=$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -t, -k3,3n -k2,2n -k1,1n | awk -F, '!seen[$3 "," $2]++ {print $1}' | head -8 | paste -sd,)
 fi
 pin=(); [ -n "${PIN:-}" ] && [ "$PIN" != off ] && pin=(taskset -c "$PIN") && echo "benchab: runs pinned to cpus $PIN"
+[ "${CACHE:-}" = shared ] && CB=$CA        # diagnostics: one cache dir for both sides / none at all
+[ "${CACHE:-}" = off ] && export LUMA_CACHE=off
 extra=(); [ -n "${QUICK:-}" ] && extra+=(--quick); [ -n "${ONLY:-}" ] && extra+=(--only "$ONLY")
 total_units=0 ran=0 failed=0
 
