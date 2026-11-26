@@ -939,7 +939,7 @@ impl Segment {
             return Ok(());
         }
         // Before the state lock: aborting a recording can pin this segment.
-        self.ctx.abort_recording()?;
+        self.ctx.abort_recording_for("write back of a file segment")?;
         let state = lock(&self.state);
         let State::Device(buffer) = &*state else { return Ok(()) };
         if self.home_valid.load(Ordering::Acquire) {

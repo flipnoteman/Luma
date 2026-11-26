@@ -1628,7 +1628,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     if program.stmts.iter().any(|stmt| matches!(stmt, Stmt::Loop { .. })) {
         return Err(Fail::Limit("a program with a loop".into()));
     }
-    let cx = Cx { ctx: ctx.clone(), math: program.math };
+    let cx = Cx { ctx: ctx.clone(), math: program.math, files: false };
     let other = with_other_data(program);
     let (host_a, outcomes) = host_run(program);
     let (host_b, outcomes_b) = host_run(&other);
@@ -1652,7 +1652,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     let record = std::sync::Arc::clone(&ran);
     let stmts = program.stmts.clone();
     let host_outcomes = outcomes.clone();
-    let inside = Cx { ctx: ctx.clone(), math: program.math };
+    let inside = Cx { ctx: ctx.clone(), math: program.math, files: false };
     let compiled = crate::trace::trace(move |inp| {
         let mut env: Env = Vec::new();
         let (mut next, mut stopped) = (0, None);
