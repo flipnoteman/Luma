@@ -10,6 +10,11 @@ impl Comprehension {
     /// The result of the form over `inputs` (the flat source of access `j` in `inputs[j]`): one value per point of the parallel
     /// dims, output axis 0 fastest. Single-part combiners only; the elementwise instructions the tests use.
     pub(crate) fn eval_reference(&self, inputs: &[&[f64]]) -> Vec<f64> {
+        self.eval_reference_with(inputs, &[])
+    }
+
+    /// [`Comprehension::eval_reference`] with the values of the index array of each indirect access (`indices[j]` for access `j`).
+    pub(crate) fn eval_reference_with(&self, inputs: &[&[f64]], indices: &[Option<&[f64]>]) -> Vec<f64> {
         let extents: Vec<u64> = self.space.iter().map(|dim| dim.extent).collect();
         assert!(self.space.iter().all(|dim| matches!(dim.kind, DimKind::Parallel | DimKind::Reduce)), "no segmented dims in the reference");
         let part = match self.combiner.as_ref().map(|combiner| &combiner.op) {
@@ -36,7 +41,7 @@ impl Comprehension {
                     point[d] = (rest % extents[d]) as i64;
                     rest /= extents[d];
                 }
-                let value = self.body_at(&point, inputs);
+                let value = self.body_at(&point, inputs, indices);
                 acc = Some(match (acc, part) {
                     (None, _) => value,
                     (Some(a), Some(CombinePart::Add)) => a + value,
@@ -52,8 +57,8 @@ impl Comprehension {
     }
 
     /// The first out of the body at `point`.
-    fn body_at(&self, point: &[i64], inputs: &[&[f64]]) -> f64 {
-        let loads: Vec<f64> = self.inputs.iter().enumerate().map(|(j, access)| load(access, point, inputs[j])).collect();
+    fn body_at(&self, point: &[i64], inputs: &[&[f64]], indices: &[Option<&[f64]>]) -> f64 {
+        let loads: Vec<f64> = self.inputs.iter().enumerate().map(|(j, access)| load(access, point, inputs[j], indices.get(j).copied().flatten())).collect();
         let mut temps: Vec<f64> = Vec::with_capacity(self.body.instrs.len());
         for instr in self.body.instrs.iter() {
             let arg = |r: Ref| match r {
@@ -70,13 +75,27 @@ impl Comprehension {
     }
 }
 
-fn load(access: &super::Access, point: &[i64], data: &[f64]) -> f64 {
+fn load(access: &super::Access, point: &[i64], data: &[f64], index: Option<&[f64]>) -> f64 {
     let mut flat = 0i64;
     let mut stride = 1i64;
     for (a, row) in access.map.rows.iter().enumerate() {
         let mut coordinate = row.offset;
         for (&c, &p) in row.coeff.iter().zip(point) {
             coordinate += i64::from(c) * p;
+        }
+        if let Some(indirect) = access.indirect.as_ref().filter(|indirect| usize::from(indirect.row) == a) {
+            // The index array is read through its own map, flat.
+            let mut at = 0i64;
+            let mut below = 1i64;
+            for (r, irow) in indirect.index_map.rows.iter().enumerate() {
+                let mut c = irow.offset;
+                for (&k, &p) in irow.coeff.iter().zip(point) {
+                    c += i64::from(k) * p;
+                }
+                at += c * below;
+                below *= i64::from(indirect.index_shape[r]);
+            }
+            coordinate += index.expect("the values of the index array")[at as usize] as i64;
         }
         let extent = i64::from(access.shape[a]);
         coordinate = match access.edge {

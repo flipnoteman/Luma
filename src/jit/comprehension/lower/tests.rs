@@ -539,3 +539,33 @@ fn the_registry_picks_the_contraction_tail_for_a_big_product() {
     assert_eq!(decisions.len(), 1, "{decisions:?}");
     assert_eq!(decisions[0].chosen, "generic-contract", "{:?}", decisions[0]);
 }
+
+// -- gathers --
+
+use crate::jit::comprehension::Indirect;
+
+#[test]
+fn a_gathered_access_reads_the_elements_an_index_names() {
+    // y[i] = sum_j x[col[j, i]] * val[j, i]: the rows of a sparse matrix, dense in `j`.
+    let ctx = cpu();
+    let (rows, per, columns) = (6u64, 4u64, 11u64);
+    let col_values: Vec<u32> = (0..rows * per).map(|e| ((e * 5 + 3) % columns) as u32).collect();
+    let col = Array::<u32>::from_slice_on(&ctx, &col_values, [per as usize, rows as usize]).unwrap().src().ok().unwrap();
+    // Dims: i (P), j (R).
+    let dims = [(rows, false), (per, true)];
+    let reads = [
+        Read::plain([columns as u32, 1, 1, 1], vec![AffineRow::ZERO]),
+        Read::plain([per as u32, rows as u32, 1, 1], vec![row(&[(1, 1)], 0), row(&[(0, 1)], 0)]),
+    ];
+    let (mut f, data) = form(&ctx, &dims, &[0], &reads, mul01(), CombinePart::Add);
+    let mut index_map = AffineMap::ZERO;
+    index_map.rows[0] = row(&[(1, 1)], 0);
+    index_map.rows[1] = row(&[(0, 1)], 0);
+    f.inputs[0].indirect = Some(Box::new(Indirect { index: col, index_shape: [per as u32, rows as u32, 1, 1], index_map, row: 0 }));
+    f.validate().unwrap();
+    assert!(lowerable(&f));
+    let index_values: Vec<f64> = col_values.iter().map(|&v| f64::from(v)).collect();
+    let refs: Vec<&[f64]> = data.iter().map(Vec::as_slice).collect();
+    let expected = f.eval_reference_with(&refs, &[Some(&index_values), None]);
+    assert_eq!(values(&build(&ctx, &f)), expected);
+}

@@ -186,10 +186,11 @@ pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
                     continue;
                 }
                 let composes = form.inputs.iter().all(|a| {
-                    a.map.rows.iter().all(|row| {
+                    let follows = |row: &AffineRow| {
                         let (cs, cf) = (i64::from(row.coeff[slow]), i64::from(row.coeff[fast]));
                         cs == cf * extent as i64
-                    })
+                    };
+                    a.map.rows.iter().all(follows) && a.indirect.as_ref().is_none_or(|indirect| indirect.index_map.rows.iter().all(follows))
                 });
                 // A parallel pair must be neighbours in the output order, the faster one first.
                 let adjacent = form.space[fast].is_reduce() || {
@@ -212,6 +213,11 @@ pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
                 row.coeff[slow] = 0;
             }
             access.map = super::MapRef::owned(map);
+            if let Some(indirect) = &mut access.indirect {
+                for row in &mut indirect.index_map.rows {
+                    row.coeff[slow] = 0;
+                }
+            }
         }
         for axis in &mut form.output.dim_of_axis {
             if *axis == Some(slow as u8) {
@@ -221,12 +227,17 @@ pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
     }
 }
 
+/// The rows of an access that read dims: its map's and, for a gather, those of its index.
+fn all_rows(access: &Access) -> impl Iterator<Item = &AffineRow> {
+    access.map.rows.iter().chain(access.indirect.iter().flat_map(|indirect| indirect.index_map.rows.iter()))
+}
+
 /// Plans the lowering of `form`, or `None` when it has none: `lowerable` is exactly this.
 pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     if form.ty != ElemTy::F32 || !matches!(form.epilogue, Epilogue::None) || form.output.order != super::OutMap::IDENTITY || form.validate().is_err() {
         return None;
     }
-    if form.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) || form.inputs.iter().any(|a| a.indirect.is_some() || matches!(a.src, Src::Scalar(_))) {
+    if form.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) || form.inputs.iter().any(|a| (a.indirect.is_some() && !gathers(a)) || matches!(a.src, Src::Scalar(_))) {
         return None;
     }
     let part = match form.combiner.as_ref().map(|combiner| &combiner.op) {
@@ -244,7 +255,7 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     let multi = |row: &AffineRow, among: &[usize]| among.iter().filter(|&&d| row.coeff[d] != 0).count() >= 2;
     let mut taps: SmallVec<[usize; 2]> = SmallVec::new();
     for &d in live.iter().filter(|&&d| form.space[d].is_reduce()) {
-        if form.inputs.iter().any(|a| a.map.rows.iter().any(|row| multi(row, &live) && row.coeff[d] != 0)) {
+        if form.inputs.iter().any(|a| all_rows(a).any(|row| multi(row, &live) && row.coeff[d] != 0)) {
             taps.push(d);
         }
     }
@@ -253,7 +264,7 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     }
     let rest: SmallVec<[usize; 6]> = live.iter().copied().filter(|d| !taps.contains(d)).collect();
     // A row that still reads two dims once the taps are fixed is no view (an anti-diagonal of two parallel dims).
-    if form.inputs.iter().any(|a| a.map.rows.iter().any(|row| multi(row, &rest))) {
+    if form.inputs.iter().any(|a| all_rows(a).any(|row| multi(row, &rest))) {
         return None;
     }
     let parallel: SmallVec<[usize; 4]> = form.output.dim_of_axis.iter().flatten().map(|&d| usize::from(d)).filter(|d| rest.contains(d)).collect();
@@ -285,13 +296,13 @@ pub(crate) fn lowerable(form: &Comprehension) -> bool {
 #[derive(Clone, Copy)]
 pub(super) struct Origin6(pub(super) [i64; MAX_DIMS]);
 
-/// The node of access `j` of `form` over a tile: a view of the source whose axis `o` follows dim `axes[o]` for `extent[o]` points,
-/// the dims off the axes held at their value in `origin` (so are the dims on them, plus their coordinate in the tile). The access's
-/// edge and fill are the view's. The rows must read at most one dim of the axes each.
-pub(super) fn view_node(ctx: &Context, form: &Comprehension, j: usize, axes_of: &[usize], origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
-    let access: &Access = &form.inputs[j];
-    let mut map = AffineMap::ZERO;
-    for (row, source) in map.rows.iter_mut().zip(&access.map.rows) {
+/// The view of `src` (read as `shape`) over a tile: axis `o` of the view follows dim `axes_of[o]` for `extent[o]` points, the dims off
+/// the axes held at their value in `origin`, the coordinate of the tile added for the dims on them. The rows of `map` must read at
+/// most one dim of the axes each.
+#[allow(clippy::too_many_arguments)]
+fn view_of(ctx: &Context, form: &Comprehension, src: &Src, shape: [u32; 4], ty: ElemTy, map: &AffineMap, edge: crate::jit::Edge, fill: Option<crate::jit::Scalar>, axes_of: &[usize], origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
+    let mut folded = AffineMap::ZERO;
+    for (row, source) in folded.rows.iter_mut().zip(&map.rows) {
         let mut offset = source.offset;
         for (d, &c) in source.coeff.iter().enumerate().take(form.space.len()) {
             offset += i64::from(c) * origin.0[d];
@@ -307,11 +318,37 @@ pub(super) fn view_node(ctx: &Context, form: &Comprehension, j: usize, axes_of: 
         axes[o] = Some(d as u8);
         out[o] = u32::try_from(extent[o]).map_err(|_| Failure::from(LumaError::InvalidShape("a tile of a form has more points than the budget".into())))?;
     }
-    let view = map.to_view(axes, access.shape, out).ok_or_else(|| Failure::from(LumaError::Unsupported("a form's access is not a view of its source".into())))?;
+    let view = folded.to_view(axes, shape, out).ok_or_else(|| Failure::from(LumaError::Unsupported("a form's access is not a view of its source".into())))?;
     let len: usize = out.iter().map(|&e| e as usize).product();
-    let fill = access.fill.map_or_else(Src::unused, Src::Scalar);
-    let op = Op::new(OpKind::Shift(ShiftKind::View { map: view, edge: access.edge }), access.ty);
-    jit::create(ctx, len, op, [access.src.clone(), fill, Src::unused()], "comprehension", location)
+    let fill = fill.map_or_else(Src::unused, Src::Scalar);
+    let op = Op::new(OpKind::Shift(ShiftKind::View { map: view, edge }), ty);
+    jit::create(ctx, len, op, [src.clone(), fill, Src::unused()], "comprehension", location)
+}
+
+/// The node of access `j` of `form` over a tile (see [`view_of`]): the access's edge and fill are the view's. An indirect access
+/// (`x[col[j]]`, see [`gathers`]) is the source read at the elements an index array over the tile names (`ShiftKind::Take`).
+pub(super) fn view_node(ctx: &Context, form: &Comprehension, j: usize, axes_of: &[usize], origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
+    let access: &Access = &form.inputs[j];
+    let Some(indirect) = &access.indirect else {
+        return view_of(ctx, form, &access.src, access.shape, access.ty, &access.map, access.edge, access.fill, axes_of, origin, extent, location);
+    };
+    let index = view_of(ctx, form, &indirect.index, indirect.index_shape, ElemTy::U32, &indirect.index_map, crate::jit::Edge::None, None, axes_of, origin, extent, location)?;
+    let len: usize = extent.iter().map(|&e| e as usize).product();
+    let source_len: u32 = access.shape.iter().product();
+    let op = Op::new(OpKind::Shift(ShiftKind::Take { len: source_len }), access.ty);
+    jit::create(ctx, len, op, [access.src.clone(), Src::Node(index), Src::unused()], "comprehension", location)
+}
+
+/// Whether `access` is a gather the generic lowering takes: `x[index(point)]`, the source read flat at the element the index names
+/// (no affine part, no edge: an index past the end reads the last element, as `Take` does, so the index must be in range).
+pub(super) fn gathers(access: &Access) -> bool {
+    access.indirect.as_ref().is_some_and(|indirect| {
+        indirect.row == 0
+            && access.shape[1..].iter().all(|&e| e == 1)
+            && access.edge == crate::jit::Edge::None
+            && access.map.rows.iter().all(|row| *row == AffineRow::ZERO)
+            && !matches!(indirect.index, Src::Scalar(_))
+    })
 }
 
 impl Prepared {
