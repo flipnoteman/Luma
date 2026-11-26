@@ -42,6 +42,12 @@ pub(crate) fn tuning_of(ctx: &crate::context::Context) -> std::borrow::Cow<'_, T
     std::borrow::Cow::Borrowed(ctx.tuning())
 }
 
+/// Whether a test forces the tuning on this thread: a selection then reads what the selection cache cannot see.
+#[cfg(test)]
+pub(crate) fn tuning_forced() -> bool {
+    tests::FORCED.with(|forced| forced.get().is_some())
+}
+
 /// Solves `lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]` along `axis` for every line of
 /// the four arrays, which share one shape. `lo` at the first and `up` at the last cell of a line
 /// are ignored. The result has the shape of `rhs`.

@@ -2,7 +2,7 @@
 //! plan of `image::plan`; the median selections are the two code paths of the kernel source (`MEDIAN_REGISTERS`); the separable
 //! extremum is the entry of `minfilt`/`maxfilt` (`extremum`).
 
-use super::{boundary, entry, id, split_halo};
+use super::{boundary, entry, id, split_halo, FitsInputs};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::image::first_fit;
@@ -20,10 +20,10 @@ impl StrategyId {
 /// Table order: the separable extremum at the entry of `extremum` (its `if` is before `rank_filter`); at the plan, the median
 /// selections then the tiled window every other op takes (and a forced `window:tiled` takes for a median: the same kernel).
 pub(crate) static WINDOW_STRATEGIES: [Strategy; 4] = [
-    entry(StrategyId::WINDOW_SEPARABLE_EXTREMUM, "separable_extremum", Caps::empty(), split_halo, fits_separable_extremum),
-    entry(StrategyId::WINDOW_MEDIAN_REGISTERS, "median_registers", Caps::empty(), split_halo, fits_median_registers),
-    entry(StrategyId::WINDOW_MEDIAN_BITWISE, "median_bitwise", Caps::empty(), split_halo, fits_median_bitwise),
-    entry(StrategyId::WINDOW_TILED, "tiled", Caps::empty(), split_halo, fits_tiled),
+    entry(StrategyId::WINDOW_SEPARABLE_EXTREMUM, "separable_extremum", Caps::empty(), FitsInputs::NONE, split_halo, fits_separable_extremum),
+    entry(StrategyId::WINDOW_MEDIAN_REGISTERS, "median_registers", Caps::empty(), FitsInputs::NONE, split_halo, fits_median_registers),
+    entry(StrategyId::WINDOW_MEDIAN_BITWISE, "median_bitwise", Caps::empty(), FitsInputs::NONE, split_halo, fits_median_bitwise),
+    entry(StrategyId::WINDOW_TILED, "tiled", Caps::empty(), FitsInputs::NONE, split_halo, fits_tiled),
 ];
 
 /// The entries that apply at `WindowStage::Entry` and `Plan`: runs of the table, so an op scans only its own.

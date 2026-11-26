@@ -1244,7 +1244,10 @@ impl Context {
             ));
         }
         if !self.hal().is_profiling()? {
-            self.hal().enable_profiling()?;
+            let enabled = self.hal().enable_profiling();
+            // `can_run_on_host` reads whether the device is profiling.
+            self.jit().selcache.bump();
+            enabled?;
             self.jit().start_decisions();
         }
         Ok(())
@@ -1278,7 +1281,9 @@ impl Context {
                 _ => None,
             })
             .collect();
-        let profile = self.hal().finish_profiling(splits)?;
+        let finished = self.hal().finish_profiling(splits);
+        self.jit().selcache.bump();
+        let profile = finished?;
         self.jit().park_decisions(decisions);
         Ok(profile)
     }

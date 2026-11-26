@@ -2,7 +2,7 @@
 //! is the order of today's checks: cyclic reduction (`cyclic::plan`), the native Thomas solve, the Thomas kernel, and for parts the
 //! composition through the stacked solver. The plans stay the functions they were (`cyclic::plan`, `thomas_plan`); `fits` calls them.
 
-use super::{boundary, entry, id, split_map};
+use super::{boundary, entry, id, split_map, FitsInputs};
 use crate::builtin::{thomas_plan, UNROLLED_BLOCK};
 use crate::caps::Caps;
 use crate::context::Context;
@@ -19,10 +19,10 @@ impl StrategyId {
 }
 
 pub(crate) static LINE_SOLVE_STRATEGIES: [Strategy; 4] = [
-    entry(StrategyId::LINE_SOLVE_CYCLIC, "cyclic", Caps::empty(), split_map, fits_cyclic),
-    entry(StrategyId::LINE_SOLVE_NATIVE, "native", Caps::NATIVE_LINE_SOLVE, split_map, fits_native),
-    entry(StrategyId::LINE_SOLVE_THOMAS, "thomas", Caps::empty(), split_map, fits_thomas),
-    entry(StrategyId::LINE_SOLVE_STACKED_FROM_PARTS, "stacked_from_parts", Caps::empty(), split_map, fits_stacked_from_parts),
+    entry(StrategyId::LINE_SOLVE_CYCLIC, "cyclic", Caps::empty(), FitsInputs::NONE, split_map, fits_cyclic),
+    entry(StrategyId::LINE_SOLVE_NATIVE, "native", Caps::NATIVE_LINE_SOLVE, FitsInputs::NONE, split_map, fits_native),
+    entry(StrategyId::LINE_SOLVE_THOMAS, "thomas", Caps::empty(), FitsInputs::NONE, split_map, fits_thomas),
+    entry(StrategyId::LINE_SOLVE_STACKED_FROM_PARTS, "stacked_from_parts", Caps::empty(), FitsInputs::NONE, split_map, fits_stacked_from_parts),
 ];
 
 /// `(n, stride, lines, systems)` and the attributes of a line-solve boundary.

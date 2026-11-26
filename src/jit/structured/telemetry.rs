@@ -320,7 +320,7 @@ mod tests {
         fn here() -> &'static std::panic::Location<'static> {
             std::panic::Location::caller()
         }
-        Boundary { family: FamilyTag::Reduce, op: "test", location: here(), dims: [4096, 1, 1, 1], attrs: BoundaryAttrs::None, _borrow: std::marker::PhantomData }
+        Boundary::new(FamilyTag::Reduce, "test", here(), [4096, 1, 1, 1], BoundaryAttrs::None)
     }
 
     /// The sampled execution of `id`: begins it until the clock says so (the first executions are warm-up).

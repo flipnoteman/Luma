@@ -59,6 +59,7 @@ LUMA_RECORD_DECISIONS	user	W1-U0a	never	off
 LUMA_SAMPLER_	internal	W0	never	prefix wildcard in docs (LUMA_SAMPLER_*)
 LUMA_SAMPLER_COARSEN	dev	W0	before-release	2
 LUMA_SAMPLER_TILE	dev	W0	before-release	auto
+LUMA_SELCACHE	dev	W2-SELCACHE	before-release	on (off | on | verify: the strategy registry's selection cache; verify runs the full `fits` on every hit and panics on a different answer; debug builds verify 1 hit in 16)
 LUMA_SINGLE_PASS_REDUCE	dev	W0	before-release	auto
 LUMA_SMALLINT_SEEDS	test	W0	never	40
 LUMA_SPECULATE	dev	W0	before-release	on

@@ -6,7 +6,7 @@
 //! stays a function ([`crate::fft::overlap_blocks`]) called from `fits`, as the spec says, and its result travels in the
 //! parameters so that the lowering does not compute it twice.
 
-use super::{boundary, entry, id, split_global};
+use super::{boundary, entry, id, split_global, FitsInputs};
 use crate::builtin::CONV_MAX_STRIDE;
 use crate::caps::Caps;
 use crate::context::Context;
@@ -25,13 +25,13 @@ impl StrategyId {
 }
 
 pub(crate) static CONV_STRATEGIES: [Strategy; 7] = [
-    entry(StrategyId::CONV_DIRECT_TILED, "direct_tiled", Caps::empty(), split_halo, fits_direct_tiled),
-    entry(StrategyId::CONV_DIRECT, "direct", Caps::empty(), split_halo, fits_direct),
-    entry(StrategyId::CONV_FFT_SINGLE, "fft_single", Caps::empty(), split_global, fits_fft_single),
-    entry(StrategyId::CONV_FFT_BLOCKED, "fft_blocked", Caps::empty(), split_halo, fits_fft_blocked),
-    entry(StrategyId::CONV_FIR_DIRECT, "fir_direct", Caps::empty(), split_halo, fits_fir_direct),
-    entry(StrategyId::CONV_FIR_BLOCKS, "fir_blocks", Caps::empty(), split_halo, fits_fir_blocks),
-    entry(StrategyId::CONV_FIR_FFT, "fir_fft", Caps::empty(), split_halo, fits_fir_fft),
+    entry(StrategyId::CONV_DIRECT_TILED, "direct_tiled", Caps::empty(), FitsInputs::NONE, split_halo, fits_direct_tiled),
+    entry(StrategyId::CONV_DIRECT, "direct", Caps::empty(), FitsInputs::NONE, split_halo, fits_direct),
+    entry(StrategyId::CONV_FFT_SINGLE, "fft_single", Caps::empty(), FitsInputs::NONE, split_global, fits_fft_single),
+    entry(StrategyId::CONV_FFT_BLOCKED, "fft_blocked", Caps::empty(), FitsInputs::NONE, split_halo, fits_fft_blocked),
+    entry(StrategyId::CONV_FIR_DIRECT, "fir_direct", Caps::empty(), FitsInputs::NONE, split_halo, fits_fir_direct),
+    entry(StrategyId::CONV_FIR_BLOCKS, "fir_blocks", Caps::empty(), FitsInputs::NONE, split_halo, fits_fir_blocks),
+    entry(StrategyId::CONV_FIR_FFT, "fir_fft", Caps::empty(), FitsInputs::NONE, split_halo, fits_fir_fft),
 ];
 
 /// The entries that apply at `ConvStage::Direct`, `Fft` and `Fir`: runs of the table, so an op scans only its own.

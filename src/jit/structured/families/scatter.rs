@@ -2,7 +2,7 @@
 //! `factorize`, `unique`). Two selections: the host path in `put_with` and the kernel's tail in `jit::assign::scatter`
 //! (`ScatterAttrs::host_site` tells which).
 
-use super::{boundary, entry, id, split_global, split_reduce};
+use super::{boundary, entry, id, split_global, split_reduce, FitsInputs};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::assign::{PRIVATE_BINS, PRIVATE_RATIO};
@@ -18,10 +18,10 @@ impl StrategyId {
 
 /// Table order is today's: the host path first, then the tail of the kernel.
 pub(crate) static SCATTER_STRATEGIES: [Strategy; 4] = [
-    entry(StrategyId::SCATTER_HOST, "host", Caps::HOST_PATH, split_global, fits_host),
-    entry(StrategyId::SCATTER_PLAIN, "plain", Caps::empty(), split_global, fits_plain),
-    entry(StrategyId::SCATTER_ATOMIC_PRIVATE, "atomic_private", Caps::empty(), split_reduce, fits_atomic_private),
-    entry(StrategyId::SCATTER_ATOMIC_GLOBAL, "atomic_global", Caps::empty(), split_reduce, fits_atomic_global),
+    entry(StrategyId::SCATTER_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, split_global, fits_host),
+    entry(StrategyId::SCATTER_PLAIN, "plain", Caps::empty(), FitsInputs::NONE, split_global, fits_plain),
+    entry(StrategyId::SCATTER_ATOMIC_PRIVATE, "atomic_private", Caps::empty(), FitsInputs::NONE, split_reduce, fits_atomic_private),
+    entry(StrategyId::SCATTER_ATOMIC_GLOBAL, "atomic_global", Caps::empty(), FitsInputs::NONE, split_reduce, fits_atomic_global),
 ];
 
 fn attrs(subject: &Subject<'_>) -> ScatterAttrs {

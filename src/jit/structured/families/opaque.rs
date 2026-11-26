@@ -3,7 +3,7 @@
 //! (the matrix keeps a counter, so `fits` is told `first_non_native`), the next converts to the native format (not a strategy: the
 //! recursion selects again). The other ops of the family are declarations (`structured::opaque`).
 
-use super::{boundary, entry, id, split_global};
+use super::{boundary, entry, id, split_global, FitsInputs};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::structured::boundary::{OpaqueAttrs, OpaqueParams};
@@ -18,10 +18,10 @@ impl StrategyId {
 
 /// Table order is today's: the guard, the scatter of a first non-native product, then the native kernels.
 pub(crate) static OPAQUE_STRATEGIES: [Strategy; 4] = [
-    entry(StrategyId::OPAQUE_SPARSE_EMPTY, "sparse_empty", Caps::empty(), split_global, fits_empty),
-    entry(StrategyId::OPAQUE_SPARSE_SCATTER, "sparse_scatter", Caps::empty(), split_global, fits_scatter),
-    entry(StrategyId::OPAQUE_SPARSE_SPMV_MERGE, "sparse_spmv_merge", Caps::empty(), split_global, fits_merge),
-    entry(StrategyId::OPAQUE_SPARSE_ROWS, "sparse_rows", Caps::empty(), split_global, fits_rows),
+    entry(StrategyId::OPAQUE_SPARSE_EMPTY, "sparse_empty", Caps::empty(), FitsInputs::NONE, split_global, fits_empty),
+    entry(StrategyId::OPAQUE_SPARSE_SCATTER, "sparse_scatter", Caps::empty(), FitsInputs::NONE, split_global, fits_scatter),
+    entry(StrategyId::OPAQUE_SPARSE_SPMV_MERGE, "sparse_spmv_merge", Caps::empty(), FitsInputs::NONE, split_global, fits_merge),
+    entry(StrategyId::OPAQUE_SPARSE_ROWS, "sparse_rows", Caps::empty(), FitsInputs::NONE, split_global, fits_rows),
 ];
 
 /// The guard, the scatter, and the native kernels: runs of the table, so a product scans only the entries of its own case.

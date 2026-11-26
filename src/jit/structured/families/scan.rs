@@ -1,7 +1,7 @@
 //! The scan family: `Lines::scan` (every `cumsum`, `scan`, and the scans of the counts of a sort) and the by-key scan. The `fits`
 //! functions are the inline conditions of `Lines::scan` and `run_scan_by_key`, in their order (table order is semantics).
 
-use super::{boundary, entry, id, split_scan, with_prologue};
+use super::{boundary, entry, id, split_scan, with_prologue, FitsInputs};
 use crate::bykey::CHUNK as BY_KEY_CHUNK;
 use crate::caps::Caps;
 use crate::context::Context;
@@ -22,15 +22,15 @@ impl StrategyId {
 }
 
 pub(crate) static SCAN_STRATEGIES: [Strategy; 9] = [
-    with_prologue(entry(StrategyId::SCAN_ROWS, "rows", Caps::empty(), split_scan, fits_rows)),
-    with_prologue(entry(StrategyId::SCAN_WARP, "warp", Caps::SUBGROUP32, split_scan, fits_warp)),
-    with_prologue(entry(StrategyId::SCAN_LOOKBACK, "lookback", Caps::LOOKBACK, split_scan, fits_lookback)),
-    with_prologue(entry(StrategyId::SCAN_CHUNK_SINGLE, "chunk_single", Caps::empty(), split_scan, fits_chunk_single)),
-    with_prologue(entry(StrategyId::SCAN_CHUNK_THREE_PASS, "chunk_three_pass", Caps::empty(), split_scan, fits_chunk_three_pass)),
-    with_prologue(entry(StrategyId::SCAN_SEQ, "seq", Caps::empty(), split_scan, fits_seq)),
-    with_prologue(entry(StrategyId::SCAN_FOLD_WALK, "fold_walk", Caps::empty(), split_scan, fits_fold_walk)),
-    entry(StrategyId::SCAN_BY_KEY_SINGLE, "by_key_single", Caps::empty(), split_scan, fits_by_key_single),
-    entry(StrategyId::SCAN_BY_KEY_CHUNKED, "by_key_chunked", Caps::empty(), split_scan, fits_by_key_chunked),
+    with_prologue(entry(StrategyId::SCAN_ROWS, "rows", Caps::empty(), FitsInputs::NONE, split_scan, fits_rows)),
+    with_prologue(entry(StrategyId::SCAN_WARP, "warp", Caps::SUBGROUP32, FitsInputs::NONE, split_scan, fits_warp)),
+    with_prologue(entry(StrategyId::SCAN_LOOKBACK, "lookback", Caps::LOOKBACK, FitsInputs::NONE, split_scan, fits_lookback)),
+    with_prologue(entry(StrategyId::SCAN_CHUNK_SINGLE, "chunk_single", Caps::empty(), FitsInputs::NONE, split_scan, fits_chunk_single)),
+    with_prologue(entry(StrategyId::SCAN_CHUNK_THREE_PASS, "chunk_three_pass", Caps::empty(), FitsInputs::NONE, split_scan, fits_chunk_three_pass)),
+    with_prologue(entry(StrategyId::SCAN_SEQ, "seq", Caps::empty(), FitsInputs::NONE, split_scan, fits_seq)),
+    with_prologue(entry(StrategyId::SCAN_FOLD_WALK, "fold_walk", Caps::empty(), FitsInputs::NONE, split_scan, fits_fold_walk)),
+    entry(StrategyId::SCAN_BY_KEY_SINGLE, "by_key_single", Caps::empty(), FitsInputs::NONE, split_scan, fits_by_key_single),
+    entry(StrategyId::SCAN_BY_KEY_CHUNKED, "by_key_chunked", Caps::empty(), FitsInputs::NONE, split_scan, fits_by_key_chunked),
 ];
 
 /// `(n, stride, lines)` and the attributes of a scan boundary.

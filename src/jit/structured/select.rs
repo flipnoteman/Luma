@@ -10,11 +10,13 @@
 //!    family is over `Tuning::variant_budget`: the call falls back **only to a candidate of the same `BitClass`**; with none, it
 //!    blocks on the compile (the same call must not return different bits early and late in a process).
 
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::strategy::{table, BitClass, FamilyTag, NumClass, Output, Params, Residencies, ResClass, Strategy, StrategyId, Subject, FAMILY_COUNT, MAX_PER_FAMILY};
+use super::contraction::ContractionView;
+use super::strategy::{table, BitClass, Boundary, FamilyTag, FitsInputs, NumClass, Output, Params, PassMode, ReduceParams, Residencies, ResClass, Strategy, StrategyId, Subject, FAMILY_COUNT, MAX_PER_FAMILY};
 use super::telemetry::{CellKey, ShapeClass};
 use crate::array::Failure;
 use crate::caps::Caps;
@@ -154,6 +156,364 @@ fn signature(subject: &Subject<'_>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+// -- The selection cache --
+//
+// A call whose inputs to `fits` are the ones of an earlier call reuses that call's answer: the first strategy of the entries that
+// fits, with its parameters. Everything a `fits` reads is one of
+//
+// * the subject: its shape and attributes (in the key), and for a contraction the state of its operands (`operand_state`, in the key);
+// * what is fixed when the context opens (capabilities, limits, tuning, numerics, budgets, `LUMA_STRATEGY`, the environment): not in
+//   the key, but every key names the context it was made on (the generation below), so a context that forced another strategy
+//   never shares an answer;
+// * this thread's recording (`Context::can_run_on_host`, `recording_open`): while any thread has a recording open on the context its
+//   selections do not use the cache (`SelState::gate`), so an answer from before a recording opened is never used inside it;
+// * whether the device is profiling (`can_run_on_host`): bumps the generation (`enable_profiling`, `finish_profiling`), as does
+//   `set_assume_busy` and a recording beginning or ending;
+// * the life of other values (`FitsInputs::LIVE`: the reductions' partners): the family is not cached.
+//
+// Each strategy's `reads` says which of these its `fits` has; the union over the family's table is what `cacheable` and the tests
+// check. The cache is a per-thread table of 64 slots, direct mapped, overwritten on collision: no lock, and the context's gate and
+// generation are the only shared reads. It serves tables that are priority chains (no cost, every entry a baseline), where the
+// first strategy that fits is the selection: a table that ranks by cost or gates variants selects through `select_in`, whose
+// ranking has a cache of its own (`SelectionCache`).
+
+/// `LUMA_SELCACHE`: `on` (default), `off`, or `verify`, which runs the full `fits` on every hit and panics on a different answer
+/// (debug builds do that on 1 hit in 16 under `on`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CacheMode {
+    Off,
+    On,
+    Verify,
+}
+
+impl CacheMode {
+    fn from_env() -> CacheMode {
+        match std::env::var("LUMA_SELCACHE").as_deref() {
+            Ok("off") => CacheMode::Off,
+            Ok("verify") => CacheMode::Verify,
+            Ok("on") | Err(_) => CacheMode::On,
+            Ok(other) => {
+                log::warn!("luma: LUMA_SELCACHE={other:?} is not off, on or verify; on");
+                CacheMode::On
+            }
+        }
+    }
+}
+
+/// Generations are told apart across contexts: each starts in a range of its own (the low 32 bits count its bumps).
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1 << 32);
+
+/// Set in [`SelState::gate`] when the mode is not plain `on`: every lookup takes the slow path, which does what the mode says.
+const GATE_MODE: u32 = 1 << 31;
+
+/// What a context keeps of the selection cache.
+#[derive(Debug)]
+pub(crate) struct SelState {
+    /// The generation that a global input of `fits` changing bumps (see the module comment).
+    generation: AtomicU64,
+    /// 0 where a lookup may use the cache: the mode is `on` and no thread has a recording open on the context. Else the number of
+    /// recordings open, with [`GATE_MODE`] where the mode is `off` or `verify`.
+    gate: AtomicU32,
+    mode: CacheMode,
+}
+
+impl SelState {
+    pub(crate) fn new() -> SelState {
+        let mode = CacheMode::from_env();
+        SelState {
+            generation: AtomicU64::new(NEXT_GENERATION.fetch_add(1 << 32, Ordering::Relaxed)),
+            gate: AtomicU32::new(if mode == CacheMode::On { 0 } else { GATE_MODE }),
+            mode,
+        }
+    }
+
+    /// An input of `fits` that the key does not hold changed: everything cached so far is stale.
+    pub(crate) fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// A thread began a recording on the context.
+    pub(crate) fn recording_opened(&self) {
+        self.gate.fetch_add(1, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// A thread's recording on the context ended.
+    pub(crate) fn recording_closed(&self) {
+        self.gate.fetch_sub(1, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// How this context was told to cache (tests).
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> CacheMode {
+        self.mode
+    }
+}
+
+/// What each family's `fits` read, over its whole table.
+static READS: [FitsInputs; FAMILY_COUNT] = [
+    FitsInputs::union(&crate::reduce::REDUCE_STRATEGIES),
+    FitsInputs::union(&super::families::sort::SORT_STRATEGIES),
+    FitsInputs::union(&super::families::scan::SCAN_STRATEGIES),
+    FitsInputs::union(&super::families::scatter::SCATTER_STRATEGIES),
+    FitsInputs::NONE,
+    FitsInputs::NONE,
+    FitsInputs::NONE,
+    FitsInputs::union(&super::contraction::CONTRACTION_STRATEGIES),
+    FitsInputs::union(&super::families::line_solve::LINE_SOLVE_STRATEGIES),
+    FitsInputs::union(&super::families::factor::FACTOR_STRATEGIES),
+    FitsInputs::NONE,
+    FitsInputs::NONE,
+    FitsInputs::union(&super::families::conv::CONV_STRATEGIES),
+    FitsInputs::union(&super::families::window::WINDOW_STRATEGIES),
+    FitsInputs::union(&super::families::opaque::OPAQUE_STRATEGIES),
+];
+
+/// Whether `family`'s selections may be cached at all (no `fits` of its table reads [`FitsInputs::LIVE`]).
+#[inline(always)]
+pub(crate) fn cacheable(family: FamilyTag) -> bool {
+    !READS[family.index()].contains(FitsInputs::LIVE)
+}
+
+const SLOTS: usize = 64;
+
+/// One slot of the per-thread table: the key (`generation` and the words of [`Words`]) and what it answered.
+struct Slot {
+    /// The context and its generation; 0 for an empty slot (no generation is 0).
+    generation: Cell<u64>,
+    stage: Cell<u64>,
+    d01: Cell<u64>,
+    d23: Cell<u64>,
+    k0: Cell<u64>,
+    k1: Cell<u64>,
+    k2: Cell<u64>,
+    k3: Cell<u64>,
+    found: Cell<(StrategyId, Params)>,
+}
+
+impl Slot {
+    const fn empty() -> Slot {
+        Slot {
+            generation: Cell::new(0),
+            stage: Cell::new(0),
+            d01: Cell::new(0),
+            d23: Cell::new(0),
+            k0: Cell::new(0),
+            k1: Cell::new(0),
+            k2: Cell::new(0),
+            k3: Cell::new(0),
+            found: Cell::new((StrategyId(FamilyTag::Reduce, 0), Params::Reduce(ReduceParams { pass: PassMode::Auto, groups: 0 }))),
+        }
+    }
+}
+
+thread_local! {
+    static PICKS: [Slot; SLOTS] = const { [const { Slot::empty() }; SLOTS] };
+    /// Hits so far on this thread, for the sampled verification of debug builds.
+    static HITS: Cell<u32> = const { Cell::new(0) };
+    /// Whether the last [`first_fit`] of this thread was answered from the cache (tests).
+    #[cfg(test)]
+    static LAST_HIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// What a lookup is keyed on besides the generation, in seven words.
+#[derive(Clone, Copy)]
+struct Words {
+    /// Where the entries asked about start (a stage of a family's table: this also says the family) and how many (above bit 48).
+    stage: u64,
+    /// The shape: a contraction's fourth extent, which is 1, holds the precision asked for and the state of its operands.
+    d01: u64,
+    d23: u64,
+    /// The attributes of a boundary (`BoundaryAttrs::pack`).
+    k: [u64; 4],
+}
+
+impl Words {
+    #[inline(always)]
+    fn new(entries: &[Strategy], dims: [u32; 4], k: [u64; 4]) -> Words {
+        Words { stage: entries.as_ptr() as u64 | (entries.len() as u64) << 48, d01: u64::from(dims[0]) | u64::from(dims[1]) << 32, d23: u64::from(dims[2]) | u64::from(dims[3]) << 32, k }
+    }
+
+    #[inline(always)]
+    fn slot(&self) -> usize {
+        ((self.stage ^ self.d01 ^ self.d23.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+    }
+}
+
+/// This thread's slots, without going through a closure that the compiler would leave out of line.
+#[inline(always)]
+fn slots() -> &'static [Slot; SLOTS] {
+    // SAFETY: `PICKS` is const-initialised and has no destructor, so its storage lives as long as the thread and is never torn down
+    // before it ends. The reference stays on the calling thread (`Slot` holds `Cell`s, so it is not `Sync`), and every access to a
+    // slot is a `Cell::get` or `set` of one word: nothing borrows into a cell, so reentrancy cannot alias.
+    PICKS.with(|slots| unsafe { &*std::ptr::from_ref(slots) })
+}
+
+/// The answer the slot of the key holds, if it holds that key's.
+#[inline(always)]
+fn probe(generation: u64, words: &Words) -> Option<(StrategyId, Params)> {
+    let slot = &slots()[words.slot()];
+    let differs = (slot.generation.get() ^ generation)
+        | (slot.stage.get() ^ words.stage)
+        | (slot.d01.get() ^ words.d01)
+        | (slot.d23.get() ^ words.d23)
+        | (slot.k0.get() ^ words.k[0])
+        | (slot.k1.get() ^ words.k[1])
+        | (slot.k2.get() ^ words.k[2])
+        | (slot.k3.get() ^ words.k[3]);
+    if differs == 0 { Some(slot.found.get()) } else { None }
+}
+
+/// Whether the last selection of this thread came from the cache (tests).
+#[cfg(test)]
+pub(crate) fn last_was_hit() -> bool {
+    LAST_HIT.with(Cell::get)
+}
+
+/// The first strategy of `entries` (a table or a stage of one) that applies to `subject`, with its parameters; the forced strategy
+/// of `LUMA_STRATEGY` first where it fits. Where `subject` is a boundary this is what the op runs, and a contraction's `lower` is
+/// asked for in the same order (a table of a family with a `lower` skips the entries without). Answered from the cache where the key
+/// matches.
+pub(crate) fn first_fit(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
+    match subject {
+        Subject::Boundary(boundary) => first_fit_boundary(ctx, boundary, entries),
+        Subject::Contraction(view) => first_fit_view(ctx, view, entries),
+        Subject::Reduce(_) => first_fit_live(ctx, subject, entries),
+    }
+}
+
+/// [`first_fit`] of a boundary: the hit path, linear and short and inlined into the op (where the stage, the family's attributes and
+/// often the shape are constants); every other case (a miss, a mode, a recording open) is the slow one, out of line.
+#[inline(always)]
+pub(crate) fn first_fit_boundary(ctx: &Context, boundary: &Boundary<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
+    let state = &ctx.jit().selcache;
+    if state.gate.load(Ordering::Relaxed) == 0 {
+        let words = Words::new(entries, boundary.dims, boundary.key);
+        if let Some(found) = probe(state.generation.load(Ordering::Acquire), &words) {
+            boundary.from_cache.set(true);
+            #[cfg(test)]
+            LAST_HIT.with(|hit| hit.set(true));
+            if cfg!(debug_assertions) && sampled() {
+                verify(ctx, &Subject::Boundary(boundary), entries, found);
+            }
+            return Some(found);
+        }
+    }
+    boundary.from_cache.set(false);
+    first_fit_slow(ctx, &Subject::Boundary(boundary), entries)
+}
+
+/// [`first_fit`] of a contraction: its key also holds the precision asked for and the state of the operands.
+#[inline(never)]
+fn first_fit_view(ctx: &Context, view: &ContractionView<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
+    let state = &ctx.jit().selcache;
+    if state.gate.load(Ordering::Relaxed) == 0 {
+        let words = view_words(ctx, view, entries);
+        if let Some(found) = probe(state.generation.load(Ordering::Acquire), &words) {
+            #[cfg(test)]
+            LAST_HIT.with(|hit| hit.set(true));
+            if cfg!(debug_assertions) && sampled() {
+                verify(ctx, &Subject::Contraction(view), entries, found);
+            }
+            return Some(found);
+        }
+    }
+    first_fit_slow(ctx, &Subject::Contraction(view), entries)
+}
+
+/// The key of a contraction: its shape, and in the fourth extent (always 1) the precision it asks for and its operands' state.
+#[inline(always)]
+fn view_words(ctx: &Context, view: &ContractionView<'_>, entries: &[Strategy]) -> Words {
+    let [n, m, k, _] = view.dims();
+    Words::new(entries, [n, m, k, 1 + (view.attrs.tf32 as u32 | super::contraction::operand_state(view, ctx) << 2)], [0; 4])
+}
+
+/// Everything but the hit: the full `fits` where the cache is not to be used (the mode is `off`, a recording is open, the family is
+/// not cacheable), the check of a hit under `verify`, and the full `fits` of a miss, kept for the next call that asks the same.
+#[inline(never)]
+fn first_fit_slow(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
+    #[cfg(test)]
+    LAST_HIT.with(|hit| hit.set(false));
+    let state = &ctx.jit().selcache;
+    #[cfg(test)]
+    if crate::linalg::tuning_forced() {
+        return first_fit_live(ctx, subject, entries);
+    }
+    let gate = state.gate.load(Ordering::Relaxed);
+    if state.mode == CacheMode::Off || gate & !GATE_MODE != 0 || !cacheable(subject.family()) {
+        return first_fit_live(ctx, subject, entries);
+    }
+    let generation = state.generation.load(Ordering::Acquire);
+    let words = match subject {
+        Subject::Boundary(boundary) => Words::new(entries, boundary.dims, boundary.key),
+        Subject::Contraction(view) => view_words(ctx, view, entries),
+        Subject::Reduce(_) => return first_fit_live(ctx, subject, entries),
+    };
+    if state.mode == CacheMode::Verify
+        && let Some(found) = probe(generation, &words)
+    {
+        verify(ctx, subject, entries, found);
+        #[cfg(test)]
+        LAST_HIT.with(|hit| hit.set(true));
+        if let Subject::Boundary(boundary) = subject {
+            boundary.from_cache.set(true);
+        }
+        return Some(found);
+    }
+    let live = first_fit_live(ctx, subject, entries);
+    if let Some(found) = live {
+        let slot = &slots()[words.slot()];
+        slot.generation.set(generation);
+        slot.stage.set(words.stage);
+        slot.d01.set(words.d01);
+        slot.d23.set(words.d23);
+        slot.k0.set(words.k[0]);
+        slot.k1.set(words.k[1]);
+        slot.k2.set(words.k[2]);
+        slot.k3.set(words.k[3]);
+        slot.found.set(found);
+    }
+    live
+}
+
+/// [`first_fit`] without the cache: the entries in order, each one's capabilities, numerics and `fits`.
+pub(crate) fn first_fit_live(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strategy]) -> Option<(StrategyId, Params)> {
+    let res = &Residencies::DEVICE;
+    if let Some(forced) = ctx.strategy_override(subject.family())
+        && let Some(strategy) = entries.iter().find(|strategy| strategy.id == forced)
+        && let Ok(params) = admit(strategy, subject, ctx, res)
+    {
+        return Some((forced, params));
+    }
+    // A boundary's table has no `lower` (the op runs the strategy it is given); a chain's entries without one are skipped.
+    let lowered = !matches!(subject, Subject::Boundary(_));
+    entries.iter().filter(|strategy| !lowered || strategy.lower.is_some()).find_map(|strategy| admit(strategy, subject, ctx, res).ok().map(|params| (strategy.id, params)))
+}
+
+/// Whether this hit runs the full `fits` too (debug builds: 1 hit in 16).
+#[cold]
+#[inline(never)]
+fn sampled() -> bool {
+    HITS.with(|hits| {
+        let n = hits.get().wrapping_add(1);
+        hits.set(n);
+        n % 16 == 0
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn verify(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strategy], cached: (StrategyId, Params)) {
+    let live = first_fit_live(ctx, subject, entries);
+    assert!(
+        live == Some(cached),
+        "LUMA_SELCACHE: a {} selection answered from the cache ({cached:?}) differs from the full `fits` ({live:?}) at {}: an input of `fits` is not in the key",
+        subject.family().name(),
+        subject.site().0,
+    );
 }
 
 // -- Variants --
@@ -470,6 +830,18 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
     execute_with(table(family), PLAIN[family.index()], ctx, subject, ctx.strategy_override(family))
 }
 
+/// [`execute`] for a family whose selections are cached (see [`cacheable`]: the products). A separate entry, not a branch of
+/// `execute`: the reductions recurse through that one, and in debug builds every call site in it is stack that deep expressions use.
+pub(crate) fn execute_cacheable(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
+    let family = subject.family();
+    debug_assert!(cacheable(family), "{} is not a cacheable family", family.name());
+    let forced = ctx.strategy_override(family);
+    if forced.is_none() && PLAIN[family.index()] && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
+        return execute_cached(table(family), ctx, subject);
+    }
+    execute_ranked(table(family), ctx, subject, forced)
+}
+
 /// [`plain`] of every family's table, worked out once.
 static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES), true, true, plain(&super::families::conv::CONV_STRATEGIES), plain(&super::families::window::WINDOW_STRATEGIES), plain(&super::families::opaque::OPAQUE_STRATEGIES)];
 
@@ -487,7 +859,7 @@ const fn plain(entries: &[Strategy]) -> bool {
 
 /// [`execute_in`] for a table that is a priority chain (see [`plain`]), when no one listens to the Decision: the entries are
 /// tried in table order, each one's `fits` evaluated when it is its turn, which is what the `if` chains it replaces did. Nothing
-/// is ranked or cached.
+/// is ranked or cached (the families that cannot be cached: see [`execute_cached`]).
 fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
     use super::strategy::Lowered;
     let res = &Residencies::DEVICE;
@@ -495,6 +867,41 @@ fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>) -> 
     for strategy in entries {
         let Some(lower) = strategy.lower else { continue };
         let Ok(params) = admit(strategy, subject, ctx, res) else { continue };
+        let mut begun = telemetry.begin(ctx, subject, strategy.id, strategy.needs.contains(Caps::HOST_PATH));
+        let result = lower(subject, &params, &mut begun.emit);
+        telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
+        if let Lowered::Done(output) = result? {
+            return Ok(output);
+        }
+    }
+    Err(LumaError::Unsupported(format!("no {} strategy ran {}", subject.family().name(), subject.site().0)).into())
+}
+
+/// [`execute_plain`] for a family whose selections can be cached: the first entry that fits comes from [`first_fit`] (the cache, or
+/// the scan it caches), and only the entries after it, where it declines, are evaluated in their turn. Kept out of line, as the
+/// reductions' frame (recursive, see [`execute_ranked`]) must not carry its locals.
+#[inline(never)]
+fn execute_cached(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
+    use super::strategy::Lowered;
+    let res = &Residencies::DEVICE;
+    let telemetry = &ctx.jit().telemetry;
+    let Some((first, first_params)) = first_fit(ctx, subject, entries) else {
+        return Err(LumaError::Unsupported(format!("no {} strategy ran {}", subject.family().name(), subject.site().0)).into());
+    };
+    let mut skipping = true;
+    for strategy in entries {
+        let Some(lower) = strategy.lower else { continue };
+        let params = if skipping {
+            if strategy.id != first {
+                continue;
+            }
+            skipping = false;
+            first_params
+        } else if let Ok(params) = admit(strategy, subject, ctx, res) {
+            params
+        } else {
+            continue;
+        };
         let mut begun = telemetry.begin(ctx, subject, strategy.id, strategy.needs.contains(Caps::HOST_PATH));
         let result = lower(subject, &params, &mut begun.emit);
         telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
@@ -658,7 +1065,7 @@ mod tests {
     }
 
     fn boundary() -> Boundary<'static> {
-        Boundary { family: FamilyTag::Reduce, op: "test", location: here(), dims: [1 << 16, 1, 1, 1], attrs: BoundaryAttrs::None, _borrow: std::marker::PhantomData }
+        Boundary::new(FamilyTag::Reduce, "test", here(), [1 << 16, 1, 1, 1], BoundaryAttrs::None)
     }
 
     fn params() -> Params {
@@ -700,6 +1107,7 @@ mod tests {
             baseline,
             group: 0,
             prologue: false,
+            reads: FitsInputs::NONE,
             epilogue: false,
             fits,
             cost,

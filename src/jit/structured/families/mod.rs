@@ -11,7 +11,7 @@ pub(crate) mod scatter;
 pub(crate) mod sort;
 pub(crate) mod window;
 
-use super::strategy::{BoundaryAttrs, BitClass, FamilyTag, FitsFn, NumClass, Params, SplitClass, Strategy, StrategyId, Subject, Warm};
+use super::strategy::{BoundaryAttrs, BitClass, FamilyTag, FitsFn, FitsInputs, NumClass, Params, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::Failure;
 use crate::caps::Caps;
 use crate::context::Context;
@@ -28,8 +28,8 @@ pub(super) fn boundary<'a, 'b>(subject: &'b Subject<'a>) -> &'b Boundary<'a> {
 
 /// An entry of a boundary family: exact, baseline, its own bit class and rank group, no cost (table order decides), no prologue
 /// or epilogue; the op runs it by matching on `id`.
-pub(super) const fn entry(id: StrategyId, name: &'static str, needs: Caps, split: fn(&Subject<'_>, &Params) -> SplitClass, fits: FitsFn) -> Strategy {
-    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(id.1 as u16), baseline: true, group: id.1, prologue: false, epilogue: false, fits, cost: None, split, warm: no_warm, lower: None }
+pub(super) const fn entry(id: StrategyId, name: &'static str, needs: Caps, reads: FitsInputs, split: fn(&Subject<'_>, &Params) -> SplitClass, fits: FitsFn) -> Strategy {
+    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(id.1 as u16), baseline: true, group: id.1, prologue: false, epilogue: false, reads, fits, cost: None, split, warm: no_warm, lower: None }
 }
 
 /// `strategy` taking a pending operand into its first read (`Strategy::prologue`).
@@ -79,3 +79,5 @@ mod dense_tests;
 mod tests;
 #[cfg(test)]
 mod tests_conv;
+#[cfg(test)]
+mod tests_selcache;

@@ -7,6 +7,7 @@
 //! ranks what is left and returns the strategy to run; `execute` lowers in rank order until one does not decline.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::Arc;
@@ -162,6 +163,51 @@ pub(crate) enum NumClass {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct BitClass(pub(crate) u16);
 
+/// What a strategy's `fits` reads besides the shape and the attributes of its subject, so that the selection cache (see
+/// [`super::select`]) can tell when an earlier answer still holds. Every table entry declares it (`Strategy::reads`), the cache
+/// key carries what the union over the family's table asks for, and a `fits` that starts reading something else must say so here.
+///
+/// Not listed because it never changes once the context is open: the device's capabilities, limits and tuning, the numerics
+/// policy, `LUMA_STRATEGY`, the memory, host and chunk budgets, and the environment switches `fits` reads (`LUMA_HOST_FAST`,
+/// `LUMA_CHOL_NB`, `LUMA_TRSV`, `LUMA_QR_TSQR`, `LUMA_LINALG_PANEL`: set before the process starts, as the ledger says).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FitsInputs(u8);
+
+impl FitsInputs {
+    /// Nothing beyond the subject and what is fixed at open.
+    pub(crate) const NONE: FitsInputs = FitsInputs(0);
+    /// This thread's recording (`Context::can_run_on_host`, `recording_open`): the context's selections do not use the cache while
+    /// any thread has a recording open on it; and whether the device is profiling (a change of it bumps the generation).
+    pub(crate) const HOST: FitsInputs = FitsInputs(1);
+    /// The state of the operand arrays behind the subject (a contraction's: pending, over a segment, stored along `K`,
+    /// recomputed by a skinny kernel): the family packs it into the key.
+    pub(crate) const OPERANDS: FitsInputs = FitsInputs(2);
+    /// State of other values on the context or of the value's own life (a reduction's partners, whether it was forced or failed):
+    /// the key cannot hold it, so the family is never cached.
+    pub(crate) const LIVE: FitsInputs = FitsInputs(4);
+
+    #[inline(always)]
+    pub(crate) const fn with(self, other: FitsInputs) -> FitsInputs {
+        FitsInputs(self.0 | other.0)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn contains(self, other: FitsInputs) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union of what the entries of a table read.
+    pub(crate) const fn union(entries: &[Strategy]) -> FitsInputs {
+        let mut all = 0;
+        let mut at = 0;
+        while at < entries.len() {
+            all |= entries[at].reads.0;
+            at += 1;
+        }
+        FitsInputs(all)
+    }
+}
+
 /// One way to run a family's operation. `prologue`, `epilogue` and `split` are declared for the schedule compiler and the epilogue
 /// fusion (W3-U6, W3-U4); nothing in wave 2 reads them.
 #[allow(dead_code)]
@@ -180,6 +226,8 @@ pub(crate) struct Strategy {
     pub(crate) prologue: bool,
     /// Can take an absorbed epilogue (false for every wave-2 strategy).
     pub(crate) epilogue: bool,
+    /// What `fits` reads besides the subject (the selection cache's key).
+    pub(crate) reads: FitsInputs,
     /// Today's plan and gate functions, pure: the parameters of the run, or `None` where the strategy does not apply.
     pub(crate) fits: FitsFn,
     /// `None`: table order decides.
@@ -414,6 +462,10 @@ pub(crate) struct Boundary<'a> {
     pub(crate) dims: [u32; 4],
     /// Small and `Copy`, one variant per family, defined by the family's spec.
     pub(crate) attrs: BoundaryAttrs,
+    /// `attrs` in four words (`BoundaryAttrs::pack`): what the selection cache compares.
+    pub(crate) key: [u64; 4],
+    /// Whether the last selection over this descriptor was answered by the selection cache (the Decision says `cached`).
+    pub(crate) from_cache: Cell<bool>,
     pub(crate) _borrow: PhantomData<&'a ()>,
 }
 
@@ -436,14 +488,14 @@ pub(crate) enum BoundaryAttrs {
 }
 
 /// The candidates of a boundary op in table order whose `needs` and numerics hold and whose `fits` returned `Some`, evaluated
-/// lazily; the override of `LUMA_STRATEGY` makes the forced strategy the only one (when it fits). No cache: their conditions are
-/// O(1) tests, cheaper than a lookup over at most six entries. The op loops over it, runs the body of today's function for the id
-/// and, where a host path declines after `fits`, takes the next.
-#[allow(dead_code)]
+/// lazily; the override of `LUMA_STRATEGY` makes the forced strategy the only one (when it fits). Tests iterate over it to see
+/// every candidate; the ops ask for the first, through the selection cache ([`first_candidate`]).
+#[cfg(test)]
 pub(crate) fn candidates<'a>(ctx: &'a Context, boundary: &'a Boundary<'a>) -> impl Iterator<Item = (StrategyId, Params)> + 'a {
     candidates_in(table(boundary.family), ctx, boundary)
 }
 
+#[cfg(test)]
 pub(crate) fn candidates_in<'a>(entries: &'static [Strategy], ctx: &'a Context, boundary: &'a Boundary<'a>) -> impl Iterator<Item = (StrategyId, Params)> + 'a {
     let forced = ctx.strategy_override(boundary.family).and_then(|id| {
         let strategy = entries.iter().find(|strategy| strategy.id == id)?;
@@ -468,13 +520,13 @@ pub(crate) fn candidates_in<'a>(entries: &'static [Strategy], ctx: &'a Context, 
 }
 
 /// The parameters of the strategy `id` for `boundary` if it applies (capabilities, numerics, `fits`): for the host paths a boundary op
-/// tries first, which are the only strategy that applies at their site.
-#[inline]
+/// tries first, which are the only strategy that applies at their site. Answered by the selection cache where it can.
+#[inline(always)]
 pub(crate) fn admit_one(ctx: &Context, boundary: &Boundary<'_>, id: StrategyId) -> Option<Params> {
     // A strategy's id is its place in its family's table.
     let strategy = &table(boundary.family)[usize::from(id.1)];
     debug_assert_eq!(strategy.id, id);
-    super::select::admit(strategy, &Subject::Boundary(boundary), ctx, &Residencies::DEVICE).ok()
+    super::select::first_fit_boundary(ctx, boundary, std::slice::from_ref(strategy)).map(|(_, params)| params)
 }
 
 /// Whether the device has the capabilities strategy `id` needs: a boundary op tries a host path only where this holds, and builds
@@ -484,26 +536,18 @@ pub(crate) fn has_caps_for(ctx: &Context, family: FamilyTag, id: StrategyId) -> 
     ctx.caps().contains(table(family)[usize::from(id.1)].needs)
 }
 
-/// The first of [`candidates`]: the strategy a boundary op without a host path to try runs, without the iterator (one scan of the table
-/// in order, the forced strategy of `LUMA_STRATEGY` first where it fits).
-#[inline]
+/// The first strategy of the family's table that applies to `boundary`: what a boundary op without a host path to try runs (the
+/// forced strategy of `LUMA_STRATEGY` first where it fits). Answered by the selection cache where it can.
+#[inline(always)]
 pub(crate) fn first_candidate(ctx: &Context, boundary: &Boundary<'_>) -> Option<(StrategyId, Params)> {
-    if ctx.strategy_override(boundary.family).is_some() {
-        return candidates(ctx, boundary).next();
-    }
-    let subject = Subject::Boundary(boundary);
-    table(boundary.family).iter().find_map(|strategy| super::select::admit(strategy, &subject, ctx, &Residencies::DEVICE).ok().map(|params| (strategy.id, params)))
+    super::select::first_fit_boundary(ctx, boundary, table(boundary.family))
 }
 
 /// [`first_candidate`] over the entries of one stage of a family whose table serves several (`Factor`: the LU leaves, the QR panels,
 /// the triangular solves, ... and the stages of conv, window and the sparse products); the forced strategy of `LUMA_STRATEGY` counts where it is one of `entries`.
 #[inline(always)]
 pub(crate) fn first_candidate_in(entries: &'static [Strategy], ctx: &Context, boundary: &Boundary<'_>) -> Option<(StrategyId, Params)> {
-    if ctx.strategy_override(boundary.family).is_some() {
-        return candidates_in(entries, ctx, boundary).next();
-    }
-    let subject = Subject::Boundary(boundary);
-    entries.iter().find_map(|strategy| super::select::admit(strategy, &subject, ctx, &Residencies::DEVICE).ok().map(|params| (strategy.id, params)))
+    super::select::first_fit_boundary(ctx, boundary, entries)
 }
 
 /// Records the Decision of a boundary op that chose `chosen` (with `params`) after `declined` ones gave up, while decisions are
@@ -528,7 +572,7 @@ pub(crate) fn note_in(ctx: &Context, boundary: &Boundary<'_>, entries: &'static 
 #[inline(never)]
 fn note_recorded(ctx: &Context, boundary: &Boundary<'_>, entries: &'static [Strategy], chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
     let subject = Subject::Boundary(boundary);
-    let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen, &subject, ctx));
+    let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen, &subject, ctx)).cached(boundary.from_cache.get());
     for strategy in entries {
         if strategy.id == chosen {
             continue;

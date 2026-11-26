@@ -3116,6 +3116,8 @@ pub(crate) struct JitState {
     merged_seen: Mutex<FxMap<u64, u32>>,
     /// Strategy rankings by subject (see [`structured::select`]).
     pub(crate) selections: structured::select::SelectionCache,
+    /// What the selection cache of the strategy registry needs of the context (see [`structured::select`]).
+    pub(crate) selcache: structured::select::SelState,
     /// Sampled launch timings of strategies (see [`structured::telemetry`]).
     pub(crate) telemetry: structured::telemetry::Telemetry,
     /// Kernels of non-baseline strategies built so far, against the variant budget.
@@ -3266,6 +3268,7 @@ impl JitState {
             structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             selections: Mutex::new(FxMap::default()),
+            selcache: structured::select::SelState::new(),
             telemetry: structured::telemetry::Telemetry::default(),
             variants: structured::select::Variants::default(),
             requested: Mutex::new(RequestList::default()),

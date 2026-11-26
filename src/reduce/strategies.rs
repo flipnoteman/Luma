@@ -7,7 +7,7 @@ use crate::array::Failure;
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::structured::emit::Emit;
-use crate::jit::structured::strategy::{BitClass, FamilyTag, Lowered, NumClass, Output, Params, PassMode, ReduceParams, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+use crate::jit::structured::strategy::{BitClass, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, PassMode, ReduceParams, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 
 impl StrategyId {
     pub(crate) const REDUCE_HOST: StrategyId = StrategyId(FamilyTag::Reduce, 0);
@@ -21,27 +21,30 @@ impl StrategyId {
 
 /// The reductions' table, in preference order.
 pub(crate) const REDUCE_STRATEGIES: [Strategy; 7] = [
-    // The host's `f64` accumulation differs from the device's: its own bit class.
-    entry(StrategyId::REDUCE_HOST, "host", Caps::HOST_PATH, 1, 0, fits_host, lower_host),
-    entry(StrategyId::REDUCE_MERGED, "merged", Caps::empty(), 2, 1, fits_merged, lower_merged),
-    entry(StrategyId::REDUCE_AXIS_MERGED, "axis-merged", Caps::empty(), 3, 2, fits_axis_merged, lower_axis_merged),
-    entry(StrategyId::REDUCE_BITS, "bits", Caps::empty(), 4, 3, fits_bits, lower_bits),
+    // The host's `f64` accumulation differs from the device's: its own bit class. `fits` of the host and merged paths read the
+    // operand's life (forced, failed, pending) and the reductions registered beside it: `LIVE`, so the family is never cached.
+    entry(StrategyId::REDUCE_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST.with(FitsInputs::LIVE), 1, 0, fits_host, lower_host),
+    entry(StrategyId::REDUCE_MERGED, "merged", Caps::empty(), FitsInputs::HOST.with(FitsInputs::LIVE), 2, 1, fits_merged, lower_merged),
+    entry(StrategyId::REDUCE_AXIS_MERGED, "axis-merged", Caps::empty(), FitsInputs::HOST.with(FitsInputs::LIVE), 3, 2, fits_axis_merged, lower_axis_merged),
+    entry(StrategyId::REDUCE_BITS, "bits", Caps::empty(), FitsInputs::NONE, 4, 3, fits_bits, lower_bits),
     // A first pass of several groups that finishes itself, or a second pass: different bits where the first pass has several groups.
-    entry(StrategyId::REDUCE_SINGLE_PASS, "single-pass", Caps::empty(), 5, 4, fits_single_pass, lower_single_pass),
-    entry(StrategyId::REDUCE_TWO_PASS, "two-pass", Caps::empty(), 6, 5, fits_two_pass, lower_two_pass),
-    entry(StrategyId::REDUCE_AXIS_LINES, "axis", Caps::empty(), 3, 6, fits_axis_lines, lower_axis_lines),
+    entry(StrategyId::REDUCE_SINGLE_PASS, "single-pass", Caps::empty(), FitsInputs::NONE, 5, 4, fits_single_pass, lower_single_pass),
+    entry(StrategyId::REDUCE_TWO_PASS, "two-pass", Caps::empty(), FitsInputs::NONE, 6, 5, fits_two_pass, lower_two_pass),
+    entry(StrategyId::REDUCE_AXIS_LINES, "axis", Caps::empty(), FitsInputs::NONE, 3, 6, fits_axis_lines, lower_axis_lines),
 ];
 
+#[allow(clippy::too_many_arguments)]
 const fn entry(
     id: StrategyId,
     name: &'static str,
     needs: Caps,
+    reads: FitsInputs,
     bits: u16,
     group: u8,
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(bits), baseline: true, group, prologue: true, epilogue: false, fits, cost: None, split: split_reduce, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(bits), baseline: true, group, prologue: true, epilogue: false, reads, fits, cost: None, split: split_reduce, warm: no_warm, lower: Some(lower) }
 }
 
 fn split_reduce(_: &Subject<'_>, _: &Params) -> SplitClass {

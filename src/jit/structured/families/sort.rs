@@ -3,7 +3,7 @@
 //! selection it is at and runs the body of the id it gets. The `fits` functions are the inline conditions of `src/sort.rs` at
 //! `f0e5723`.
 
-use super::{boundary, entry, id, split_global, split_map};
+use super::{boundary, entry, id, split_global, split_map, FitsInputs};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::structured::boundary::{SortAttrs, SortParams, SortPayload, SortStage};
@@ -24,15 +24,15 @@ impl StrategyId {
 
 /// Table order is today's preference: the host path, then sweep before ballots before the count/scan/scatter passes.
 pub(crate) static SORT_STRATEGIES: [Strategy; 9] = [
-    entry(StrategyId::SORT_HOST, "host", Caps::HOST_PATH, split_global, fits_host),
-    entry(StrategyId::SORT_RADIX_SWEEP, "radix_sweep", Caps::LOOKBACK.with(Caps::SUBGROUP32), split_global, fits_radix_sweep),
-    entry(StrategyId::SORT_RADIX_BALLOTS, "radix_ballots", Caps::SUBGROUP32, split_global, fits_radix_ballots),
-    entry(StrategyId::SORT_RADIX_COUNT_SCAN, "radix_count_scan", Caps::empty(), split_global, fits_radix_count_scan),
-    entry(StrategyId::SORT_LINES, "lines", Caps::empty(), split_map, fits_lines),
-    entry(StrategyId::SORT_LINES_RADIX, "lines_radix", Caps::empty(), split_global, fits_lines_radix),
-    entry(StrategyId::SORT_BY_KEY_PAYLOAD, "by_key_payload", Caps::empty(), split_global, fits_by_key_payload),
-    entry(StrategyId::SORT_BY_KEY_PERMUTATION, "by_key_permutation", Caps::empty(), split_global, fits_by_key_permutation),
-    entry(StrategyId::SORT_BY_KEY_AXIS, "by_key_axis", Caps::empty(), split_global, fits_by_key_axis),
+    entry(StrategyId::SORT_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, split_global, fits_host),
+    entry(StrategyId::SORT_RADIX_SWEEP, "radix_sweep", Caps::LOOKBACK.with(Caps::SUBGROUP32), FitsInputs::NONE, split_global, fits_radix_sweep),
+    entry(StrategyId::SORT_RADIX_BALLOTS, "radix_ballots", Caps::SUBGROUP32, FitsInputs::NONE, split_global, fits_radix_ballots),
+    entry(StrategyId::SORT_RADIX_COUNT_SCAN, "radix_count_scan", Caps::empty(), FitsInputs::NONE, split_global, fits_radix_count_scan),
+    entry(StrategyId::SORT_LINES, "lines", Caps::empty(), FitsInputs::NONE, split_map, fits_lines),
+    entry(StrategyId::SORT_LINES_RADIX, "lines_radix", Caps::empty(), FitsInputs::NONE, split_global, fits_lines_radix),
+    entry(StrategyId::SORT_BY_KEY_PAYLOAD, "by_key_payload", Caps::empty(), FitsInputs::HOST, split_global, fits_by_key_payload),
+    entry(StrategyId::SORT_BY_KEY_PERMUTATION, "by_key_permutation", Caps::empty(), FitsInputs::NONE, split_global, fits_by_key_permutation),
+    entry(StrategyId::SORT_BY_KEY_AXIS, "by_key_axis", Caps::empty(), FitsInputs::NONE, split_global, fits_by_key_axis),
 ];
 
 fn attrs(subject: &Subject<'_>) -> SortAttrs {

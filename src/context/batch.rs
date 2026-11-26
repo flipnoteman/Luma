@@ -73,6 +73,8 @@ impl Context {
     #[doc(hidden)]
     pub fn set_assume_busy(&self, on: bool) {
         self.inner.assume_busy.store(on, std::sync::atomic::Ordering::Relaxed);
+        // `can_run_on_host` reads it (tests).
+        self.jit().selcache.bump();
     }
 
     /// Makes `eval` and the fusion-limit cuts behave as if the GPU were always idle: every `eval`

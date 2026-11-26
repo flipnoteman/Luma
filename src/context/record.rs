@@ -154,7 +154,7 @@ impl Context {
     /// matter.
     pub(crate) fn begin_recording(&self, seed: Vec<(Arc<Storage>, Arc<Storage>)>) -> bool {
         let id = self.inner.id;
-        RECORDINGS
+        let began = RECORDINGS
             .try_with(|all| {
                 let mut all = all.borrow_mut();
                 if all.iter().any(|(known, _)| *known == id) {
@@ -176,7 +176,11 @@ impl Context {
                 ));
                 true
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if began {
+            self.jit().selcache.recording_opened();
+        }
+        began
     }
 
     /// Runs `f` on the recording if one is active on the calling thread.
@@ -244,6 +248,9 @@ impl Context {
             })
             .ok()
             .flatten();
+        if state.is_some() {
+            self.jit().selcache.recording_closed();
+        }
         match state {
             Some(RecState::Active(mut recording)) => {
                 // A buffer handed out again during the recording that a result, state or probe

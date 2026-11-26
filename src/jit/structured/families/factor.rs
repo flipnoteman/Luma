@@ -6,7 +6,7 @@
 
 use std::panic::Location;
 
-use super::{boundary, entry, id, split_global};
+use super::{boundary, entry, id, split_global, FitsInputs};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::dense::svd::{self, Kind};
@@ -40,28 +40,28 @@ impl StrategyId {
 }
 
 pub(crate) static FACTOR_STRATEGIES: [Strategy; 22] = [
-    entry(StrategyId::LU_SMALL, "lu_small", Caps::empty(), split_global, fits_lu_small),
-    entry(StrategyId::LU_CALU_SINGLE, "lu_calu_single", Caps::empty(), split_global, fits_lu_calu_single),
-    entry(StrategyId::LU_CALU_TOURNAMENT, "lu_calu_tournament", Caps::empty(), split_global, fits_lu_calu_tournament),
-    entry(StrategyId::LU_PANEL, "lu_panel", Caps::empty(), split_global, fits_lu_panel),
-    entry(StrategyId::LU_RECURSIVE, "lu_recursive", Caps::empty(), split_global, fits_lu_recursive),
-    entry(StrategyId::CHOL_SMALL, "chol_small", Caps::empty(), split_global, fits_chol_small),
-    entry(StrategyId::CHOL_BLOCKED, "chol_blocked", Caps::empty(), split_global, fits_chol_blocked),
-    entry(StrategyId::QR_TSQR_PANEL, "qr_tsqr_panel", Caps::empty(), split_global, fits_qr_tsqr_panel),
-    entry(StrategyId::QR_LEAF, "qr_leaf", Caps::empty(), split_global, fits_qr_leaf),
-    entry(StrategyId::QR_RECURSIVE, "qr_recursive", Caps::empty(), split_global, fits_qr_recursive),
-    entry(StrategyId::TRI_SUBSTITUTE, "tri_substitute", Caps::empty(), split_global, fits_tri_substitute),
-    entry(StrategyId::TRI_TRSV, "tri_trsv", Caps::LOOKBACK, split_global, fits_tri_trsv),
-    entry(StrategyId::TRI_BLOCKED, "tri_blocked", Caps::empty(), split_global, fits_tri_blocked),
-    entry(StrategyId::SVD_SMALL, "svd_small", Caps::empty(), split_global, fits_svd_small),
-    entry(StrategyId::SVD_JACOBI, "svd_jacobi", Caps::empty(), split_global, fits_svd_jacobi),
-    entry(StrategyId::SVD_BLOCK_JACOBI, "svd_block_jacobi", Caps::empty(), split_global, fits_svd_block_jacobi),
-    entry(StrategyId::SVD_PRECONDITIONED, "svd_preconditioned", Caps::empty(), split_global, fits_svd_preconditioned),
-    entry(StrategyId::EIGH_SMALL, "eigh_small", Caps::empty(), split_global, fits_eigh_small),
-    entry(StrategyId::EIGH_JACOBI, "eigh_jacobi", Caps::empty(), split_global, fits_eigh_jacobi),
-    entry(StrategyId::EIGH_BLOCK_JACOBI, "eigh_block_jacobi", Caps::empty(), split_global, fits_eigh_block_jacobi),
-    entry(StrategyId::LU_REFINED_F32, "lu_refined_f32", Caps::empty(), split_global, fits_lu_refined_f32),
-    entry(StrategyId::CHOL_REFINED_F32, "chol_refined_f32", Caps::empty(), split_global, fits_chol_refined_f32),
+    entry(StrategyId::LU_SMALL, "lu_small", Caps::empty(), FitsInputs::NONE, split_global, fits_lu_small),
+    entry(StrategyId::LU_CALU_SINGLE, "lu_calu_single", Caps::empty(), FitsInputs::NONE, split_global, fits_lu_calu_single),
+    entry(StrategyId::LU_CALU_TOURNAMENT, "lu_calu_tournament", Caps::empty(), FitsInputs::NONE, split_global, fits_lu_calu_tournament),
+    entry(StrategyId::LU_PANEL, "lu_panel", Caps::empty(), FitsInputs::NONE, split_global, fits_lu_panel),
+    entry(StrategyId::LU_RECURSIVE, "lu_recursive", Caps::empty(), FitsInputs::NONE, split_global, fits_lu_recursive),
+    entry(StrategyId::CHOL_SMALL, "chol_small", Caps::empty(), FitsInputs::NONE, split_global, fits_chol_small),
+    entry(StrategyId::CHOL_BLOCKED, "chol_blocked", Caps::empty(), FitsInputs::NONE, split_global, fits_chol_blocked),
+    entry(StrategyId::QR_TSQR_PANEL, "qr_tsqr_panel", Caps::empty(), FitsInputs::NONE, split_global, fits_qr_tsqr_panel),
+    entry(StrategyId::QR_LEAF, "qr_leaf", Caps::empty(), FitsInputs::NONE, split_global, fits_qr_leaf),
+    entry(StrategyId::QR_RECURSIVE, "qr_recursive", Caps::empty(), FitsInputs::NONE, split_global, fits_qr_recursive),
+    entry(StrategyId::TRI_SUBSTITUTE, "tri_substitute", Caps::empty(), FitsInputs::NONE, split_global, fits_tri_substitute),
+    entry(StrategyId::TRI_TRSV, "tri_trsv", Caps::LOOKBACK, FitsInputs::NONE, split_global, fits_tri_trsv),
+    entry(StrategyId::TRI_BLOCKED, "tri_blocked", Caps::empty(), FitsInputs::NONE, split_global, fits_tri_blocked),
+    entry(StrategyId::SVD_SMALL, "svd_small", Caps::empty(), FitsInputs::NONE, split_global, fits_svd_small),
+    entry(StrategyId::SVD_JACOBI, "svd_jacobi", Caps::empty(), FitsInputs::NONE, split_global, fits_svd_jacobi),
+    entry(StrategyId::SVD_BLOCK_JACOBI, "svd_block_jacobi", Caps::empty(), FitsInputs::NONE, split_global, fits_svd_block_jacobi),
+    entry(StrategyId::SVD_PRECONDITIONED, "svd_preconditioned", Caps::empty(), FitsInputs::NONE, split_global, fits_svd_preconditioned),
+    entry(StrategyId::EIGH_SMALL, "eigh_small", Caps::empty(), FitsInputs::NONE, split_global, fits_eigh_small),
+    entry(StrategyId::EIGH_JACOBI, "eigh_jacobi", Caps::empty(), FitsInputs::NONE, split_global, fits_eigh_jacobi),
+    entry(StrategyId::EIGH_BLOCK_JACOBI, "eigh_block_jacobi", Caps::empty(), FitsInputs::NONE, split_global, fits_eigh_block_jacobi),
+    entry(StrategyId::LU_REFINED_F32, "lu_refined_f32", Caps::empty(), FitsInputs::HOST, split_global, fits_lu_refined_f32),
+    entry(StrategyId::CHOL_REFINED_F32, "chol_refined_f32", Caps::empty(), FitsInputs::HOST, split_global, fits_chol_refined_f32),
 ];
 
 /// The entries an LU selects over: the leaves, then the recursion. `leaf` tried the tournament first, then the workgroup-memory kernel;

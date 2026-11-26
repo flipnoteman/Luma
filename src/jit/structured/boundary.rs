@@ -4,6 +4,7 @@
 //! stack by the op; nothing here evaluates anything or holds a node.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::panic::Location;
 
@@ -13,9 +14,10 @@ use crate::profile::{Decision, DecisionSite};
 
 impl<'a> Boundary<'a> {
     /// The descriptor of an op of `family` at `location`: `dims` is the shape that picks the plan.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn new(family: FamilyTag, op: &'static str, location: &'static Location<'static>, dims: [u32; 4], attrs: BoundaryAttrs) -> Boundary<'a> {
-        Boundary { family, op, location, dims, attrs, _borrow: PhantomData }
+        let key = attrs.pack();
+        Boundary { family, op, location, dims, attrs, key, from_cache: Cell::new(false), _borrow: PhantomData }
     }
 }
 
@@ -388,4 +390,38 @@ pub(crate) struct FactorParams {
 
 impl FactorParams {
     pub(crate) const NONE: FactorParams = FactorParams { nb: 0 };
+}
+
+// -- The key the selection cache compares --
+
+/// Every field of the attributes, in four words, so that two attributes are equal exactly where their words are: what the selection
+/// cache's hit path compares instead of the structures (a `Boundary` is built where the variant is a constant, so the packing
+/// folds to a few shifts at the op). A field that is added must be packed: `tests_selcache` flips each field in turn.
+impl BoundaryAttrs {
+    #[inline(always)]
+    pub(crate) fn pack(&self) -> [u64; 4] {
+        match self {
+            BoundaryAttrs::None => [0; 4],
+            BoundaryAttrs::Sort(a) => [a.len, a.stage as u64 | (a.payload as u64) << 8 | u64::from(a.errored) << 16 | u64::from(a.value4) << 17 | u64::from(a.key_bits) << 24, 0, 0],
+            BoundaryAttrs::Scan(a) => [u64::from(a.grouping_free) | u64::from(a.by_key) << 1 | (a.operand as u64) << 2, 0, 0, 0],
+            BoundaryAttrs::Scatter(a) => [a.base_len, a.count, a.atomic as u64 | u64::from(a.base_is_view) << 8 | u64::from(a.base_is_read_view) << 9 | u64::from(a.host_site) << 10, 0],
+            BoundaryAttrs::Conv(a) => [
+                u64::from(a.kernel_len) | u64::from(a.input_len) << 32,
+                u64::from(a.out_len) | u64::from(a.stride) << 32,
+                u64::from(a.batch) | u64::from(a.tile_log) << 32,
+                a.stage as u64,
+            ],
+            BoundaryAttrs::Window(a) => [
+                u64::from(a.k[0]) | u64::from(a.k[1]) << 16 | u64::from(a.k[2]) << 32 | u64::from(a.stride[0]) << 48 | u64::from(a.stride[1]) << 56,
+                u64::from(a.stride[2]) | (a.op as u64) << 8 | u64::from(a.three_d) << 16 | (a.pixel as u64) << 24 | (a.edge as u64) << 32 | (a.stage as u64) << 40,
+                a.aux_cells,
+                0,
+            ],
+            BoundaryAttrs::Opaque(a) => [a.nnz, a.outer, u64::from(a.columns) | u64::from(a.native) << 32 | u64::from(a.first_non_native) << 33 | u64::from(a.tiles) << 34 | u64::from(a.long) << 35, 0],
+            BoundaryAttrs::Compact(a) => [u64::from(a.padded) | u64::from(a.words) << 1, 0, 0, 0],
+            BoundaryAttrs::Merge(a) => [a.total, 0, 0, 0],
+            BoundaryAttrs::LineSolve(a) => [a.len, a.max_scratch, u64::from(a.block) | u64::from(a.parts) << 8 | u64::from(a.fused) << 9 | u64::from(a.starts) << 10, 0],
+            BoundaryAttrs::Factor(a) => [a.kind as u64 | u64::from(a.inverse) << 8 | u64::from(a.exact) << 9 | u64::from(a.vectors) << 10, 0, 0, 0],
+        }
+    }
 }
