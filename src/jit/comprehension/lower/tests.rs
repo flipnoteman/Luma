@@ -568,3 +568,21 @@ fn a_gathered_access_reads_the_elements_an_index_names() {
     let expected = f.eval_reference_with(&refs, &[Some(&index_values), None]);
     assert_eq!(values(&build(&ctx, &f)), expected);
 }
+
+#[test]
+fn a_product_sum_equals_the_hand_written_broadcast_sum() {
+    // `(a.broadcast_to([K, M, N]) * b.broadcast_to([K, M, N])).sum_axis(0)`: the program G-B1 builds is that one.
+    let ctx = device();
+    let (k, m, n) = (31u64, 5u64, 7u64);
+    let dims = [(m, false), (n, false), (k, true)];
+    let reads = [
+        Read::plain([k as u32, m as u32, 1, 1], vec![row(&[(2, 1)], 0), row(&[(0, 1)], 0)]),
+        Read::plain([k as u32, 1, n as u32, 1], vec![row(&[(2, 1)], 0), AffineRow::ZERO, row(&[(1, 1)], 0)]),
+    ];
+    let (f, data) = form(&ctx, &dims, &[0, 1], &reads, mul01(), CombinePart::Add);
+    let as_f32 = |values: &[f64]| values.iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let a = Array::<f32>::from_slice_on(&ctx, &as_f32(&data[0]), [k as usize, m as usize, 1]).unwrap();
+    let b = Array::<f32>::from_slice_on(&ctx, &as_f32(&data[1]), [k as usize, 1, n as usize]).unwrap();
+    let by_hand = (&a.broadcast_to([k as usize, m as usize, n as usize]) * &b.broadcast_to([k as usize, m as usize, n as usize])).sum_axis(0).to_vec().unwrap();
+    assert_eq!(build(&ctx, &f).to_vec().unwrap(), by_hand);
+}
