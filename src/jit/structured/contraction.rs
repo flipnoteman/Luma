@@ -431,6 +431,13 @@ fn fits_gemm_f32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
 
 /// Smallest product (multiply-adds) that runs on a ragged or a padded kernel: below it the shader kernels' launch is as cheap.
 const RAGGED_MIN_FMAS: u64 = 1 << 20;
+/// Shortest K of a ragged or padded product: a short K is memory-bound and the shader kernels (and their skinny plans) do as well
+/// (`2001 x 37 x 2001` was 1.21x slower on the ragged kernel, 4096 x 33 x 4096 4 % faster).
+const RAGGED_MIN_K: usize = 64;
+/// Largest `f32` product (multiply-adds) that runs on a ragged or padded kernel: the padded kernel's copy launch and its masked
+/// copies lose what the 16-byte lanes gain on a big square (3001^3 1.05x, 4097^3 1.00x of the shader kernels, 1001^3 1.20x on an
+/// RTX 3090), so those keep the shader kernels until the kernel is faster (follow-up). TF32 has no such cap.
+const RAGGED_MAX_FMAS_F32: u64 = 4_000_000_000;
 /// What the 4-byte lanes of a ragged kernel reach of the rate of the 16-byte ones (to be set from the bench rows of the gate).
 const RAGGED_LANE_FACTOR: f64 = 0.6;
 /// Measured rates of the backend's own kernels at 4096^3 on an RTX 3090, in flops per nanosecond, scaled by the device's
@@ -450,7 +457,8 @@ fn ragged_fits(subject: &Subject<'_>, ctx: &Context, by: StrategyId) -> Option<P
     let geom = view.geometry()?;
     let (m, n, k) = (geom.m as usize, geom.n as usize, geom.k as usize);
     let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
-    if m < GEMM_MIN_EXTENT || n < few_columns || k < GEMM_MIN_EXTENT || (m as u64) * (n as u64) * (k as u64) < RAGGED_MIN_FMAS {
+    let fmas = (m as u64) * (n as u64) * (k as u64);
+    if m < GEMM_MIN_EXTENT || n < few_columns || k < RAGGED_MIN_K || fmas < RAGGED_MIN_FMAS || (exact && fmas > RAGGED_MAX_FMAS_F32) {
         return None;
     }
     if ctx.hal().gemm_tiles(exact).is_empty() || !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
