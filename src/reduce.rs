@@ -97,7 +97,10 @@ impl Structured {
             (OpTag::ReduceAxis(ops), Some(geom)) => Comprehension::reduce_axis(src, geom, ops.as_slice()[0], ty),
             (tag, geom) => unreachable!("a structured value is a reduction, not {tag:?} over {geom:?}"),
         };
-        form.with_steps(*finish)
+        let form = form.with_steps(*finish);
+        // The guarantee of 07 §4.1: an API form is well formed and of the class its tag says.
+        debug_assert!(form.validate().is_ok(), "the form of {:?}: {:?}", comp.meta.tag, form.validate());
+        form
     }
 
     /// The lines of an axis reduction; `None` for a reduction of the whole array.

@@ -94,7 +94,7 @@ mod tests {
     /// in the log would mean an operation fell through to the fallback. Every case of the suites runs once on the CPU backend
     /// with its decisions recorded.
     #[test]
-    #[ignore = "runs every case of five suites once (minutes); the gate job runs it with --ignored"]
+    #[ignore = "runs every case of five suites once (about a minute in release); the gate runs it with --release -- --ignored"]
     fn no_bench_case_reaches_the_generic_lowering() {
         let options = ContextOptions::from_env().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false);
         let ctx = Context::with_options(options).expect("a CPU context");
