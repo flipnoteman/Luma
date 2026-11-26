@@ -435,6 +435,9 @@ pub enum DecisionSite {
     WindowPlan,
     /// Ops declared on the registry with one strategy (vision, image, IIR, sparse products).
     OpaquePlan,
+    /// A form without an API tag was specialised (`recognised-<form>`) or lowered by the generic strategies (`generic-contract`,
+    /// `generic-reduce`, `generic-unrolled`). Never recorded for an API operation.
+    Comprehension,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }

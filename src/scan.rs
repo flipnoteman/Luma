@@ -1408,7 +1408,7 @@ impl<T: ScalarType> Array<T> {
 
     /// Runs the reductions `ops` along `axis`: one array per op. A pending operand is computed
     /// inside the first pass unless it cannot be (see [`jit::axis_reduce`]).
-    fn run_axis_reduce(&self, axis: usize, ops: ReduceList) -> Outcome<Vec<Array<T>>> {
+    pub(crate) fn run_axis_reduce(&self, axis: usize, ops: ReduceList) -> Outcome<Vec<Array<T>>> {
         let ctx = self.context();
         let ty = ElemTy::of::<T>()?;
         if ty.layout() != ElemLayout::plain(4) {

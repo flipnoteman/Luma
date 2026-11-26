@@ -59,7 +59,7 @@ fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
 fn reduced<'a>(subject: &Subject<'a>) -> Option<&'a Structured> {
     match subject {
         Subject::Comp(reduced) => Some(reduced),
-        Subject::Contraction(_) | Subject::Boundary(_) => None,
+        Subject::Contraction(_) | Subject::Boundary(_) | Subject::Form(..) => None,
     }
 }
 

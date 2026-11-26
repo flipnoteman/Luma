@@ -30,6 +30,7 @@ use crate::jit::{Edge, ElemTy, Scalar, Src};
 pub(crate) mod build;
 mod combiner;
 pub(crate) mod inline;
+pub(crate) mod lower;
 mod map;
 #[cfg(test)]
 mod recognition_tests;
@@ -39,8 +40,8 @@ pub(crate) mod roles;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use combiner::{CombineOp, CombinePart, Combiner};
-pub(crate) use map::{AffineMap, MapRef};
+pub(crate) use combiner::{CombineOp, CombinePart, Combiner, Compensation};
+pub(crate) use map::{AffineMap, AffineRow, MapRef};
 pub(crate) use roles::classify;
 
 /// 07 open question 8, resolved: six dims, four inputs, four source rows (luma arrays have four axes).

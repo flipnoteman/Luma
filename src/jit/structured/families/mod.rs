@@ -3,6 +3,7 @@
 //! gets (a `match` on a constant: the existing generic code stays monomorphic, so `lower` is `None`).
 
 pub(crate) mod factor;
+pub(crate) mod generic;
 pub(crate) mod line_solve;
 pub(crate) mod conv;
 pub(crate) mod opaque;
@@ -22,7 +23,7 @@ use super::strategy::Boundary;
 pub(super) fn boundary<'a, 'b>(subject: &'b Subject<'a>) -> &'b Boundary<'a> {
     match subject {
         Subject::Boundary(boundary) => boundary,
-        Subject::Comp(_) | Subject::Contraction(_) => unreachable!("a boundary family's table is only asked about boundaries"),
+        Subject::Comp(_) | Subject::Contraction(_) | Subject::Form(..) => unreachable!("a boundary family's table is only asked about boundaries"),
     }
 }
 

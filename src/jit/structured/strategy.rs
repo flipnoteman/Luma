@@ -15,6 +15,7 @@ use std::sync::Arc;
 use super::boundary::{ConvAttrs, ConvParams, OpaqueAttrs, OpaqueParams, WindowAttrs, WindowParams, CompactAttrs, FactorAttrs, FactorParams, LineSolveAttrs, LineSolveParams, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
 use super::emit::Emit;
 use super::contraction::{ContractionParams, ContractionView};
+use crate::jit::comprehension::Comprehension;
 use super::Structured;
 use crate::array::{Array, Failure, Storage};
 use crate::caps::Caps;
@@ -41,10 +42,12 @@ pub(crate) enum FamilyTag {
     Conv,
     Window,
     Opaque,
+    /// The generic lowering of a form no tag or recogniser accepts (W2-R0 §5.3-5.6).
+    Generic,
 }
 
 /// How many families have a table.
-pub(crate) const FAMILY_COUNT: usize = 15;
+pub(crate) const FAMILY_COUNT: usize = 16;
 
 /// Most entries one family's table may have (the ranking cache keeps them in a `u32` mask and an array).
 pub(crate) const MAX_PER_FAMILY: usize = 12;
@@ -68,6 +71,7 @@ impl FamilyTag {
             FamilyTag::Conv => 12,
             FamilyTag::Window => 13,
             FamilyTag::Opaque => 14,
+            FamilyTag::Generic => 15,
         }
     }
 
@@ -88,6 +92,7 @@ impl FamilyTag {
             FamilyTag::Conv => "conv",
             FamilyTag::Window => "window",
             FamilyTag::Opaque => "opaque",
+            FamilyTag::Generic => "generic",
         }
     }
 
@@ -108,6 +113,7 @@ impl FamilyTag {
             "conv" => Some(FamilyTag::Conv),
             "window" => Some(FamilyTag::Window),
             "opaque" => Some(FamilyTag::Opaque),
+            "generic" => Some(FamilyTag::Generic),
             _ => None,
         }
     }
@@ -252,13 +258,15 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 /// One table per family; the shared edit of a new family is one line here.
 ///
 /// Search, Compact, Merge, Spectral and Sample are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES, &super::families::line_solve::LINE_SOLVE_STRATEGIES, &super::families::factor::FACTOR_STRATEGIES, &[], &[], &super::families::conv::CONV_STRATEGIES, &super::families::window::WINDOW_STRATEGIES, &super::families::opaque::OPAQUE_STRATEGIES];
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES, &super::families::line_solve::LINE_SOLVE_STRATEGIES, &super::families::factor::FACTOR_STRATEGIES, &[], &[], &super::families::conv::CONV_STRATEGIES, &super::families::window::WINDOW_STRATEGIES, &super::families::opaque::OPAQUE_STRATEGIES, &super::families::generic::GENERIC_STRATEGIES];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
     Comp(&'a Structured),
     Contraction(&'a ContractionView<'a>),
     Boundary(&'a Boundary<'a>),
+    /// A form that has no API tag, and where it was asked for (`Origin::Recognised` and `Origin::Rewritten`).
+    Form(&'a Comprehension, &'static Location<'static>),
 }
 
 impl Subject<'_> {
@@ -267,6 +275,7 @@ impl Subject<'_> {
             Subject::Comp(_) => FamilyTag::Reduce,
             Subject::Contraction(_) => FamilyTag::Contraction,
             Subject::Boundary(boundary) => boundary.family,
+            Subject::Form(..) => FamilyTag::Generic,
         }
     }
 
@@ -276,6 +285,7 @@ impl Subject<'_> {
             Subject::Comp(reduced) => reduced.dims(),
             Subject::Contraction(view) => view.dims(),
             Subject::Boundary(boundary) => boundary.dims,
+            Subject::Form(form, _) => crate::jit::comprehension::lower::dims(form),
         }
     }
 
@@ -285,6 +295,7 @@ impl Subject<'_> {
             Subject::Comp(reduced) => (reduced.name, reduced.location),
             Subject::Contraction(view) => ("matmul", view.location),
             Subject::Boundary(boundary) => (boundary.op, boundary.location),
+            Subject::Form(_, location) => ("comprehension", location),
         }
     }
 
@@ -306,6 +317,7 @@ impl Subject<'_> {
             FamilyTag::Conv => DecisionSite::ConvPlan,
             FamilyTag::Window => DecisionSite::WindowPlan,
             FamilyTag::Opaque => DecisionSite::OpaquePlan,
+            FamilyTag::Generic => DecisionSite::Comprehension,
         }
     }
 
@@ -328,6 +340,7 @@ pub(crate) enum Params {
     Conv(ConvParams),
     Window(WindowParams),
     Opaque(OpaqueParams),
+    Generic(GenericParams),
 }
 
 impl Params {
@@ -356,8 +369,16 @@ impl Params {
             // not cyclic reduction (the native and the stacked ones included) are all the Thomas algorithm there.
             Params::LineSolve(params) => Cow::Owned(params.legacy_label(name)),
             Params::Opaque(_) => Cow::Owned(format!("opaque::{name}")),
+            Params::Generic(_) => Cow::Borrowed(name),
         }
     }
+}
+
+/// What a generic strategy runs with: the launches of the lowering (tiles, and the taps unrolled into one program).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct GenericParams {
+    pub(crate) tiles: u32,
+    pub(crate) taps: u32,
 }
 
 /// What a reduction runs with: how its passes finish, and how many workgroups its first pass has.

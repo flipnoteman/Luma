@@ -41,7 +41,7 @@ impl StrategyOverride {
         let mut forced = StrategyOverride::default();
         for item in text.split(',').map(str::trim).filter(|item| !item.is_empty()) {
             let (family, name) = item.split_once(':').ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: {item:?} is not <family>:<strategy>")))?;
-            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce, sort, scan, scatter, contraction, line_solve, factor)", family.trim())))?;
+            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce, sort, scan, scatter, contraction, line_solve, factor, generic)", family.trim())))?;
             if table(family).is_empty() {
                 return Err(LumaError::InvalidOption(format!("LUMA_STRATEGY: {}: family not ported (it records its Decision only)", family.name())));
             }
@@ -149,6 +149,7 @@ fn signature(subject: &Subject<'_>) -> u64 {
     match subject {
         Subject::Comp(reduced) => reduced.signature(&mut hasher),
         Subject::Contraction(view) => view.attrs.hash(&mut hasher),
+        Subject::Form(form, _) => form.structure_hash().hash(&mut hasher),
         Subject::Boundary(boundary) => {
             boundary.op.hash(&mut hasher);
             boundary.attrs.hash(&mut hasher);
@@ -799,7 +800,7 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
 }
 
 /// [`plain`] of every family's table, worked out once.
-static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES), true, true, plain(&super::families::conv::CONV_STRATEGIES), plain(&super::families::window::WINDOW_STRATEGIES), plain(&super::families::opaque::OPAQUE_STRATEGIES)];
+static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES), plain(&super::families::line_solve::LINE_SOLVE_STRATEGIES), plain(&super::families::factor::FACTOR_STRATEGIES), true, true, plain(&super::families::conv::CONV_STRATEGIES), plain(&super::families::window::WINDOW_STRATEGIES), plain(&super::families::opaque::OPAQUE_STRATEGIES), plain(&super::families::generic::GENERIC_STRATEGIES)];
 
 /// Whether every entry is a baseline without a cost: selection is the priority chain.
 const fn plain(entries: &[Strategy]) -> bool {
