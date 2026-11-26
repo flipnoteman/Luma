@@ -1188,7 +1188,8 @@ mod tests {
     /// decomposition without vectors.
     #[test]
     fn the_qr_preconditioned_decomposition_is_a_decomposition() {
-        let ctx = Context::new().unwrap();
+        // The checks below are `f32` bounds: odd shapes now run on tensor cores under the default numerics, so the context is strict.
+        let ctx = Context::with_options(crate::context::ContextOptions::from_env().numerics(crate::numerics::Numerics::strict())).unwrap();
         for (rows, cols, rank) in [(150, 150, 150), (200, 130, 130), (130, 200, 130), (150, 150, 70)] {
             let a = matrix(&ctx, rows, cols, rank, 9 + rows as u64);
             let k = rows.min(cols);
