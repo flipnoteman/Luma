@@ -55,7 +55,7 @@ fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
 
 fn reduced<'a>(subject: &Subject<'a>) -> Option<&'a Structured> {
     match subject {
-        Subject::Reduce(reduced) => Some(reduced),
+        Subject::Comp(reduced) => Some(reduced),
         Subject::Contraction(_) | Subject::Boundary(_) => None,
     }
 }
@@ -69,7 +69,7 @@ fn one_group(pass: PassMode) -> Params {
 }
 
 fn geom(reduced: &Structured) -> Option<AxisGeom> {
-    reduced.comp().meta.geom
+    reduced.geom()
 }
 
 fn done(storage: std::sync::Arc<crate::array::Storage>) -> Result<Lowered, Failure> {

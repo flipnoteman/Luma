@@ -208,7 +208,7 @@ static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES,
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
-    Reduce(&'a Structured),
+    Comp(&'a Structured),
     Contraction(&'a ContractionView<'a>),
     Boundary(&'a Boundary<'a>),
 }
@@ -216,7 +216,7 @@ pub(crate) enum Subject<'a> {
 impl Subject<'_> {
     pub(crate) fn family(&self) -> FamilyTag {
         match self {
-            Subject::Reduce(_) => FamilyTag::Reduce,
+            Subject::Comp(_) => FamilyTag::Reduce,
             Subject::Contraction(_) => FamilyTag::Contraction,
             Subject::Boundary(boundary) => boundary.family,
         }
@@ -225,7 +225,7 @@ impl Subject<'_> {
     /// The shape that picks the plan (the cache key's shape class and the telemetry cell's).
     pub(crate) fn dims(&self) -> [u32; 4] {
         match self {
-            Subject::Reduce(reduced) => reduced.dims(),
+            Subject::Comp(reduced) => reduced.dims(),
             Subject::Contraction(view) => view.dims(),
             Subject::Boundary(boundary) => boundary.dims,
         }
@@ -234,7 +234,7 @@ impl Subject<'_> {
     /// The operation that asked and where it was written, for the Decision.
     pub(crate) fn site(&self) -> (&'static str, &'static Location<'static>) {
         match self {
-            Subject::Reduce(reduced) => (reduced.name, reduced.location),
+            Subject::Comp(reduced) => (reduced.name, reduced.location),
             Subject::Contraction(view) => ("matmul", view.location),
             Subject::Boundary(boundary) => (boundary.op, boundary.location),
         }

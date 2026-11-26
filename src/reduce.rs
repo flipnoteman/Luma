@@ -3,7 +3,7 @@
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
@@ -13,7 +13,9 @@ use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
 use crate::jit::structured::emit::Emit;
 use crate::jit::structured::select;
 use crate::jit::structured::strategy::{Output, PassMode, Subject};
-use crate::jit::structured::{Comp, Family, Meta, OpTag, ReduceOrigin, RunState, Structured};
+use crate::gpu::lock;
+use crate::jit::comprehension::{Algebra, Comprehension, OpTag};
+use crate::jit::structured::{Comp, Family, Launch, Meta, RunState, Structured};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
 use crate::shape::Shape;
@@ -57,11 +59,56 @@ pub(crate) struct PackRead {
 impl Structured {
     /// The node whose values the reduction reduces.
     pub(crate) fn operand(&self) -> &Arc<Node> {
-        &self.comp().origin.operand
+        let RunState::Reduce { operand, .. } = &self.comp().run;
+        operand
     }
 
+    /// The ops of the reduction (a `dot` is a sum).
     pub(crate) fn ops(&self) -> ReduceList {
-        self.comp().origin.ops
+        match &self.comp().meta.tag {
+            OpTag::Reduce(ops) | OpTag::ReduceAxis(ops) => *ops,
+            OpTag::Dot => ReduceList::new(&[ReduceOp::Sum]),
+            tag => unreachable!("a structured value is a reduction, not {tag:?}"),
+        }
+    }
+
+    /// The form of the reduction (`None` under `LUMA_ALGEBRA=off`), built by the builder of its tag from what the value holds the
+    /// first time it is asked for and kept: the registered reader node as the one access, the steps of `finish` as the epilogue.
+    /// A copy: the lock is not held while a rule or the recogniser works on it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by recognition (R1), the rewrite engine (R3) and `explain`"))]
+    pub(crate) fn form(&self) -> Option<Comprehension> {
+        if !Algebra::builds_forms() {
+            return None;
+        }
+        let comp = self.comp();
+        let mut slot = lock(&comp.form);
+        let form = slot.get_or_insert_with(|| Box::new(self.build_form()));
+        Some(Comprehension::clone(form))
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by `Structured::form`"))]
+    fn build_form(&self) -> Comprehension {
+        let comp = self.comp();
+        let RunState::Reduce { operand, finish, .. } = &comp.run;
+        let (src, len, ty) = (Src::Node(Arc::clone(operand)), comp.meta.len, comp.meta.ty);
+        let form = match (&comp.meta.tag, comp.meta.geom) {
+            (OpTag::Reduce(ops), None) => Comprehension::reduce(src, len, *ops, ty),
+            (OpTag::Dot, None) => Comprehension::dot(src, len, ty),
+            (OpTag::ReduceAxis(ops), Some(geom)) => Comprehension::reduce_axis(src, geom, ops.as_slice()[0], ty),
+            (tag, geom) => unreachable!("a structured value is a reduction, not {tag:?} over {geom:?}"),
+        };
+        form.with_steps(*finish)
+    }
+
+    /// The lines of an axis reduction; `None` for a reduction of the whole array.
+    pub(crate) fn geom(&self) -> Option<AxisGeom> {
+        self.comp().meta.geom
+    }
+
+    /// The WGSL type of the elements the passes work on.
+    pub(crate) fn wgsl(&self) -> &'static str {
+        let RunState::Reduce { wgsl, .. } = &self.comp().run;
+        wgsl
     }
 
     pub(crate) fn finish(&self) -> Finish {
@@ -79,8 +126,8 @@ impl Structured {
     /// `None` unless it is a reduction of `f32`s that has not been recorded, and has not failed.
     pub(crate) fn fusable(&self) -> Option<(&Arc<Node>, ReduceList, Finish)> {
         let comp = self.comp();
-        let RunState::Reduce { wgsl, finish, .. } = &comp.run;
-        (comp.meta.tag == OpTag::Reduce && *wgsl == "f32" && comp.meta.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then_some((&comp.origin.operand, comp.origin.ops, *finish))
+        let RunState::Reduce { operand, wgsl, finish, .. } = &comp.run;
+        (comp.meta.tag.is_whole_reduce() && *wgsl == "f32" && comp.meta.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then(|| (operand, self.ops(), *finish))
     }
 
     /// Whether this reduction may be recorded together with others: a plain `f32`, `u32` or `i32` reduction of an
@@ -92,15 +139,15 @@ impl Structured {
     /// What [`Structured::mergeable`] says without the context.
     fn eligible(&self) -> bool {
         let comp = self.comp();
-        let RunState::Reduce { wgsl, layout, solo, .. } = &comp.run;
-        comp.meta.tag == OpTag::Reduce
+        let RunState::Reduce { operand, wgsl, layout, solo, .. } = &comp.run;
+        comp.meta.tag.is_whole_reduce()
             && matches!(comp.meta.ty, ElemTy::F32 | ElemTy::U32 | ElemTy::I32)
             && *wgsl == comp.meta.ty.wgsl()
             && !layout.is_packed()
             && self.is_unforced()
             && !solo.load(Ordering::Relaxed)
-            && comp.origin.operand.is_pending()
-            && comp.origin.operand.has_operands()
+            && operand.is_pending()
+            && operand.has_operands()
             && self.failure().is_none()
     }
 
@@ -116,7 +163,7 @@ impl Structured {
 
     /// Whether this is an axis reduction (see [`Meta::geom`]), which is recorded with its own kind only.
     pub(crate) fn is_axis(&self) -> bool {
-        self.comp().meta.tag == OpTag::ReduceAxis
+        matches!(self.comp().meta.tag, OpTag::ReduceAxis(_))
     }
 
     /// Whether this axis reduction may be recorded together with others of the same lines: a plain `f32` reduction of an
@@ -128,13 +175,13 @@ impl Structured {
     /// What [`Structured::axis_mergeable`] says without the context.
     fn axis_eligible(&self) -> bool {
         let comp = self.comp();
-        let RunState::Reduce { wgsl, .. } = &comp.run;
-        comp.meta.tag == OpTag::ReduceAxis
+        let RunState::Reduce { operand, .. } = &comp.run;
+        matches!(comp.meta.tag, OpTag::ReduceAxis(_))
             && comp.meta.ty == ElemTy::F32
-            && *wgsl == "f32"
+            && self.wgsl() == "f32"
             && self.is_unforced()
-            && comp.origin.operand.is_pending()
-            && comp.origin.operand.has_operands()
+            && operand.is_pending()
+            && operand.has_operands()
             && self.failure().is_none()
     }
 
@@ -217,7 +264,7 @@ impl Structured {
 
     /// Whether this reduction would be the seed of a kernel recorded after the one of `first`, which it does not share a kernel with.
     pub(crate) fn follows(&self, ctx: &Context, first: &Structured) -> bool {
-        self.thread == first.thread && self.comp().meta.tag == OpTag::Reduce && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.mergeable(ctx)
+        self.thread == first.thread && self.comp().meta.tag.is_whole_reduce() && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.mergeable(ctx)
     }
 
     /// Starts the compiles of the kernels the reductions pending after `first_group` (this one and its `partners`) will be
@@ -270,7 +317,7 @@ impl Structured {
     /// [`strategies`]): on the host if it can run there, else on the GPU together with the reductions that are pending.
     pub(crate) fn record_reduce(&self, ctx: &Context) -> std::result::Result<Arc<Storage>, Arc<LumaError>> {
         self.forcing.store(true, Ordering::Relaxed);
-        let result = select::execute(ctx, &Subject::Reduce(self)).map(Output::into_storage).map_err(|failure| Arc::new(failure.into_error()));
+        let result = select::execute(ctx, &Subject::Comp(self)).map(Output::into_storage).map_err(|failure| Arc::new(failure.into_error()));
         self.forcing.store(false, Ordering::Relaxed);
         result
     }
@@ -291,13 +338,13 @@ impl Structured {
     pub(crate) fn record_alone(&self, emit: &mut Emit<'_>, mode: PassMode, bits: bool) -> std::result::Result<Arc<Storage>, Failure> {
         let ctx = emit.ctx();
         let comp = self.comp();
-        let RunState::Reduce { wgsl, elem, layout, finish, .. } = &comp.run;
-        let count = comp.origin.ops.as_slice().len();
-        let storage = Arc::new(Storage::new(ctx, count, *layout));
+        let RunState::Reduce { operand, wgsl, elem, layout, finish, .. } = &comp.run;
+        let ops = self.ops();
+        let storage = Arc::new(Storage::new(ctx, ops.as_slice().len(), *layout));
         let pin = storage.pin(0)?;
-        let array = Array::<u32>::from_node(ctx, Shape::from(comp.origin.operand.len()), Arc::clone(&comp.origin.operand));
+        let array = Array::<u32>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
         let mut scratch = emit.scratch();
-        reduce_into(emit, &array, bits, *elem, wgsl, comp.origin.ops, mode, &mut scratch, Some(pin.buffer()), *finish)?;
+        reduce_into(emit, &array, bits, *elem, wgsl, ops, mode, &mut scratch, Some(pin.buffer()), *finish)?;
         Ok(storage)
     }
 
@@ -355,9 +402,8 @@ impl Structured {
     pub(crate) fn signature(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         let comp = self.comp();
-        comp.origin.ops.hash(hasher);
-        comp.meta.ty.hash(hasher);
         comp.meta.tag.hash(hasher);
+        comp.meta.ty.hash(hasher);
         self.layout().is_packed().hash(hasher);
     }
 
@@ -372,7 +418,7 @@ impl Structured {
         if std::mem::size_of::<T::Repr>() == 4
             && let Some(words) = crate::host::reduced_words(self, ctx)
         {
-            return Ok(T::from_repr(bytemuck::pod_collect_to_vec(&words), comp.origin.ops.as_slice().len()));
+            return Ok(T::from_repr(bytemuck::pod_collect_to_vec(&words), self.ops().as_slice().len()));
         }
         // Read with others that are pending, in one kernel, which records them all (before the speculation, which
         // records one reduction at a time).
@@ -385,16 +431,16 @@ impl Structured {
                 let storage = result.as_ref().map_err(|error| LumaError::clone(error))?;
                 let values = match self.packed_values::<T>(ctx) {
                     Some(values) => values?,
-                    None => T::from_repr(ctx.read_storage::<T::Repr>(storage)?, comp.origin.ops.as_slice().len()),
+                    None => T::from_repr(ctx.read_storage::<T::Repr>(storage)?, self.ops().as_slice().len()),
                 };
                 // The leaves that stand for this value in expressions get its buffer, as `force` does.
                 self.force(ctx);
                 return Ok(values);
             }
         }
-        let RunState::Reduce { wgsl, buffer, finish, .. } = &comp.run;
-        let array = Array::<T>::from_node(ctx, Shape::from(comp.origin.operand.len()), Arc::clone(&comp.origin.operand));
-        reduce_array(&array, wgsl, comp.origin.ops, *finish, !*buffer)
+        let RunState::Reduce { operand, wgsl, buffer, finish, .. } = &comp.run;
+        let array = Array::<T>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
+        reduce_array(&array, wgsl, self.ops(), *finish, !*buffer)
     }
 }
 
@@ -523,13 +569,20 @@ impl Array<bool> {
 impl<T: ScalarType> Array<T> {
     pub(crate) fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
         const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
-        let result = self.run_reduce(ReduceList::new(&ops.map(Reduction::op)), name, location);
+        let result = self.run_reduce(OpTag::Reduce(ReduceList::new(&ops.map(Reduction::op))), name, location);
         Array::resolve(self.context(), Shape::from(N), result, name, location)
     }
 
-    fn run_reduce(&self, ops: ReduceList, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
+    /// A reduction of the whole array that is `tag` (`Reduce(ops)`, or `Dot` for the sum of a product).
+    pub(crate) fn reduce_tagged(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> Array<T> {
+        let shape = Shape::from(tag.op_count());
+        let result = self.run_reduce(tag, name, location);
+        Array::resolve(self.context(), shape, result, name, location)
+    }
+
+    fn run_reduce(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
-        let shape = Shape::from(ops.as_slice().len());
+        let shape = Shape::from(tag.op_count());
         let elem = T::LAYOUT.stride() as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.
@@ -551,10 +604,10 @@ impl<T: ScalarType> Array<T> {
             let ty = ElemTy::of::<T>()?;
             let len = reader.len();
             let reduced = Arc::new(Structured::new(
-                Family::Reduce(Comp {
-                    meta: Meta { ty, len, tag: OpTag::Reduce, geom: None },
-                    run: RunState::Reduce { wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
-                    origin: ReduceOrigin { operand: reader, ops },
+                Family::Comprehension(Comp {
+                    form: Mutex::new(None),
+                    meta: Meta { ty, len, tag, geom: None, launch: Launch::Now },
+                    run: RunState::Reduce { operand: reader, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
                 }),
                 ctx.recording_here(),
                 name,
@@ -564,6 +617,7 @@ impl<T: ScalarType> Array<T> {
             return Ok(Array::from_structured(ctx, shape, reduced));
         }
         // Nothing is left to fuse: record the passes now.
+        let ops = tag.reduce_list().expect("a reduction has ops");
         let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
@@ -598,12 +652,13 @@ impl<T: ScalarType> Array<T> {
         let arrays = ops
             .iter()
             .map(|&op| {
+                let ops = ReduceList::new(&[op]);
                 let comp = Comp {
-                    meta: Meta { ty: ElemTy::F32, len: reader.len(), tag: OpTag::ReduceAxis, geom: Some(geom) },
-                    run: RunState::Reduce { wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
-                    origin: ReduceOrigin { operand: Arc::clone(&reader), ops: ReduceList::new(&[op]) },
+                    form: Mutex::new(None),
+                    meta: Meta { ty: ElemTy::F32, len: reader.len(), tag: OpTag::ReduceAxis(ops), geom: Some(geom), launch: Launch::Now },
+                    run: RunState::Reduce { operand: Arc::clone(&reader), wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
                 };
-                let reduced = Arc::new(Structured::new(Family::Reduce(comp), false, name, location));
+                let reduced = Arc::new(Structured::new(Family::Comprehension(comp), false, name, location));
                 ctx.jit().register_reduction(&reduced);
                 Array::from_structured(ctx, shape, reduced)
             })
@@ -618,8 +673,8 @@ impl<T: ScalarType> Array<T> {
     pub(crate) fn fuse_step<O: ScalarType>(&self, step: EpilogueStep, word: u32) -> Option<Array<O>> {
         let reduced = self.structured()?;
         let comp = reduced.comp();
-        let RunState::Reduce { wgsl, elem, layout, buffer, finish, .. } = &comp.run;
-        if comp.meta.tag != OpTag::Reduce || *wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
+        let RunState::Reduce { operand, wgsl, elem, layout, buffer, finish, .. } = &comp.run;
+        if !comp.meta.tag.is_whole_reduce() || *wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
             return None;
         }
         if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
@@ -638,11 +693,11 @@ impl<T: ScalarType> Array<T> {
         debug_assert!(at < MAX_EPILOGUE);
         finish.words[at] = word;
         let derived = Comp {
-            meta: Meta { ty: comp.meta.ty, len: comp.meta.len, tag: OpTag::Reduce, geom: None },
-            run: RunState::Reduce { wgsl, elem: *elem, layout: *layout, buffer: *buffer, finish, solo: AtomicBool::new(false), pack: OnceLock::new() },
-            origin: ReduceOrigin { operand: Arc::clone(&comp.origin.operand), ops: comp.origin.ops },
+            form: Mutex::new(None),
+            meta: Meta { ty: comp.meta.ty, len: comp.meta.len, tag: comp.meta.tag.clone(), geom: None, launch: Launch::Now },
+            run: RunState::Reduce { operand: Arc::clone(operand), wgsl, elem: *elem, layout: *layout, buffer: *buffer, finish, solo: AtomicBool::new(false), pack: OnceLock::new() },
         };
-        let derived = Arc::new(Structured::new(Family::Reduce(derived), self.context().recording_here(), reduced.name, reduced.location));
+        let derived = Arc::new(Structured::new(Family::Comprehension(derived), self.context().recording_here(), reduced.name, reduced.location));
         self.context().jit().register_reduction(&derived);
         Some(Array::from_structured(self.context(), self.shape(), derived))
     }

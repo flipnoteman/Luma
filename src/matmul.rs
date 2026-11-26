@@ -33,6 +33,7 @@
 use std::panic::Location;
 
 use crate::array::Array;
+use crate::jit::comprehension::OpTag;
 use crate::jit::structured::contraction::{self, ContractionAttrs, Tf32Request};
 use crate::view::PadMode;
 
@@ -231,7 +232,7 @@ pub fn matmul_tt(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
 /// [`Array::dot`] as a function.
 #[track_caller]
 pub fn dot(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    (lhs * rhs).sum()
+    (lhs * rhs).reduce_tagged(OpTag::Dot, "sum", Location::caller())
 }
 
 /// [`Array::matmul`] as a function: the product of `lhs` (`[K, M]`) and `rhs` (`[N, K]`) as an

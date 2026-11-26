@@ -43,7 +43,7 @@ pub use warp::{transform_coordinates, transform_coordinates_on, TransformMatrix}
 use window::{Edge, Op, Pixel};
 
 /// What the cells outside an array are, for a filter whose window reaches past its border.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Border {
     /// Zeros.
     #[default]
@@ -71,7 +71,7 @@ impl From<PadMode> for Border {
 }
 
 /// How much of the border a convolution pads with.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Padding {
     /// None: only windows that lie inside the array; the output shrinks by `k - 1`.
     Valid,
@@ -102,7 +102,7 @@ pub enum Padding {
 /// let spec = ConvSpec::new().padding(Padding::Valid).stride([2, 2]).border(Border::Edge);
 /// # let _ = spec;
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConvSpec {
     padding: Padding,
     stride: [usize; 3],

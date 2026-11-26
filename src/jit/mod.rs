@@ -157,6 +157,7 @@ mod bits;
 pub(crate) mod assign;
 mod codegen;
 mod coarsen;
+pub(crate) mod comprehension;
 pub(crate) mod cost;
 mod inline;
 mod kirgen;

@@ -146,7 +146,7 @@ pub(crate) type SelectionCache = Mutex<FxMap<SelKey, Ranked>>;
 fn signature(subject: &Subject<'_>) -> u64 {
     let mut hasher = FxHasher::default();
     match subject {
-        Subject::Reduce(reduced) => reduced.signature(&mut hasher),
+        Subject::Comp(reduced) => reduced.signature(&mut hasher),
         Subject::Contraction(view) => view.attrs.hash(&mut hasher),
         Subject::Boundary(boundary) => {
             boundary.op.hash(&mut hasher);
