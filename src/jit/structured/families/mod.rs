@@ -17,7 +17,7 @@ use super::strategy::Boundary;
 pub(super) fn boundary<'a, 'b>(subject: &'b Subject<'a>) -> &'b Boundary<'a> {
     match subject {
         Subject::Boundary(boundary) => boundary,
-        Subject::Reduce(_) => unreachable!("a boundary family's table is only asked about boundaries"),
+        Subject::Reduce(_) | Subject::Contraction(_) => unreachable!("a boundary family's table is only asked about boundaries"),
     }
 }
 
