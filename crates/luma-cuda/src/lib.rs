@@ -10,6 +10,7 @@
 mod ptx;
 pub mod backend;
 pub mod codegen;
+mod gemm_copy;
 mod nvvm;
 mod sgemm;
 mod tensor;

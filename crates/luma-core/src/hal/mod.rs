@@ -1194,12 +1194,15 @@ pub struct LineSolveSpec {
 
 /// A matrix product that a backend may run as native code instead of compiling the tiled shader
 /// that describes it (`Builtin::Matmul` of `luma`). The launch is the shader's: the bindings `c`
-/// (written), `a` and `b` (read) and the uniform `{m, n, k, kc}` (`u32`s), one workgroup per
+/// (written), `a` and `b` (read) and the uniform `{m, n, k, kc, lda, ldb, a_off, b_off}` (`u32`s;
+/// the four words after `kc` are those of [`GemmSpec`]: leading dimensions and element offsets of
+/// the matrices in their buffers), one workgroup per
 /// output tile of `edge` x `edge` (the tiles numbered row by row along the folded grid: tile
 /// `x + y * num_workgroups.x`, column tile `tile % ceil(n / edge)`), the third grid dimension
 /// slicing K: workgroup layer `z` multiplies `K` from `z * kc` to `min(k, (z + 1) * kc)` and
 /// writes its tile of the `M x N` partial product at `z * m * n` of `c`. `a` is the row-major
-/// `M x K` matrix, `b` the row-major `K x N` one, `c` row-major `M x N`; `c` is overwritten. With
+/// `M x K` matrix (rows `lda` apart, from element `a_off`), `b` the row-major `K x N` one (rows
+/// `ldb` apart, from `b_off`), `c` dense row-major `M x N`; `c` is overwritten. With
 /// `lhs_transposed` the buffer `a` holds the row-major `K x M` matrix instead (the product reads
 /// its transpose), with `rhs_transposed` `b` holds the row-major `N x K` one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1216,9 +1219,18 @@ pub struct MatmulSpec {
 /// `Gemm` tile): on tensor cores with the operands rounded to TF32 (10 bits of mantissa) and
 /// accumulated in `f32`, or with `exact` on the ordinary cores, every output an `f32` chain of
 /// fused multiply-adds over `k` in ascending order (per slice of K). The launch is that of
-/// [`MatmulSpec`] (the bindings, the uniform `{m, n, k, kc}`, the slices of K), but one workgroup
-/// computes a tile of `rows` x `cols` outputs and the grid is `[column tiles, row tiles, slices]`
-/// (never folded). `m`, `n` and `k` are multiples of 4.
+/// [`MatmulSpec`] (the bindings, the slices of K), but one workgroup computes a tile of `rows` x
+/// `cols` outputs and the grid is `[column tiles, row tiles, slices]` (never folded).
+///
+/// The uniform is eight `u32` words, `{m, n, k, kc, lda, ldb, a_off, b_off}`: `lda` and `ldb` are
+/// the leading dimensions in elements of the matrices as the buffers hold them (the distance
+/// between the starts of their rows: `k` for an `M x K` left matrix, `m` for its transpose, `n`
+/// for a `K x N` right matrix, `k` for its transpose, in a dense product), `a_off` and `b_off`
+/// the element offsets of their first element in the buffers. `c` is dense, `[m, n]` row-major.
+/// The products of [`GemmLanes::Vec4`] need `m`, `n` and `k` and the leading dimensions and
+/// offsets to be multiples of 4 (16-byte copies); [`GemmLanes::Vec4Tails`] only the leading
+/// dimensions and offsets; [`GemmLanes::Scalar`] nothing. Every lane gives the same bits for the
+/// same slices of K.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GemmSpec {
     /// Rows of an output tile.
@@ -1231,13 +1243,33 @@ pub struct GemmSpec {
     pub rhs_transposed: bool,
     /// `f32` multiply-adds instead of TF32 tensor cores.
     pub exact: bool,
+    /// How the kernel copies the operands, and so which shapes it takes.
+    pub lanes: GemmLanes,
+}
+
+/// How a [`GemmSpec`] kernel copies its operands from global memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GemmLanes {
+    /// 16-byte copies; `m`, `n`, `k`, the leading dimensions and the offsets are multiples of 4.
+    Vec4,
+    /// 16-byte copies whose chunks that cross the edge of the matrix are cut (the rest of the chunk is zeros), and stores
+    /// that guard the edge; the leading dimensions and offsets are multiples of 4, the extents are any.
+    Vec4Tails,
+    /// 4-byte copies and stores, each guarded; any extents, leading dimensions and offsets.
+    Scalar,
 }
 
 impl GemmSpec {
     /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
-    /// transposed, in `f32` (`exact`) or TF32. Build a spec with this, not with a struct literal: the struct grows fields.
+    /// transposed, in `f32` (`exact`) or TF32, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
     pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, exact: bool) -> Self {
-        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact }
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4 }
+    }
+
+    /// The same product copying its operands with `lanes`.
+    pub const fn with_lanes(self, lanes: GemmLanes) -> Self {
+        GemmSpec { lanes, ..self }
     }
 }
 
@@ -1475,6 +1507,10 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// none.
     fn gemm_tiles(&self, _exact: bool) -> &[(u32, u32)] {
         &[]
+    }
+    /// Whether [`Backend::compile_gemm`] takes the [`GemmLanes`] other than `Vec4` (any shape, any leading dimension and offset).
+    fn gemm_ragged(&self) -> bool {
+        false
     }
     /// The code of a matrix product with one of the tiles of [`Backend::gemm_tiles`].
     fn compile_gemm(&self, _spec: &GemmSpec) -> Option<RawKernel> {

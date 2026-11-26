@@ -403,7 +403,7 @@ fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) ->
     let wmat = matmul_f32(&t1.transpose(), &wmat);
     let c = (&c - &matmul_f32(&v1, &wmat)).cache();
     let Node { qr: f2, v: v2, tau: tau2, t: t2 } = recurse(&block(&c, n1..m, 0..n2), op, loc);
-    let v1b = block(&v1, n1..m, 0..n1).cache();
+    let v1b = block(&v1, n1..m, 0..n1);
     // T12 = -T1 (V1bᵀ V2) T2.
     let z = matmul_f32(&v1b.transpose(), &v2);
     let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2));

@@ -96,7 +96,46 @@ fn shape_case(h: &mut Harness, m: usize, k: usize, n: usize, layout: u8) {
     h.case("matmul/shape", &format!("{name} {m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || run().eval().unwrap());
 }
 
+/// `(m, k, n)` of the rows for the odd-shape kernels (`LUMA_BENCH_SHAPES=odd`, `LUMA_BENCH_TF32=odd`, also run after the full lists): the
+/// odd squares with their aligned neighbours, rectangles of odd extents, and the products that keep the shader kernels (an extent below
+/// 32 or a short K), which must not get slower.
+const ODD_SHAPES: [(usize, usize, usize); 17] = [
+    (1000, 1000, 1000),
+    (1001, 1001, 1001),
+    (1024, 1024, 1024),
+    (3001, 3001, 3001),
+    (4096, 4096, 4096),
+    (4097, 4097, 4097),
+    (1537, 513, 255),
+    (4097, 1001, 129),
+    (10, 4096, 4096),
+    (4096, 4096, 10),
+    (4096, 10, 4096),
+    (4096, 31, 4096),
+    (4096, 33, 4096),
+    (2001, 37, 2001),
+    (1024, 16, 1024),
+    (257, 259, 261),
+    (131, 67, 4001),
+];
+
 pub fn run(h: &mut Harness) {
+    if !h.ctx.is_cpu() && std::env::var("LUMA_BENCH_SHAPES").as_deref() == Ok("odd") {
+        h.guarded("matmul", |h| {
+            for &(m, k, n) in &ODD_SHAPES {
+                shape_case(h, m, k, n, 0);
+            }
+        });
+        return;
+    }
+    if !h.ctx.is_cpu() && std::env::var("LUMA_BENCH_TF32").as_deref() == Ok("odd") {
+        h.guarded("matmul", |h| {
+            for &(m, k, n) in &ODD_SHAPES {
+                tf32_pair(h, m, k, n, 0);
+            }
+        });
+        return;
+    }
     if !h.ctx.is_cpu() && std::env::var_os("LUMA_BENCH_SHAPES").is_some() {
         h.guarded("matmul", |h| {
             let small = std::env::var("LUMA_BENCH_SHAPES").as_deref() == Ok("small");
@@ -111,6 +150,11 @@ pub fn run(h: &mut Harness) {
             };
             for &(m, k, n) in shapes {
                 shape_case(h, m, k, n, 0);
+            }
+            if !small {
+                for &(m, k, n) in &ODD_SHAPES {
+                    shape_case(h, m, k, n, 0);
+                }
             }
             for layout in [1, 2] {
                 shape_case(h, 1024, 1024, 1024, layout);
@@ -138,6 +182,9 @@ pub fn run(h: &mut Harness) {
             }
             // Attention: Q K^T (K = head width) and P V (K = tokens).
             for (m, k, n) in [(2048, 64, 2048), (4096, 128, 4096), (2048, 2048, 64), (4096, 4096, 128)] {
+                tf32_pair(h, m, k, n, 0);
+            }
+            for &(m, k, n) in &ODD_SHAPES {
                 tf32_pair(h, m, k, n, 0);
             }
             for layout in [1, 2] {

@@ -431,8 +431,12 @@ impl CpuBackend {
             CpuKernel::Compiled(compiled) => compiled,
             CpuKernel::Matmul(product) => {
                 let uniform = bindings.last().ok_or_else(|| invalid("a matrix product without its uniform"))?;
-                // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
-                let words = unsafe { uniform.cast::<[u32; 4]>().read() };
+                // The uniform's storage is 16-byte aligned and padded to what the launch passed (see `sizes`): the words need 32 bytes.
+                if binding_bytes.last().is_none_or(|&bytes| bytes < 4 * crate::gemm::UNIFORM_WORDS as u64) {
+                    return Err(invalid("a matrix product's uniform of fewer than eight words"));
+                }
+                // SAFETY: just checked: the storage holds the eight words.
+                let words = unsafe { uniform.cast::<[u32; crate::gemm::UNIFORM_WORDS]>().read() };
                 product.validate(&binding_bytes, words, workgroups)?;
                 let start = Instant::now();
                 self.pool.dispatch_native(

@@ -1090,6 +1090,9 @@ impl Context {
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
                                 Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact)))
                             }
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
+                                Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes)))
+                            }
                             Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
                             _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
                         };

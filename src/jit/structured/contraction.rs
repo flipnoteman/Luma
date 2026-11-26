@@ -1,13 +1,14 @@
 //! The contraction family's strategies: the branches `matmul::run` chose between with `if`s, one strategy each, and the plan
-//! functions they run with (moved here from `matmul.rs`). Table order is the old priority chain: host, narrow `N` (padded), tensor
-//! cores in TF32, the backend's own `f32` tiles, the CPU's native product, skinny, tiled. Every one is a baseline (it exists at
-//! f0e5723) and its own rank group; none has a cost in this part, so selection is the priority chain (checked by the Decision log).
+//! functions they run with (moved here from `matmul.rs`). Table order is the priority chain: host, tensor cores in TF32 (the
+//! aligned kernels, then the ragged and padded ones for any other shape), the backend's own `f32` tiles (likewise), the CPU's
+//! native product, skinny, tiled. The aligned ones, the CPU's, skinny and tiled are baselines, each its own rank group; the ragged
+//! and the padded kernel of one precision share a group and are ranked by cost (same bits, so either may stand in for the other).
 
 use std::panic::Location;
 use std::sync::Arc;
 
 use super::emit::Emit;
-use super::strategy::{BitClass, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+use super::strategy::{BitClass, Estimate, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::caps::Caps;
@@ -21,6 +22,8 @@ use crate::numerics::Reduced;
 use crate::ops::{fold_grid, Outcome};
 use crate::shape::Shape;
 use crate::tuning::Tuning;
+use crate::view::PadMode;
+use luma_core::{CostModel, GemmLanes};
 
 // -- the value --
 
@@ -115,10 +118,8 @@ pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, l
     let view = ContractionView { lhs, rhs, attrs, location };
     let geom = view.check()?;
     let ctx = lhs.context();
-    match select::execute(ctx, &Subject::Contraction(&view))? {
-        Output::Storage(storage) => Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage)),
-        Output::Array(array) => Ok(*array),
-    }
+    let Output::Storage(storage) = select::execute(ctx, &Subject::Contraction(&view))?;
+    Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage))
 }
 
 // -- what a strategy runs with --
@@ -132,15 +133,91 @@ pub(crate) struct ContractionParams {
     pub(crate) geom: Geometry,
 }
 
+/// How an operand of a native product sits in its buffer: whether the buffer holds the transpose of the matrix, the leading dimension
+/// (the distance in elements between the starts of its rows) and the element offset of its first element.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Layout {
+    pub(crate) transposed: bool,
+    pub(crate) ld: u32,
+    pub(crate) off: u32,
+}
+
+impl Layout {
+    /// Whether 16-byte copies can read the operand: the leading dimension and the offset are multiples of 4.
+    fn vector_aligned(self) -> bool {
+        self.ld.is_multiple_of(4) && self.off.is_multiple_of(4)
+    }
+}
+
+/// The extent of the first axis of `array`, which is its leading dimension when it is stored densely.
+fn first_axis(array: &Array<f32>) -> u32 {
+    u32::try_from(array.shape().dims()[0]).unwrap_or(u32::MAX)
+}
+
+/// How `array` is read as an operand of a native product, without evaluating anything: a window of a stored matrix in place, else a
+/// dense buffer of the array's own shape. Pure.
+fn layout(array: &Array<f32>) -> Layout {
+    match matrix_window(array) {
+        Some(window) => Layout { transposed: window.transposed, ld: window.ld, off: window.offset },
+        None => Layout { transposed: false, ld: first_axis(array), off: 0 },
+    }
+}
+
+/// Whether `by` is a padded strategy: it copies the operands that are not 16-byte aligned.
+fn is_padded(by: StrategyId) -> bool {
+    matches!(by, StrategyId::GEMM_TF32_PADDED | StrategyId::GEMM_F32_PADDED)
+}
+
+/// Whether `by` multiplies in `f32` (else TF32).
+fn is_exact(by: StrategyId) -> bool {
+    matches!(by, StrategyId::GEMM_F32 | StrategyId::GEMM_F32_RAGGED | StrategyId::GEMM_F32_PADDED)
+}
+
+/// The operands of the strategy `by` that are copied before the product: those the padded kernels cannot read in place.
+fn copies(view: &ContractionView<'_>, by: StrategyId) -> [bool; 2] {
+    [view.lhs, view.rhs].map(|array| is_padded(by) && !layout(array).vector_aligned())
+}
+
+/// The layouts the strategy `by` reads the operands with: the arrays' own, except the copies (dense, a leading dimension rounded
+/// up to 4). Pure.
+fn read_layouts(view: &ContractionView<'_>, by: StrategyId) -> [Layout; 2] {
+    let copied = copies(view, by);
+    let mut layouts = [layout(view.lhs), layout(view.rhs)];
+    for ((layout, copied), array) in layouts.iter_mut().zip(copied).zip([view.lhs, view.rhs]) {
+        if copied {
+            *layout = Layout { transposed: false, ld: first_axis(array).next_multiple_of(4), off: 0 };
+        }
+    }
+    layouts
+}
+
+/// `plan` for a kernel that copies its operands with `lanes`.
+fn with_lanes(plan: Plan, lanes: GemmLanes) -> Plan {
+    match plan.tile {
+        MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact } => Plan { tile: MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact, lanes }, ..plan },
+        _ => plan,
+    }
+}
+
 /// The plan of the strategy `params.by` for its product, `transposed` saying which operands are read as the transpose of the buffer
-/// they are views of (see [`transposed_source`]; it is the tile's, not the cut's): `None` where the strategy has none (the host,
-/// the padding), the error of the plan function (a grid too large) otherwise. Pure.
+/// they are views of (see [`matrix_window`]; it is the tile's, not the cut's): `None` where the strategy has none (the host),
+/// the error of the plan function (a grid too large) otherwise. Pure.
 fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams, transposed: [bool; 2]) -> Option<Result<Plan, LumaError>> {
     let Geometry { m, n, k } = params.geom;
     let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
+    let finish = |plan: Result<Plan, LumaError>, lanes: Option<GemmLanes>| Some(match lanes {
+        Some(lanes) => plan.map(|plan| with_lanes(plan, lanes)),
+        None => plan,
+    });
+    let tensor = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(false), transposed, false, groups, bytes), lanes);
+    let f32_tiles = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(true), transposed, true, groups, bytes), lanes);
     match params.by {
-        StrategyId::GEMM_TF32 => Some(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(false), transposed, false, groups, bytes)),
-        StrategyId::GEMM_F32 => Some(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(true), transposed, true, groups, bytes)),
+        StrategyId::GEMM_TF32 => tensor(None),
+        StrategyId::GEMM_TF32_RAGGED => tensor(Some(GemmLanes::Scalar)),
+        StrategyId::GEMM_TF32_PADDED => tensor(Some(GemmLanes::Vec4Tails)),
+        StrategyId::GEMM_F32 => f32_tiles(None),
+        StrategyId::GEMM_F32_RAGGED => f32_tiles(Some(GemmLanes::Scalar)),
+        StrategyId::GEMM_F32_PADDED => f32_tiles(Some(GemmLanes::Vec4Tails)),
         StrategyId::CONTRACTION_NATIVE_CPU => Some(native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)),
         StrategyId::CONTRACTION_SKINNY => skinny_plan(m, n, k, along_k(view.lhs, params.geom), groups, bytes).map(Ok),
         StrategyId::CONTRACTION_TILED => Some(tiled_plan(ctx.tuning(), m, n, k, groups, bytes)),
@@ -152,7 +229,6 @@ fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams
 pub(crate) fn label(params: &ContractionParams, subject: &Subject<'_>, ctx: &Context) -> String {
     match params.by {
         StrategyId::CONTRACTION_HOST => "host".to_string(),
-        StrategyId::GEMM_NARROW_N => format!("padded n={} to {}", params.geom.n, params.geom.n.next_multiple_of(4)),
         _ => match view(subject).and_then(|view| plan_of(view, ctx, params, [false; 2])) {
             Some(Ok(plan)) => plan_label(&plan),
             Some(Err(_)) => "grid too large".to_string(),
@@ -177,36 +253,55 @@ fn along_k(lhs: &Array<f32>, geom: Geometry) -> bool {
     lhs.pending().is_none_or(|node| jit::stored_along_k(&MatmulSide::Pending(Arc::clone(node)), [geom.k, geom.m]))
 }
 
-/// The tensor-core tiles the product runs on, if it is one that does.
+/// Whether the product runs on tensor cores where the device has them: the numerics ask for TF32 and the device can.
+fn tf32_here(view: &ContractionView<'_>, ctx: &Context) -> bool {
+    view.wants_tf32(ctx) && ctx.caps().contains(Caps::TF32)
+}
+
+/// The tensor-core tiles the product runs on in its aligned kernels, if it is one that does.
 fn tensor_tiles<'c>(view: &ContractionView<'_>, ctx: &'c Context) -> &'c [(u32, u32)] {
-    if view.wants_tf32(ctx) && ctx.caps().contains(Caps::TF32) && gemm_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(false) } else { &[] }
+    if tf32_here(view, ctx) && aligned_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(false) } else { &[] }
+}
+
+/// Whether the operands' leading dimensions and offsets are multiples of 4: what the aligned kernels (and the 16-byte lanes) read.
+fn aligned_operands(view: &ContractionView<'_>) -> bool {
+    layout(view.lhs).vector_aligned() && layout(view.rhs).vector_aligned()
 }
 
 // -- the table --
 
 impl StrategyId {
     pub(crate) const CONTRACTION_HOST: StrategyId = StrategyId(FamilyTag::Contraction, 0);
-    pub(crate) const GEMM_NARROW_N: StrategyId = StrategyId(FamilyTag::Contraction, 1);
-    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 2);
-    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 3);
-    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 4);
-    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 5);
-    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
+    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 1);
+    pub(crate) const GEMM_TF32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 2);
+    pub(crate) const GEMM_TF32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 3);
+    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 4);
+    pub(crate) const GEMM_F32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 5);
+    pub(crate) const GEMM_F32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
+    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 7);
+    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 8);
+    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 9);
 }
 
 /// The products' table, in preference order.
-pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 7] = [
-    // The host's sums differ from the device's: its own bit class. The backend's own `f32` kernels and the skinny ones read the
-    // operands' state (`FitsInputs::OPERANDS`); the others only the shape, the numerics and the device.
-    entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, NumClass::Exact, 1, fits_host, lower_host),
-    entry(StrategyId::GEMM_NARROW_N, "gemm-narrow-n", Caps::GEMM_TILES, FitsInputs::NONE, NumClass::Exact, 2, fits_narrow_n, lower_narrow_n),
-    entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, FitsInputs::NONE, NumClass::Reduced(Reduced::TF32_MATMUL), 3, fits_gemm_tf32, lower_gemm),
-    entry(StrategyId::GEMM_F32, "gemm-f32", Caps::GEMM_TILES, FitsInputs::OPERANDS, NumClass::Exact, 4, fits_gemm_f32, lower_gemm),
-    entry(StrategyId::CONTRACTION_NATIVE_CPU, "native-cpu", Caps::NATIVE_GEMM, FitsInputs::NONE, NumClass::Exact, 5, fits_native_cpu, lower_gemm),
-    entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 6, fits_skinny, lower_skinny),
-    entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), FitsInputs::NONE, NumClass::Exact, 7, fits_tiled, lower_tiled),
+pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 10] = [
+    // The host's sums differ from the device's: its own bit class. The backend's own kernels and the skinny ones read the
+    // operands' state (`FitsInputs::OPERANDS`); the others only the shape, the numerics and the device. The aligned, the ragged and
+    // the padded kernels of one precision give the same bits for the same plan: one class each (3: TF32, 4: `f32`).
+    entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, NumClass::Exact, 1, 0, fits_host, lower_host),
+    entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, FitsInputs::OPERANDS, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 1, fits_gemm_tf32, lower_gemm),
+    cut(StrategyId::GEMM_TF32_RAGGED, "gemm-tf32-ragged", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_ragged),
+    cut(StrategyId::GEMM_TF32_PADDED, "gemm-tf32-padded", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_padded),
+    entry(StrategyId::GEMM_F32, "gemm-f32", Caps::GEMM_TILES, FitsInputs::OPERANDS, NumClass::Exact, 4, 3, fits_gemm_f32, lower_gemm),
+    cut(StrategyId::GEMM_F32_RAGGED, "gemm-f32-ragged", Caps::GEMM_TILES, NumClass::Exact, 4, 4, fits_gemm_f32_ragged),
+    cut(StrategyId::GEMM_F32_PADDED, "gemm-f32-padded", Caps::GEMM_TILES, NumClass::Exact, 4, 4, fits_gemm_f32_padded),
+    entry(StrategyId::CONTRACTION_NATIVE_CPU, "native-cpu", Caps::NATIVE_GEMM, FitsInputs::NONE, NumClass::Exact, 5, 5, fits_native_cpu, lower_gemm),
+    entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 6, 6, fits_skinny, lower_skinny),
+    entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), FitsInputs::NONE, NumClass::Exact, 7, 7, fits_tiled, lower_tiled),
 ];
 
+/// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
+/// first of the table that fits runs.
 #[allow(clippy::too_many_arguments)]
 const fn entry(
     id: StrategyId,
@@ -215,11 +310,33 @@ const fn entry(
     reads: FitsInputs,
     numerics: NumClass,
     bits: u16,
+    group: u8,
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    // Every entry is its own group (`group` = its place in the table): the first that fits runs.
-    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group: id.1, prologue: false, epilogue: false, reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+}
+
+/// A ragged or a padded kernel: new in this part, so not a baseline (its kernel may be compiling, or over the variant budget: the
+/// call then blocks on the compile, as nothing of its bit class can stand in), ranked by cost against the other of its group.
+const fn cut(id: StrategyId, name: &'static str, needs: Caps, numerics: NumClass, bits: u16, group: u8, fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>) -> Strategy {
+    Strategy {
+        id,
+        name,
+        needs,
+        numerics,
+        bits: BitClass(bits),
+        baseline: false,
+        group,
+        prologue: false,
+        epilogue: false,
+        reads: FitsInputs::OPERANDS,
+        fits,
+        cost: Some(cost_cut),
+        split: split_global,
+        warm: warm_cut,
+        lower: Some(lower_gemm),
+    }
 }
 
 fn split_global(_: &Subject<'_>, _: &Params) -> SplitClass {
@@ -278,41 +395,12 @@ fn lower_host(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Re
     }
 }
 
-// -- narrow N --
-
-/// The product of a few columns that is not a multiple of 4 (the 10 classes of a classifier head), padded with zero columns up
-/// to one on the backend's own kernels and sliced back.
-fn fits_narrow_n(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
-    let view = view(subject)?;
-    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF {
-        return None;
-    }
-    let geom = view.geometry()?;
-    let (k, m, n) = (geom.k as usize, geom.m as usize, geom.n as usize);
-    if n.is_multiple_of(4) || !(2..GEMM_MIN_EXTENT).contains(&n) || !(SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) || !m.is_multiple_of(4) || k < GEMM_MIN_EXTENT || !k.is_multiple_of(4) {
-        return None;
-    }
-    if if view.wants_tf32(ctx) { !ctx.caps().contains(Caps::TF32) } else { ctx.hal().gemm_tiles(true).is_empty() } {
-        return None;
-    }
-    Some(params(StrategyId::GEMM_NARROW_N, geom))
-}
-
-/// Pads the right operand with zero columns (an expression, evaluated first like any other: a copy of a few thousand elements),
-/// runs the product again (which now takes the backend's kernels) and returns a lazy view of the columns that are not padding.
-fn lower_narrow_n(subject: &Subject<'_>, params: &Params, _: &mut Emit<'_>) -> Result<Lowered, Failure> {
-    let (Some(view), Params::Contraction(params)) = (view(subject), params) else { return Ok(Lowered::Declined) };
-    let n = params.geom.n as usize;
-    let wide = crate::matmul::with_zero_columns(view.rhs, n.next_multiple_of(4) - n);
-    let out = run(view.lhs, &wide, view.attrs, view.location)?;
-    Ok(Lowered::Done(Output::Array(Box::new(out.slice(0, ..n)))))
-}
-
 // -- the backend's own kernels --
 
+/// The aligned tensor-core kernels: the shapes of [`aligned_shape`] with operands the 16-byte copies can read.
 fn fits_gemm_tf32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let view = view(subject)?;
-    if tensor_tiles(view, ctx).is_empty() {
+    if tensor_tiles(view, ctx).is_empty() || !aligned_operands(view) {
         return None;
     }
     Some(params(StrategyId::GEMM_TF32, view.geometry()?))
@@ -326,7 +414,7 @@ fn fits_gemm_f32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
         return None;
     }
     let geom = view.geometry()?;
-    if gemm_shape(view.lhs, view.rhs).is_none() || !tensor_tiles(view, ctx).is_empty() {
+    if aligned_shape(view.lhs, view.rhs).is_none() || !tensor_tiles(view, ctx).is_empty() {
         return None;
     }
     if !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
@@ -335,7 +423,97 @@ fn fits_gemm_f32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
     if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() || ctx.hal().gemm_tiles(true).is_empty() {
         return None;
     }
+    if !aligned_operands(view) {
+        return None;
+    }
     Some(params(StrategyId::GEMM_F32, geom))
+}
+
+/// Smallest product (multiply-adds) that runs on a ragged or a padded kernel: below it the shader kernels' launch is as cheap.
+const RAGGED_MIN_FMAS: u64 = 1 << 20;
+/// What the 4-byte lanes of a ragged kernel reach of the rate of the 16-byte ones (to be set from the bench rows of the gate).
+const RAGGED_LANE_FACTOR: f64 = 0.6;
+/// Measured rates of the backend's own kernels at 4096^3 on an RTX 3090, in flops per nanosecond, scaled by the device's
+/// `f32_ops_per_ns` against the 3090's calibration.
+const GEMM_F32_FLOPS_PER_NS: f64 = 22_900.0;
+const GEMM_TF32_FLOPS_PER_NS: f64 = 27_900.0;
+
+/// The products of any shape (and leading dimension and offset) that the backend's own kernels take: `exact` in `f32`, else TF32.
+/// Not the skinny shapes (their shader kernels read the operands once), the products below [`GEMM_MIN_EXTENT`] on a side (a tile
+/// would be mostly padding: the same bounds as the aligned kernels, see [`aligned_shape`]), nor those below [`RAGGED_MIN_FMAS`].
+fn ragged_fits(subject: &Subject<'_>, ctx: &Context, by: StrategyId) -> Option<Params> {
+    let view = view(subject)?;
+    let exact = is_exact(by);
+    if !ctx.hal().gemm_ragged() || ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || tf32_here(view, ctx) == exact {
+        return None;
+    }
+    let geom = view.geometry()?;
+    let (m, n, k) = (geom.m as usize, geom.n as usize, geom.k as usize);
+    let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
+    if m < GEMM_MIN_EXTENT || n < few_columns || k < GEMM_MIN_EXTENT || (m as u64) * (n as u64) * (k as u64) < RAGGED_MIN_FMAS {
+        return None;
+    }
+    if ctx.hal().gemm_tiles(exact).is_empty() || !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
+        return None;
+    }
+    if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() {
+        return None;
+    }
+    Some(params(by, geom))
+}
+
+fn fits_gemm_tf32_ragged(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    ragged_fits(subject, ctx, StrategyId::GEMM_TF32_RAGGED)
+}
+
+fn fits_gemm_tf32_padded(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    ragged_fits(subject, ctx, StrategyId::GEMM_TF32_PADDED)
+}
+
+fn fits_gemm_f32_ragged(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    ragged_fits(subject, ctx, StrategyId::GEMM_F32_RAGGED)
+}
+
+fn fits_gemm_f32_padded(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    ragged_fits(subject, ctx, StrategyId::GEMM_F32_PADDED)
+}
+
+/// Nanoseconds a ragged or a padded kernel is expected to take: its launch, the copies the padded one makes (one kernel for both
+/// operands, a read and a write of each), and the product at the rate of its tile (see [`f32_tile_rate`]) times the share of
+/// that rate the lanes reach ([`RAGGED_LANE_FACTOR`] for the 4-byte ones).
+fn cost_cut(subject: &Subject<'_>, params: &Params, ctx: &Context, _: &Residencies) -> Estimate {
+    let (Some(view), Params::Contraction(params)) = (view(subject), params) else { return Estimate { ns: f64::INFINITY, measured: false } };
+    let Geometry { m, n, k } = params.geom;
+    let by = params.by;
+    let model = ctx.cost_model();
+    let layouts = read_layouts(view, by);
+    let ns = plan_of(view, ctx, params, layouts.map(|layout| layout.transposed)).and_then(Result::ok).map_or(f64::INFINITY, |plan| {
+        let (rows, cols) = plan.tile.edges();
+        let tiles = f64::from(m.div_ceil(rows)) * f64::from(n.div_ceil(cols));
+        let useful = f64::from(m) * f64::from(n) / (tiles * f64::from(rows * cols));
+        let workgroups = plan.groups.iter().fold(1u32, |all, &g| all.saturating_mul(g));
+        let base = if is_exact(by) { GEMM_F32_FLOPS_PER_NS } else { GEMM_TF32_FLOPS_PER_NS };
+        let rate = base * f32_tile_rate((rows, cols), workgroups, ctx.tuning().compute_units, useful) * model.f32_ops_per_ns / CostModel::NVIDIA.f32_ops_per_ns;
+        let flops = 2.0 * f64::from(m) * f64::from(n) * f64::from(k);
+        let lanes = if is_padded(by) { 1.0 } else { RAGGED_LANE_FACTOR };
+        let mut ns = model.launch_us * 1e3 + flops / (rate * lanes);
+        let copied = copies(view, by);
+        let copy_elems: u64 = [(copied[0], u64::from(m) * u64::from(k)), (copied[1], u64::from(n) * u64::from(k))].into_iter().filter(|&(copied, _)| copied).map(|(_, elems)| elems).sum();
+        if copy_elems > 0 {
+            ns += model.launch_us * 1e3 + (8 * copy_elems) as f64 / model.bandwidth_gbs;
+        }
+        ns
+    });
+    Estimate { ns, measured: false }
+}
+
+/// Starts compiling the kernel of a ragged or a padded product.
+fn warm_cut(subject: &Subject<'_>, params: &Params, ctx: &Context) -> Result<Warm, Failure> {
+    let Some((view, params)) = lowering(subject, params) else { return Ok(Warm { kernels: Vec::new() }) };
+    let layouts = read_layouts(view, params.by);
+    let Some(plan) = plan_or_decline(view, ctx, &params, layouts.map(|layout| layout.transposed))? else { return Ok(Warm { kernels: Vec::new() }) };
+    let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;
+    Ok(Warm { kernels: vec![core] })
 }
 
 /// The CPU's native product.
@@ -348,13 +526,25 @@ fn fits_native_cpu(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Opt
 }
 
 /// A product the backend multiplies as native code (its own tiles, or the CPU's): the operands are evaluated first and read as
-/// stored.
+/// stored, windows of stored matrices in place (`native_sides`); the padded kernels first copy the operands their 16-byte copies
+/// cannot read.
 fn lower_gemm(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
     let ctx = emit.ctx();
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
-    let (sides, transposed) = native_sides(ctx, view.lhs, view.rhs)?;
-    let Some(plan) = plan_or_decline(view, ctx, &params, transposed)? else { return Ok(Lowered::Declined) };
-    done(launch(ctx, sides, plan, params.geom)?)
+    let copied = copies(view, params.by);
+    let (lhs_copy, rhs_copy) = (copied[0].then(|| padded_copy(view.lhs)), copied[1].then(|| padded_copy(view.rhs)));
+    let (lhs, rhs) = (lhs_copy.as_ref().unwrap_or(view.lhs), rhs_copy.as_ref().unwrap_or(view.rhs));
+    let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
+    let Some(plan) = plan_or_decline(view, ctx, &params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
+    done(launch(ctx, sides, plan, params.geom, Some(layouts))?)
+}
+
+/// `array` in a buffer of its own whose leading dimension is a multiple of 4: zero columns appended to its first axis (an expression,
+/// evaluated first together with the other operand's), or a plain copy where the axis is one already and only the offset was not.
+fn padded_copy(array: &Array<f32>) -> Array<f32> {
+    let first = array.shape().dims()[0];
+    let extra = first.next_multiple_of(4) - first;
+    if extra > 0 { array.pad([(0, extra), (0, 0)], PadMode::Zero) } else { array.cache() }
 }
 
 // -- the shader kernels --
@@ -395,7 +585,7 @@ fn lower_skinny(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> 
             sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
         }
     }
-    done(launch(ctx, sides, plan, geom)?)
+    done(launch(ctx, sides, plan, geom, None)?)
 }
 
 /// The staged tiles: always (the plan fails only when the grid is too large, which `lower` reports).
@@ -409,15 +599,36 @@ fn lower_tiled(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> R
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
     let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
     let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
-    done(launch(ctx, sides, plan, params.geom)?)
+    done(launch(ctx, sides, plan, params.geom, None)?)
 }
 
 // -- launch --
 
+/// The last element of a `rows x cols` matrix stored with `ld` columns from `off`, one past it: what the kernels index with 32 bits.
+fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
+    if rows == 0 || cols == 0 { 0 } else { u64::from(off) + u64::from(rows - 1) * u64::from(ld) + u64::from(cols) }
+}
+
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
-fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry) -> Result<Arc<Storage>, Failure> {
+/// `layouts` are the operands' leading dimensions and offsets for the backend's own kernels (which read eight words of uniform),
+/// `None` for the shader kernels.
+fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<[Layout; 2]>) -> Result<Arc<Storage>, Failure> {
     let Geometry { m: m32, n: n32, k: k32 } = geom;
     let len = Shape::from([n32 as usize, m32 as usize, 1, 1]).validate()?;
+    let words = match layouts {
+        Some([lhs, rhs]) => {
+            // The kernels index their operands with 32 bits.
+            let (a_extent, b_extent) = (
+                if lhs.transposed { extent(lhs.off, k32, m32, lhs.ld) } else { extent(lhs.off, m32, k32, lhs.ld) },
+                if rhs.transposed { extent(rhs.off, n32, k32, rhs.ld) } else { extent(rhs.off, k32, n32, rhs.ld) },
+            );
+            if a_extent > u64::from(u32::MAX) || b_extent > u64::from(u32::MAX) {
+                return Err(LumaError::DimensionTooLarge { shape: [n32 as usize, m32 as usize, 1, 1] }.into());
+            }
+            Some([lhs.ld, rhs.ld, lhs.off, rhs.off])
+        }
+        None => None,
+    };
     let out_storage = Arc::new(Storage::new(ctx, len, ElemLayout::plain(4)));
     let out_pin = out_storage.pin_single()?;
     let out_bytes = out_storage.byte_len();
@@ -428,7 +639,15 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry) -> 
         None => (out_pin.buffer(), out_bytes),
     };
     let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: 0 };
-    jit::matmul(ctx, sides, kernel, [m32, n32, k32, plan.kc], plan.groups, RawArg::write(target, target_bytes))?;
+    let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0];
+    let words = match words {
+        Some(extra) => {
+            uniform[4..].copy_from_slice(&extra);
+            &uniform[..]
+        }
+        None => &uniform[..4],
+    };
+    jit::matmul(ctx, sides, kernel, words, plan.groups, RawArg::write(target, target_bytes))?;
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
         let slices = [plan.slices];
@@ -680,10 +899,10 @@ const SMALL_N_MAX_M: usize = 4096;
 /// (`train/sgd_small`, `adam_small` of the `ml` suite, batch 64, 11 % slower on an RTX 3080 Laptop).
 const SMALL_N_MIN_M: usize = 128;
 
-/// The `M`, `N` and `K` of the product of `lhs` and `rhs` if the backend's own kernels take its
+/// The `M`, `N` and `K` of the product of `lhs` and `rhs` if the backend's aligned kernels take its
 /// shapes: all multiples of 4 and at least [`GEMM_MIN_EXTENT`] (the extents are checked again by
 /// [`run`]).
-fn gemm_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> Option<[u32; 3]> {
+fn aligned_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> Option<[u32; 3]> {
     let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
     let ok = |extent: usize, least: usize| u32::try_from(extent).ok().filter(|_| extent >= least && extent.is_multiple_of(4));
     if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
@@ -812,39 +1031,50 @@ fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &
     Ok(Plan { tile: MatmulTile::Gemm { rows, cols, lhs_t: transposed[0], rhs_t: transposed[1], exact }, aligned: false, split: slices > 1, slices, kc, groups })
 }
 
-/// The operand of a native product that is a transposed view (a swap of axes 0 and 1, see
-/// `host::transposed_source`): what it is the transpose of, so that the product reads that
-/// buffer through its strides instead of the view being copied.
-fn transposed_source(array: &Array<f32>) -> Option<Src> {
+/// A matrix operand that is a window of a stored matrix: the source buffer (or the expression that computes it), where the matrix
+/// starts in it (`offset`, in elements), the leading dimension of the source (`ld`) and whether the buffer holds the transpose.
+pub(crate) struct MatrixWindow {
+    pub(crate) src: Src,
+    pub(crate) offset: u32,
+    pub(crate) ld: u32,
+    pub(crate) transposed: bool,
+}
+
+/// The window of a stored matrix that `array` is, if it is one: a view of a buffer (or of a pending expression) that keeps the two
+/// axes, in order or swapped, each stepping by one, with a start on each, so that a product reads the buffer through a leading
+/// dimension and an offset instead of the view being copied (a block of a matrix, its transpose, a block of a block: the maps of
+/// views compose). A full swap with no offset is the special case this replaced. Pure: nothing is evaluated.
+pub(crate) fn matrix_window(array: &Array<f32>) -> Option<MatrixWindow> {
     let node = array.pending()?;
     let op = node.op();
     let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = op.kind else { return None };
     let unit = |from: u8| AxisMap { from, start: 0, step: 1 };
-    let swaps = op.ty == ElemTy::F32
-        && map.axes[0] == unit(1)
-        && map.axes[1] == unit(0)
-        && map.axes[2] == unit(2)
-        && map.axes[3] == unit(3)
-        && map.src[0] == map.out[1]
-        && map.src[1] == map.out[0]
-        && map.src[2..] == [1, 1]
-        && map.out[2..] == [1, 1];
-    if !swaps || node.failure().is_some() || node.is_looped() {
+    if op.ty != ElemTy::F32 || map.axes[2] != unit(2) || map.axes[3] != unit(3) || map.src[2..] != [1, 1] || map.out[2..] != [1, 1] {
         return None;
     }
+    // `axes[i]` is source axis `i`: it reads the output axis `from`.
+    let [first, second] = [map.axes[0], map.axes[1]];
+    let transposed = match (first.from, second.from) {
+        (0, 1) => false,
+        (1, 0) => true,
+        _ => return None,
+    };
+    if first.step != 1 || second.step != 1 || first.start < 0 || second.start < 0 || node.failure().is_some() || node.is_looped() {
+        return None;
+    }
+    let offset = u32::try_from(i64::from(first.start) + i64::from(map.src[0]) * i64::from(second.start)).ok()?;
     let [source, ..] = node.operands()?;
-    matches!(source, Src::Buffer(_) | Src::Node(_)).then_some(source)
+    matches!(source, Src::Buffer(_) | Src::Node(_)).then_some(MatrixWindow { src: source, offset, ld: map.src[0], transposed })
 }
 
-/// The operands of a product that is multiplied natively, with whether each is read transposed:
-/// the native product reads buffers, so the operands that are expressions (or the expressions a
-/// transposed view reads) are evaluated first, together, sharing what they read.
-fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([MatmulSide; 2], [bool; 2])> {
+/// The operands of a product that is multiplied natively, with how each sits in its buffer: the native product reads buffers, so
+/// the operands that are expressions (or the expressions a window reads) are evaluated first, together, sharing what they read; a
+/// window of a stored matrix is read where it is, through its leading dimension and offset.
+fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([MatmulSide; 2], [Layout; 2])> {
     // A poisoned operand reports its own error.
-    let mut sources = [None, None];
-    for (array, source) in [lhs, rhs].into_iter().zip(&mut sources) {
-        *source = transposed_source(array);
-        match (&*source, array.pending()) {
+    let windows = [matrix_window(lhs), matrix_window(rhs)];
+    for (array, window) in [lhs, rhs].into_iter().zip(&windows) {
+        match (window.as_ref().map(|window| &window.src), array.pending()) {
             (Some(Src::Node(node)), _) if node.is_pending() => array.context().jit().request(node),
             (Some(_), _) => {}
             (None, Some(node)) => array.context().jit().request(node),
@@ -856,20 +1086,22 @@ fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([
     }
     ctx.jit().evaluate_requested();
     let mut sides = Vec::with_capacity(2);
-    for (array, source) in [lhs, rhs].into_iter().zip(sources) {
-        let (storage, transposed) = match source {
-            Some(Src::Buffer(storage)) => (storage, true),
-            Some(Src::Node(node)) => (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), true),
+    for (array, window) in [lhs, rhs].into_iter().zip(windows) {
+        let (storage, layout) = match window {
+            Some(MatrixWindow { src: Src::Buffer(storage), offset, ld, transposed }) => (storage, Layout { transposed, ld, off: offset }),
+            Some(MatrixWindow { src: Src::Node(node), offset, ld, transposed }) => {
+                (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), Layout { transposed, ld, off: offset })
+            }
             _ => {
                 let (pin, bytes) = array.ready()?;
-                sides.push((MatmulSide::Ready(pin, bytes), false));
+                sides.push((MatmulSide::Ready(pin, bytes), Layout { transposed: false, ld: first_axis(array), off: 0 }));
                 continue;
             }
         };
-        sides.push((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), transposed));
+        sides.push((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), layout));
     }
-    let [(lhs_side, lhs_t), (rhs_side, rhs_t)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
-    Ok(([lhs_side, rhs_side], [lhs_t, rhs_t]))
+    let [(lhs_side, lhs_layout), (rhs_side, rhs_layout)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
+    Ok(([lhs_side, rhs_side], [lhs_layout, rhs_layout]))
 }
 
 /// The side of the product `array` stands for: its expression if it is pending (so it may be
@@ -898,6 +1130,9 @@ fn plan_label(plan: &Plan) -> String {
         MatmulTile::T32 => "tiled 32x32".to_string(),
         MatmulTile::Native { edge, .. } => format!("native {edge}"),
         MatmulTile::Gemm { rows, cols, exact, .. } => format!("gemm {rows}x{cols}{}", if exact { " exact" } else { "" }),
+        MatmulTile::GemmRagged { rows, cols, exact, lanes, .. } => {
+            format!("gemm {rows}x{cols}{} {}", if exact { " exact" } else { "" }, if lanes == GemmLanes::Scalar { "ragged" } else { "padded" })
+        }
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => format!("skinny {rows}x{cols} groups={groups} width={width}{}", if along_k { " along-k" } else { "" }),
     };
     format!("{tile} split={}{}", plan.slices, if plan.aligned { " aligned" } else { "" })
@@ -1134,12 +1369,24 @@ mod tests {
         for (at, strategy) in entries.iter().enumerate() {
             assert_eq!(usize::from(strategy.id.1), at, "{} sits at its id", strategy.name);
             assert_eq!(strategy.id.family(), FamilyTag::Contraction);
-            assert!(strategy.baseline && strategy.cost.is_none() && strategy.lower.is_some());
+            assert!(strategy.lower.is_some());
+            // The ragged and the padded kernels are the only ones ranked by cost, and the only ones that are not baselines.
+            let cut = strategy.name.ends_with("-ragged") || strategy.name.ends_with("-padded");
+            assert_eq!(strategy.baseline, !cut, "{}", strategy.name);
+            assert_eq!(strategy.cost.is_some(), cut, "{}", strategy.name);
             assert_eq!(StrategyId::parse(FamilyTag::Contraction, strategy.name), Some(strategy.id));
-            assert_eq!(entries.iter().filter(|other| other.group == strategy.group).count(), 1, "every entry is its own group");
+            // Every entry is its own group, but a ragged and a padded kernel share one (and a bit class with the aligned kernel of their precision).
+            let group = entries.iter().filter(|other| other.group == strategy.group).count();
+            assert_eq!(group, if cut { 2 } else { 1 }, "{}", strategy.name);
         }
         let names: Vec<&str> = entries.iter().map(|strategy| strategy.name).collect();
-        assert_eq!(names, ["host", "gemm-narrow-n", "gemm-tf32", "gemm-f32", "native-cpu", "skinny", "tiled"]);
+        assert_eq!(names, ["host", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
+        let class = |name: &str| entries.iter().find(|strategy| strategy.name == name).unwrap().bits;
+        assert_eq!(class("gemm-tf32"), class("gemm-tf32-ragged"));
+        assert_eq!(class("gemm-tf32"), class("gemm-tf32-padded"));
+        assert_eq!(class("gemm-f32"), class("gemm-f32-ragged"));
+        assert_eq!(class("gemm-f32"), class("gemm-f32-padded"));
+        assert_ne!(class("gemm-f32"), class("tiled"));
     }
 
     #[test]
@@ -1159,7 +1406,7 @@ mod tests {
             // A CPU context has neither the host path nor the backend's own tiles: those strategies do not apply.
             let [lhs, rhs] = operands(&ctx, (64, 12, 64), [false; 2]);
             let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32 }, location: Location::caller() };
-            for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_NARROW_N, StrategyId::GEMM_TF32, StrategyId::GEMM_F32] {
+            for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_TF32, StrategyId::GEMM_TF32_RAGGED, StrategyId::GEMM_TF32_PADDED, StrategyId::GEMM_F32, StrategyId::GEMM_F32_RAGGED, StrategyId::GEMM_F32_PADDED] {
                 let strategy = &CONTRACTION_STRATEGIES[usize::from(id.1)];
                 assert!(admit(strategy, &Subject::Contraction(&view), &ctx, &Residencies::DEVICE).is_err(), "{}", strategy.name);
             }

@@ -2,12 +2,13 @@
 //! pipelined like the tensor-core ones of [`crate::tensor`].
 //!
 //! The launch is that of `Builtin::Matmul` (grid `[column tiles, row tiles, slices of K]`, uniform
-//! `{m, n, k, kc}`, the slice of grid layer `z` written at `z * m * n` of `c`) for the row-major
-//! `M x K` and `K x N` matrices of the spec or their transposes. A workgroup computes a `bm x bn`
+//! `{m, n, k, kc, lda, ldb, a_off, b_off}`, the slice of grid layer `z` written at `z * m * n` of `c`) for the
+//! row-major `M x K` and `K x N` matrices of the spec or their transposes. A workgroup computes a `bm x bn`
 //! tile of `C`; each thread owns `tm x tn` outputs in registers, as groups of four consecutive
 //! rows and columns so that every fragment load is one `ld.shared.v4`. Every output is a chain of
 //! `fma.rn.f32` over `k` in ascending order from zero (within a slice of K), so results are
-//! reproducible. `m`, `n` and `k` are multiples of 4.
+//! reproducible, whichever [`luma_core::GemmLanes`] copy the operands. With `Vec4` `m`, `n` and `k` are multiples of 4, and the leading dimensions
+//! and offsets of every lane except `Scalar`.
 //!
 //! Shared memory holds each stage as `A[k][m]` and `B[k][n]` (`m` and `n` contiguous). An operand
 //! stored along its rows (`A` as `M x K`, `B` as `N x K`) is copied with 4-byte `cp.async`
@@ -16,6 +17,7 @@
 
 use luma_core::GemmSpec;
 
+use crate::gemm_copy::{self, Mode};
 use crate::ptx::Ptx;
 
 /// The shape of a kernel.
@@ -36,6 +38,8 @@ pub(crate) struct Config {
     pub rhs_t: bool,
     /// Rows of tiles a group of consecutive workgroups covers (0: row-major order).
     pub group: u32,
+    /// How the copies guard the edges of the matrices.
+    pub mode: Mode,
 }
 
 /// The tiles of the kernels the planner picks from, largest first: `(rows, cols)`. A 128 x 128 tile
@@ -60,7 +64,7 @@ impl Config {
         // read `B` along `n` and for the smallest one (a short K); 8 where the transposing copies
         // of `B` or a 64-thread workgroup's registers make the deeper stage lose.
         let bk = if (spec.rows, spec.cols) == (32, 32) || ((spec.rows, spec.cols) == (64, 128) && !spec.rhs_transposed) { 16 } else { 8 };
-        Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8 }
+        Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, mode: Mode::of(spec.lanes) }
     }
 
     pub(crate) fn threads(&self) -> u32 {
@@ -106,10 +110,11 @@ struct Operand {
     /// Stored along `k` (`A` as `M x K`, `B` as `N x K`): loaded 4 `k` at a time into registers and
     /// stored transposed; otherwise copied by 16-byte `cp.async`.
     staged: bool,
-    /// Registers holding the base pointer, the tile origin and the extent of the whole matrix.
+    /// Registers holding the base pointer, the tile origin, the extent of the whole matrix and the leading dimension.
     base: &'static str,
     origin: &'static str,
     dim: &'static str,
+    ld: &'static str,
     /// Copies (chunks of 4 floats) per thread.
     per_thread: u32,
 }
@@ -117,7 +122,7 @@ struct Operand {
 /// The state of every copy of an operand a thread makes: global pointer, validity of its row (or
 /// column), its `k` within the tile, and its offset in the staged tile (in bytes; for a staged
 /// operand the offset of its first float, the next ones `stride` floats on).
-fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32) {
+fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32, mode: Mode) {
     let (x, extent, stride) = (o.name, o.extent, o.stride);
     for j in 0..o.per_thread {
         p!(w, "add.u32 %r27, %r4, {};", j * threads);
@@ -138,7 +143,7 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32) {
             p!(w, "mov.u32 %k{x}{j}, %r29;");
             p!(w, "add.u32 %r30, {}, %r28;", o.origin);
             p!(w, "setp.lt.u32 %v{x}{j}, %r30, {};", o.dim);
-            p!(w, "mad.lo.u32 %r31, %r30, %r2, %r13;");
+            p!(w, "mad.lo.u32 %r31, %r30, {}, %r13;", o.ld);
             p!(w, "add.u32 %r31, %r31, %r29;");
             p!(w, "mul.wide.u32 %rd3, %r31, 4;");
             p!(w, "add.u64 %g{x}{j}, {}, %rd3;", o.base);
@@ -153,8 +158,11 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32) {
             p!(w, "mov.u32 %k{x}{j}, %r28;");
             p!(w, "add.u32 %r30, {}, %r29;", o.origin);
             p!(w, "setp.lt.u32 %v{x}{j}, %r30, {};", o.dim);
+            if mode.guarded() {
+                p!(w, "sub.s32 %z{x}{j}, {}, %r30;", o.dim);
+            }
             p!(w, "add.u32 %r31, %r13, %r28;");
-            p!(w, "mad.lo.u32 %r31, %r31, {}, %r30;", o.dim);
+            p!(w, "mad.lo.u32 %r31, %r31, {}, %r30;", o.ld);
             p!(w, "mul.wide.u32 %rd3, %r31, 4;");
             p!(w, "add.u64 %g{x}{j}, {}, %rd3;", o.base);
             p!(w, "mad.lo.u32 %r31, %r28, {stride}, %r29;");
@@ -165,7 +173,7 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32) {
 
 /// The PTX of the kernel `main` for `config`.
 pub(crate) fn ptx(config: &Config) -> String {
-    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group } = *config;
+    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group, mode } = *config;
     assert!(bk == 8 || bk == 16);
     let threads = config.threads();
     let (warp_rows, warp_cols) = (8 * tm, 4 * tn);
@@ -173,15 +181,18 @@ pub(crate) fn ptx(config: &Config) -> String {
     let (sa, sb) = (config.a_stride(), config.b_stride());
     let (a_bytes, stage_bytes) = (config.a_bytes(), config.stage_bytes());
     let chunks = |extent: u32| extent * bk / 4;
-    let a = Operand { name: "a", extent: bm, stride: sa, staged: !lhs_t, base: "%rd1", origin: "%r11", dim: "%r0", per_thread: chunks(bm) / threads };
-    let b = Operand { name: "b", extent: bn, stride: sb, staged: rhs_t, base: "%rd2", origin: "%r12", dim: "%r1", per_thread: chunks(bn) / threads };
+    let a = Operand { name: "a", extent: bm, stride: sa, staged: !lhs_t, base: "%rd1", origin: "%r11", dim: "%r0", ld: "%r50", per_thread: chunks(bm) / threads };
+    let b = Operand { name: "b", extent: bn, stride: sb, staged: rhs_t, base: "%rd2", origin: "%r12", dim: "%r1", ld: "%r51", per_thread: chunks(bn) / threads };
     assert!(a.per_thread >= 1 && b.per_thread >= 1 && a.per_thread * threads == chunks(bm) && b.per_thread * threads == chunks(bn), "{config:?}");
     let ops = [a, b];
 
     let mut w = Ptx { text: String::new() };
     w.text.push_str(".version 7.0\n.target sm_80\n.address_size 64\n\n");
     w.text.push_str(".extern .shared .align 16 .b8 smem[];\n\n");
-    w.text.push_str(".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n    .param .align 16 .b8 pu[16]\n)\n");
+    w.text.push_str(&format!(
+        ".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n    .param .align 16 .b8 pu[{}]\n)\n",
+        gemm_copy::UNIFORM_BYTES
+    ));
     w.text.push_str(&format!(".maxntid {threads}, 1, 1\n"));
     w.text.push_str("{\n    .reg .pred %p<16>;\n    .reg .b32 %r<80>;\n    .reg .b64 %rd<64>;\n");
     w.text.push_str(&format!("    .reg .f32 %c<{}>;\n", tm * tn));
@@ -190,7 +201,7 @@ pub(crate) fn ptx(config: &Config) -> String {
     }
     for o in &ops {
         let (x, n) = (o.name, o.per_thread);
-        w.text.push_str(&format!("    .reg .b64 %g{x}<{n}>;\n    .reg .b32 %d{x}<{n}>;\n    .reg .b32 %k{x}<{n}>;\n    .reg .pred %v{x}<{n}>;\n"));
+        gemm_copy::declare_chunks(&mut w.text, x, n);
         if o.staged {
             // Registers of the tile in flight, `s{x}{j}x{q}`.
             for j in 0..n {
@@ -202,15 +213,9 @@ pub(crate) fn ptx(config: &Config) -> String {
     // r10 warp column, r11 bm0, r12 bn0, r13 kbeg, r14 klen, r15 ktiles, r16 kt, r17 read stage,
     // r18 write stage of the `cp.async` copies, r19 kleft of those, r20 smem base, r21 A fragment
     // base, r22 B fragment base, r23 A thread offset, r24 B thread offset, r38 k left of the
-    // staged tile, r39 stage the staged tile goes to.
+    // staged tile, r39 stage the staged tile goes to, r50 lda, r51 ldb, r52 a_off, r53 b_off.
     w.text.push('\n');
-    p!(w, "ld.param.u32 %r0, [pu];");
-    p!(w, "ld.param.u32 %r1, [pu+4];");
-    p!(w, "ld.param.u32 %r2, [pu+8];");
-    p!(w, "ld.param.u32 %r3, [pu+12];");
-    p!(w, "ld.param.u64 %rd0, [pc];");
-    p!(w, "ld.param.u64 %rd1, [pa];");
-    p!(w, "ld.param.u64 %rd2, [pb];");
+    gemm_copy::load_uniform(&mut w);
     p!(w, "mov.u32 %r4, %tid.x;");
     p!(w, "and.b32 %r5, %r4, 31;");
     p!(w, "shr.u32 %r6, %r4, 5;");
@@ -251,16 +256,16 @@ pub(crate) fn ptx(config: &Config) -> String {
         p!(w, "mov.f32 %c{i}, 0f00000000;");
     }
     for o in &ops {
-        setup(&mut w, o, threads, bk);
+        setup(&mut w, o, threads, bk, mode);
     }
     // Bytes the global pointers advance per tile.
     if !lhs_t {
         p!(w, "mov.u64 %rd10, {};", bk * 4);
     } else {
-        p!(w, "mul.wide.u32 %rd10, %r0, {};", bk * 4);
+        p!(w, "mul.wide.u32 %rd10, %r50, {};", bk * 4);
     }
     if !rhs_t {
-        p!(w, "mul.wide.u32 %rd11, %r1, {};", bk * 4);
+        p!(w, "mul.wide.u32 %rd11, %r51, {};", bk * 4);
     } else {
         p!(w, "mov.u64 %rd11, {};", bk * 4);
     }
@@ -281,15 +286,11 @@ pub(crate) fn ptx(config: &Config) -> String {
             let (x, step) = (o.name, if o.name == "a" { "%rd10" } else { "%rd11" });
             let region = if o.name == "a" { 0 } else { a_bytes };
             for j in 0..o.per_thread {
-                p!(w, "setp.lt.s32 %p1, %k{x}{j}, %r19;");
-                p!(w, "and.pred %p1, %p1, %v{x}{j};");
-                p!(w, "selp.b32 %r32, 16, 0, %p1;");
                 p!(w, "add.u32 %r33, %r35, %d{x}{j};");
                 if region != 0 {
                     p!(w, "add.u32 %r33, %r33, {region};");
                 }
-                p!(w, "cp.async.cg.shared.global [%r33], [%g{x}{j}], 16, %r32;");
-                p!(w, "add.u64 %g{x}{j}, %g{x}{j}, {step};");
+                gemm_copy::copy_chunk(w, mode, false, x, j, "%r33", "%r19", step);
             }
         }
         p!(w, "sub.s32 %r19, %r19, {bk};");
@@ -305,9 +306,35 @@ pub(crate) fn ptx(config: &Config) -> String {
                 for q in 0..4 {
                     p!(w, "mov.f32 %s{x}{j}x{q}, 0f00000000;");
                 }
-                p!(w, "setp.lt.s32 %p1, %k{x}{j}, %r38;");
-                p!(w, "and.pred %p1, %p1, %v{x}{j};");
-                p!(w, "@%p1 ld.global.v4.f32 {{%s{x}{j}x0, %s{x}{j}x1, %s{x}{j}x2, %s{x}{j}x3}}, [%g{x}{j}];");
+                match mode {
+                    Mode::Aligned => {
+                        p!(w, "setp.lt.s32 %p1, %k{x}{j}, %r38;");
+                        p!(w, "and.pred %p1, %p1, %v{x}{j};");
+                        p!(w, "@%p1 ld.global.v4.f32 {{%s{x}{j}x0, %s{x}{j}x1, %s{x}{j}x2, %s{x}{j}x3}}, [%g{x}{j}];");
+                    }
+                    Mode::Tails => {
+                        // The whole chunk with one vector load, a cut one element by element.
+                        p!(w, "sub.s32 %r36, %r38, %k{x}{j};");
+                        p!(w, "setp.ge.s32 %p1, %r36, 4;");
+                        p!(w, "and.pred %p1, %p1, %v{x}{j};");
+                        p!(w, "@%p1 ld.global.v4.f32 {{%s{x}{j}x0, %s{x}{j}x1, %s{x}{j}x2, %s{x}{j}x3}}, [%g{x}{j}];");
+                        p!(w, "not.pred %p13, %p1;");
+                        p!(w, "and.pred %p13, %p13, %v{x}{j};");
+                        for q in 0..4 {
+                            p!(w, "setp.gt.s32 %p12, %r36, {q};");
+                            p!(w, "and.pred %p12, %p12, %p13;");
+                            p!(w, "@%p12 ld.global.f32 %s{x}{j}x{q}, [%g{x}{j}+{}];", 4 * q);
+                        }
+                    }
+                    Mode::Scalar => {
+                        p!(w, "sub.s32 %r36, %r38, %k{x}{j};");
+                        for q in 0..4 {
+                            p!(w, "setp.gt.s32 %p12, %r36, {q};");
+                            p!(w, "and.pred %p12, %p12, %v{x}{j};");
+                            p!(w, "@%p12 ld.global.f32 %s{x}{j}x{q}, [%g{x}{j}+{}];", 4 * q);
+                        }
+                    }
+                }
                 p!(w, "add.u64 %g{x}{j}, %g{x}{j}, {step};");
             }
         }
@@ -409,6 +436,11 @@ pub(crate) fn ptx(config: &Config) -> String {
     p!(w, "mul.lo.u32 %r28, %r10, {warp_cols};");
     p!(w, "add.u32 %r28, %r28, %r12;");
     p!(w, "mad.lo.u32 %r28, %r8, 4, %r28;");
+    if mode.guarded() {
+        // Groups of four are stored as `v4` only where `n` is a multiple of 4 (the rows start 16-byte aligned).
+        p!(w, "and.b32 %r35, %r1, 3;");
+        p!(w, "setp.eq.u32 %p6, %r35, 0;");
+    }
     for g in 0..ga {
         for ii in 0..4u32 {
             let i = g * 4 + ii;
@@ -421,10 +453,26 @@ pub(crate) fn ptx(config: &Config) -> String {
             p!(w, "add.u64 %rd5, %rd5, %rd0;");
             for h in 0..gb {
                 p!(w, "add.u32 %r32, %r28, {};", h * 16);
-                p!(w, "setp.lt.u32 %p5, %r32, %r1;");
-                p!(w, "and.pred %p5, %p5, %p4;");
                 let c = i * tn + h * 4;
-                p!(w, "@%p5 st.global.v4.f32 [%rd5+{}], {{%c{}, %c{}, %c{}, %c{}}};", h * 64, c, c + 1, c + 2, c + 3);
+                if mode.guarded() {
+                    p!(w, "add.u32 %r36, %r32, 3;");
+                    p!(w, "setp.lt.u32 %p7, %r36, %r1;");
+                    p!(w, "and.pred %p7, %p7, %p4;");
+                    p!(w, "and.pred %p8, %p7, %p6;");
+                    p!(w, "@%p8 st.global.v4.f32 [%rd5+{}], {{%c{}, %c{}, %c{}, %c{}}};", h * 64, c, c + 1, c + 2, c + 3);
+                    p!(w, "not.pred %p9, %p8;");
+                    p!(w, "and.pred %p9, %p9, %p4;");
+                    for e in 0..4u32 {
+                        p!(w, "add.u32 %r36, %r32, {e};");
+                        p!(w, "setp.lt.u32 %p10, %r36, %r1;");
+                        p!(w, "and.pred %p10, %p10, %p9;");
+                        p!(w, "@%p10 st.global.f32 [%rd5+{}], %c{};", h * 64 + 4 * e, c + e);
+                    }
+                } else {
+                    p!(w, "setp.lt.u32 %p5, %r32, %r1;");
+                    p!(w, "and.pred %p5, %p5, %p4;");
+                    p!(w, "@%p5 st.global.v4.f32 [%rd5+{}], {{%c{}, %c{}, %c{}, %c{}}};", h * 64, c, c + 1, c + 2, c + 3);
+                }
             }
         }
     }
@@ -441,14 +489,16 @@ mod tests {
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in TILES.into_iter().chain([(128, 128)]) {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
-                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true));
-                let text = ptx(&config);
-                assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
-                // One multiply-add per output per `k` of a stage.
-                assert_eq!(text.matches("fma.rn.f32").count() as u32, config.tm * config.tn * config.bk, "{rows}x{cols}");
-                assert!(config.shared_bytes() <= 99 * 1024, "{rows}x{cols}: {} bytes of shared memory", config.shared_bytes());
-                assert_eq!(config.bm, config.wm * 8 * config.tm);
-                assert_eq!(config.bn, config.wn * 4 * config.tn);
+                for lanes in [luma_core::GemmLanes::Vec4, luma_core::GemmLanes::Vec4Tails, luma_core::GemmLanes::Scalar] {
+                    let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true).with_lanes(lanes));
+                    let text = ptx(&config);
+                    assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
+                    // One multiply-add per output per `k` of a stage.
+                    assert_eq!(text.matches("fma.rn.f32").count() as u32, config.tm * config.tn * config.bk, "{rows}x{cols}");
+                    assert!(config.shared_bytes() <= 99 * 1024, "{rows}x{cols}: {} bytes of shared memory", config.shared_bytes());
+                    assert_eq!(config.bm, config.wm * 8 * config.tm);
+                    assert_eq!(config.bn, config.wn * 4 * config.tn);
+                }
             }
         }
     }

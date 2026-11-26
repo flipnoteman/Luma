@@ -351,7 +351,12 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, 
     if let Some(dir) = DUMP_DIR.as_deref() {
         // Best effort: a debugging aid must not fail a compile.
         let _ = std::fs::create_dir_all(dir);
-        let name = format!("{}-{}x{}-{}{}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed));
+        let lanes = match spec.lanes {
+            luma_core::GemmLanes::Vec4 => "v4",
+            luma_core::GemmLanes::Vec4Tails => "tails",
+            _ => "scalar",
+        };
+        let name = format!("{}-{}x{}-{}{}-{lanes}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed));
         let _ = std::fs::write(dir.join(name), &source);
     }
     shared.ctx.bind_to_thread().map_err(gpu)?;
@@ -380,7 +385,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, 
         func,
         workgroup: [threads, 1, 1],
         shared_bytes: bytes,
-        param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: 16 }],
+        param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: crate::gemm_copy::UNIFORM_BYTES }],
         array_lengths: Vec::new(),
         strides: Vec::new(),
     })
@@ -1566,6 +1571,10 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn gemm_ragged(&self) -> bool {
+        self.shared.cc.0 >= 8
+    }
+
     fn compile_gemm(&self, spec: &GemmSpec) -> Option<RawKernel> {
         // Loaded on a worker thread (which binds the context in `compile_gemm_ptx`): a failure
         // arrives at the first resolve.
@@ -2103,7 +2112,7 @@ mod tests {
             binding("c", BindingKind::StorageReadWrite),
             binding("a", BindingKind::StorageRead),
             binding("b", BindingKind::StorageRead),
-            BindingInfo { min_size: Some(16), ..binding("u", BindingKind::Uniform) },
+            BindingInfo { min_size: Some(32), ..binding("u", BindingKind::Uniform) },
         ];
         CompiledKernel::new("gemm".into(), raw, bindings, 4, None, [1, 1, 1])
     }
@@ -2113,7 +2122,7 @@ mod tests {
         let make = |bytes: u64| backend.create_buffer(bytes, BufferUsage::STORAGE, false).expect("a buffer");
         let (c, a, b) = (make(u64::from(m) * u64::from(n) * 4), make(u64::from(m) * u64::from(k) * 4), make(u64::from(k) * u64::from(n) * 4));
         let mut uniform = Vec::new();
-        for value in [m, n, k, k] {
+        for value in [m, n, k, k, k, n, 0, 0] {
             uniform.extend_from_slice(&value.to_le_bytes());
         }
         let grid = [n.div_ceil(spec.cols), m.div_ceil(spec.rows), 1];
@@ -2184,7 +2193,7 @@ mod tests {
         let make = |bytes: u64| backend.create_buffer(bytes, BufferUsage::STORAGE, false).expect("a buffer");
         let (c, a, b) = (make(64 * 64 * 4), make(64 * 64 * 4), make(64 * 64 * 4));
         let mut uniform = Vec::new();
-        for value in [64u32, 64, 64, 64] {
+        for value in [64u32, 64, 64, 64, 64, 64, 0, 0] {
             uniform.extend_from_slice(&value.to_le_bytes());
         }
         let args = [RawArg::write(&c, c.size()), RawArg::read(&a, a.size()), RawArg::read(&b, b.size()), RawArg::Uniform(&uniform)];

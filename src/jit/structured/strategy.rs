@@ -17,7 +17,7 @@ use super::emit::Emit;
 use super::contraction::{ContractionParams, ContractionView};
 use crate::jit::comprehension::Comprehension;
 use super::Structured;
-use crate::array::{Array, Failure, Storage};
+use crate::array::{Failure, Storage};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::kernel::KernelCore;
@@ -443,16 +443,12 @@ pub(crate) enum Lowered {
 /// What a lowered value is.
 pub(crate) enum Output {
     Storage(Arc<Storage>),
-    /// An array that is already a value of its own: `gemm-narrow-n`'s result is a lazy view of the product of a padded operand. Transitional
-    /// (W2-GEMM part B retires the strategy and the variant).
-    Array(Box<Array<f32>>),
 }
 
 impl Output {
     pub(crate) fn into_storage(self) -> Arc<Storage> {
         match self {
             Output::Storage(storage) => storage,
-            Output::Array(_) => unreachable!("only a contraction strategy returns an array"),
         }
     }
 }

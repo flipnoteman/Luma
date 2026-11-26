@@ -25,6 +25,8 @@ impl NativeKernel for NativeMatmul {}
 
 /// Bindings of a launch: `c`, `a`, `b` and the uniform.
 const BINDINGS: usize = 4;
+/// Words of the uniform of a product: `m, n, k, kc, lda, ldb, a_off, b_off`.
+pub(crate) const UNIFORM_WORDS: usize = 8;
 
 impl NativeMatmul {
     /// The product of `spec`, `None` if its tile is empty.
@@ -33,14 +35,14 @@ impl NativeMatmul {
     }
 
     /// Checks that the buffers of a launch hold every element the product touches (it trusts
-    /// them): `bytes` are the sizes of the bindings, `words` the uniform `{m, n, k, kc}` and
-    /// `workgroups` the grid.
-    pub(crate) fn validate(&self, bytes: &[u64], words: [u32; 4], workgroups: [u32; 3]) -> Result<(), BackendError> {
+    /// them): `bytes` are the sizes of the bindings, `words` the uniform `{m, n, k, kc, lda, ldb,
+    /// a_off, b_off}` and `workgroups` the grid.
+    pub(crate) fn validate(&self, bytes: &[u64], words: [u32; UNIFORM_WORDS], workgroups: [u32; 3]) -> Result<(), BackendError> {
         let bad = |what: String| Err(BackendError::Unsupported(format!("native matrix product: {what}")));
         if bytes.len() != BINDINGS {
             return bad(format!("{} bindings, expected {BINDINGS}", bytes.len()));
         }
-        let [m, n, k, kc] = words.map(u64::from);
+        let [m, n, k, kc, lda, ldb, a_off, b_off] = words.map(u64::from);
         if m == 0 || n == 0 || workgroups.contains(&0) {
             return Ok(());
         }
@@ -59,9 +61,16 @@ impl NativeMatmul {
             }
             Ok(())
         };
+        // The elements a matrix of `rows x cols` stored with `ld` columns from `off` touches: up to the last element of its last row.
+        let extent = |off: u64, rows: u64, cols: u64, ld: u64| if rows == 0 || cols == 0 { 0 } else { off + (rows - 1) * ld + cols };
         need(0, slices * m * n, "c")?;
-        need(1, m * k, "a")?;
-        need(2, k * n, "b")
+        if k > 0 {
+            let (a_rows, a_cols) = if self.spec.lhs_transposed { (k, m) } else { (m, k) };
+            let (b_rows, b_cols) = if self.spec.rhs_transposed { (n, k) } else { (k, n) };
+            need(1, extent(a_off, a_rows, a_cols, lda), "a")?;
+            need(2, extent(b_off, b_rows, b_cols, ldb), "b")?;
+        }
+        Ok(())
     }
 }
 
@@ -73,7 +82,7 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
         let ctx = &*ctx;
         let kernel = &*ctx.native.cast::<NativeMatmul>();
         let [c, a, b, uniform] = [0, 1, 2, 3].map(|at| *ctx.bindings.add(at));
-        let [m, n, k, kc] = uniform.cast::<[u32; 4]>().read().map(|word| word as usize);
+        let [m, n, k, kc, lda, ldb, a_off, b_off] = uniform.cast::<[u32; UNIFORM_WORDS]>().read().map(|word| word as usize);
         let edge = kernel.spec.edge as usize;
         let [x, y, z, _] = ctx.workgroup_id;
         let tile = y as usize * ctx.num_workgroups[0] as usize + x as usize;
@@ -93,13 +102,14 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
             return;
         }
         // Element `(r, q)` of a row-major matrix of `ld` columns is at `r * ld + q`, of its
-        // transpose (what the buffer holds if transposed) at `q * ld + r`.
+        // transpose (what the buffer holds if transposed) at `q * ld + r`; the matrix starts at
+        // element `off` of its buffer.
         let (lhs_strides, rhs_strides) = (
-            if kernel.spec.lhs_transposed { (1, m as isize) } else { (k as isize, 1) },
-            if kernel.spec.rhs_transposed { (1, k as isize) } else { (n as isize, 1) },
+            if kernel.spec.lhs_transposed { (1, lda as isize) } else { (lda as isize, 1) },
+            if kernel.spec.rhs_transposed { (1, ldb as isize) } else { (ldb as isize, 1) },
         );
-        let a = a.cast::<f32>().offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
-        let b = b.cast::<f32>().offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
+        let a = a.cast::<f32>().add(a_off).offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
+        let b = b.cast::<f32>().add(b_off).offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
         matrixmultiply::sgemm(rows, depth, cols, 1.0, a, lhs_strides.0, lhs_strides.1, b, rhs_strides.0, rhs_strides.1, 0.0, c, n as isize, 1);
     }
 }
@@ -172,5 +182,41 @@ unsafe extern "C" fn batched_group(ctx: *const WorkgroupCtx) {
         let a = a.cast::<f32>().add(index * a_stride);
         let b = b.cast::<f32>().add(index * b_stride);
         matrixmultiply::sgemm(m, k, n, 1.0, a, k as isize, 1, b, n as isize, 1, 0.0, c, n as isize, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn product(lhs_transposed: bool, rhs_transposed: bool) -> NativeMatmul {
+        NativeMatmul::new(&MatmulSpec { edge: 32, lhs_transposed, rhs_transposed }).unwrap()
+    }
+
+    /// The sizes of the bindings `c, a, b` in floats, then the uniform's.
+    fn launch(product: &NativeMatmul, floats: [u64; 3], words: [u32; UNIFORM_WORDS]) -> Result<(), BackendError> {
+        product.validate(&[floats[0] * 4, floats[1] * 4, floats[2] * 4, 32], words, [1, 1, 1])
+    }
+
+    #[test]
+    fn ld_and_offset_bounds_are_checked_on_the_cpu() {
+        // A 4 x 5 left window (rows of `k = 5`) at offset 3 of a buffer with rows of 8: its last element is `3 + 3 * 8 + 5 = 32`, one past.
+        let plain = product(false, false);
+        let words = |lda, ldb, a_off, b_off| [4, 6, 5, 5, lda, ldb, a_off, b_off];
+        // The right matrix `5 x 6` with rows of 6, whole.
+        assert!(launch(&plain, [24, 32, 30], words(8, 6, 3, 0)).is_ok());
+        assert!(launch(&plain, [24, 31, 30], words(8, 6, 3, 0)).is_err(), "one float short of the last row of `a`");
+        assert!(launch(&plain, [24, 32, 30], words(8, 6, 3, 1)).is_err(), "`b` shifted past its end");
+        assert!(launch(&plain, [24, 32, 35], words(8, 7, 3, 1)).is_ok());
+        // Transposed operands are `k` rows of `lda` (`m` columns) and `n` rows of `ldb` (`k` columns).
+        let transposed = product(true, true);
+        assert!(launch(&transposed, [24, 3 + 4 * 9 + 4, 2 + 5 * 7 + 5], words(9, 7, 3, 2)).is_ok());
+        assert!(launch(&transposed, [24, 3 + 4 * 9 + 3, 2 + 5 * 7 + 5], words(9, 7, 3, 2)).is_err());
+        // Offsets and leading dimensions near the top of `u32` do not wrap.
+        assert!(launch(&plain, [24, 1 << 20, 1 << 20], words(u32::MAX, 6, u32::MAX, 0)).is_err());
+        // An empty product touches nothing.
+        assert!(launch(&plain, [0, 0, 0], [0, 6, 5, 5, 1 << 31, 1 << 31, 1 << 31, 1 << 31]).is_ok());
+        // Bindings are `c, a, b` and the uniform.
+        assert!(plain.validate(&[96, 128, 120], [4, 6, 5, 5, 8, 6, 3, 0], [1, 1, 1]).is_err());
     }
 }

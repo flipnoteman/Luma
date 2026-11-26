@@ -19,7 +19,8 @@
 //! K as above.
 //!
 //! On a backend with its own gemm kernels (CUDA, see the strategies of `jit::structured::contraction`) the shapes they take (`M`, `K` and `N`
-//! multiples of 4 and at least 32, or a few columns, see `gemm-narrow-n`) are multiplied by them,
+//! multiples of 4 and at least 32, or a few columns: the aligned kernels; any shape above 32 on a side and a million multiply-adds:
+//! the ragged and padded ones, which cut the tiles at the edges) are multiplied by them,
 //! reading the operands as stored (a transposed view is read in place) and evaluating an operand
 //! that is an expression first, once (`gemm_operand`). Otherwise, with the shader kernels, an operand that is a pending expression is not evaluated first: its program is flattened
 //! into the kernel (`jit::program::Tail::Matmul`), which calls it as `luma_lhs(i)` /
@@ -33,10 +34,10 @@
 use std::panic::Location;
 
 use crate::array::Array;
+use luma_core::GemmLanes;
 use crate::jit::comprehension::lower::contract::ContractForm;
 use crate::jit::comprehension::OpTag;
 use crate::jit::structured::contraction::{self, ContractionAttrs, Tf32Request};
-use crate::view::PadMode;
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,6 +58,9 @@ pub(crate) enum MatmulTile {
     /// or with `exact` in `f32` on the ordinary cores (see [`gemm_plan`]), the buffer of an operand holding the matrix transposed if `lhs_t` /
     /// `rhs_t`; its shader is that of `T32` (the bindings), never run.
     Gemm { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool },
+    /// [`MatmulTile::Gemm`] for a product of any extents, leading dimensions and offsets, copying the operands with `lanes` (never
+    /// `Vec4`: those are `Gemm`); see [`GemmLanes`].
+    GemmRagged { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool, lanes: GemmLanes },
     /// A small output (see [`skinny_tile`]): each invocation of a workgroup of `width` computes
     /// `rows` x `cols` outputs straight from global memory, and the `groups` invocations that own
     /// the same outputs take the `k` in turn. With `along_k` neighbouring invocations take
@@ -73,7 +77,7 @@ impl MatmulTile {
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
             MatmulTile::Native { edge, .. } => (edge, edge),
-            MatmulTile::Gemm { rows, cols, .. } => (rows, cols),
+            MatmulTile::Gemm { rows, cols, .. } | MatmulTile::GemmRagged { rows, cols, .. } => (rows, cols),
             MatmulTile::Skinny { .. } => unreachable!("a skinny product has no output tiles of fixed edges"),
         }
     }
@@ -270,12 +274,6 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     Array::resolve(lhs.context(), shape, result, "matmul", location)
 }
 
-/// `rhs` with `extra` zero columns: the operand of a narrow-`N` product (`gemm-narrow-n`). Not `#[track_caller]`: the decisions of the
-/// padding (an inline, a staging) keep this file as their location, as they had before the strategy moved.
-pub(crate) fn with_zero_columns(rhs: &Array<f32>, extra: usize) -> Array<f32> {
-    rhs.pad([(0, extra), (0, 0)], PadMode::Zero)
-}
-
 /// How a product is cut into workgroups.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Plan {
@@ -385,7 +383,7 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         MatmulTile::T128 => t128(aligned, split, &loads),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
-        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Gemm { .. } => t32(aligned, split, &loads, form),
+        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } => t32(aligned, split, &loads, form),
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
     }
 }

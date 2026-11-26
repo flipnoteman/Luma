@@ -518,9 +518,9 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let mut ko = 0;
     while ko < n {
         let wo = wide.min(n - ko);
-        // The rows of the outer step are the first rows of the operand: one copy of the finished columns.
+        // The rows of the outer step are the first rows of the operand: the finished columns are read where they are (a window of `out`).
         let big = (ko > 0).then(|| {
-            let done = block(&out, ko..n, 0..ko).cache();
+            let done = block(&out, ko..n, 0..ko);
             product(&done, &done.slice(1, 0..wo).transpose())
         });
         let mut k = ko;
@@ -528,7 +528,7 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
             let nbw = nb.min(ko + wo - k);
             // The columns of this outer step before the block, `K = k - ko` of them.
             let corr = (k > ko).then(|| {
-                let done = block(&out, k..n, ko..k).cache();
+                let done = block(&out, k..n, ko..k);
                 product(&done, &done.slice(1, 0..nbw).transpose())
             });
             let params = BlockParams {

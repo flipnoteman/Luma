@@ -1008,7 +1008,7 @@ fn recurse(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'st
     let a22 = block(&right, n1..m, 0..n2);
     let u12 = solve_lower(&block(&f1, 0..n1, 0..n1), &a12, true, op, loc).cache();
     let l21 = block(&f1, n1..m, 0..n1);
-    let s = &a22 - &matmul_f32(&l21.cache(), &u12);
+    let s = &a22 - &matmul_f32(&l21, &u12);
     let Lu { lu: f2, perm: p2 } = node(&s, Dims { rows: m - n1, cols: n2, batch: 1 }, op, loc);
     let l21 = gather_rows(&l21, &p2, loc);
     let perm = concat(0, [&p1.slice(0, 0..n1), &p1.slice(0, n1..m).take(&p2)]);

@@ -801,7 +801,28 @@ fn rank(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res: &Reside
 /// Selects a strategy for `subject` and lowers it, taking the next candidate while a `lower` declines; records the Decision.
 pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
     let family = subject.family();
-    execute_with(table(family), PLAIN[family.index()], ctx, subject, ctx.strategy_override(family))
+    // A table that is a priority chain apart from kernels only a device with the backend's own tiles has (`needs` them, so their `fits`
+    // never run elsewhere) is a plain chain on every other device.
+    let plain = PLAIN[family.index()] || PLAIN_WITHOUT_TILES[family.index()] && !ctx.caps().contains(Caps::GEMM_TILES);
+    execute_with(table(family), plain, ctx, subject, ctx.strategy_override(family))
+}
+
+/// [`plain_without_tiles`] of every family's table, worked out once.
+static PLAIN_WITHOUT_TILES: [bool; FAMILY_COUNT] = [false, false, false, false, false, false, false, plain_without_tiles(&super::contraction::CONTRACTION_STRATEGIES), false, false, false, false, false, false, false, false];
+
+/// Whether the entries that are not plain (not a baseline, or ranked by cost) all need the capabilities of the backend's own tiles,
+/// and the others are.
+const fn plain_without_tiles(entries: &[Strategy]) -> bool {
+    let tiles = Caps::TF32.with(Caps::GEMM_TILES).bits();
+    let mut at = 0;
+    while at < entries.len() {
+        let strategy = &entries[at];
+        if (strategy.cost.is_some() || !strategy.baseline) && strategy.needs.bits() & tiles == 0 {
+            return false;
+        }
+        at += 1;
+    }
+    true
 }
 
 /// [`plain`] of every family's table, worked out once.

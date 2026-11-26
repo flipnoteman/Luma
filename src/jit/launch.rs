@@ -1857,14 +1857,16 @@ pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
 }
 
 /// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM
-/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc` (see `matmul::body`).
+/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc` (see `matmul::body`), and for the backend's native tiles
+/// (`Native`, `Gemm`, `GemmRagged`) also `lda, ldb, a_off, b_off`, the leading dimensions and element offsets of the operand
+/// matrices in their buffers (see `GemmSpec`).
 /// Operands that are lazy expressions are fused into the kernel when they can be (see
 /// [`fusable`]); otherwise they are evaluated and the kernel reads their buffers.
 pub(crate) fn matmul(
     ctx: &crate::context::Context,
     sides: [MatmulSide; 2],
     kernel: MatmulKernel,
-    words: [u32; 4],
+    words: &[u32],
     groups: [u32; 3],
     out: RawArg<'_>,
 ) -> Result<(), Failure> {
@@ -1876,7 +1878,7 @@ pub(crate) fn matmul_with(
     ctx: &crate::context::Context,
     sides: [MatmulSide; 2],
     kernel: MatmulKernel,
-    words: [u32; 4],
+    words: &[u32],
     extra: &[u32],
     groups: [u32; 3],
     out: RawArg<'_>,
@@ -1902,7 +1904,7 @@ pub(crate) fn matmul_with(
         let (Some((a, a_bytes)), Some((b, b_bytes))) = (&ready[0], &ready[1]) else {
             return Err(Failure::New(LumaError::Gpu("matrix product operand neither evaluated nor fused".into())));
         };
-        ctx.launch(&core, groups, size, &[out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes), RawArg::Uniform(bytemuck::cast_slice(&words))])?;
+        ctx.launch(&core, groups, size, &[out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
         return Ok(());
     };
     fused.mark_fused();
@@ -1911,7 +1913,7 @@ pub(crate) fn matmul_with(
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
     let mut uniform = Vec::with_capacity(words.len() + extra.len() + scalars.len());
-    uniform.extend_from_slice(&words);
+    uniform.extend_from_slice(words);
     uniform.extend_from_slice(extra);
     uniform.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
