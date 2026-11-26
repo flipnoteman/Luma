@@ -9,7 +9,8 @@ use luma_core::naga;
 use luma_core::{Backend, BackendError, CompiledKernel, KernelTrust, LineSolveSpec, MatmulSpec, RawKernel, GemmSpec};
 pub use luma_core::{BindingInfo, BindingKind};
 
-use crate::array::{Array, Failure};
+use crate::array::{Array, Failure, Storage};
+use crate::jit::structured::emit::Emit;
 use crate::context::{default_context, Context, RawArg};
 use crate::gpu::pager::Pin;
 use crate::error::{LumaError, Result};
@@ -42,6 +43,35 @@ impl KernelKey {
     }
 }
 
+/// Which elements of its arrays one invocation of a [`Kernel`] reads and writes: the contract a
+/// schedule uses to run the kernel over parts of its arrays. Declared with
+/// [`KernelBuilder::elementwise`] and [`KernelBuilder::halo`]; the default is [`Reach::Whole`].
+///
+/// The declaration is a claim. A launch checks that the arrays have the shape the claim
+/// implies, never that the kernel keeps it: a wrong claim computes wrong values once a schedule
+/// runs the kernel over parts of its arrays, and with
+/// [`KernelBuilder::unchecked_bounds`] it is undefined behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Reach {
+    /// No promise: the kernel may read any element of any array. It needs single-buffer arrays.
+    Whole,
+    /// With `launch(size, ..)`, invocation `g = x + size.x * (y + size.y * z)` reads element `g`
+    /// of every storage binding it reads and writes element `g` of every storage binding it
+    /// writes, and nothing else. Every storage binding is an array of exactly
+    /// `size.x * size.y * size.z` elements. A result that depends on `g` itself (a counter, a
+    /// coordinate) is not elementwise: declare [`Reach::Whole`].
+    Elementwise,
+    /// Reads elements `g + d`, `|d| <= radius`, of every input binding (flat index) and writes
+    /// only element `g`. The kernel itself must not read outside `[0, n)` at the ends of the
+    /// array (a guard or a clamp): a schedule supplies real neighbours across the boundaries
+    /// of the parts it cuts, but cannot know what an out-of-range read means to the kernel.
+    Halo {
+        /// The largest `|d|`.
+        radius: u32,
+    },
+}
+
 /// Everything about a built kernel that does not depend on the caller; cached per context.
 pub(crate) type KernelCore = CompiledKernel;
 
@@ -54,6 +84,7 @@ pub struct KernelBuilder<'a> {
     workgroup: Option<[u32; 3]>,
     label: Option<String>,
     trust: KernelTrust,
+    reach: Reach,
 }
 
 impl<'a> KernelBuilder<'a> {
@@ -65,7 +96,29 @@ impl<'a> KernelBuilder<'a> {
             workgroup: None,
             label: None,
             trust: KernelTrust::Checked,
+            reach: Reach::Whole,
         }
+    }
+
+    /// Declares the kernel [`Reach::Elementwise`]: invocation `g` reads and writes element `g` of
+    /// its arrays and nothing else. A launch then requires every storage argument to have
+    /// exactly as many elements as the problem size, and refuses [`Kernel::launch_raw`],
+    /// [`view`] arguments and textures ([`LumaError::KernelReach`]). The declaration does not
+    /// change how the kernel runs today; it is the contract a schedule will use to run it over
+    /// parts of its arrays. It is not part of the kernel's identity: builders that differ only
+    /// in reach share one compiled kernel.
+    pub fn elementwise(mut self) -> Self {
+        self.reach = Reach::Elementwise;
+        self
+    }
+
+    /// Declares the kernel [`Reach::Halo`]: invocation `g` reads elements `g + d`,
+    /// `|d| <= radius`, of every input and writes only element `g`. The kernel must guard its own
+    /// reads at the ends of the arrays. Launch validation is that of
+    /// [`elementwise`](KernelBuilder::elementwise).
+    pub fn halo(mut self, radius: u32) -> Self {
+        self.reach = Reach::Halo { radius };
+        self
     }
 
     /// Name of the `@compute` entry point. Defaults to `"main"`. Only the bindings this entry
@@ -104,8 +157,10 @@ impl<'a> KernelBuilder<'a> {
     /// Every access of every invocation must be within the bounds of the array it names
     /// (`arrayLength` for storage arrays, the declared length for workgroup and function
     /// arrays). An access outside them is undefined behavior: it may read or overwrite other
-    /// arrays, crash the process or hang the device. Kernels built on the same source with and
-    /// without this call are separate kernels.
+    /// arrays, crash the process or hang the device. The same holds for the kernel's declared
+    /// reach ([`elementwise`](KernelBuilder::elementwise), [`halo`](KernelBuilder::halo)): the
+    /// reach must hold. Kernels built on the same source with and without this call are
+    /// separate kernels.
     pub unsafe fn unchecked_bounds(mut self) -> Self {
         self.trust = KernelTrust::UncheckedBounds;
         self
@@ -123,7 +178,7 @@ impl<'a> KernelBuilder<'a> {
         };
         let label = key.label.as_deref();
         let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, key.trust).map(Arc::new))?;
-        Ok(Kernel { ctx: self.ctx.clone(), core })
+        Ok(Kernel { ctx: self.ctx.clone(), core, reach: self.reach })
     }
 }
 
@@ -389,6 +444,17 @@ fn view_arg<'a>(
 }
 
 impl<'a> KernelArg<'a> {
+    /// The storage of an array (or scratch) as a read or read_write binding, pinned for the launch.
+    pub(crate) fn from_storage(ctx: &'a Context, storage: &Arc<Storage>, writable: bool) -> Result<Self> {
+        let pin = if writable { storage.pin_single()? } else { storage.pin_single_read()? };
+        Ok(KernelArg { repr: ArgRepr::Storage { ctx, pin, bytes: storage.byte_len(), element_size: storage.layout().stride() as u32, writable } })
+    }
+
+    /// A uniform of bytes that are already laid out.
+    pub(crate) fn from_uniform_bytes(bytes: Vec<u8>) -> Self {
+        KernelArg { repr: ArgRepr::Uniform(Ok(UniformBytes::Heap(bytes))) }
+    }
+
     /// A texture for a `texture_2d<f32>` binding or the `sampler` binding that samples it.
     pub(crate) fn texture(texture: &'a crate::texture::Texture) -> Self {
         KernelArg { repr: ArgRepr::Texture { ctx: &texture.ctx, _pin: texture.pin.dup(), texture: texture.buffer.clone() } }
@@ -462,6 +528,14 @@ pub fn uniform<'a, T: UniformValue>(value: &T) -> KernelArg<'a> {
     KernelArg { repr: ArgRepr::Uniform(value.encode_uniform()) }
 }
 
+/// The bytes `uniform(value)` binds.
+pub(crate) fn uniform_bytes<T: UniformValue>(value: &T) -> Result<Vec<u8>> {
+    match value.encode_uniform() {
+        Ok(bytes) => Ok(bytes.as_slice().to_vec()),
+        Err(message) => Err(LumaError::KernelArgUniform { index: 0, message }),
+    }
+}
+
 /// Builds the arguments for [`Kernel::launch`]: `args![&x, &mut y, uniform(&params)]`. The
 /// result is an array on the stack, so it does not allocate.
 #[macro_export]
@@ -497,12 +571,13 @@ macro_rules! args {
 pub struct Kernel {
     ctx: Context,
     core: Arc<KernelCore>,
+    reach: Reach,
 }
 
 impl Kernel {
     /// The kernel of `core` on `ctx`.
     pub(crate) fn from_core(ctx: &Context, core: Arc<KernelCore>) -> Kernel {
-        Kernel { ctx: ctx.clone(), core }
+        Kernel { ctx: ctx.clone(), core, reach: Reach::Whole }
     }
 
     /// The compiled kernel, shared.
@@ -519,6 +594,12 @@ impl Kernel {
     /// The reflected `@group(1)` bindings, in argument order.
     pub fn bindings(&self) -> &[BindingInfo] {
         &self.core.bindings
+    }
+
+    /// Which elements of its arrays an invocation touches, as declared when it was built
+    /// ([`Reach::Whole`] by default).
+    pub fn reach(&self) -> Reach {
+        self.reach
     }
 
     /// The kernel's workgroup size.
@@ -543,7 +624,21 @@ impl Kernel {
         let wg = self.core.workgroup;
         let [(sx, wx), (sy, wy), (sz, wz)] = [(size[0], wg[0]), (size[1], wg[1]), (size[2], wg[2])];
         let workgroups = [sx.div_ceil(wx), sy.div_ceil(wy), sz.div_ceil(wz)];
-        self.run(workgroups, size, args.as_ref())
+        self.run(workgroups, size, args.as_ref(), false)
+    }
+
+    /// [`Kernel::launch`] into `emit`, over `args` that were built without borrowing arrays (a
+    /// custom op's strategy).
+    pub(crate) fn launch_into(&self, size: [u32; 3], args: &[KernelArg<'_>], emit: &mut Emit<'_>) -> Result<()> {
+        if !emit.ctx().same_as(&self.ctx) {
+            return Err(LumaError::ContextMismatch);
+        }
+        if size.contains(&0) {
+            return Err(LumaError::InvalidShape(format!("Problem size {size:?} has a zero dimension")));
+        }
+        let wg = self.core.workgroup;
+        let workgroups = [size[0].div_ceil(wg[0]), size[1].div_ceil(wg[1]), size[2].div_ceil(wg[2])];
+        self.run_with(workgroups, size, args, false, |core, groups, size, raw| emit.launch(core, groups, size, raw))
     }
 
     /// Runs exactly `workgroups` workgroups; `luma.size` is `workgroups * workgroup`.
@@ -561,10 +656,24 @@ impl Kernel {
         // Within the device limit (checked in `run`) this cannot overflow; saturate otherwise.
         let [x, y, z] = workgroups;
         let size = [x.saturating_mul(wg[0]), y.saturating_mul(wg[1]), z.saturating_mul(wg[2])];
-        self.run(workgroups, size, args.as_ref())
+        self.run(workgroups, size, args.as_ref(), true)
     }
 
-    fn run(&self, workgroups: [u32; 3], size: [u32; 3], args: &[KernelArg<'_>]) -> Result<()> {
+    #[inline(always)]
+    fn run(&self, workgroups: [u32; 3], size: [u32; 3], args: &[KernelArg<'_>], raw_launch: bool) -> Result<()> {
+        self.run_with(workgroups, size, args, raw_launch, |core, groups, size, raw| self.ctx.launch(core, groups, size, raw))
+    }
+
+    /// Validates `args` against the kernel and hands the bound launch to `launch`.
+    #[inline(always)]
+    fn run_with(
+        &self,
+        workgroups: [u32; 3],
+        size: [u32; 3],
+        args: &[KernelArg<'_>],
+        raw_launch: bool,
+        launch: impl FnOnce(&KernelCore, [u32; 3], [u32; 3], &[RawArg<'_>]) -> Result<()>,
+    ) -> Result<()> {
         let ctx = &self.ctx;
         let core = &*self.core;
 
@@ -575,6 +684,10 @@ impl Kernel {
         let total: usize = args.iter().map(|a| if matches!(a.repr, ArgRepr::View { .. }) { 2 } else { 1 }).sum();
         if total != core.bindings.len() {
             return Err(LumaError::KernelArgCount { expected: core.bindings.len(), actual: total });
+        }
+
+        if self.reach != Reach::Whole {
+            check_reach(self.reach, size, args, raw_launch)?;
         }
 
         // The validated arguments, on the stack unless there are very many.
@@ -673,7 +786,7 @@ impl Kernel {
             index += 1;
         }
 
-        ctx.launch(core, workgroups, size, raw)
+        launch(core, workgroups, size, raw)
     }
 }
 
@@ -692,4 +805,59 @@ fn check_storage(info: &BindingInfo, index: usize, element_size: u32, writable: 
             return Err(LumaError::KernelArgElementSize { index, expected: stride, actual: element_size });
         }
     Ok(())
+}
+
+/// Checks a launch against the kernel's declared reach (not `Whole`): launched over a problem
+/// size, no views or textures, every storage argument exactly as long as the problem.
+pub(crate) fn check_reach(reach: Reach, size: [u32; 3], args: &[KernelArg<'_>], raw_launch: bool) -> Result<()> {
+    let what = match reach {
+        Reach::Elementwise => "elementwise".to_owned(),
+        Reach::Halo { radius } => format!("halo({radius})"),
+        Reach::Whole => return Ok(()),
+    };
+    if raw_launch {
+        return Err(LumaError::KernelReach {
+            index: 0,
+            message: format!("a {what} kernel is launched over a problem size, not with launch_raw"),
+        });
+    }
+    let n: u64 = size.iter().map(|&s| u64::from(s)).product();
+    for (index, arg) in args.iter().enumerate() {
+        match &arg.repr {
+            ArgRepr::View { .. } => {
+                return Err(LumaError::KernelReach { index, message: format!("a {what} kernel takes no strided views") });
+            }
+            ArgRepr::Texture { .. } => {
+                return Err(LumaError::KernelReach { index, message: format!("a {what} kernel takes no textures") });
+            }
+            ArgRepr::Storage { bytes, element_size, .. } => {
+                let len = *bytes / u64::from((*element_size).max(1));
+                if len != n {
+                    return Err(LumaError::KernelReach {
+                        index,
+                        message: format!("the array has {len} elements, the problem size {size:?} has {n}"),
+                    });
+                }
+            }
+            ArgRepr::Poisoned(error) => return Err(LumaError::clone(error)),
+            ArgRepr::Uniform(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_methods_set_reach_without_a_second_kernel() {
+        let Ok(ctx) = Context::cpu() else { return };
+        let src = "@group(1) @binding(0) var<storage, read_write> y: array<f32>;\n@compute @workgroup_size(8) fn main(@builtin(global_invocation_id) g: vec3<u32>) { y[g.x] = 1.0; }";
+        let a = ctx.kernel(src).build().unwrap();
+        let b = ctx.kernel(src).elementwise().build().unwrap();
+        let c = ctx.kernel(src).halo(3).build().unwrap();
+        assert_eq!((a.reach(), b.reach(), c.reach()), (Reach::Whole, Reach::Elementwise, Reach::Halo { radius: 3 }));
+        assert!(Arc::ptr_eq(&a.core, &b.core) && Arc::ptr_eq(&a.core, &c.core));
+    }
 }

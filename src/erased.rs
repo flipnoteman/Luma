@@ -62,6 +62,29 @@ impl ElemKind {
         T::ELEM_KIND
     }
 
+    /// How arrays of this kind lay their elements out in a buffer.
+    pub(crate) fn layout(self) -> crate::gpu_type::ElemLayout {
+        match self {
+            ElemKind::F32 => <f32 as GpuType>::LAYOUT,
+            ElemKind::U32 => <u32 as GpuType>::LAYOUT,
+            ElemKind::I32 => <i32 as GpuType>::LAYOUT,
+            ElemKind::Bool => <bool as GpuType>::LAYOUT,
+            ElemKind::U8 => <u8 as GpuType>::LAYOUT,
+            ElemKind::I8 => <i8 as GpuType>::LAYOUT,
+            ElemKind::U16 => <u16 as GpuType>::LAYOUT,
+            ElemKind::I16 => <i16 as GpuType>::LAYOUT,
+            ElemKind::F16 => <half::f16 as GpuType>::LAYOUT,
+            ElemKind::Bf16 => <half::bf16 as GpuType>::LAYOUT,
+            ElemKind::F64 => <f64 as GpuType>::LAYOUT,
+            ElemKind::Df32 => <crate::gpu_type::Df32 as GpuType>::LAYOUT,
+            ElemKind::C32 => <crate::complex::C32 as GpuType>::LAYOUT,
+            ElemKind::F32x2 => <[f32; 2] as GpuType>::LAYOUT,
+            ElemKind::F32x4 => <[f32; 4] as GpuType>::LAYOUT,
+            ElemKind::U32x2 => <[u32; 2] as GpuType>::LAYOUT,
+            ElemKind::U32x4 => <[u32; 4] as GpuType>::LAYOUT,
+        }
+    }
+
     const fn name(self) -> &'static str {
         match self {
             ElemKind::F32 => "f32",

@@ -1,0 +1,22 @@
+# Public surface of the extension API (W2-EXT). Kept in step with tests/ext_surface.rs, which names every item; a change here is a semver decision.
+luma::Reach                       enum, non_exhaustive: Whole | Elementwise | Halo { radius: u32 }
+luma::KernelBuilder::elementwise  fn(self) -> Self
+luma::KernelBuilder::halo         fn(self, radius: u32) -> Self
+luma::Kernel::reach               fn(&self) -> Reach
+luma::LumaError::KernelReach      { index: usize, message: String }
+luma::LumaError::Extension        { op: String, strategy: String, message: String }
+luma::LumaError::NoStrategy       { op: String, reasons: Vec<(String, String)> }
+luma::LumaError::Declined
+luma::DecisionSite::Extension
+luma::Context::custom_op          fn(&self, name: &str) -> ext::OpBuilder<'_>
+luma::ext::OpBuilder              input::<T>, output::<T>(OutShape), params(usize), strategy(Strategy), build() -> Result<Op>
+luma::ext::Op                     Clone; apply(&[&dyn AnyArray], &[u8]) -> Result<Vec<Dyn>>, apply1::<T>, name()
+luma::ext::OutShape               enum, non_exhaustive: Same(usize) | Fixed(Shape) | With(Arc<dyn Fn(&[ArgInfo], &[u8]) -> Result<Shape> + Send + Sync>); OutShape::with(f)
+luma::ext::ArgInfo                struct, non_exhaustive: pub elem: ElemKind, pub shape: Shape; ArgInfo::new
+luma::ext::NumericsClass          enum, non_exhaustive: Exact | Reassociating | Reduced
+luma::ext::params_bytes           fn<T: UniformValue>(&T) -> Result<Vec<u8>>
+luma::ext::Strategy               struct, non_exhaustive: new(name, lower), needs, numerics, reach, fits, cost
+luma::ext::Fit                    struct, non_exhaustive: inputs, outputs, params, features, cost_model, numerics
+luma::ext::Lower                  struct, non_exhaustive: inputs, outputs, params, kernel, scratch, launch
+luma::ext::Bind                   enum, non_exhaustive: Input(usize) | Output(usize) | Scratch(ScratchId) | Uniform(Vec<u8>)
+luma::ext::ScratchId              struct (opaque)

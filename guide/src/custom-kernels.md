@@ -372,10 +372,122 @@ assert_eq!(dst.to_vec()?, vec![1.0, 2.0, 3.0]);
 An access outside the bounds of such a kernel is undefined behavior: it may read or overwrite other
 arrays, crash the process or hang the device. A kernel built with and without the call is two kernels.
 
+## Declaring reach
+
+A kernel can say which elements of its arrays an invocation touches. The declaration changes
+nothing about how the kernel runs today; it is the contract the planner needs to run the kernel
+over parts of its arrays later, and a launch checks that the arrays have the shape the claim
+implies.
+
+```rust
+use luma::*;
+
+const SCALE: &str = r#"
+@group(1) @binding(0) var<storage, read> x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> y: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x) { return; }
+    y[gid.x] = 2.0 * x[gid.x];
+}
+"#;
+
+let kernel = default_context()?.kernel(SCALE).elementwise().build()?;
+assert_eq!(kernel.reach(), Reach::Elementwise);
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+let mut y = Array::<f32>::zeros(3)?;
+kernel.launch([3], args![&x, &mut y])?;
+assert_eq!(y.to_vec()?, vec![2.0, 4.0, 6.0]);
+
+// An array of another length is refused.
+let mut short = Array::<f32>::zeros(2)?;
+assert!(matches!(kernel.launch([3], args![&x, &mut short]), Err(LumaError::KernelReach { .. })));
+# Ok::<(), luma::LumaError>(())
+```
+
+- `.elementwise()`: invocation `g = x + size.x * (y + size.y * z)` reads element `g` of every
+  storage binding it reads and writes element `g` of every storage binding it writes, and nothing
+  else. Every storage binding holds exactly `size.x * size.y * size.z` elements. A result that
+  depends on `g` itself (a counter, a coordinate) is not elementwise.
+- `.halo(radius)`: reads elements `g + d`, `|d| <= radius`, of every input and writes only element
+  `g`. The kernel must guard its own reads at the ends of the array.
+- Neither accepts `launch_raw`, `view` arguments or textures.
+- The default is `Reach::Whole`: no promise.
+
+The claim is trusted, not verified: a wrong one computes wrong values once the planner runs the
+kernel over parts of its arrays, and together with `unchecked_bounds` it is undefined behavior.
+
+## Custom ops and strategies
+
+A kernel is one implementation. A custom op groups several implementations (strategies) of one
+operation, chooses between them as the planner chooses between its own, and logs the choice
+(`DecisionSite::Extension`, see `Context::take_decisions`). `LUMA_STRATEGY=ext:<op>/<strategy>`
+forces one.
+
+```rust
+use luma::ext::{Bind, OutShape, Strategy};
+use luma::*;
+
+#[derive(luma::encase::ShaderType)]
+struct Params {
+    k: f32,
+}
+
+const SCALE: &str = r#"
+struct Params { k: f32 }
+@group(1) @binding(0) var<storage, read> x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> y: array<f32>;
+@group(1) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x) { return; }
+    y[gid.x] = p.k * x[gid.x];
+}
+"#;
+
+let ctx = default_context()?;
+let scale = ctx
+    .custom_op("scale")
+    .input::<f32>()
+    .output::<f32>(OutShape::Same(0))          // the output has the shape of input 0
+    .params(4)                                  // bytes of the uniform block of `apply`
+    .strategy(Strategy::new("plain", |lower| {
+        let kernel = lower.kernel(SCALE).build()?;
+        let n = lower.inputs()[0].shape.len() as u32;
+        let params = lower.params().to_vec();
+        lower.launch(&kernel, [n, 1, 1], &[Bind::Input(0), Bind::Output(0), Bind::Uniform(params)])
+    }))
+    .build()?;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+let y = scale.apply1::<f32>(&[&x], &luma::ext::params_bytes(&Params { k: 2.0 })?)?;
+assert_eq!(y.to_vec()?, vec![2.0, 4.0, 6.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+A strategy can say what it `needs` (device features), its `numerics` class (`Exact`,
+`Reassociating`, `Reduced`: the context's numerics policy has to allow it), when it `fits`, and what
+it `cost`s in nanoseconds. Among the strategies that apply, the cheapest wins when all of them have
+a cost, otherwise the first registered; none is `LumaError::NoStrategy` with the reason for each.
+A strategy that cannot handle a call may return `LumaError::Declined` before it launched anything,
+and the next one runs.
+
+A custom op is a fusion barrier: its inputs are evaluated first and its outputs are buffers that
+later expressions read and fuse around. Its launches are recorded in order with everything else.
+An op that is a function of scalars should be an elementwise function instead, which fuses.
+Arrays split over several buffers are `LumaError::Chunked`. A panic in a strategy is returned as
+`LumaError::Extension`. A strategy must be idempotent and free of side effects apart from its
+launches, because the planner may run it again with the same arrays.
+
+Kernels built through `Lower::kernel` are bounds-checked unless the author calls the unsafe
+`unchecked_bounds`; a strategy cannot reach a buffer except through the `Bind` positions of a
+launch; scratch from `Lower::scratch` is charged to the memory budget and released after the op.
+
 ## Limits
 
 - Kernel arguments must be arrays that fit one buffer; an array split over several buffers
-  fails with `LumaError::Chunked`.
+  fails with `LumaError::Chunked` (a declared reach does not lift this yet).
 - You cannot pass a read-only view as `&mut`, nor write the state of an `iterate` step.
 - The shader features the device was opened with decide what WGSL compiles (`f64` needs
   `SHADER_F64`, subgroup operations need `SUBGROUP`; check `ctx.features()`). Cooperative matrices

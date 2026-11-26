@@ -69,6 +69,8 @@ struct Inner {
     caps: Caps,
     /// The strategies forced by `LUMA_STRATEGY` (see [`ContextOptions::strategy`]).
     strategy_override: StrategyOverride,
+    /// The custom ops declared on this context (see [`crate::ext`]).
+    ext: crate::ext::Registry,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -460,7 +462,7 @@ impl ContextOptions {
 }
 
 /// `text` as a `&'static str`, leaked once per distinct text (the options are `Copy`).
-fn intern(text: String) -> &'static str {
+pub(crate) fn intern(text: String) -> &'static str {
     static KNOWN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut known = lock(&KNOWN);
     if let Some(&found) = known.iter().find(|&&known| known == text) {
@@ -666,6 +668,11 @@ impl Context {
         self.inner.strategy_override.of(family)
     }
 
+    /// The custom ops of this context.
+    pub(crate) fn ext_registry(&self) -> &crate::ext::Registry {
+        &self.inner.ext
+    }
+
     /// Whether value-changing algebraic rewrites are allowed.
     pub(crate) fn fast_math(&self) -> bool {
         self.inner.numerics.fast_math()
@@ -774,6 +781,7 @@ impl Context {
                 numerics: options.effective_numerics(),
                 caps,
                 strategy_override,
+                ext: crate::ext::Registry::new(options.strategy),
                 pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),

@@ -116,6 +116,32 @@ pub enum LumaError {
         /// Index of the second argument bound to the shared buffer.
         second: usize,
     },
+    /// A kernel that declared a [`Reach`](crate::Reach) was launched in a way, or with an array,
+    /// that the declaration does not allow.
+    KernelReach {
+        /// Index of the offending argument.
+        index: usize,
+        /// What is wrong.
+        message: String,
+    },
+    /// A custom op's strategy failed (its `lower` returned an error or panicked).
+    Extension {
+        /// Name of the custom op.
+        op: String,
+        /// Name of the strategy that failed.
+        strategy: String,
+        /// The error or panic message.
+        message: String,
+    },
+    /// No strategy of a custom op fits its operands on this device.
+    NoStrategy {
+        /// Name of the custom op.
+        op: String,
+        /// For each strategy, in registration order, why it was rejected.
+        reasons: Vec<(String, String)>,
+    },
+    /// Returned by a custom strategy's `lower` before it launched anything: the next strategy is tried.
+    Declined,
     /// A launch needs more workgroups in a dimension than the device supports.
     KernelGridTooLarge {
         /// The workgroup counts the launch needs per dimension.
@@ -218,6 +244,20 @@ impl fmt::Display for LumaError {
                 "Kernel arguments {first} and {second} share one buffer and at least one is \
                  writable (arrays created by `reshape` share their buffer)"
             ),
+            LumaError::KernelReach { index, message } => {
+                write!(f, "Kernel argument {index}: violates the declared reach: {message}")
+            }
+            LumaError::Extension { op, strategy, message } => {
+                write!(f, "custom op `{op}`, strategy `{strategy}` failed: {message}")
+            }
+            LumaError::NoStrategy { op, reasons } => {
+                write!(f, "custom op `{op}` has no strategy that fits")?;
+                for (name, why) in reasons {
+                    write!(f, "; `{name}`: {why}")?;
+                }
+                Ok(())
+            }
+            LumaError::Declined => f.write_str("a custom strategy declined the operation"),
             LumaError::KernelGridTooLarge { workgroups, max } => write!(
                 f,
                 "Dispatch of {workgroups:?} workgroups exceeds the device limit of {max} per dimension"

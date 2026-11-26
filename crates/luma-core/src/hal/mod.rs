@@ -442,6 +442,8 @@ pub enum DecisionSite {
     /// `before` and `after` the estimated nanoseconds of the scope where they were compared. Never recorded for an elementwise
     /// rewrite (`simplify`).
     Rewrite,
+    /// A custom op of the public extension API chose one of its strategies (`op` is its name, `chosen` the strategy).
+    Extension,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }
