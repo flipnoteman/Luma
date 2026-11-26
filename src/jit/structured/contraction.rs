@@ -36,6 +36,17 @@ pub(crate) enum Tf32Request {
     Tf32,
 }
 
+impl Tf32Request {
+    /// The request as `OpTag::Matmul` says it: `None` for the context's numerics, else the precision asked for.
+    pub(crate) fn request(self) -> Option<bool> {
+        match self {
+            Tf32Request::Default => None,
+            Tf32Request::Exact => Some(false),
+            Tf32Request::Tf32 => Some(true),
+        }
+    }
+}
+
 /// What a contraction's `fits` reads besides the operands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ContractionAttrs {
@@ -120,6 +131,28 @@ pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, l
     let ctx = lhs.context();
     let Output::Storage(storage) = select::execute(ctx, &Subject::Contraction(&view))?;
     Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage))
+}
+
+/// Whether the product is one the padded strategy `GemmNarrowN` takes. Pure (no graph is read, nothing happens): the lazy sites ask it
+/// before they decide, because that strategy returns a lazy view and has no lazy form (W2-GEMM part B retires it).
+pub(crate) fn narrow_n_fits(view: &ContractionView<'_>, ctx: &Context) -> bool {
+    ctx.caps().contains(Caps::GEMM_TILES) && fits_narrow_n(&Subject::Contraction(view), ctx, &Residencies::DEVICE).is_some()
+}
+
+/// Whether the host strategy takes the product (a small one, on a backend whose memory the host reads). Pure.
+pub(crate) fn host_fits(view: &ContractionView<'_>, ctx: &Context) -> bool {
+    ctx.caps().contains(Caps::HOST_PATH) && fits_host(&Subject::Contraction(view), ctx, &Residencies::DEVICE).is_some()
+}
+
+/// What a launch of a product fails with when an operand or the result needs several buffers (the kernels read and write one).
+pub(crate) fn chunked() -> Failure {
+    LumaError::Chunked("this operation needs an array that fits one buffer").into()
+}
+
+/// Whether an operand that is evaluated already, or a result of `out_len` elements, needs more than one buffer: what a launch of
+/// the product would fail on with [`chunked`], and what a lazy product reports when it is made.
+pub(crate) fn split_over_buffers(ctx: &Context, operands: [&Array<f32>; 2], out_len: usize) -> bool {
+    operands.iter().any(|array| array.recorded_storage().is_some_and(|storage| storage.segments() > 1)) || (out_len as u64).saturating_mul(4) > ctx.segment_bytes()
 }
 
 // -- what a strategy runs with --

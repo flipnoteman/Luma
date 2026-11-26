@@ -684,3 +684,111 @@ fn an_interned_body_exists_for_every_element_type() {
         F32 | U32 | I32 | Bool | U8 | I8 | U16 | I16 | F16 | BF16 | F64 | Df32 | C32 => (),
     };
 }
+
+// -- the lazy product (W2-LAZY: the Contraction row of 07 §2.1) --
+
+use crate::jit::structured::contraction::ContractionView;
+use crate::jit::structured::sites::LazyMode;
+use crate::jit::structured::Launch;
+
+fn lazy_cpu() -> Context {
+    let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
+    Context::with_tuning(options, |tuning| tuning.lazy = LazyMode::Always).unwrap()
+}
+
+/// `lhs` is `[K=5, M=3]`, `rhs` `[N=4, K=5]`.
+fn product_operands(ctx: &Context) -> (Array<f32>, Array<f32>) {
+    (array(ctx, 15).reshape([5, 3]), array(ctx, 20).reshape([4, 5]))
+}
+
+#[test]
+fn a_contraction_view_has_the_form_of_the_call() {
+    let ctx = lazy_cpu();
+    let (lhs, rhs) = product_operands(&ctx);
+    for (request, tf32) in [(Tf32Request::Default, None), (Tf32Request::Exact, Some(false)), (Tf32Request::Tf32, Some(true))] {
+        let attrs = ContractionAttrs { tf32: request };
+        let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs, location: std::panic::Location::caller() };
+        let Some(form) = view.form() else {
+            assert!(!Algebra::builds_forms(), "LUMA_ALGEBRA=off builds no form");
+            return;
+        };
+        // The space: n and m parallel, k reduce, in that order, fastest first.
+        assert_eq!(extents(&form), [(4, "P"), (3, "P"), (5, "R")], "n, m, k");
+        // The maps: the left operand's rows are k and m, the right one's n and k.
+        assert_eq!(form.inputs[0].shape, [5, 3, 1, 1]);
+        assert_eq!(form.inputs[1].shape, [4, 5, 1, 1]);
+        assert_eq!((coeff(&form, 0, 0), coeff(&form, 0, 1)), (vec![0, 0, 1], vec![0, 1, 0]), "lhs: rows k, m");
+        assert_eq!((coeff(&form, 1, 0), coeff(&form, 1, 1)), (vec![1, 0, 0], vec![0, 0, 1]), "rhs: rows n, k");
+        // The body multiplies the two reads, the combiner adds them, the output is `[N, M]`.
+        assert_eq!(form.body.instrs.len(), 1);
+        assert!(is_mul(&form.body.instrs[0]));
+        assert_eq!(parts(&form), [CombinePart::Add]);
+        assert!(matches!(form.epilogue, Epilogue::None));
+        assert_eq!(form.output.dim_of_axis, [Some(0), Some(1), None, None], "[N, M]");
+        // The origin: the call, with the precision it asked for.
+        assert_eq!(form.origin, Origin::Api(OpTag::Matmul { tf32 }));
+        form.validate().unwrap();
+        // It is the builder's form of the same operands, which is what a recogniser or a rule reads.
+        let geom = Geometry { m: 3, n: 4, k: 5 };
+        let built = Comprehension::contract(src(&lhs), src(&rhs), geom, attrs);
+        assert_eq!(form.structure_hash(), built.structure_hash());
+    }
+}
+
+#[test]
+fn a_contraction_view_of_operands_that_make_no_product_has_no_form() {
+    let ctx = lazy_cpu();
+    let (lhs, rhs) = (array(&ctx, 15).reshape([5, 3]), array(&ctx, 20).reshape([5, 4]));
+    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Default }, location: std::panic::Location::caller() };
+    assert!(view.form().is_none(), "the shapes do not match");
+}
+
+#[test]
+fn a_lazy_product_holds_no_form_until_it_is_asked_and_then_remembers_it() {
+    let ctx = lazy_cpu();
+    let (lhs, rhs) = product_operands(&ctx);
+    let c = lhs.matmul(&rhs);
+    let value = c.structured().expect("a product at a lazy site is a structured value");
+    assert!(value.is_unforced());
+    assert_eq!(value.comp().meta.launch, Launch::AtForce);
+    assert_eq!(value.comp().meta.tag, OpTag::Matmul { tf32: None });
+    assert!(crate::gpu::lock(&value.comp().form).is_none(), "no form is built per product");
+    let Some(form) = value.form() else {
+        assert!(!Algebra::builds_forms());
+        return;
+    };
+    assert_eq!(extents(&form), [(4, "P"), (3, "P"), (5, "R")]);
+    assert_eq!(form.origin, Origin::Api(OpTag::Matmul { tf32: None }));
+    form.validate().unwrap();
+    assert!(crate::gpu::lock(&value.comp().form).is_some(), "asked once, kept");
+    assert_eq!(value.form().unwrap().structure_hash(), form.structure_hash());
+    // Used, the product holds neither its operands nor a form that holds them.
+    c.to_vec().unwrap();
+    assert!(crate::gpu::lock(&value.comp().form).is_none());
+    assert!(value.form().is_none(), "a forced product has no operands to say a form of");
+    // The transposed forms are the same product over views.
+    let transposed = Array::<f32>::from_slice_on(&ctx, &(0..20).map(|i| (i % 7) as f32).collect::<Vec<_>>(), [5, 4]).unwrap();
+    let nt = lhs.matmul_nt(&transposed);
+    assert_eq!(nt.structured().unwrap().form().unwrap().structure_hash(), form.structure_hash(), "a transposed operand has the same maps");
+}
+
+#[test]
+fn a_lazy_batched_product_holds_the_batched_form() {
+    let ctx = lazy_cpu();
+    // [K=5, M=3, B=2] by a shared [N=4, K=5].
+    let (lhs, rhs) = (array(&ctx, 30).reshape([5, 3, 2]), array(&ctx, 20).reshape([4, 5]));
+    let c = lhs.matmul_batched(&rhs);
+    let value = c.structured().expect("a batch of one launch at a lazy site is a structured value");
+    assert_eq!(value.comp().meta.tag, OpTag::MatmulBatched);
+    let Some(form) = value.form() else {
+        assert!(!Algebra::builds_forms());
+        return;
+    };
+    assert_eq!(extents(&form), [(4, "P"), (3, "P"), (2, "P"), (5, "R")], "n, m, b, k");
+    assert_eq!(coeff(&form, 0, 2), [0, 0, 1, 0], "the batched lhs follows b");
+    assert_eq!(coeff(&form, 1, 2), [0, 0, 0, 0], "the shared rhs has a zero batch row");
+    assert_eq!(form.origin, Origin::Api(OpTag::MatmulBatched));
+    form.validate().unwrap();
+    let built = Comprehension::contract_batched(src(&lhs), src(&rhs), [5, 3, 4, 2], true, false);
+    assert_eq!(form.structure_hash(), built.structure_hash());
+}

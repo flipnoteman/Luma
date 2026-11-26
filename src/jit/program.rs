@@ -581,7 +581,15 @@ fn leaf_reads_probes(leaf: &Arc<Node>, probes: &[u64]) -> bool {
                     return true;
                 }
                 if let Some(value) = node.deferred.get() {
-                    stack.push(Arc::clone(value.operand()));
+                    // What its recording reads; where that is not known (it is being recorded) the leaf counts as reading them.
+                    let Some(sources) = value.sources() else { return true };
+                    for source in sources {
+                        match source {
+                            Src::Buffer(storage) if probes.contains(&storage.id()) => return true,
+                            Src::Node(operand) => stack.push(operand),
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

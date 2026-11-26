@@ -395,9 +395,11 @@ enum Repr {
     Lazy(Held),
     /// An operation producing this array failed; see [`Array::error`].
     Poisoned(Arc<LumaError>),
-    /// A reduction of a pending expression: recorded into a buffer when the GPU needs it, read
-    /// from the expression when the host does. See [`crate::reduce`].
-    Structured(Arc<Structured>),
+    /// A structured value that has not been recorded (a reduction, a lazy product) or has: recorded into a buffer when the GPU needs
+    /// it, read from the expression when the host does for a reduction (see [`crate::reduce`]). A lazy product also holds its leaf,
+    /// the node that stands for it in expressions and registers as a reader of its operands: the leaf keeps the product alive and
+    /// the product keeps the operands (see `jit::structured::lazy`).
+    Structured(Arc<Structured>, Option<Arc<Node>>),
 }
 
 /// GPU-resident array of up to four dimensions.
@@ -470,7 +472,7 @@ impl<T: GpuType> Clone for Array<T> {
             Repr::Valid(storage) => Repr::Valid(Arc::clone(storage)),
             Repr::Lazy(node) => Repr::Lazy(node.share()),
             Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
-            Repr::Structured(value) => Repr::Structured(Arc::clone(value)),
+            Repr::Structured(value, leaf) => Repr::Structured(Arc::clone(value), leaf.clone()),
         };
         Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, _marker: PhantomData }
     }
@@ -500,7 +502,12 @@ impl<T: GpuType> Array<T> {
 
     /// The (not yet recorded) structured value `value` as an array of `shape`.
     pub(crate) fn from_structured(ctx: &Context, shape: Shape, value: Arc<Structured>) -> Self {
-        Self::new(ctx, shape, Repr::Structured(value))
+        Self::new(ctx, shape, Repr::Structured(value, None))
+    }
+
+    /// The lazy product `value` as an array of `shape`, with the `leaf` that stands for it in expressions.
+    pub(crate) fn from_product(ctx: &Context, shape: Shape, value: Arc<Structured>, leaf: Arc<Node>) -> Self {
+        Self::new(ctx, shape, Repr::Structured(value, Some(leaf)))
     }
 
     /// Placeholder sharing this array's buffer under a fresh [`Storage`] id, for [`Array::iterate`].
@@ -634,7 +641,7 @@ impl<T: GpuType> Array<T> {
             Repr::Valid(_) => None,
             Repr::Lazy(held) => held.latest().failure(),
             Repr::Poisoned(error) => Some(error),
-            Repr::Structured(value) => value.failure(),
+            Repr::Structured(value, _) => value.failure(),
         }
     }
 
@@ -664,7 +671,7 @@ impl<T: GpuType> Array<T> {
                 held.latest().force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
             }
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
-            Repr::Structured(value) => {
+            Repr::Structured(value, _) => {
                 value.force(&self.ctx).as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
             }
         }
@@ -700,10 +707,13 @@ impl<T: GpuType> Array<T> {
             Repr::Valid(storage) => Ok(Src::Buffer(Arc::clone(storage))),
             Repr::Lazy(held) => held.latest().as_src(),
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
-            Repr::Structured(value) => match value.result_if_recorded() {
+            Repr::Structured(value, leaf) => match value.result_if_recorded() {
                 Some(result) => result.as_ref().map(|storage| Src::Buffer(Arc::clone(storage))).map_err(|error| Failure::Inherited(Arc::clone(error))),
                 // Not recorded yet: an operation on it is built without recording it.
-                None => Ok(Src::Node(value.leaf(&self.ctx, self.len()))),
+                None => Ok(Src::Node(match leaf {
+                    Some(leaf) => Arc::clone(leaf),
+                    None => value.leaf(&self.ctx, self.len()),
+                })),
             },
         }
     }
@@ -761,8 +771,48 @@ impl<T: GpuType> Array<T> {
     /// The structured value this array is (recorded into a buffer or not), if it is one.
     pub(crate) fn structured(&self) -> Option<&Arc<Structured>> {
         match &self.repr {
-            Repr::Structured(value) => Some(value),
+            Repr::Structured(value, _) => Some(value),
             _ => None,
+        }
+    }
+
+    /// The buffer of this array if it holds one already, whatever kind of array it is (an evaluated expression, a recorded structured
+    /// value); never evaluates anything.
+    pub(crate) fn recorded_storage(&self) -> Option<&Arc<Storage>> {
+        match &self.repr {
+            Repr::Valid(storage) => Some(storage),
+            Repr::Lazy(held) => held.latest().evaluated(),
+            Repr::Structured(value, _) => value.result_if_recorded()?.as_ref().ok(),
+            Repr::Poisoned(_) => None,
+        }
+    }
+
+    /// Records a structured value that has no leaf of its own (a reduction) and is not recorded yet: a reader registers with something
+    /// that lives, and the value only has a leaf while an expression holds one.
+    pub(crate) fn record_for_reader(&self) {
+        if let Repr::Structured(value, None) = &self.repr
+            && value.is_unforced()
+        {
+            let _ = self.storage();
+        }
+    }
+
+    /// Registers `reader`, a pending node that reads this array later, with what a write into this array evaluates first (see
+    /// `Readers`): the buffer of an evaluated array, the pending node of an expression, the leaf of a lazy product. A reduction that was
+    /// not recorded has none: see [`Array::record_for_reader`].
+    pub(crate) fn add_reader(&self, reader: &std::sync::Weak<Node>) {
+        match &self.repr {
+            Repr::Valid(storage) => storage.readers.add_weak(reader.clone()),
+            Repr::Lazy(held) => match held.latest().evaluated() {
+                Some(storage) => storage.readers.add_weak(reader.clone()),
+                None => held.latest().add_reader(reader),
+            },
+            Repr::Structured(value, leaf) => match (value.result_if_recorded(), leaf) {
+                (Some(Ok(storage)), _) => storage.readers.add_weak(reader.clone()),
+                (None, Some(leaf)) => leaf.add_reader(reader),
+                _ => {}
+            },
+            Repr::Poisoned(_) => {}
         }
     }
 
@@ -824,7 +874,9 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        if let Repr::Structured(value) = &self.repr {
+        if let Repr::Structured(value, _) = &self.repr
+            && value.is_reduction()
+        {
             if value.is_unforced() {
                 return value.read::<T>(&self.ctx);
             }
@@ -841,7 +893,9 @@ impl<T: GpuType> Array<T> {
     /// which cost about as much as the transfer itself on large arrays: prefer this when
     /// reading results back repeatedly.
     pub fn read_into(&self, out: &mut [T]) -> Result<()> {
-        if let Repr::Structured(value) = &self.repr {
+        if let Repr::Structured(value, _) = &self.repr
+            && value.is_reduction()
+        {
             let values = if value.is_unforced() { Some(value.read::<T>(&self.ctx)) } else { value.packed_values::<T>(&self.ctx) };
             if let Some(values) = values {
                 if out.len() != self.len() {
@@ -1020,13 +1074,13 @@ impl<T: GpuType> Array<T> {
         }
         // A reduction that has not been recorded is the same pending reduction in the new shape: recorded
         // when either is used, together with the others that are pending (see `jit::multireduce`).
-        if let Repr::Structured(value) = &self.repr
+        if let Repr::Structured(value, leaf) = &self.repr
             && value.is_unforced()
         {
             return Ok(Array {
                 ctx: self.ctx.clone(),
                 shape,
-                repr: Repr::Structured(Arc::clone(value)),
+                repr: Repr::Structured(Arc::clone(value), leaf.clone()),
                 view: None,
                 read_view: self.read_view,
                 _marker: PhantomData,

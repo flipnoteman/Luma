@@ -1391,6 +1391,12 @@ impl Node {
         self.deferred.get()
     }
 
+    /// Registers `reader`, a pending node that reads this node's value later, so that whoever is about to write the buffer this node
+    /// produces (or what it reads) evaluates the reader first (see [`Readers`]). Like what [`create`] does for each operand.
+    pub(crate) fn add_reader(&self, reader: &Weak<Node>) {
+        self.readers.add_weak(reader.clone());
+    }
+
     /// Whether the node is a state of a repeating step (see [`looped`]).
     pub(crate) fn is_looped(&self) -> bool {
         self.looped.get().is_some()
@@ -3141,6 +3147,8 @@ pub(crate) struct JitState {
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
+    /// What each call site of a library op has learned about being lazy (see [`structured::sites`]).
+    pub(crate) sites: structured::sites::Sites,
     /// The structured values made and not yet recorded (see [`multireduce`]), oldest first.
     structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
@@ -3298,6 +3306,7 @@ impl JitState {
             scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
+            sites: structured::sites::Sites::default(),
             structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             selections: Mutex::new(FxMap::default()),
@@ -3898,12 +3907,15 @@ impl JitState {
     /// [`Node::thread`]).
     pub(crate) fn evaluate_requested(&self) {
         let me = current_thread();
+        // A node that reads one this thread is computing right now would wait for it forever (a lazy product being recorded asks for
+        // the expressions waiting to be evaluated, one of which may read the product): it stays requested.
+        let computing = COMPUTING.with_borrow(|computing| if computing.is_empty() { Vec::new() } else { computing.clone() });
         let requested = std::mem::take(&mut lock(&self.requested).nodes);
         let mut others = Vec::new();
         let mut pending: Vec<Arc<Node>> = Vec::with_capacity(requested.len());
         for weak in requested {
             let Some(node) = weak.upgrade() else { continue };
-            if node.thread != me {
+            if node.thread != me || computing.iter().any(|&id| node.below_contains(id)) {
                 others.push(weak);
                 continue;
             }

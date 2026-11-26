@@ -53,6 +53,7 @@ mod iterate_until_all;
 mod keccak;
 mod kernel;
 mod kernel_edges;
+mod lazy_products;
 mod lazy_scalars;
 mod matmul;
 mod matmul_ragged;

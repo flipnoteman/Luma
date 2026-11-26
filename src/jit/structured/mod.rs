@@ -17,10 +17,15 @@ pub(crate) mod boundary;
 pub(crate) mod contraction;
 pub(crate) mod emit;
 pub(crate) mod families;
+pub(crate) mod lazy;
 pub(crate) mod opaque;
 pub(crate) mod select;
+pub(crate) mod sites;
 pub(crate) mod strategy;
 pub(crate) mod telemetry;
+
+#[cfg(test)]
+mod lazy_tests;
 
 use super::comprehension::{Comprehension, OpTag};
 use super::{ElemTy, Node};
@@ -77,7 +82,6 @@ pub(crate) struct Comp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Launch {
     Now,
-    #[expect(dead_code, reason = "made by W2-LAZY's lazy sites")]
     AtForce,
 }
 
@@ -116,14 +120,21 @@ pub(crate) enum RunState {
         /// Where the values are when they were recorded together with other reductions' (see [`PackRead`]), and the first one's index there.
         pack: OnceLock<(Arc<PackRead>, usize)>,
     },
+    /// A matrix product that launches when it is forced (`Launch::AtForce`, W2-LAZY): its operands until then, and what the
+    /// strategies need. Boxed, so that the reductions' payload is not made bigger by the operand arrays.
+    Contraction(Box<lazy::ContractionRun>),
 }
 
 impl std::fmt::Debug for Structured {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.family {
             Family::Comprehension(comp) => {
-                let RunState::Reduce { finish, .. } = &comp.run;
-                f.debug_struct("Structured").field("tag", &comp.meta.tag).field("launch", &comp.meta.launch).field("steps", &finish.epilogue).field("forced", &self.result.get().is_some()).finish()
+                let mut debug = f.debug_struct("Structured");
+                debug.field("tag", &comp.meta.tag).field("launch", &comp.meta.launch);
+                if let RunState::Reduce { finish, .. } = &comp.run {
+                    debug.field("steps", &finish.epilogue);
+                }
+                debug.field("forced", &self.result.get().is_some()).finish()
             }
         }
     }
@@ -158,9 +169,21 @@ impl Structured {
         self.comp().meta.ty
     }
 
-    /// The error of the operands' evaluation or of the recorded passes, if any.
+    /// The error of the operands' evaluation or of the recorded passes, if any. A lazy product that was not forced reads its operands'.
     pub(crate) fn failure(&self) -> Option<&Arc<LumaError>> {
-        self.operand().failure().or_else(|| self.result.get().and_then(|result| result.as_ref().err()))
+        match &self.comp().run {
+            RunState::Reduce { operand, .. } => operand.failure().or_else(|| self.result.get().and_then(|result| result.as_ref().err())),
+            RunState::Contraction(run) => match self.result.get() {
+                Some(result) => result.as_ref().err(),
+                None => run.operand_failure(),
+            },
+        }
+    }
+
+    /// Whether this is a reduction (what `Array::to_vec` may read ahead of its recording), not a lazy library value.
+    #[inline(always)]
+    pub(crate) fn is_reduction(&self) -> bool {
+        matches!(self.comp().run, RunState::Reduce { .. })
     }
 
     /// The buffer of the value if it has been recorded (or the error), without recording it.
@@ -196,8 +219,9 @@ impl Structured {
 
     /// [`Structured::force`] for the node that stands for the value: it takes the buffer itself.
     pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
-        self.record_with(|| match &self.family {
-            Family::Comprehension(_) => self.record_reduce(ctx),
+        self.record_with(|| match &self.comp().run {
+            RunState::Reduce { .. } => self.record_reduce(ctx),
+            RunState::Contraction(run) => self.record_contraction(ctx, run),
         })
     }
 
@@ -231,12 +255,20 @@ impl Structured {
     /// The buffer of the value computed on the host, or the one already recorded; `None` if it cannot run on the host and has
     /// not been recorded.
     pub(crate) fn host_result(&self, ctx: &Context) -> Option<Arc<Storage>> {
-        if self.result.get().is_none()
-            && let Some(storage) = match &self.family {
-                Family::Comprehension(_) => crate::host::try_eval_reduced(self, ctx),
+        if self.result.get().is_none() {
+            match &self.comp().run {
+                RunState::Reduce { .. } => {
+                    if let Some(storage) = crate::host::try_eval_reduced(self, ctx) {
+                        let _ = self.set_result(storage);
+                    }
+                }
+                // A small product on the CPU backend is the host strategy's: recorded here, in the host expression that reads it.
+                RunState::Contraction(run) => {
+                    if run.fits_host(ctx, self.location) {
+                        let _ = self.record_once(ctx);
+                    }
+                }
             }
-        {
-            let _ = self.set_result(storage);
         }
         self.result.get()?.as_ref().ok().cloned()
     }

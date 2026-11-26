@@ -136,7 +136,7 @@ impl Readers {
 
     /// [`Readers::add`] for a caller that made the weak reference already (making one is an
     /// atomic compare-and-swap; cloning one is cheaper).
-    pub(super) fn add_weak(&self, weak: Weak<Node>) {
+    pub(crate) fn add_weak(&self, weak: Weak<Node>) {
         lock(&self.list).add_weak(weak);
     }
 

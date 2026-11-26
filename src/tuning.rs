@@ -24,6 +24,10 @@ const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
 /// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
 const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
+/// `LUMA_LAZY=never|site|always` sets [`Tuning::lazy`] (a dev switch of W2-LAZY, removed before 0.6.0).
+const LAZY_ENV: &str = "LUMA_LAZY";
+/// `LUMA_LAZY_PROBE=<n>` sets [`Tuning::lazy_probe_every`] (0, or a power of two up to 256: other values are rounded down to one).
+const LAZY_PROBE_ENV: &str = "LUMA_LAZY_PROBE";
 /// `LUMA_MULTI_REDUCE=off|n` overrides [`Tuning::reduce_multi`] (`off` or `1` keeps every reduction
 /// in a kernel of its own; clamped to the most accumulators a kernel has).
 const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
@@ -100,6 +104,7 @@ pub(crate) enum LineSolver {
 
 pub(crate) use luma_core::TuningProfile;
 use luma_core::{BackendKind, DeviceInfo, DeviceLimits, Features};
+use crate::jit::structured::sites::{LazyMode, MAX_PROBE_EVERY};
 
 /// Kernel parameters of a context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +156,12 @@ pub(crate) struct Tuning {
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
     /// across workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
     pub(crate) single_pass_reduce: bool,
+    /// When library ops (the matrix product first) launch: at the call, or when the value is used (see `jit::structured::sites`).
+    /// `LUMA_LAZY` overrides; `Never` in wave 2, `Site` once an op can absorb an epilogue (W3-U4).
+    pub(crate) lazy: LazyMode,
+    /// A lazy site probes (makes one call lazy) at its first call and every this many calls after it; 0: never. At most 256 and a
+    /// power of two. `LUMA_LAZY_PROBE` overrides.
+    pub(crate) lazy_probe_every: u32,
     /// One execution of a strategy in this many is timed on the device (`jit::structured::telemetry`); 0: never.
     /// `LUMA_TELEMETRY` overrides.
     pub(crate) telemetry_every: u32,
@@ -265,6 +276,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        lazy: LazyMode::Never,
+        lazy_probe_every: 0,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,
@@ -306,6 +319,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        lazy: LazyMode::Never,
+        lazy_probe_every: 0,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,
@@ -349,6 +364,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
+        lazy: LazyMode::Never,
+        lazy_probe_every: 0,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,
@@ -417,6 +434,12 @@ impl Tuning {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
+        };
+        tuning.lazy = std::env::var(LAZY_ENV).ok().and_then(|value| LazyMode::parse(&value)).unwrap_or(tuning.lazy);
+        tuning.lazy_probe_every = match std::env::var(LAZY_PROBE_ENV).ok().and_then(|value| value.trim().parse::<u32>().ok()) {
+            Some(0) => 0,
+            Some(every) => 1 << every.min(MAX_PROBE_EVERY).ilog2(),
+            None => tuning.lazy_probe_every,
         };
         tuning.telemetry_every = match std::env::var(TELEMETRY_ENV).as_deref().map(str::trim) {
             Ok("off") => 0,

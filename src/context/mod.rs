@@ -552,6 +552,22 @@ fn open_cpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
     Ok(luma_cpu::open()?)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The workgroups per grid dimension the next context this thread opens allows at most (see [`Context::with_workgroup_limit`]).
+    static WORKGROUP_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The most workgroups per grid dimension the context allows: the device's, or in a test the limit it asked for.
+#[inline(always)]
+fn workgroup_limit(device: u32) -> u32 {
+    #[cfg(test)]
+    if let Some(max) = WORKGROUP_LIMIT.with(std::cell::Cell::get) {
+        return device.min(max);
+    }
+    device
+}
+
 /// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu for GPU devices
 /// and falls back to the native CPU backend when needed. A CPU device is the native CPU backend only.
 fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Backend>> {
@@ -709,6 +725,16 @@ impl Context {
         Context::open(options, tune, Caps::empty())
     }
 
+    /// [`Context::with_tuning`] on a device that allows at most `max` workgroups per grid dimension (tests of the resource errors that
+    /// depend on it, which no real device can be made to give with arrays that fit a test).
+    #[cfg(test)]
+    pub(crate) fn with_workgroup_limit(options: ContextOptions, max: u32, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
+        WORKGROUP_LIMIT.with(|limit| limit.set(Some(max)));
+        let opened = Context::open(options, tune, Caps::empty());
+        WORKGROUP_LIMIT.with(|limit| limit.set(None));
+        opened
+    }
+
     /// [`Context::with_options`] reporting the device without the capabilities of `removed`.
     #[cfg(test)]
     pub(crate) fn with_caps_removed(options: ContextOptions, removed: Caps) -> Result<Context> {
@@ -761,7 +787,7 @@ impl Context {
         let ctx = Context {
             inner: Arc::new(Inner {
                 max_uniform_bytes: limits.max_uniform_bytes,
-                max_workgroups_per_dimension: limits.max_workgroups_per_dim,
+                max_workgroups_per_dimension: workgroup_limit(limits.max_workgroups_per_dim),
                 timestamps: info.features.contains(Features::TIMESTAMP_QUERY),
                 zero_copy: info.zero_copy,
                 tuning,

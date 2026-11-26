@@ -4,6 +4,7 @@
 
 use super::cost::CostModel;
 use super::follow::StatsSnapshot;
+use super::structured::sites::LazyMode;
 use crate::array::Array;
 use crate::context::{Context, ContextOptions};
 use crate::ops::eval_all;
@@ -305,6 +306,30 @@ fn a_node_a_replay_left_pending_has_what_create_would_have_made() {
     if on_cpu() {
         assert!(on.jit().follow_stats().replayed > 0, "{:?}", on.jit().follow_stats());
     }
+}
+
+#[test]
+fn a_lazy_product_in_a_step_diverges_the_tape_and_changes_no_bit() {
+    let run = |follow: bool| {
+        let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.lazy = LazyMode::Always).unwrap();
+        ctx.set_cost_model(CostModel::TEST);
+        ctx.jit().set_follow(follow);
+        let w = A::from_slice_on(&ctx, &(0..16).map(|i| ((i * 5) % 7) as f32 * 0.125 - 0.3).collect::<Vec<_>>(), [4, 4]).unwrap();
+        let mut x = A::from_slice_on(&ctx, &(0..16).map(|i| 0.5 + (i % 5) as f32 * 0.1).collect::<Vec<_>>(), [4, 4]).unwrap();
+        let mut out = Vec::new();
+        for _ in 0..14 {
+            // A product that launches when it is used, in a step that repeats.
+            x = &x.matmul(&w) * 0.5 + 0.1;
+            x.eval().unwrap();
+            out.extend(bits(&x.to_vec().unwrap()));
+        }
+        (out, ctx.jit().follow_stats())
+    };
+    let (off, off_stats) = run(false);
+    let (on, on_stats) = run(true);
+    assert_eq!(on, off, "following changed what the program computes");
+    assert_eq!(off_stats, StatsSnapshot::default());
+    assert_eq!(on_stats.replayed, 0, "a step that makes a lazy product is a divergence, not a replay: {on_stats:?}");
 }
 
 #[test]

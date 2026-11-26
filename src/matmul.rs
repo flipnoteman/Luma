@@ -28,8 +28,8 @@
 //! expression (a view), and the kernel then divides its slices so that neighbouring invocations
 //! load neighbours in memory ([`MatmulOperand::Transposed`]). Programs that read sub-programs
 //! through circular shifts, or arrays split over several buffers, are evaluated instead. The
-//! product itself is not lazy: it is recorded when called and returns an evaluated array, so what
-//! consumes it runs as its own kernel.
+//! product itself launches when it is called, and returns an evaluated array, unless its call site is a lazy one (`LUMA_LAZY`, see
+//! `jit::structured::sites`): it is then a value that launches when it is used (`jit::structured::lazy`).
 
 use std::panic::Location;
 
@@ -37,7 +37,8 @@ use crate::array::Array;
 use luma_core::GemmLanes;
 use crate::jit::comprehension::lower::contract::ContractForm;
 use crate::jit::comprehension::OpTag;
-use crate::jit::structured::contraction::{self, ContractionAttrs, Tf32Request};
+use crate::jit::structured::contraction::{ContractionAttrs, Tf32Request};
+use crate::jit::structured::lazy;
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -268,10 +269,9 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
         Some(true) => Tf32Request::Tf32,
         Some(false) => Tf32Request::Exact,
     };
-    let result = contraction::run(lhs, rhs, ContractionAttrs { tf32 }, location);
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
-    Array::resolve(lhs.context(), shape, result, "matmul", location)
+    lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location)
 }
 
 /// How a product is cut into workgroups.

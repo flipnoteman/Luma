@@ -21,17 +21,20 @@
 //! by the native GEMM; the products are spread over the cores unless there are fewer products
 //! than cores and they are big enough for the tiles of [`Array::matmul`] to do better.
 //!
-//! The operands are evaluated first (the kernel reads buffers), and the product is not lazy,
-//! like [`Array::matmul`].
+//! The operands are evaluated first (the kernel reads buffers). The launch is made when the product is called, like
+//! [`Array::matmul`]'s, unless the call site is a lazy one (`LUMA_LAZY`, see `jit::structured::sites`): the product is then a value
+//! that launches when it is used (`jit::structured::lazy`). A batch that is a loop of products is always made at the call, as a view
+//! of one product per matrix, each of which is its own call site.
 
 use std::panic::Location;
 use std::sync::Arc;
 
-use crate::array::{Array, Failure};
+use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
-use crate::context::RawArg;
+use crate::context::{Context, RawArg};
 use crate::error::LumaError;
 use crate::jit;
+use crate::jit::structured::lazy;
 use crate::ops::Outcome;
 
 /// K elements of each operand a workgroup stages at a time.
@@ -82,7 +85,7 @@ fn edge(extent: u32) -> u32 {
 
 /// The kernel of an `m x k` by `k x n` product and the workgroups of `batch` of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Launch {
+pub(crate) struct Launch {
     kernel: Bmm,
     groups: [u32; 3],
 }
@@ -131,15 +134,15 @@ fn route(m: u32, n: u32, k: u32, batch: u32, cores: u32, max_groups: u32) -> Res
 
 /// The sizes of a batched product.
 #[derive(Clone, Copy, Debug)]
-struct Geometry {
-    k: usize,
-    m: usize,
-    n: usize,
+pub(crate) struct Geometry {
+    pub(crate) k: usize,
+    pub(crate) m: usize,
+    pub(crate) n: usize,
     /// Batch extents (axes 2 and 3) of the result.
     batch_dims: [usize; 2],
     /// Whether the operands have the batch (else one matrix is shared by every product).
-    lhs_batched: bool,
-    rhs_batched: bool,
+    pub(crate) lhs_batched: bool,
+    pub(crate) rhs_batched: bool,
 }
 
 impl Geometry {
@@ -159,11 +162,11 @@ impl Geometry {
         Ok(Geometry { k: ld[0], m: ld[1], n: rd[0], batch_dims, lhs_batched, rhs_batched })
     }
 
-    fn batch(&self) -> usize {
+    pub(crate) fn batch(&self) -> usize {
         self.batch_dims[0] * self.batch_dims[1]
     }
 
-    fn out_shape(&self) -> [usize; 4] {
+    pub(crate) fn out_shape(&self) -> [usize; 4] {
         [self.n, self.m, self.batch_dims[0], self.batch_dims[1]]
     }
 }
@@ -215,6 +218,9 @@ pub fn matmul_batched(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
     };
     let shape = geometry.out_shape();
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
+    if let Some(lazy) = lazy::batched(lhs, rhs, &geometry, shape, location) {
+        return lazy;
+    }
     match run(lhs, rhs, &geometry) {
         Ok(Some(out)) => out,
         Ok(None) => looped(lhs, rhs, &geometry),
@@ -236,8 +242,9 @@ fn looped(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Array<f32> {
     crate::concat_slice(2, &products).reshape(g.out_shape())
 }
 
-/// The batched product as one launch, `None` if [`route`] sends it to [`looped`].
-fn run(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Outcome<Option<Array<f32>>> {
+/// How the batch is launched, `None` if [`route`] sends it to [`looped`]: pure (it reads the sizes, the backend's constants and
+/// whether an operand is too big for a buffer), so a lazy product can decide it when it is made.
+pub(crate) fn plan(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Outcome<Option<Launch>> {
     let ctx = lhs.context();
     // Operands first, so that a poisoned one reports its own error.
     let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: g.out_shape() }));
@@ -249,6 +256,20 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Outcome<Option<Array
             return Ok(None);
         }
     }
+    Ok(Some(launch))
+}
+
+/// The batched product as one launch, `None` if [`plan`] sends it to [`looped`].
+fn run(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Outcome<Option<Array<f32>>> {
+    let ctx = lhs.context();
+    let Some(launch) = plan(lhs, rhs, g)? else { return Ok(None) };
+    let storage = execute(ctx, lhs, rhs, g, launch)?;
+    Ok(Some(Array::from_storage(ctx, g.out_shape().into(), storage)))
+}
+
+/// Launches the batched product of `lhs` and `rhs` as `launch` says into a new buffer.
+pub(crate) fn execute(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry, launch: Launch) -> Outcome<Arc<Storage>> {
+    let (m, n, k, batch) = (g.m as u32, g.n as u32, g.k as u32, g.batch() as u32);
     let (a, a_bytes) = lhs.ready()?;
     let (b, b_bytes) = rhs.ready()?;
     if !ctx.same_as(rhs.context()) {
@@ -268,7 +289,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, g: &Geometry) -> Outcome<Option<Array
         &[RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(a.buffer(), a_bytes), RawArg::read(b.buffer(), b_bytes), RawArg::Uniform(bytemuck::cast_slice(&words))],
     )?;
     jit::check_finite(ctx, &out_storage, jit::ElemTy::F32)?;
-    Ok(Some(out))
+    Ok(out_storage)
 }
 
 /// The kernel of [`Builtin::Bmm`]: arguments out `c`, the buffers `a` and `b` and the uniform

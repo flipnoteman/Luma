@@ -11,6 +11,7 @@ mod hoststep;
 mod launch;
 mod launchcost;
 mod loops;
+mod matmul_build;
 mod memory;
 mod readback;
 mod reduce_build;
@@ -30,6 +31,7 @@ pub fn run(h: &mut Harness) {
         ("launch", launch::run),
         ("launchcost", launchcost::run),
         ("hoststep", hoststep::run),
+        ("matmul_build", matmul_build::run),
         ("reduce_build", reduce_build::run),
         ("reduce_force", reduce_force::run),
         ("loop", loops::run),
