@@ -3,13 +3,14 @@
 # the two alternate unit by unit (a unit is a luma-bench group of cases, `luma-bench --list-groups`): A B B A for one unit, B A A B
 # for the next, ..., each run after a 400 ms GPU warm-up, so the clock, thermal and host-load drift of a long job hits both sides
 # alike (alternating whole suites let it hit whichever side ran in the slow state: 10-30 unrelated 1.05-1.5x "regressions").
-# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR] [--chunk N]
+# Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR] [--chunk N] [--aa]
 #   BASE/NEW  git refs of this repo or paths to luma trees
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
 #   SUITES    comma list (default: ml,cfd,datasci,compute,jit,sparse)   BACKENDS  default "cuda wgpu"
 #   --rounds  A/B pairs per side and unit (default 1: A B B A, two samples per side); benchcmp.py takes the median over the samples
 #   --only    luma-bench --only PATTERN: a group by `suite/group`, a case by `suite/group/case` or the short `group/case`
 #             (`matmul/square`), several with commas, `X$` exact; a job that selects no case fails loudly
+#   --aa      A/A test: NEW's binary is a copy of BASE's (the flags then show the tool's noise floor)
 #   --chunk   units per alternation step (default: auto, at most 48 steps per suite; 1 = every group alternates on its own)
 #   --timeout gpuq timeout of the job (default 7200). gpuq copies out/ back only when the job ends by itself, so the
 #             job stops starting runs 300 s before the timeout and ends normally (the results so far are kept).
@@ -19,12 +20,12 @@
 # Results: out/<label>-<backend>-<suite>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir), sample n (1 .. 2 x rounds)
 # of every unit of the suite; compare with tools/benchcmp.py --base 'DIR/<base>-cuda-*' --new 'DIR/<new>-cuda-*'.
 set -euo pipefail
-pos=() quick="" only="" chunk=0 rounds=1 timeout=7200
+pos=() aa="" quick="" only="" chunk=0 rounds=1 timeout=7200
 while [ $# -gt 0 ]; do
-  case $1 in --quick) quick=1 ;; --only) only=$2; shift ;; --chunk) chunk=$2; shift ;; --rounds) rounds=$2; shift ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
+  case $1 in --quick) quick=1 ;; --only) only=$2; shift ;; --chunk) chunk=$2; shift ;; --rounds) rounds=$2; shift ;; --aa) aa=1 ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
   shift
 done
-[ ${#pos[@]} -ge 3 ] || { sed -n 2,22p "$0"; exit 2; }
+[ ${#pos[@]} -ge 3 ] || { sed -n 2,23p "$0"; exit 2; }
 base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,compute,jit,sparse} backends=${pos[4]:-cuda wgpu}
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
@@ -56,6 +57,8 @@ for s in a b; do
   cp "$T/ab-$s/release/luma-bench" "$snap/bin/$s"
   rm -rf "${snap:?}/$s"
 done
+# --aa: B is a copy of the A binary, so every change the comparison shows is the noise floor of the tool itself.
+[ -z "$aa" ] || cp "$snap/bin/a" "$snap/bin/b"
 # The job: tools/benchab-job.sh (shipped in the snapshot) alternates the two binaries unit by unit; its input is the environment.
 cp "$here/tools/benchab-job.sh" "$snap/job.sh"
 git -C "$snap" init -q && git -C "$snap" add -A >/dev/null && git -C "$snap" -c user.name=b -c user.email=b@b commit -qm "ab $la $lb" >/dev/null
