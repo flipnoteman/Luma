@@ -401,7 +401,7 @@ fn a_compensated_dot_product_multiplies_exactly() {
     let (sa, sb) = (Array::<f32>::from_slice_on(&ctx, &a, len).unwrap(), Array::<f32>::from_slice_on(&ctx, &b, len).unwrap());
     let truth: f64 = a.iter().zip(&b).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
     let dot = |c: Compensation| {
-        let mut f = Comprehension::dot(Array::<f32>::from_slice_on(&ctx, &vec![0f32; 1], 1).unwrap().src().ok().unwrap(), 1, ElemTy::F32);
+        let mut f = Comprehension::dot(Array::<f32>::from_slice_on(&ctx, &[0f32; 1], 1).unwrap().src().ok().unwrap(), 1, ElemTy::F32);
         // Two accesses over one reduce dim.
         let access = |s: &Array<f32>| Access { src: s.src().ok().unwrap(), shape: [len as u32, 1, 1, 1], ty: ElemTy::F32, map: MapRef::owned(AffineMap::following([0])), edge: Edge::None, fill: None, indirect: None };
         f.inputs = smallvec![access(&sa), access(&sb)];

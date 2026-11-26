@@ -82,6 +82,9 @@ pub(super) fn combine_of(part: CombinePart) -> Option<(BinOp, ReduceOp)> {
     }
 }
 
+/// The nodes of the views of the accesses and of the instructions of a body.
+type Nodes = (Vec<Arc<Node>>, Vec<Arc<Node>>);
+
 /// How the dims of a (coalesced) form sit in the nodes of a tile.
 #[derive(Clone, Debug)]
 pub(crate) struct Prepared {
@@ -324,7 +327,7 @@ impl Prepared {
     }
 
     /// The views of the accesses and the nodes of the instructions of the body over the tile.
-    fn nodes(&self, ctx: &Context, origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<(Vec<Arc<Node>>, Vec<Arc<Node>>), Failure> {
+    fn nodes(&self, ctx: &Context, origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Nodes, Failure> {
         let views = (0..self.form.inputs.len()).map(|j| self.view(ctx, j, origin, extent, location)).collect::<Result<Vec<_>, _>>()?;
         let len: usize = extent.iter().map(|&e| e as usize).product();
         let mut temps: Vec<Arc<Node>> = Vec::with_capacity(self.form.body.instrs.len());

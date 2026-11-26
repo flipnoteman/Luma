@@ -70,6 +70,7 @@ LUMA_SVD_PRECOND	dev	W0	before-release	auto
 LUMA_TELEMETRY	user	W2-U2	never	32 (one execution of a strategy in n is timed on the device; off disables; tools/hosttime and decisiondiff pin it off)
 LUMA_TELEMETRY_MIN	dev	W2-U2	before-release	8
 LUMA_TEST_CACHE	test	W0	never	unset
+LUMA_TILE_BUDGET	test	W2-R0	never	unset (points of one tile of a generic lowering, at most u32::MAX; a test hook that makes the tiler and the chunked reduction run at test size)
 LUMA_TRACE_VERIFY	dev	W2-TRACE	before-release	0 (off; read by the internal callable engine's tests)
 LUMA_TRIDIAGONAL	dev	W0	before-release	auto
 LUMA_TRSV	dev	W0	before-release	on

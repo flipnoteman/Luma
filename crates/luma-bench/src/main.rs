@@ -84,3 +84,35 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The no-generic guard of W2-R0: no bench case reaches the generic lowering. API operations never do (their strategies are
+    /// today's code), and recognition and the rewrite rules only make forms for patterns no bench case has; a `generic-*` decision
+    /// in the log would mean an operation fell through to the fallback. Every case of the suites runs once on the CPU backend
+    /// with its decisions recorded.
+    #[test]
+    #[ignore = "runs every case of five suites once (minutes); the gate job runs it with --ignored"]
+    fn no_bench_case_reaches_the_generic_lowering() {
+        let options = ContextOptions::from_env().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false);
+        let ctx = Context::with_options(options).expect("a CPU context");
+        ctx.set_assume_idle(true);
+        let path = std::env::temp_dir().join(format!("luma-bench-no-generic-{}.jsonl", std::process::id()));
+        let mut h = harness::Harness::new(ctx, true, None, None);
+        h.iters = Some(1);
+        h.log_decisions(path.to_str().unwrap());
+        for (name, run) in suites::ALL {
+            if ["jit", "cfd", "ml", "datasci", "compute"].contains(name) {
+                h.suite = name.to_string();
+                run(&mut h);
+            }
+        }
+        drop(h);
+        let log = std::fs::read_to_string(&path).expect("the decision log");
+        let _ = std::fs::remove_file(&path);
+        let generic: Vec<&str> = log.lines().filter(|line| line.contains("\"site\":\"Comprehension\"") && line.contains("\"chosen\":\"generic-")).collect();
+        assert!(generic.is_empty(), "{} decisions reached the generic lowering, the first: {}", generic.len(), generic[0]);
+    }
+}

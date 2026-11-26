@@ -169,50 +169,69 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     Some(Prepared { form, factors: [lhs_factors, rhs_factors], axes: [lhs_axes, rhs_axes], m, n, k, batch, mac, instrs })
 }
 
+/// The points of the operand over `axes`.
+fn extent_len(form: &Comprehension, axes: &[usize]) -> usize {
+    axes.iter().map(|&d| form.space[d].extent as usize).product()
+}
+
+/// The nodes of one side's operand program: the views of its inputs and the instructions over them.
+struct Operand<'a> {
+    plan: &'a Prepared,
+    ctx: &'a Context,
+    axes: &'a [usize],
+    extent: SmallVec<[u64; 4]>,
+    len: usize,
+    views: HashMap<u32, Arc<Node>>,
+    temps: HashMap<u32, Arc<Node>>,
+    location: &'static Location<'static>,
+}
+
+impl Operand<'_> {
+    /// The value `r` names, as an operand of a node.
+    fn value(&mut self, r: Ref) -> Result<Src, Failure> {
+        match r {
+            Ref::Input(j) => {
+                if let Some(view) = self.views.get(&j) {
+                    return Ok(Src::Node(Arc::clone(view)));
+                }
+                let view = view_node(self.ctx, &self.plan.form, j as usize, self.axes, &Origin6([0; MAX_DIMS]), &self.extent, self.location)?;
+                self.views.insert(j, Arc::clone(&view));
+                Ok(Src::Node(view))
+            }
+            Ref::Scalar(k) => Ok(Src::Scalar(self.plan.form.body.scalars[k as usize])),
+            Ref::Tmp(t) => {
+                if let Some(node) = self.temps.get(&t) {
+                    return Ok(Src::Node(Arc::clone(node)));
+                }
+                let instr = &self.plan.instrs[t as usize];
+                let mut args = [Src::unused(), Src::unused(), Src::unused()];
+                for (slot, &arg) in args.iter_mut().zip(&instr.args) {
+                    *slot = self.value(arg)?;
+                }
+                let node = jit::create(self.ctx, self.len, instr.op, args, "comprehension", self.location)?;
+                self.temps.insert(t, Arc::clone(&node));
+                Ok(Src::Node(node))
+            }
+            Ref::Unused | Ref::Sub(_) => Ok(Src::unused()),
+        }
+    }
+}
+
 impl Prepared {
     /// The program of a side: the product of its factors over the views of its inputs, one node of `[k.., m.., b..]` points.
     fn operand(&self, ctx: &Context, side: usize, location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
         let axes = &self.axes[side];
         let extent: SmallVec<[u64; 4]> = axes.iter().map(|&d| self.form.space[d].extent).collect();
-        let len: usize = extent.iter().map(|&e| e as usize).product();
-        let origin = Origin6([0; MAX_DIMS]);
-        let mut views: HashMap<u32, Arc<Node>> = HashMap::new();
-        let mut temps: HashMap<u32, Arc<Node>> = HashMap::new();
-        let node_of = |this: &Self, r: Ref, views: &mut HashMap<u32, Arc<Node>>, temps: &mut HashMap<u32, Arc<Node>>| -> Result<Arc<Node>, Failure> {
-            fn build(this: &Prepared, ctx: &Context, r: Ref, axes: &[usize], extent: &[u64], origin: &Origin6, len: usize, views: &mut HashMap<u32, Arc<Node>>, temps: &mut HashMap<u32, Arc<Node>>, location: &'static Location<'static>) -> Result<Src, Failure> {
-                match r {
-                    Ref::Input(j) => {
-                        if !views.contains_key(&j) {
-                            views.insert(j, view_node(ctx, &this.form, j as usize, axes, origin, extent, location)?);
-                        }
-                        Ok(Src::Node(Arc::clone(&views[&j])))
-                    }
-                    Ref::Scalar(k) => Ok(Src::Scalar(this.form.body.scalars[k as usize])),
-                    Ref::Tmp(t) => {
-                        if !temps.contains_key(&t) {
-                            let instr = &this.instrs[t as usize];
-                            let mut args = [Src::unused(), Src::unused(), Src::unused()];
-                            for (slot, &arg) in args.iter_mut().zip(&instr.args) {
-                                *slot = build(this, ctx, arg, axes, extent, origin, len, views, temps, location)?;
-                            }
-                            temps.insert(t, jit::create(ctx, len, instr.op, args, "comprehension", location)?);
-                        }
-                        Ok(Src::Node(Arc::clone(&temps[&t])))
-                    }
-                    Ref::Unused | Ref::Sub(_) => Ok(Src::unused()),
-                }
-            }
-            match build(this, ctx, r, axes, &extent, &origin, len, views, temps, location)? {
-                Src::Node(node) => Ok(node),
-                _ => Err(Failure::from(LumaError::Unsupported("an operand of a contraction is a constant".into()))),
-            }
-        };
+        let mut program = Operand { plan: self, ctx, axes, extent, len: extent_len(&self.form, axes), views: HashMap::new(), temps: HashMap::new(), location };
         let mut product: Option<Arc<Node>> = None;
         for &factor in &self.factors[side] {
-            let node = node_of(self, factor, &mut views, &mut temps)?;
+            let node = match program.value(factor)? {
+                Src::Node(node) => node,
+                _ => return Err(Failure::from(LumaError::Unsupported("an operand of a contraction is a constant".into()))),
+            };
             product = Some(match product {
                 None => node,
-                Some(acc) => jit::create(ctx, len, Op::new(OpKind::Binary(BinOp::Mul), ElemTy::F32), [Src::Node(acc), Src::Node(node), Src::unused()], "comprehension", location)?,
+                Some(acc) => jit::create(ctx, program.len, Op::new(OpKind::Binary(BinOp::Mul), ElemTy::F32), [Src::Node(acc), Src::Node(node), Src::unused()], "comprehension", location)?,
             });
         }
         Ok(product.expect("a side has a factor"))

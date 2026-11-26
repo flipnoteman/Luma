@@ -41,7 +41,9 @@ pub(crate) mod roles;
 mod tests;
 
 pub(crate) use combiner::{CombineOp, CombinePart, Combiner, Compensation};
-pub(crate) use map::{AffineMap, AffineRow, MapRef};
+pub(crate) use map::{AffineMap, MapRef};
+#[cfg(test)]
+pub(crate) use map::AffineRow;
 pub(crate) use roles::classify;
 
 /// 07 open question 8, resolved: six dims, four inputs, four source rows (luma arrays have four axes).
