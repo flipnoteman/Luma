@@ -484,6 +484,42 @@ Kernels built through `Lower::kernel` are bounds-checked unless the author calls
 `unchecked_bounds`; a strategy cannot reach a buffer except through the `Bind` positions of a
 launch; scratch from `Lower::scratch` is charged to the memory budget and released after the op.
 
+## Custom elementwise functions
+
+A WGSL function of scalars can become an array operation that fuses with its neighbours into one
+kernel, like `sin` or `max`. Register it once; call it on arrays (and scalars) like any method.
+
+```rust
+use luma::*;
+
+let ctx = default_context()?;
+let ease = ctx.elementwise_fn::<f32>(
+    "ease",
+    "fn ease(a: f32, b: f32, x: f32) -> f32 {
+        let t = clamp((x - a) / (b - a), 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    }",
+)?;
+
+let x = Array::from_slice(&[-1.0f32, 0.25, 0.5, 2.0], 4)?;
+// `ease` fuses with the arithmetic around it: one kernel.
+let y = ease.call3(0.0f32, 1.0f32, &x * 1.0) * 2.0 + 1.0;
+assert_eq!(y.to_vec()?, vec![1.0, 1.3125, 2.0, 3.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+The function takes one to three parameters and returns a value, all of one scalar type (`f32`,
+`u32` or `i32`). It must be pure: no `var<storage>`, `var<uniform>`, `var<workgroup>` or
+`var<private>`, no arrays, pointers, atomics, barriers, subgroup, derivative or texture operations.
+Helper functions and constants in the same source are named `ease` or `ease_*`, so that two
+functions in one fused kernel cannot collide. A violation is `LumaError::ShaderCompile`. Registering
+a name twice with the same source gives the same function, with another source an error.
+
+The result is whatever the WGSL computes on each backend; the backend compiler may contract
+`a * b + c` into a fused multiply-add, as it does in fused chains of built-ins. The planner charges
+a call 4 `f32` operations when it decides how much to fuse (`ElementwiseFn::weight` changes it).
+A call is never evaluated on the host: small arrays still run on the device.
+
 ## Limits
 
 - Kernel arguments must be arrays that fit one buffer; an array split over several buffers

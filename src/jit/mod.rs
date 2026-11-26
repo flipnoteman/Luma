@@ -155,6 +155,7 @@
 
 mod bits;
 pub(crate) mod assign;
+pub(crate) mod calls;
 mod codegen;
 mod coarsen;
 pub(crate) mod comprehension;
@@ -511,6 +512,14 @@ pub(crate) enum OpKind {
     Cast(ElemTy),
     /// A value computed from the element's index alone; no array operands (see [`Gen`]).
     Generate(Gen),
+    /// A function registered by `Context::elementwise_fn` (see [`calls`]): `arity` scalar operands of the op's type, the
+    /// result of the same type.
+    Call {
+        /// The function's id in the process-wide table of [`calls`].
+        id: u16,
+        /// Operands: 1 to 3.
+        arity: u8,
+    },
 }
 
 /// What a [`OpKind::Generate`] computes for element `i` (its index in the whole array).
@@ -727,6 +736,7 @@ impl OpKind {
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
             OpKind::Generate(Gen::Index | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => 0,
             OpKind::Generate(_) => 2,
+            OpKind::Call { arity, .. } => *arity as usize,
         }
     }
 }
@@ -2156,6 +2166,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
         OpKind::Compare(cmp) => cmp.exists_for(op.ty),
         OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
         OpKind::Clamp => op.ty != ElemTy::C32,
+        OpKind::Call { .. } => matches!(op.ty, ElemTy::F32 | ElemTy::U32 | ElemTy::I32),
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
         OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::F16 | ElemTy::BF16),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
@@ -2182,7 +2193,7 @@ fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<()
 
 /// Turns the operands among the first `arity` that were evaluated since they were created into
 /// plain buffers; an operand that failed makes the operation fail the same way.
-#[inline]
+#[inline(always)]
 fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), Failure> {
     for i in 0..arity {
         let evaluated = match args.get(i) {

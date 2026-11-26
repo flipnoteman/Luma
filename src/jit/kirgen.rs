@@ -27,6 +27,7 @@ use crate::gpu::hash::FxMap;
 use crate::gpu::lower::{Library, finish, library};
 use crate::tuning::Tuning;
 
+use super::calls;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
@@ -806,6 +807,7 @@ impl<'a> Lower<'a> {
             }
             OpKind::Cast(to) => self.cast(fb, op.ty, to, x),
             OpKind::Generate(kind) => self.generate(fb, kind, op.out_ty(), index, x, y),
+            OpKind::Call { id, arity } => self.call(fb, &calls::fn_name(id), &[x, y, z][..arity as usize]),
             OpKind::Shift(_) => return None,
         })
     }
@@ -1950,6 +1952,7 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
         text.push_str(complex_library());
     }
     text.push_str(&generator_helpers(programs.iter().copied()));
+    text.push_str(&calls::helpers(programs.iter().copied()));
     if edges {
         text.push_str(EDGE_HELPERS);
     }

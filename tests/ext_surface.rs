@@ -1,7 +1,7 @@
 //! Names every item of the extension API (`tools/public-api/ext.txt`): a rename or removal fails to compile.
 
 use luma::ext::{params_bytes, ArgInfo, Bind, Fit, Lower, NumericsClass, Op, OpBuilder, OutShape, ScratchId, Strategy};
-use luma::{AnyArray, Context, DecisionSite, Dyn, ElemKind, Features, Kernel, LumaError, Reach, Result, Shape};
+use luma::{elementwise_fn, AnyArray, ElemFnType, ElementwiseFn, Context, DecisionSite, Dyn, ElemKind, Features, Kernel, LumaError, Reach, Result, Shape};
 
 #[allow(dead_code, clippy::type_complexity)]
 fn surface(ctx: &Context, kernel: &Kernel, x: &dyn AnyArray) -> Result<()> {
@@ -47,6 +47,15 @@ fn surface(ctx: &Context, kernel: &Kernel, x: &dyn AnyArray) -> Result<()> {
     let _ = op.apply1::<f32>(&[x], &[])?;
     let _ = ArgInfo::new(ElemKind::F32, Shape::from(1));
     let _ = params_bytes(&1.0f32)?;
+    let f: ElementwiseFn<f32> = ctx.elementwise_fn::<f32>("surface_f", "fn surface_f(x: f32) -> f32 { return x; }")?;
+    let g: ElementwiseFn<u32> = elementwise_fn::<u32>("surface_g", "fn surface_g(x: u32) -> u32 { return x; }")?;
+    let _ = (f.clone().weight(2.0).name(), g.name());
+    let a = luma::Array::<f32>::zeros(1)?;
+    let _ = (f.call1(&a), f.call2(&a, 1.0f32), f.call3(&a, &a, 1.0f32));
+    fn takes<T: ElemFnType>() {}
+    takes::<f32>();
+    takes::<u32>();
+    takes::<i32>();
     Ok(())
 }
 

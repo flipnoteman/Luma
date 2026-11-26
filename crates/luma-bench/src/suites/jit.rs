@@ -5,6 +5,7 @@
 
 mod common;
 mod compile;
+mod ext;
 mod fusion;
 mod hoststep;
 mod launch;
@@ -24,7 +25,7 @@ use crate::harness::Harness;
 type Group = fn(&mut Harness);
 
 pub fn run(h: &mut Harness) {
-    let groups: [(&str, Group); 12] = [
+    let groups: [(&str, Group); 13] = [
         ("compile", compile::run),
         ("launch", launch::run),
         ("launchcost", launchcost::run),
@@ -37,6 +38,7 @@ pub fn run(h: &mut Harness) {
         ("memory", memory::run),
         ("readback", readback::run),
         ("threads", threads::run),
+        ("ext", ext::run),
     ];
     let start = Instant::now();
     for (name, group) in groups {

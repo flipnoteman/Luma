@@ -549,4 +549,38 @@ mod tests {
             assert!(rewrite(&op, &args(33), &Numerics::default()).is_none());
         }
     }
+
+    /// No rule folds, reassociates, reformulates or removes a call, whatever its operands are.
+    #[test]
+    fn simplify_never_folds_a_call() {
+        let ctx = context(false);
+        let f = ctx.elementwise_fn::<f32>("sf_f", "fn sf_f(x: f32, y: f32, z: f32) -> f32 { return x + y * z; }").unwrap();
+        let x = Array::from_slice_on(&ctx, &W, 6).unwrap();
+        let buffer = |a: &Array<f32>| Src::Buffer(std::sync::Arc::clone(a.storage().ok().unwrap()));
+        let scalar_of = |v: f32| Src::Scalar(Scalar { ty: ElemTy::F32, bits: u64::from(v.to_bits()) });
+        let id = match f.call3(&x, &x, &x).pending().unwrap().op().kind {
+            OpKind::Call { id, .. } => id,
+            other => panic!("{other:?}"),
+        };
+        let op = Op::new(OpKind::Call { id, arity: 3 }, ElemTy::F32);
+        let operands: Vec<[Src; 3]> = vec![
+            [scalar_of(2.0), scalar_of(3.0), scalar_of(4.0)],
+            [scalar_of(0.0), scalar_of(0.0), scalar_of(0.0)],
+            [scalar_of(1.0), scalar_of(1.0), scalar_of(1.0)],
+            [scalar_of(-0.0), scalar_of(1.0), scalar_of(0.0)],
+            [buffer(&x), buffer(&x), buffer(&x)],
+            [buffer(&x), scalar_of(0.0), scalar_of(1.0)],
+            [scalar_of(1.0), buffer(&x), scalar_of(0.0)],
+            [buffer(&x), scalar_of(1.0), buffer(&x)],
+        ];
+        for numerics in [Numerics::strict(), Numerics::default(), Numerics::algebraic(), Numerics::fast()] {
+            for args in &operands {
+                assert!(rewrite(&op, args, &numerics).is_none(), "a rule rewrote a call on {args:?} under {numerics:?}");
+            }
+        }
+        // And through the arrays: the call survives in the program with all-scalar operands.
+        let one = f.call3(&x, 1.0f32, 0.0f32);
+        assert_eq!(one.to_vec().unwrap(), W.iter().map(|&v| v + 1.0 * 0.0).collect::<Vec<_>>());
+        assert_eq!(ctx.jit().last_program_len(), 1);
+    }
 }

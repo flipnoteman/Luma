@@ -143,6 +143,7 @@ mod dense;
 mod solve;
 mod erased;
 pub mod ext;
+pub use ext::{elementwise_fn, ElemFnType, ElementwiseFn};
 mod error;
 mod fields;
 mod fields_macro;

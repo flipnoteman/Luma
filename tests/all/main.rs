@@ -32,6 +32,7 @@ mod df32_library;
 mod elementwise_math;
 mod erased;
 mod errors;
+mod ext_fn;
 mod ext_op;
 mod ext_reach;
 mod euler_residual;

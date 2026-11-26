@@ -354,7 +354,7 @@ impl FusedKey {
         for (at, instr) in self.instrs.iter().enumerate() {
             coordinates[at] = match instr.op.kind {
                 OpKind::Generate(super::Gen::Index | super::Gen::RangePow2 | super::Gen::RangeConst { .. } | super::Gen::ParamRange { .. }) => true,
-                OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+                OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select | OpKind::Call { .. } => {
                     instr.args.iter().take(instr.op.kind.arity()).all(|arg| match *arg {
                         Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
                         Ref::Scalar(_) | Ref::Unused => true,
@@ -390,6 +390,7 @@ impl FusedKey {
                 OpKind::Binary(op) => format!("{op:?}"),
                 OpKind::Compare(op) => format!("{op:?}"),
                 OpKind::Classify(class) => class.name().to_owned(),
+                OpKind::Call { id, .. } => super::calls::fn_name(id),
                 other => format!("{other:?}"),
             })
             .collect();

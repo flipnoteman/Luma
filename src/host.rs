@@ -280,7 +280,7 @@ impl<'a> Eval<'a> {
                         let cast = cast_fn(ty, to)?;
                         zip(len, &a, &b, &c, |x, _, _| cast(x))
                     }
-                    OpKind::Generate(_) | OpKind::Shift(_) | OpKind::Part(_) | OpKind::Make => return None,
+                    OpKind::Generate(_) | OpKind::Shift(_) | OpKind::Part(_) | OpKind::Make | OpKind::Call { .. } => return None,
                 })
             }
         }
@@ -1187,4 +1187,25 @@ fn put<T: ScalarType>(target: &Array<T>, indices: &Array<u32>, values: &Rhs<'_, 
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program with a call is never evaluated on the host: the device runs it (and the host would run `* 2.0`).
+    #[test]
+    fn a_call_is_not_evaluated_on_the_host() {
+        let ctx = Context::new().unwrap();
+        let f = ctx.elementwise_fn::<f32>("ho_f", "fn ho_f(x: f32) -> f32 { return x * 2.0; }").unwrap();
+        let x = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
+        let plain = &x * 2.0;
+        let call = f.call1(&x);
+        let plain_on_host = plain.pending().is_some_and(|node| Eval::new(&ctx).node(node).is_some());
+        let call_on_host = call.pending().is_some_and(|node| Eval::new(&ctx).node(node).is_some());
+        // Where the host evaluates anything here, it evaluates the product and declines the call.
+        assert!(!call_on_host);
+        assert!(plain_on_host || !ctx.zero_copy() || ctx.is_cpu(), "the control did not run on the host either");
+        assert_eq!(call.to_vec().unwrap(), vec![2.0, 4.0, 6.0]);
+    }
 }

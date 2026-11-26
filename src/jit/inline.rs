@@ -352,7 +352,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     for (at, flat) in flats.iter().enumerate() {
         coordinates[at] = match flat.op.kind {
             OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => true,
-            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select | OpKind::Call { .. } => {
                 flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
                     Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
                     Ref::Scalar(_) | Ref::Unused => true,

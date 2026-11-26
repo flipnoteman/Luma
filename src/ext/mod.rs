@@ -12,7 +12,7 @@
 //! A custom op is an eager boundary: its inputs are evaluated first (an elementwise chain that
 //! feeds it runs as one launch before it), its outputs are buffers that later expressions read
 //! and fuse around. A custom op does not fuse with its neighbours; an elementwise function that
-//! should is [`ElementwiseFn`](crate::ElementwiseFn). Its launches are recorded in order with the
+//! should is [`ElementwiseFn`]. Its launches are recorded in order with the
 //! rest of the batch, so recordings and traces see them.
 //!
 //! # Safety contract
@@ -36,6 +36,9 @@
 //!   are stable across runs.
 
 mod apply;
+mod function;
+#[cfg(test)]
+mod function_tests;
 #[cfg(test)]
 mod tests;
 
@@ -51,6 +54,7 @@ use crate::shape::Shape;
 use luma_core::{CostModel, Features};
 
 pub use apply::{Bind, Fit, Lower, ScratchId};
+pub use function::{elementwise_fn, ElemFnType, ElementwiseFn};
 
 use crate::array::Array;
 use crate::numerics::Numerics;
@@ -218,6 +222,8 @@ impl OpDef {
 pub(crate) struct Registry {
     ops: RwLock<FxMap<&'static str, Arc<OpDef>>>,
     forced: Vec<(String, String)>,
+    /// The elementwise functions registered on the context, by name: the id of the source each name holds.
+    functions: std::sync::Mutex<FxMap<String, u16>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -236,7 +242,7 @@ impl Registry {
             .filter_map(|rest| rest.split_once('/'))
             .map(|(op, strategy)| (op.trim().to_owned(), strategy.trim().to_owned()))
             .collect();
-        Registry { ops: RwLock::new(FxMap::default()), forced }
+        Registry { ops: RwLock::new(FxMap::default()), forced, functions: std::sync::Mutex::default() }
     }
 
     fn forced(&self, op: &str) -> Option<&str> {

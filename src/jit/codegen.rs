@@ -28,6 +28,7 @@ use luma_core::kir::KernelModule;
 
 use crate::error::Result;
 
+use super::calls;
 use super::inline::{Inlined, Lowered, Region};
 use super::kirgen;
 use super::params;
@@ -184,6 +185,7 @@ fn operation_unrounded(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
         OpKind::Cast(to) => cast(ty, to, a),
         OpKind::Generate(kind) => generate(kind, op.out_ty(), index, a, b),
+        OpKind::Call { id, arity } => format!("{}({})", calls::fn_name(id), [a, b, c][..arity as usize].join(", ")),
         OpKind::Shift(_) => return None,
     })
 }
@@ -937,6 +939,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         src.push_str(DF_MATH_LIBRARY);
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
+    src.push_str(&calls::helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
     if key.params.is_some() {
         let bodies: Vec<&Inlined> = match lowered {

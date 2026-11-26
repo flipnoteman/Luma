@@ -20,3 +20,7 @@ luma::ext::Fit                    struct, non_exhaustive: inputs, outputs, param
 luma::ext::Lower                  struct, non_exhaustive: inputs, outputs, params, kernel, scratch, launch
 luma::ext::Bind                   enum, non_exhaustive: Input(usize) | Output(usize) | Scratch(ScratchId) | Uniform(Vec<u8>)
 luma::ext::ScratchId              struct (opaque)
+luma::Context::elementwise_fn     fn<T: ElemFnType>(&self, name: &str, wgsl: &str) -> Result<ElementwiseFn<T>>
+luma::elementwise_fn              fn<T: ElemFnType>(name: &str, wgsl: &str) -> Result<ElementwiseFn<T>>
+luma::ElementwiseFn<T>            Clone; call1/call2/call3(impl Operand<T>...) -> Array<T>, weight(self, f32) -> Self, name()
+luma::ElemFnType                  sealed trait: f32, u32, i32

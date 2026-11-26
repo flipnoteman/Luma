@@ -98,5 +98,27 @@ pub fn run(h: &mut Harness) {
         h.case("launchcost/readback16", &format!("n={N}"), per_sec(16, "readback/s"), &mut || {
             std::hint::black_box(rb(&x));
         });
+
+        // Dependent launches of a custom kernel that declares its reach (`Kernel::launch` with the check of the declaration).
+        {
+            const SCALE: &str = "@group(1) @binding(0) var<storage, read> x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> y: array<f32>;
+@group(1) @binding(2) var<uniform> k: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) { if (gid.x < luma.size.x) { y[gid.x] = k * x[gid.x]; } }";
+            let kernel = ctx.kernel(SCALE).elementwise().build().unwrap();
+            let custom = |x: &A| {
+                let mut y = x.clone();
+                for _ in 0..CHAIN {
+                    let mut out = A::zeros_on(&ctx, N).unwrap();
+                    kernel.launch([N as u32], args![&y, &mut out, uniform(&1.0001f32)]).unwrap();
+                    y = out;
+                }
+                y
+            };
+            let want: Vec<f32> = xh.iter().map(|v| (f64::from(*v) * 1.0001f64.powi(CHAIN as i32)) as f32).collect();
+            check("launchcost/custom", &custom(&x).to_vec().unwrap(), &want, 1e-4, 1e-4);
+            h.case("launchcost/custom64", &format!("n={N}"), per_sec(CHAIN, "launch/s"), &mut || force(&custom(&x)));
+        }
     });
 }

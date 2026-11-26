@@ -399,7 +399,33 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
     }
 }
 
+/// `min` of two `f32` operands through a custom elementwise function whose WGSL is `min`: a leaf operation that must agree with
+/// the built-in one under every engine configuration (the oracle computes the minimum). Taken for statements whose first
+/// operand is a variable of odd index, so that both paths run in every program.
+fn custom_min<T: Num>(env: &Env, lhs: &Opd, rhs: &Opd) -> Option<Array<T>> {
+    use std::any::Any;
+    if T::TY != Ty::F32 {
+        return None;
+    }
+    let (Opd::Var(i), r) = (lhs, rhs) else { return None };
+    if i % 2 == 0 {
+        return None;
+    }
+    let a = (get::<T>(env, *i) as &dyn Any).downcast_ref::<Array<f32>>()?;
+    let min = a.context().elementwise_fn::<f32>("fuzz_min", "fn fuzz_min(a: f32, b: f32) -> f32 { return min(a, b); }").ok()?;
+    let out = match r {
+        Opd::Var(j) => min.call2(a, (get::<T>(env, *j) as &dyn Any).downcast_ref::<Array<f32>>()?),
+        Opd::Const(c) => min.call2(a, *c),
+    };
+    (Box::new(out) as Box<dyn Any>).downcast::<Array<T>>().ok().map(|boxed| *boxed)
+}
+
 fn binary<T: Num>(env: &Env, lhs: &Opd, rhs: &Opd, op: BinOp) -> Array<T> {
+    if op == BinOp::Minimum
+        && let Some(custom) = custom_min::<T>(env, lhs, rhs)
+    {
+        return custom;
+    }
     let op = lbin(op);
     match (lhs, rhs) {
         (Opd::Var(i), r) => get::<T>(env, *i).binary(operand::<T>(env, r).rhs(), op, false, "fuzz"),

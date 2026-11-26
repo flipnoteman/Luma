@@ -16,8 +16,18 @@ pub(crate) use luma_core::{CostModel, MemoryModel};
 
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 
+/// The weight of the registered function `id` (out of line: the table is a lock, and `op_weight` runs for every node).
+#[cold]
+#[inline(never)]
+fn call_weight(id: u16) -> f64 {
+    f64::from(super::calls::def(id).weight())
+}
+
 /// The cost of `op` per element in f32-operation units.
 pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
+    if let OpKind::Call { id, .. } = op.kind {
+        return call_weight(id);
+    }
     let base = match op.kind {
         OpKind::Unary(u) => match u {
             UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
@@ -53,6 +63,7 @@ pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
         OpKind::Make => 1.0,
         OpKind::Classify(_) => 2.0,
         OpKind::Clamp => 2.0,
+        OpKind::Call { .. } => unreachable!("returned above"),
         OpKind::Cast(to) => {
             if to == ElemTy::Df32 || op.ty == ElemTy::Df32 {
                 4.0

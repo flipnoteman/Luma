@@ -512,3 +512,29 @@ fn recording_decisions_without_profiling_logs_the_replay_and_launches_the_same_k
     assert!(decisions.iter().all(|d| !d.chosen.is_empty()));
     assert!(ctx.jit().plan_stats().hits >= 1);
 }
+
+#[test]
+fn the_plan_cache_replays_a_program_with_a_call() {
+    let ctx = ctx();
+    let f = ctx.elementwise_fn::<f32>("pc_f", "fn pc_f(x: f32, y: f32) -> f32 { return x * y + 0.5; }").unwrap();
+    let start = data(W * H, 21);
+    let run = |cached: bool| {
+        ctx.jit().set_plan_cache(cached);
+        let mut u = A::from_slice_on(&ctx, &start, [W, H]).unwrap();
+        let mut seen = Vec::new();
+        for t in 0..10 {
+            // A scalar that changes every step, a call on it and on the state, a view of the state.
+            u = (f.call2(&u, 0.5 + 0.05 * t as f32) * 0.5 + u.flip(0) * 0.25).clamp(-4.0, 4.0);
+            u.eval().unwrap();
+            seen.push(bits(&u.to_vec().unwrap()));
+        }
+        seen
+    };
+    let before = ctx.jit().plan_stats();
+    let want = run(false);
+    assert_eq!(ctx.jit().plan_stats(), before, "the cache ran while it was off");
+    let got = run(true);
+    assert_eq!(got, want);
+    let after = ctx.jit().plan_stats();
+    assert!(after.hits - before.hits >= 3, "{after:?}");
+}
