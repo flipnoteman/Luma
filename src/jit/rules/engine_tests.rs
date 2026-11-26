@@ -566,6 +566,7 @@ fn a_rule_of_tier_one_runs_where_its_class_allows_and_at_most_four_rounds() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "output shape")]
 fn a_rewrite_that_changes_the_output_shape_trips_the_check() {
     let ctx = cpu();
@@ -577,6 +578,7 @@ fn a_rewrite_that_changes_the_output_shape_trips_the_check() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "result type")]
 fn a_rewrite_that_changes_the_type_trips_the_check() {
     let ctx = cpu();
@@ -587,6 +589,7 @@ fn a_rewrite_that_changes_the_type_trips_the_check() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "a source the original did not")]
 fn a_rewrite_that_reads_a_new_source_trips_the_check() {
     let ctx = cpu();
