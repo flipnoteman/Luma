@@ -162,6 +162,7 @@ impl Structured {
     }
 
     /// Whether this reduction can be recorded together with `seed` (itself mergeable).
+    #[inline(always)]
     pub(crate) fn partners_with(&self, seed: &Structured) -> bool {
         self.thread == seed.thread
             && !self.in_recording
@@ -196,11 +197,13 @@ impl Structured {
     }
 
     /// Whether this axis reduction can be recorded together with the axis reduction `seed` (itself mergeable): the same lines.
+    #[inline(always)]
     pub(crate) fn axis_partners_with(&self, seed: &Structured) -> bool {
         self.thread == seed.thread && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.comp().meta.geom == seed.comp().meta.geom && self.axis_eligible()
     }
 
     /// Whether this reduction can be recorded together with `seed`, which is mergeable (of whichever kind it is).
+    #[inline(always)]
     pub(crate) fn partner_of(&self, seed: &Structured) -> bool {
         if seed.is_axis() { self.axis_partners_with(seed) } else { self.partners_with(seed) }
     }
