@@ -10,7 +10,7 @@
 //! One rank group: the cost decides between the contraction and the reduction tail where both fit. All three are baselines (a form
 //! that reaches them has no other way to run, so the variant budget never refuses them).
 
-use super::super::strategy::{BitClass, Estimate, FamilyTag, GenericParams, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+use super::super::strategy::{BitClass, Estimate, FamilyTag, FitsInputs, GenericParams, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 use super::super::emit::Emit;
 use crate::array::Failure;
 use crate::caps::Caps;
@@ -42,6 +42,8 @@ const fn strategy(id: StrategyId, name: &'static str, bits: u16, fits: super::su
         group: 0,
         prologue: true,
         epilogue: false,
+        // `fits` reads the whole form (its space, accesses and body), which no key holds: never cached.
+        reads: FitsInputs::LIVE,
         fits,
         cost: Some(cost),
         split: split_reduce,

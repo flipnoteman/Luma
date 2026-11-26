@@ -271,6 +271,7 @@ static READS: [FitsInputs; FAMILY_COUNT] = [
     FitsInputs::union(&super::families::conv::CONV_STRATEGIES),
     FitsInputs::union(&super::families::window::WINDOW_STRATEGIES),
     FitsInputs::union(&super::families::opaque::OPAQUE_STRATEGIES),
+    FitsInputs::union(&super::families::generic::GENERIC_STRATEGIES),
 ];
 
 /// Whether `family`'s selections are cached: its table is a priority chain whose `fits` are all keyed (none reads
@@ -278,7 +279,7 @@ static READS: [FitsInputs; FAMILY_COUNT] = [
 /// every boundary family gains from the cache (`cumsum_small` 5433 to 5330, `medfilt_small` 5492 to 5246); a product's live walk is
 /// short on the CPU (one `fits` of the native product) and the cache cost more than it saved (`launchcost/matmul32` +0.84%), so
 /// products are not cached. Reductions read `LIVE`.
-static CACHED: [bool; FAMILY_COUNT] = [false, true, true, true, false, false, false, false, true, true, false, false, true, true, true];
+static CACHED: [bool; FAMILY_COUNT] = [false, true, true, true, false, false, false, false, true, true, false, false, true, true, true, false];
 
 #[inline(always)]
 pub(crate) fn cacheable(family: FamilyTag) -> bool {
@@ -419,7 +420,7 @@ fn first_fit_slow(ctx: &Context, subject: &Subject<'_>, entries: &'static [Strat
     let generation = state.generation.load(Ordering::Acquire);
     let words = match subject {
         Subject::Boundary(boundary) => Words::new(entries, boundary.dims, boundary.key),
-        Subject::Contraction(_) | Subject::Comp(_) => return first_fit_live(ctx, subject, entries),
+        Subject::Contraction(_) | Subject::Comp(_) | Subject::Form(..) => return first_fit_live(ctx, subject, entries),
     };
     if state.mode == CacheMode::Verify
         && let Some(found) = probe(generation, &words)
