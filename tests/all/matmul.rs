@@ -289,11 +289,11 @@ fn a_lazy_operand_is_not_evaluated_separately() {
     // A backend with native products (the CPU one, or CUDA's own kernels) computes lazy operands first, together.
     let own_gemm = std::env::var("LUMA_OWN_GEMM").as_deref().map(str::trim) != Ok("off");
     let native = (ctx.backend() == luma::BackendKind::Cpu && std::env::var("LUMA_NATIVE_GEMM").as_deref().map(str::trim) != Ok("off")) || (ctx.backend() == luma::BackendKind::Cuda && own_gemm);
-    // The product is made and used inside the region, so a lazy call site launches within it too, and the operand is the product's alone:
-    // one that an array still holds would be evaluated by the same `check`.
+    // The product is made and used inside the region, so a lazy call site launches within it too, and `eval` evaluates the product alone
+    // (a `check` would also evaluate the operand, which an array still holds).
     let (c, profile) = ctx.profile(|| {
         let c = (&a * 2.0).matmul(&b);
-        c.check().unwrap();
+        c.eval().unwrap();
         c
     })
     .unwrap();
@@ -302,7 +302,7 @@ fn a_lazy_operand_is_not_evaluated_separately() {
     // Both operands lazy: one launch for the two of them, the product being a second one if native.
     let (c, profile) = ctx.profile(|| {
         let c = (&a * 2.0).matmul(&(&b + 1.0));
-        c.check().unwrap();
+        c.eval().unwrap();
         c
     })
     .unwrap();
