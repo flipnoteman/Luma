@@ -12,7 +12,7 @@ A=$(cd "$(dirname "$A")" && pwd)/$(basename "$A") B=$(cd "$(dirname "$B")" && pw
 CA=$(mktemp -d) CB=$(mktemp -d)   # a kernel/pipeline cache per side, empty at the start of the job (a shared one near its size cap
                                   # makes context creation cost ~1 ms per cached MB and vary with whatever runs left in it)
 extra=(); [ -n "${QUICK:-}" ] && extra+=(--quick); [ -n "${ONLY:-}" ] && extra+=(--only "$ONLY")
-total_units=0 ran=0
+total_units=0 ran=0 failed=0
 
 bin_of() { [ "$1" = a ] && echo "$A" || echo "$B"; }
 lab_of() { [ "$1" = a ] && echo "$LA" || echo "$LB"; }
@@ -39,7 +39,7 @@ sample_run() {
     --json "$tmp/j" > "$tmp/t" 2>> out/stderr-"$side".log
   rc=$?
   if [ $rc -eq 3 ]; then rm -rf "$tmp"; return 0; fi   # no case in this unit on this side (the other side has it)
-  [ $rc -eq 0 ] || [ $rc -eq 1 ] || echo "benchab: $side $be $suite sample $n exit $rc (${units:-whole suite})"
+  [ $rc -eq 0 ] || [ $rc -eq 1 ] || { echo "benchab: $side $be $suite sample $n exit $rc (${units:-whole suite})"; failed=$((failed + 1)); }
   [ -f "$tmp/j" ] && cat "$tmp/j" >> "$f.jsonl"
   { [ -n "$units" ] && echo "== $units"; cat "$tmp/t"; } >> "$f.txt"
   ran=$((ran + 1))
@@ -119,6 +119,10 @@ for be in $BACKENDS; do
 done
 echo "benchab: SKIPPED / FAILED cases, runs per side-backend-suite:"
 grep -H -E '^(SKIPPED|FAILED): ' out/*.txt 2>/dev/null | sed -E 's|^out/(.*)-[ab][0-9]+[.]txt:|\1 |' | sort | uniq -c | cut -c1-400 || true
+if [ "$failed" -gt 0 ]; then
+  echo "benchab: $failed run(s) crashed (see out/stderr-*.log): the results are incomplete"
+  exit 1
+fi
 if [ "$ran" -eq 0 ]; then
   echo "benchab: nothing ran: no suite/group matched${ONLY:+ --only '$ONLY'} (a group is picked by suite/group, a case by suite/group/case or group/case)"
   exit 1
