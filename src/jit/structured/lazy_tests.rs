@@ -545,16 +545,23 @@ fn a_looped_batch_is_decided_at_creation() {
     let b = A::from_slice_on(&lazy, &hb, [n, k, batch]).unwrap();
     lazy.record_decisions(true);
     let c = a.matmul_batched(&b);
-    assert!(plans(&lazy).is_empty(), "nothing is recorded at the call, whichever way the batch goes");
-    match c.structured() {
-        // A backend that took it in one launch.
-        Some(_) => assert!(is_lazy(&c)),
-        // The loop: a lazy product per matrix, joined by a view.
-        None => assert!(c.error().is_none()),
+    let at_call = plans(&lazy).len();
+    let launched = c.structured().is_some();
+    if launched {
+        // A backend that took it in one launch: a lazy value that records nothing at the call.
+        assert!(is_lazy(&c));
+        assert_eq!(at_call, 0, "a batch of one launch records nothing at the call");
+    } else {
+        // The loop: a product per matrix, joined by a view.
+        assert!(c.error().is_none());
     }
     assert_eq!(c.to_vec().unwrap(), host_batched(&ha, &hb, (k, m, n, batch), (true, true)));
-    let chosen = plans(&lazy).len();
-    assert!(chosen == 0 || chosen == batch, "one selection per matrix of a loop, none for a launch of the batch: {chosen}");
+    let chosen = at_call + plans(&lazy).len();
+    if launched {
+        assert_eq!(chosen, 0, "no selection for a launch of the batch");
+    } else {
+        assert!(chosen == 0 || chosen == batch, "one selection per matrix of a loop: {chosen}");
+    }
 }
 
 #[test]

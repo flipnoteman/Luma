@@ -128,7 +128,9 @@ fn a_product_of_expressions_and_views_matches_the_host() {
     let lazy = (&a * 2.0).matmul(&(&b + 1.0));
     let (da, db): (Vec<f32>, Vec<f32>) = (case.ha.iter().map(|v| v * 2.0).collect(), case.hb.iter().map(|v| v + 1.0).collect());
     assert_eq!(lazy.to_vec().unwrap(), host(&da, &db, K, M, N));
-    let (at, bt) = (A::from_slice_on(&case.ctx, &case.ha, [M, K]).unwrap(), A::from_slice_on(&case.ctx, &case.hb, [K, N]).unwrap());
+    // The same operands stored the other way round: `at` is `[M, K]`, `bt` is `[K, N]`.
+    let (hat, hbt): (Vec<f32>, Vec<f32>) = ((0..K * M).map(|i| case.ha[(i % M) * K + i / M]).collect(), (0..N * K).map(|i| case.hb[(i % K) * N + i / K]).collect());
+    let (at, bt) = (A::from_slice_on(&case.ctx, &hat, [M, K]).unwrap(), A::from_slice_on(&case.ctx, &hbt, [K, N]).unwrap());
     assert_eq!(a.matmul_nt(&bt).to_vec().unwrap(), case.product(), "nt");
     assert_eq!(at.matmul_tn(&b).to_vec().unwrap(), case.product(), "tn");
     assert_eq!(at.matmul_tt(&bt).to_vec().unwrap(), case.product(), "tt");

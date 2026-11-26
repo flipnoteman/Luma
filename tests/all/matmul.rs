@@ -290,12 +290,23 @@ fn a_lazy_operand_is_not_evaluated_separately() {
     let own_gemm = std::env::var("LUMA_OWN_GEMM").as_deref().map(str::trim) != Ok("off");
     let native = (ctx.backend() == luma::BackendKind::Cpu && std::env::var("LUMA_NATIVE_GEMM").as_deref().map(str::trim) != Ok("off")) || (ctx.backend() == luma::BackendKind::Cuda && own_gemm);
     let lazy = &a * 2.0;
-    let (c, profile) = ctx.profile(|| lazy.matmul(&b)).unwrap();
+    // The product is made and used inside the region, so a lazy call site launches within it too.
+    let (c, profile) = ctx.profile(|| {
+        let c = lazy.matmul(&b);
+        c.check().unwrap();
+        c
+    })
+    .unwrap();
     assert_eq!(profile.launches(), if native { 2 } else { 1 }, "{profile}");
     c.check().unwrap();
     // Both operands lazy: one launch for the two of them, the product being a second one if native.
     let (lazy_a, lazy_b) = (&a * 2.0, &b + 1.0);
-    let (c, profile) = ctx.profile(|| lazy_a.matmul(&lazy_b)).unwrap();
+    let (c, profile) = ctx.profile(|| {
+        let c = lazy_a.matmul(&lazy_b);
+        c.check().unwrap();
+        c
+    })
+    .unwrap();
     assert_eq!(profile.launches(), if native { 2 } else { 1 }, "{profile}");
     c.check().unwrap();
 }
