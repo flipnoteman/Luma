@@ -373,7 +373,11 @@ impl ContextOptions {
     pub(crate) fn effective_numerics(&self) -> Numerics {
         let mut numerics = self.numerics;
         if self.fast_math {
+            // Before the class flags existed `fast_math` was the one switch of the algebraic rewrites too.
             numerics = numerics.with_reduced(Reduced::FAST_MATH, true);
+            numerics.exact_finite = true;
+            numerics.reassociate = true;
+            numerics.reformulate = true;
         }
         if !self.tf32_matmul {
             numerics = numerics.with_reduced(Reduced::TF32_MATMUL, false);
@@ -667,6 +671,12 @@ impl Context {
         self.inner.numerics.fast_math()
     }
 
+    /// The numerics policy, by reference: what the hot paths read.
+    #[inline(always)]
+    pub(crate) fn numerics_ref(&self) -> &Numerics {
+        &self.inner.numerics
+    }
+
     /// Whether this context runs on a software (CPU) device.
     pub fn is_cpu(&self) -> bool {
         self.inner.backend.info().cpu
@@ -746,7 +756,7 @@ impl Context {
                 reduce_counter: OnceLock::new(),
                 builtins: BuildCache::default(),
                 chirps: Mutex::new(std::collections::HashMap::new()),
-                jit: JitState::new(&limits),
+                jit: JitState::new(&limits, &options.effective_numerics()),
                 kernels: BuildCache::default(),
                 module_kernels: Mutex::default(),
                 keyed_kernels: Mutex::default(),

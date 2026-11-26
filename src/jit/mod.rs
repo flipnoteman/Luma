@@ -181,7 +181,7 @@ mod readers;
 mod rerun;
 mod replay;
 mod simplify;
-mod rules;
+pub(crate) mod rules;
 pub(crate) mod speculate;
 pub(crate) mod stack;
 mod staging;
@@ -2246,7 +2246,7 @@ fn create_with(
     let mut rounds = 0;
     if jit.simplify_enabled() {
         while rounds < 4
-            && let Some((rewritten, operands)) = simplify::rewrite(rewritten_op.as_ref().unwrap_or(first_op), &args, ctx.fast_math())
+            && let Some((rewritten, operands)) = simplify::rewrite(rewritten_op.as_ref().unwrap_or(first_op), &args, ctx.numerics_ref())
         {
             rewritten_op = Some(rewritten);
             args = operands;
@@ -3114,6 +3114,8 @@ pub(crate) struct JitState {
     structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
     merged_seen: Mutex<FxMap<u64, u32>>,
+    /// What the rewrite engine decided when the context opened, and the programs its normaliser remembers (see [`rules`]).
+    pub(crate) rules: rules::RulesState,
     /// Strategy rankings by subject (see [`structured::select`]).
     pub(crate) selections: structured::select::SelectionCache,
     /// What the selection cache of the strategy registry needs of the context (see [`structured::select`]).
@@ -3242,7 +3244,7 @@ pub(crate) struct StatsSnapshot {
 }
 
 impl JitState {
-    pub(crate) fn new(limits: &luma_core::DeviceLimits) -> Self {
+    pub(crate) fn new(limits: &luma_core::DeviceLimits, numerics: &crate::numerics::Numerics) -> Self {
         let max_nodes = std::env::var(MAX_NODES_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -3268,6 +3270,7 @@ impl JitState {
             structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             selections: Mutex::new(FxMap::default()),
+            rules: rules::RulesState::new(numerics),
             selcache: structured::select::SelState::new(),
             telemetry: structured::telemetry::Telemetry::default(),
             variants: structured::select::Variants::default(),

@@ -25,6 +25,7 @@ use crate::gpu::hash::FxHasher;
 use crate::image::window::Op as WindowOp;
 use crate::image::ConvSpec;
 use crate::jit::program::{Instr, Ref};
+use crate::jit::rules::RuleId;
 use crate::jit::{Edge, ElemTy, Scalar, Src};
 
 pub(crate) mod build;
@@ -52,13 +53,15 @@ pub(crate) const MAX_INPUTS: usize = 4;
 pub(crate) const MAX_ROWS: usize = 4;
 
 /// The `LUMA_ALGEBRA` switch (removed before the release): `off` makes the builders skip the form, so the operations run as they
-/// did before the form existed; `api` builds the forms and lets only `Origin::Api` lower; `on` (the default) is everything the
-/// later specs add (recognition, rules; W2-R3 inserts `t1` between `api` and `on`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// did before the form existed; `api` builds the forms and lets only `Origin::Api` lower; `t1` adds the comprehension rules that
+/// run when a form is built; `on` (the default) adds recognition and the normaliser that runs when a value is forced. Each mode
+/// includes the ones before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Algebra {
-    Off,
-    Api,
-    On,
+    Off = 0,
+    Api = 1,
+    T1 = 2,
+    On = 3,
 }
 
 impl Algebra {
@@ -67,6 +70,7 @@ impl Algebra {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "false" => Some(Algebra::Off),
             "api" => Some(Algebra::Api),
+            "t1" => Some(Algebra::T1),
             "on" | "1" | "true" => Some(Algebra::On),
             _ => None,
         }
@@ -273,10 +277,6 @@ pub(crate) enum Origin {
     Recognised(Form),
     Rewritten(RuleId),
 }
-
-/// Which rewrite rule made a form. The rule table is W2-R3's; the generic lowering only needs to tell the origin from an API tag.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct RuleId(pub(crate) u16);
 
 /// Which API operation a value or form is. Not `Copy`: the convolution's spec is boxed, so that the tag every reduction carries is
 /// the size of its op list and not of the largest spec.

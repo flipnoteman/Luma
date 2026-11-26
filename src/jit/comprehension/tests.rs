@@ -250,7 +250,9 @@ fn props_meet_and_join_are_the_lattice_of_the_facts() {
 fn algebra_switch_parses() {
     assert_eq!(Algebra::parse("off"), Some(Algebra::Off));
     assert_eq!(Algebra::parse(" API "), Some(Algebra::Api));
+    assert_eq!(Algebra::parse("t1"), Some(Algebra::T1));
     assert_eq!(Algebra::parse("on"), Some(Algebra::On));
+    assert!(Algebra::Off < Algebra::Api && Algebra::Api < Algebra::T1 && Algebra::T1 < Algebra::On);
     assert_eq!(Algebra::parse("maybe"), None);
 }
 
@@ -579,8 +581,8 @@ fn bilateral_is_two_sums_and_a_division() {
 
 // -- the values the library makes --
 
-fn form_of(array: &Array<f32>) -> Option<Comprehension> {
-    array.structured().expect("a lazy reduction").form()
+fn form_of(ctx: &Context, array: &Array<f32>) -> Option<Comprehension> {
+    array.structured().expect("a lazy reduction").form(ctx)
 }
 
 #[test]
@@ -591,7 +593,7 @@ fn a_reduction_holds_its_form() {
     let sum = lazy.sum();
     let value = sum.structured().expect("a reduction of a lazy array is a structured value");
     assert_eq!(value.comp().meta.tag, OpTag::Reduce(ReduceList::new(&[ReduceOp::Sum])));
-    let Some(form) = form_of(&sum) else {
+    let Some(form) = form_of(&ctx, &sum) else {
         assert!(!Algebra::builds_forms(), "LUMA_ALGEBRA=off builds no form");
         return;
     };
@@ -603,13 +605,13 @@ fn a_reduction_holds_its_form() {
     form.validate().unwrap();
 
     let several = lazy.reduce([Reduction::Min, Reduction::SumOfSquares]);
-    let form = form_of(&several).unwrap();
+    let form = form_of(&ctx, &several).unwrap();
     assert_eq!(parts(&form), [CombinePart::Min, CombinePart::Add]);
     assert_eq!(form.body.outs.as_slice(), [0, 1]);
 
     // An evaluated operand is a buffer: the reduction is still lazy (steps on its result fuse), over the reader node of it.
     let buffer = array(&ctx, 1000).sum();
-    assert_eq!(form_of(&buffer).unwrap().inputs[0].shape, [1000, 1, 1, 1]);
+    assert_eq!(form_of(&ctx, &buffer).unwrap().inputs[0].shape, [1000, 1, 1, 1]);
 }
 
 #[test]
@@ -617,7 +619,7 @@ fn a_step_on_a_reduction_extends_its_epilogue() {
     let ctx = cpu();
     let a = array(&ctx, 1000);
     let mean = (&(&a * 2.0f32).sum() / 1000.0f32).sqrt();
-    let Some(form) = form_of(&mean) else {
+    let Some(form) = form_of(&ctx, &mean) else {
         assert!(!Algebra::builds_forms());
         return;
     };
@@ -637,7 +639,7 @@ fn the_dot_product_is_a_reduction_tagged_dot() {
     assert_eq!(value.comp().meta.tag, OpTag::Dot);
     assert_eq!(value.ops(), ReduceList::new(&[ReduceOp::Sum]));
     assert!(value.fusable().is_some(), "it fuses steps on its result like any sum");
-    if let Some(form) = form_of(&dot) {
+    if let Some(form) = form_of(&ctx, &dot) {
         assert_eq!(form.origin, Origin::Api(OpTag::Dot));
         assert_eq!(form.inputs.len(), 1);
     }
@@ -659,7 +661,7 @@ fn a_deferred_axis_reduction_holds_the_form_of_its_lines() {
     let value = lines.structured().expect("a long axis reduction stays pending");
     assert!(value.is_axis());
     assert_eq!(value.geom(), Some(AxisGeom { n: 400, stride: 300, lines: 600 }));
-    let Some(form) = value.form() else {
+    let Some(form) = value.form(&ctx) else {
         assert!(!Algebra::builds_forms());
         return;
     };

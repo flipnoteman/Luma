@@ -1,8 +1,8 @@
 //! Algebraic simplification of an operation about to be created (see [`rewrite`]).
 //!
-//! The rules in [`exact`] never change a result bit (up to the payload of a NaN). The rules in
-//! [`fast`] assume finite values and ignore the sign of zero and rounding, so they only run with
-//! [`Reduced::FAST_MATH`](crate::Reduced::FAST_MATH).
+//! The rules in [`exact`] never change a result bit (up to the payload of a NaN). The others are gated by the class flags of the
+//! context's [`Numerics`]: [`exact_finite`] (bit-equal on finite values), [`reassociating`] and [`reformulating`] (they change
+//! rounding, the sign of zero, or the handling of NaN and infinity; the harness of `rules` checks each by its class).
 //!
 //! A rewrite never returns an existing node: an identity becomes a `Unary(Id)` of the surviving
 //! operand and a constant a `Unary(Id)` of a scalar, because a node an array holds must not
@@ -13,12 +13,18 @@
 //! is what the hazard analysis walks, and a copy that read `x` directly would not see that the
 //! expression below it has to be evaluated before the write.
 
+use super::rules::{Rid, hit};
 use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
+use crate::numerics::Numerics;
 
-/// The operation and operands to create instead of `op` on `args`, if a rule applies.
+/// The operation and operands to create instead of `op` on `args`, if a rule applies: the rules of the tables in the order of
+/// their classes, each table only where the context's numerics allow its class (see `rules::registry`).
 #[inline]
-pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
-    exact(op, args).or_else(|| if fast { self::fast(op, args) } else { None })
+pub(super) fn rewrite(op: &Op, args: &Args, n: &Numerics) -> Option<(Op, Args)> {
+    exact(op, args)
+        .or_else(|| if n.exact_finite || n.reformulate { exact_finite(op, args, n) } else { None })
+        .or_else(|| if n.reassociate { reassociating(op, args) } else { None })
+        .or_else(|| if n.reformulate { reformulating(op, args) } else { None })
 }
 
 fn is_float(ty: ElemTy) -> bool {
@@ -43,8 +49,8 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
 /// rule that looks at the *value* of a scalar looks for one of these). A step that makes the same
 /// operations on scalars that are not sensitive gets the same rewrites (none, or those the
 /// operands decide), which is what trace following relies on to skip [`rewrite`] (see
-/// `LUMA_TRACE_FOLLOW`). The fast rules read any value: they are not covered, following always runs
-/// [`rewrite`] under fast math.
+/// `LUMA_TRACE_FOLLOW`). The rules of the flagged passes read any value: they are not covered, following always runs
+/// [`rewrite`] in a context whose numerics allow one of them.
 pub(super) fn sensitive(ty: ElemTy, bits: u64) -> bool {
     let bits = bits & 0xffff_ffff;
     let shifts = matches!(ty, ElemTy::U32 | ElemTy::I32 | ElemTy::U8 | ElemTy::U16 | ElemTy::I8 | ElemTy::I16) && bits & 31 == 0;
@@ -125,16 +131,14 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
         // Not one identity of a real number holds bit for bit for a complex one: `z * 1` has
         // `inf * 0` in it, and `z + (-0)` turns a `-0` imaginary part into `+0`.
         OpKind::Binary(_) if ty == ElemTy::C32 => None,
-        // arm: complex-part-of-make
         OpKind::Part(Part::Real | Part::Imag) => {
             let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Make)?;
-            identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))])
+            hit(Rid::PartOfMake, identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))]))
         }
-        // arm: complex-make-of-parts
         OpKind::Make => {
             let (_, real) = inner(a, |inside| inside.kind == OpKind::Part(Part::Real))?;
             let (_, imag) = inner(b, |inside| inside.kind == OpKind::Part(Part::Imag))?;
-            if same(&real[0], &imag[0]) { identity(op, &real[0]) } else { None }
+            if same(&real[0], &imag[0]) { hit(Rid::MakeOfParts, identity(op, &real[0])) } else { None }
         }
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
@@ -143,63 +147,52 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
             // All bits set: `-1` for `i32` (a larger constant saturates to `i32::MAX`).
             let all_ones = if ty == ElemTy::I32 { -1.0 } else { f64::from(u32::MAX) };
             match bin {
-                // arm: mul-one, mul-minus-one, mul-zero-int
                 BinOp::Mul => {
                     if is_value(sb, ty, 1.0) {
-                        identity(op, a)
+                        hit(Rid::MulOne, identity(op, a))
                     } else if is_value(sa, ty, 1.0) {
-                        identity(op, b)
+                        hit(Rid::MulOne, identity(op, b))
                     } else if (float || ty == ElemTy::I32) && is_value(sb, ty, -1.0) {
-                        unary(UnOp::Neg, ty, a)
+                        hit(Rid::MulNegOne, unary(UnOp::Neg, ty, a))
                     } else if (float || ty == ElemTy::I32) && is_value(sa, ty, -1.0) {
-                        unary(UnOp::Neg, ty, b)
+                        hit(Rid::MulNegOne, unary(UnOp::Neg, ty, b))
                     } else if u32s && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) {
-                        constant(op, 0.0)
+                        hit(Rid::MulZeroInt, constant(op, 0.0))
                     } else {
                         None
                     }
                 }
-                // arm: div-one
-                BinOp::Div if is_value(sb, ty, 1.0) => identity(op, a),
-                // arm: sub-zero
-                BinOp::Sub if is_value(sb, ty, 0.0) => identity(op, a),
-                // arm: sub-same-int
-                BinOp::Sub if u32s && same(a, b) => constant(op, 0.0),
-                // arm: add-neutral
+                // A division flushes a subnormal dividend to zero on a device that flushes (`div_one` is `Reformulating` by the
+                // harness) and always ran: it keeps its place in this table.
+                BinOp::Div if is_value(sb, ty, 1.0) => hit(Rid::DivOne, identity(op, a)),
+                BinOp::Sub if is_value(sb, ty, 0.0) => hit(Rid::SubZero, identity(op, a)),
+                BinOp::Sub if u32s && same(a, b) => hit(Rid::SubSameInt, constant(op, 0.0)),
                 BinOp::Add => {
-                    if float && is_value(sb, ty, -0.0) || u32s && is_value(sb, ty, 0.0) {
-                        identity(op, a)
-                    } else if float && is_value(sa, ty, -0.0) || u32s && is_value(sa, ty, 0.0) {
-                        identity(op, b)
+                    let float_b = float && is_value(sb, ty, -0.0);
+                    let float_a = float && is_value(sa, ty, -0.0);
+                    if float_b || u32s && is_value(sb, ty, 0.0) {
+                        hit(if float_b { Rid::AddNegZeroFloat } else { Rid::AddZeroInt }, identity(op, a))
+                    } else if float_a || u32s && is_value(sa, ty, 0.0) {
+                        hit(if float_a { Rid::AddNegZeroFloat } else { Rid::AddZeroInt }, identity(op, b))
                     } else {
                         None
                     }
                 }
-                // arm: min-max-same
-                BinOp::Min | BinOp::Max if same(a, b) => identity(op, a),
-                // arm: rem-one-int
-                BinOp::Rem if u32s && is_value(sb, ty, 1.0) => constant(op, 0.0),
-                // arm: xor-or-zero
-                BinOp::BitXor | BinOp::BitOr if is_value(sb, ty, 0.0) => identity(op, a),
-                BinOp::BitXor | BinOp::BitOr if is_value(sa, ty, 0.0) => identity(op, b),
-                // arm: xor-same
-                BinOp::BitXor if same(a, b) => constant(op, 0.0),
-                // arm: or-and-same
-                BinOp::BitOr | BinOp::BitAnd if same(a, b) => identity(op, a),
-                // arm: and-zero
-                BinOp::BitAnd if is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0) => constant(op, 0.0),
-                // arm: and-all-ones
-                BinOp::BitAnd if is_value(sb, ty, all_ones) => identity(op, a),
-                BinOp::BitAnd if is_value(sa, ty, all_ones) => identity(op, b),
-                // arm: binary-shift-multiple-of-32
+                BinOp::Min | BinOp::Max if same(a, b) => hit(Rid::MinMaxSame, identity(op, a)),
+                BinOp::Rem if u32s && is_value(sb, ty, 1.0) => hit(Rid::RemOneUint, constant(op, 0.0)),
+                BinOp::BitXor | BinOp::BitOr if is_value(sb, ty, 0.0) => hit(if bin == BinOp::BitXor { Rid::BitXorZero } else { Rid::BitOrZero }, identity(op, a)),
+                BinOp::BitXor | BinOp::BitOr if is_value(sa, ty, 0.0) => hit(if bin == BinOp::BitXor { Rid::BitXorZero } else { Rid::BitOrZero }, identity(op, b)),
+                BinOp::BitXor if same(a, b) => hit(Rid::BitXorSame, constant(op, 0.0)),
+                BinOp::BitOr | BinOp::BitAnd if same(a, b) => hit(Rid::BitOpSame, identity(op, a)),
+                BinOp::BitAnd if is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0) => hit(Rid::BitAndZero, constant(op, 0.0)),
+                BinOp::BitAnd if is_value(sb, ty, all_ones) => hit(Rid::BitAndOnes, identity(op, a)),
+                BinOp::BitAnd if is_value(sa, ty, all_ones) => hit(Rid::BitAndOnes, identity(op, b)),
                 // The amount is taken modulo 32: a multiple of 32 moves nothing.
-                BinOp::Shl | BinOp::Shr | BinOp::Rotl if sb.is_some_and(|s| s.ty == ty && s.bits & 31 == 0) => identity(op, a),
+                BinOp::Shl | BinOp::Shr | BinOp::Rotl if sb.is_some_and(|s| s.ty == ty && s.bits & 31 == 0) => hit(Rid::ShiftMod32, identity(op, a)),
                 _ => None,
             }
         }
-        // arm: unary-shift-zero
-        OpKind::Unary(UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0)) => identity(op, a),
-        // arm: involution, abs-chain, rounding-chain, shift-chain, sign-chain
+        OpKind::Unary(UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0)) => hit(Rid::ShiftZero, identity(op, a)),
         OpKind::Unary(un) => {
             if !matches!(
                 un,
@@ -210,44 +203,41 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) | (UnOp::Conj, UnOp::Conj) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
-                (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) => hit(Rid::NegNeg, identity(op, &iargs[0])),
+                (UnOp::Conj, UnOp::Conj) => hit(Rid::ConjConj, identity(op, &iargs[0])),
+                (UnOp::BitNot, UnOp::BitNot) => hit(Rid::BitNotBitNot, identity(op, &iargs[0])),
+                (UnOp::Abs, UnOp::Abs | UnOp::Neg) => hit(Rid::AbsAbsNeg, unary(UnOp::Abs, ty, &iargs[0])),
                 (UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round, UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round) => {
-                    unary(inner_un, ty, &iargs[0])
+                    hit(Rid::RoundFamily, unary(inner_un, ty, &iargs[0]))
                 }
-                (UnOp::Shl(x), UnOp::Shl(y)) if u32::from(x) + u32::from(y) < 32 => unary(UnOp::Shl(x + y), ty, &iargs[0]),
-                (UnOp::Shr(x), UnOp::Shr(y)) if u32::from(x) + u32::from(y) < 32 => unary(UnOp::Shr(x + y), ty, &iargs[0]),
-                (UnOp::Rotl(x), UnOp::Rotl(y)) => unary(UnOp::Rotl(((u32::from(x) + u32::from(y)) & 31) as u8), ty, &iargs[0]),
-                (UnOp::Sign, UnOp::Sign) => unary(UnOp::Sign, ty, &iargs[0]),
+                (UnOp::Shl(x), UnOp::Shl(y)) if u32::from(x) + u32::from(y) < 32 => hit(Rid::ShlShl, unary(UnOp::Shl(x + y), ty, &iargs[0])),
+                (UnOp::Shr(x), UnOp::Shr(y)) if u32::from(x) + u32::from(y) < 32 => hit(Rid::ShrShr, unary(UnOp::Shr(x + y), ty, &iargs[0])),
+                (UnOp::Rotl(x), UnOp::Rotl(y)) => hit(Rid::RotlRotl, unary(UnOp::Rotl(((u32::from(x) + u32::from(y)) & 31) as u8), ty, &iargs[0])),
+                (UnOp::Sign, UnOp::Sign) => hit(Rid::SignSign, unary(UnOp::Sign, ty, &iargs[0])),
                 _ => None,
             }
         }
-        // arm: select-scalar, select-not, select-same
         OpKind::Select => {
             if let Some(m) = scalar(a) {
-                identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c })
+                hit(Rid::SelectScalarMask, identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c }))
             } else if let Some((_, iargs)) = inner(a, |inside| inside.ty == ElemTy::Bool && inside.kind == OpKind::Unary(UnOp::BitNot)) {
-                Some((*op, args_of(iargs[0].clone(), c.clone(), b.clone())))
+                hit(Rid::SelectNotSwap, Some((*op, args_of(iargs[0].clone(), c.clone(), b.clone()))))
             } else if same(b, c) {
-                identity(op, b)
+                hit(Rid::SelectSame, identity(op, b))
             } else {
                 None
             }
         }
-        // arm: compare-same
         OpKind::Compare(cmp) if same(a, b) && cmp.exists_for(ty) => match cmp {
-            CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
-            CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
-            CmpOp::Ne if !is_float(ty) => constant(op, 0.0),
+            CmpOp::Lt | CmpOp::Gt => hit(Rid::LtGtSame, constant(op, 0.0)),
+            CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => hit(Rid::CmpSameInt, constant(op, 1.0)),
+            CmpOp::Ne if !is_float(ty) => hit(Rid::CmpSameInt, constant(op, 0.0)),
             _ => None,
         },
-        // arm: cast-f64-round-trip
         OpKind::Cast(ElemTy::F32) if ty == ElemTy::F64 => {
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Cast(_)))?;
             match iop.kind {
-                OpKind::Cast(through) if through == ty && iop.ty == ElemTy::F32 => {
-                    identity(op, &iargs[0])
-                }
+                OpKind::Cast(through) if through == ty && iop.ty == ElemTy::F32 => hit(Rid::CastThroughF64, identity(op, &iargs[0])),
                 _ => None,
             }
         }
@@ -275,8 +265,10 @@ fn survives(ty: ElemTy, value: f64, nonzero: bool) -> bool {
     rounded.is_finite() && (!nonzero || rounded != 0.0)
 }
 
-/// The rewrites that may change rounding, the sign of zero or the handling of NaN and infinity.
-fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
+/// The rules that are exact for finite values or reformulate (`ExactFinite` and the `Reformulating` arms that were always tried
+/// here, so that precedence stays what it was: `(x + a) + 0` loses its zero before `reassociating` folds the constants). Each
+/// arm checks the flag of its own gate.
+fn exact_finite(op: &Op, args: &Args, n: &Numerics) -> Option<(Op, Args)> {
     let [a, b, _] = args;
     let ty = op.ty;
     let float = is_float(ty);
@@ -284,56 +276,75 @@ fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             match bin {
-                // arm: fast-add-zero
-                BinOp::Add if float && is_value(sb, ty, 0.0) => identity(op, a),
-                BinOp::Add if float && is_value(sa, ty, 0.0) => identity(op, b),
-                // arm: fast-mul-zero
-                BinOp::Mul if float && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) => constant(op, 0.0),
-                // arm: fast-sub-same
-                BinOp::Sub if float && same(a, b) => constant(op, 0.0),
-                // arm: fast-add-neg, fast-sub-neg
-                BinOp::Add if float && inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
-                    let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
-                    binary(BinOp::Sub, ty, a, iargs[0].clone())
-                }
-                BinOp::Add if float && inner(a, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
-                    let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
-                    binary(BinOp::Sub, ty, b, iargs[0].clone())
-                }
-                BinOp::Sub if float && inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
-                    let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
-                    binary(BinOp::Add, ty, a, iargs[0].clone())
-                }
-                // arm: fast-div-same
-                BinOp::Div if float && same(a, b) => constant(op, 1.0),
-                // arm: fast-div-const
-                BinOp::Div if matches!(ty, ElemTy::F32 | ElemTy::F64) => {
-                    let divisor = sb.and_then(value_of).filter(|v| *v != 0.0)?;
-                    let recip = 1.0 / divisor;
-                    if !survives(ty, recip, true) {
-                        return None;
+                // The sign of a zero: `-0 + 0` is `+0`.
+                BinOp::Add if n.reformulate && float && is_value(sb, ty, 0.0) => hit(Rid::AddZeroFloat, identity(op, a)),
+                BinOp::Add if n.reformulate && float && is_value(sa, ty, 0.0) => hit(Rid::AddZeroFloat, identity(op, b)),
+                // A negative `x` gives `-0`, an infinite or NaN one NaN.
+                BinOp::Mul if n.reformulate && float && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) => hit(Rid::MulZeroFloat, constant(op, 0.0)),
+                BinOp::Sub if n.exact_finite && float && same(a, b) => hit(Rid::SubSameFloat, constant(op, 0.0)),
+                BinOp::Add if n.exact_finite && float => {
+                    if let Some((_, iargs)) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)) {
+                        hit(Rid::AddNegToSub, binary(BinOp::Sub, ty, a, iargs[0].clone()))
+                    } else if let Some((_, iargs)) = inner(a, |inside| inside.kind == OpKind::Unary(UnOp::Neg)) {
+                        hit(Rid::AddNegToSubLeft, binary(BinOp::Sub, ty, b, iargs[0].clone()))
+                    } else {
+                        None
                     }
-                    binary(BinOp::Mul, ty, a, scalar_of(ty, recip))
                 }
-                // arm: fast-reassociate
-                _ => reassociate(op, args),
+                BinOp::Sub if n.exact_finite && float => {
+                    let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
+                    hit(Rid::SubNegToAdd, binary(BinOp::Add, ty, a, iargs[0].clone()))
+                }
+                // A zero over a zero is NaN.
+                BinOp::Div if n.reformulate && float && same(a, b) => hit(Rid::DivSameFloat, constant(op, 1.0)),
+                _ => None,
             }
         }
-        // arm: fast-compare-same
-        OpKind::Compare(cmp) if same(a, b) => match cmp {
-            CmpOp::Le | CmpOp::Ge | CmpOp::Eq => constant(op, 1.0),
-            CmpOp::Ne => constant(op, 0.0),
+        // A NaN is not equal to itself.
+        OpKind::Compare(cmp) if n.exact_finite && same(a, b) => match cmp {
+            CmpOp::Le | CmpOp::Ge | CmpOp::Eq => hit(Rid::CmpSameFloat, constant(op, 1.0)),
+            CmpOp::Ne => hit(Rid::CmpSameFloat, constant(op, 0.0)),
             CmpOp::Lt | CmpOp::Gt => None,
         },
-        // arm: fast-powf
+        _ => None,
+    }
+}
+
+/// The rules that change rounding: a constant divisor becomes a product, constants of a chain fold, a power becomes a product,
+/// a quotient or a root.
+fn reassociating(op: &Op, args: &Args) -> Option<(Op, Args)> {
+    let [a, b, _] = args;
+    let ty = op.ty;
+    match op.kind {
+        OpKind::Binary(BinOp::Div) => {
+            if !matches!(ty, ElemTy::F32 | ElemTy::F64) {
+                return None;
+            }
+            let divisor = scalar(b).and_then(value_of).filter(|v| *v != 0.0)?;
+            let recip = 1.0 / divisor;
+            if !survives(ty, recip, true) {
+                return None;
+            }
+            hit(Rid::DivConstToMul, binary(BinOp::Mul, ty, a, scalar_of(ty, recip)))
+        }
+        OpKind::Binary(_) => reassociate(op, args),
         OpKind::Powf => match scalar(b).and_then(value_of)? {
-            0.0 => constant(op, 1.0),
-            -1.0 => Some((Op::new(OpKind::Binary(BinOp::Div), ty), args_of(scalar_of(ty, 1.0), a.clone(), Src::unused()))),
-            1.0 => identity(op, a),
-            2.0 => Some((Op::new(OpKind::Binary(BinOp::Mul), ty), args_of(a.clone(), a.clone(), Src::unused()))),
-            0.5 => unary(UnOp::Sqrt, ty, a),
+            -1.0 => hit(Rid::PowfNegOne, Some((Op::new(OpKind::Binary(BinOp::Div), ty), args_of(scalar_of(ty, 1.0), a.clone(), Src::unused())))),
+            1.0 => hit(Rid::PowfOne, identity(op, a)),
+            2.0 => hit(Rid::PowfTwo, Some((Op::new(OpKind::Binary(BinOp::Mul), ty), args_of(a.clone(), a.clone(), Src::unused())))),
+            0.5 => hit(Rid::PowfHalf, unary(UnOp::Sqrt, ty, a)),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// The rules that compute the same value another way and differ at the points their guards name.
+fn reformulating(op: &Op, args: &Args) -> Option<(Op, Args)> {
+    let [_, b, _] = args;
+    match op.kind {
+        // The device `pow` of a non-positive base is not 1.
+        OpKind::Powf if scalar(b).and_then(value_of)? == 0.0 => hit(Rid::PowfZero, constant(op, 1.0)),
         _ => None,
     }
 }
@@ -371,12 +382,12 @@ fn reassociate(op: &Op, args: &Args) -> Option<(Op, Args)> {
         _ => return None,
     };
     let (k, c) = (value_of(k)?, value_of(constant)?);
-    let (kind, folded) = match (outer, inside) {
-        (BinOp::Mul, BinOp::Mul) => (BinOp::Mul, k * c),
-        (BinOp::Add, BinOp::Add) => (BinOp::Add, k + c),
-        (BinOp::Add, BinOp::Sub) => (BinOp::Add, c - k),
-        (BinOp::Sub, BinOp::Add) => (BinOp::Add, k - c),
-        (BinOp::Sub, BinOp::Sub) => (BinOp::Sub, k + c),
+    let (kind, folded, rule) = match (outer, inside) {
+        (BinOp::Mul, BinOp::Mul) => (BinOp::Mul, k * c, Rid::ReassociateMulMul),
+        (BinOp::Add, BinOp::Add) => (BinOp::Add, k + c, Rid::ReassociateAddAdd),
+        (BinOp::Add, BinOp::Sub) => (BinOp::Add, c - k, Rid::ReassociateAddSub),
+        (BinOp::Sub, BinOp::Add) => (BinOp::Add, k - c, Rid::ReassociateSubAdd),
+        (BinOp::Sub, BinOp::Sub) => (BinOp::Sub, k + c, Rid::ReassociateSubSub),
         _ => return None,
     };
     // A constant that overflows or underflows in `ty` would turn finite results into infinities
@@ -384,7 +395,7 @@ fn reassociate(op: &Op, args: &Args) -> Option<(Op, Args)> {
     if !survives(ty, folded, kind == BinOp::Mul && k != 0.0 && c != 0.0) {
         return None;
     }
-    binary(kind, ty, x, scalar_of(ty, folded))
+    hit(rule, binary(kind, ty, x, scalar_of(ty, folded)))
 }
 
 #[cfg(test)]
@@ -477,10 +488,10 @@ mod tests {
             [Src::Scalar(Scalar::u32(m)), node(a), node(b)]
         };
         let op = Op::new(OpKind::Select, ElemTy::F32);
-        let (taken, operands) = rewrite(&op, &args(1, &f, &g), false).unwrap();
+        let (taken, operands) = rewrite(&op, &args(1, &f, &g), &Numerics::default()).unwrap();
         assert_eq!(taken.kind, OpKind::Unary(UnOp::Id));
         assert!(same(&operands[0], &args(1, &f, &g)[1]));
-        let (_, operands) = rewrite(&op, &args(0, &f, &g), false).unwrap();
+        let (_, operands) = rewrite(&op, &args(0, &f, &g), &Numerics::default()).unwrap();
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
     }
 
@@ -491,13 +502,13 @@ mod tests {
         let buffer = Src::Buffer(std::sync::Arc::clone(x.storage().ok().unwrap()));
         let op = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         let args = [buffer, Src::Scalar(Scalar::f32(3.0)), Src::unused()];
-        assert!(rewrite(&op, &args, false).is_none());
-        let (product, operands) = rewrite(&op, &args, true).unwrap();
+        assert!(rewrite(&op, &args, &Numerics::default()).is_none());
+        let (product, operands) = rewrite(&op, &args, &Numerics::fast()).unwrap();
         assert_eq!(product.kind, OpKind::Binary(BinOp::Mul));
         let Src::Scalar(factor) = operands[1] else { panic!("no constant") };
         assert_eq!(factor.bits, u64::from((1.0f32 / 3.0).to_bits()));
         let zero = [args[0].clone(), Src::Scalar(Scalar::f32(0.0)), Src::unused()];
-        assert!(rewrite(&op, &zero, true).is_none());
+        assert!(rewrite(&op, &zero, &Numerics::fast()).is_none());
     }
 
     #[test]
@@ -508,9 +519,9 @@ mod tests {
         let div = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         // Dividing by infinity or a subnormal whose reciprocal overflows `f32` must not fold.
         let by_inf = [buffer.clone(), Src::Scalar(Scalar::f32(f32::INFINITY)), Src::unused()];
-        assert!(rewrite(&div, &by_inf, true).is_none());
+        assert!(rewrite(&div, &by_inf, &Numerics::fast()).is_none());
         let by_subnormal = [buffer, Src::Scalar(Scalar::f32(1e-40)), Src::unused()];
-        assert!(rewrite(&div, &by_subnormal, true).is_none());
+        assert!(rewrite(&div, &by_subnormal, &Numerics::fast()).is_none());
         // A combined constant outside the range of `f32` must stay two operations (`fusion_limit(1)`
         // keeps the shader compiler's own fast-math from reassociating across the two steps).
         let near = |got: Vec<f32>, want: [f32; 2]| {
@@ -532,10 +543,10 @@ mod tests {
         let args = |amount: u32| [buffer.clone(), Src::Scalar(Scalar::u32(amount)), Src::unused()];
         for bin in [BinOp::Shl, BinOp::Shr, BinOp::Rotl] {
             let op = Op::new(OpKind::Binary(bin), ElemTy::U32);
-            let (kept, operands) = rewrite(&op, &args(64), false).unwrap();
+            let (kept, operands) = rewrite(&op, &args(64), &Numerics::default()).unwrap();
             assert_eq!(kept.kind, OpKind::Unary(UnOp::Id));
             assert!(same(&operands[0], &buffer));
-            assert!(rewrite(&op, &args(33), false).is_none());
+            assert!(rewrite(&op, &args(33), &Numerics::default()).is_none());
         }
     }
 }

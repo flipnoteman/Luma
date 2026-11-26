@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::array::{Failure, Storage};
 use crate::gpu_type::ElemLayout;
 use crate::context::Context;
+use crate::jit::comprehension::Algebra;
+use crate::jit::rules;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
 
@@ -377,6 +379,7 @@ pub(crate) fn stamp(ctx: &Context) -> u64 {
     mix.word(jit.max_inputs() as u64);
     mix.word(u64::from(jit.simplify_enabled()));
     mix.word(u64::from(ctx.fast_math()));
+    mix.word(rules::rules_hash(ctx.numerics_ref(), Algebra::current()));
     mix.finish()
 }
 

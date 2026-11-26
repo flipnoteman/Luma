@@ -1,10 +1,11 @@
 //! The rule checker: ℤ/p fingerprints, the class check against exact-`f32` semantics, and the
 //! rule-application check against `simplify.rs`.
 //!
-//! Every context is pinned to exact `f32` semantics: no fast math, no TF32
-//! (`Numerics::strict()`, plus `FAST_MATH` for the fast gate). The simplify gate a rule belongs to is the only one enabled
-//! in the rule-application check.
+//! Every context is pinned to exact `f32` semantics: no fast math, no TF32 (`Numerics::strict()`; the flagged passes of the
+//! rule-application check run in a context that only adds the three class flags).
 
+use super::table::*;
+use crate::jit::UnOp;
 use super::*;
 use crate::array::Array;
 use crate::context::{Context, ContextOptions};
@@ -528,14 +529,14 @@ enum Kind {
 // The harness.
 // ---------------------------------------------------------------------------------------------
 
-struct Harness {
-    /// Exact-`f32` semantics, no fast math.
-    strict: Context,
-    /// The same with `fast_math`: for the fast gate of the rule-application check.
-    fast: Context,
+pub(super) struct Harness {
+    /// Exact-`f32` semantics: no fast math, every class flag off.
+    pub(super) strict: Context,
+    /// The same with the three class flags set: for the flagged passes of the rule-application check.
+    pub(super) fast: Context,
     /// The backend flushes subnormal results of arithmetic to zero (wgpu): a property of the
     /// device, so the bit checks read a subnormal as a zero of its sign.
-    ftz: bool,
+    pub(super) ftz: bool,
 }
 
 /// A subnormal as a signed zero.
@@ -544,14 +545,24 @@ fn flush(b: u32) -> u32 {
 }
 
 impl Harness {
-    fn new() -> Harness {
-        let open = |fast: bool| Context::with_options(ContextOptions::from_env().numerics(if fast { crate::Numerics::strict().with_reduced(crate::Reduced::FAST_MATH, true) } else { crate::Numerics::strict() })).unwrap();
+    pub(super) fn new() -> Harness {
+        // Both are exact-`f32` contexts (no TF32, no fast math); the flagged one allows every class of rule.
+        let flagged = crate::Numerics { exact_finite: true, reassociate: true, reformulate: true, ..crate::Numerics::strict() };
+        let open = |fast: bool| Context::with_options(ContextOptions::from_env().numerics(if fast { flagged } else { crate::Numerics::strict() })).unwrap();
         let strict = open(false);
         strict.jit().set_simplify(false);
         let probe = Array::from_slice_on(&strict, &[1e-40f32], [1, 1]).unwrap();
         let ftz = (&probe * 1.0).to_vec().unwrap()[0].to_bits() & 0x7f80_0000 == 0;
         strict.jit().set_simplify(true);
         Harness { strict, fast: open(true), ftz }
+    }
+
+    /// Builds the lhs of `rule` in `ctx` with simplification on and the variables pending (what the application check does), so
+    /// that the rules that fire in it are counted by the trace.
+    pub(super) fn run_lhs(&self, ctx: &Context, rule: &Rule) {
+        let kind = if matches!(rule.gate, Gate::Flagged { .. }) { Kind::Random } else { Kind::Specials };
+        let batch = batches(rule, kind).swap_remove(0);
+        let _ = self.bits(ctx, &rule.lhs, rule, &batch, true, true);
     }
 
     /// The values of `e` over `batch` as the bits of its elements (a comparison: 0 or 1), with
@@ -674,9 +685,8 @@ fn check_application(h: &Harness, rule: &Rule) {
     let (fast, shortens) = match rule.gate {
         Gate::None => return,
         Gate::Exact { shortens } => (false, shortens),
-        Gate::Fast { shortens } => (true, shortens),
+        Gate::Flagged { shortens } => (true, shortens),
     };
-    assert!(!rule.arms.is_empty(), "{}: a rule of simplify.rs names its arms", rule.name);
     let as_bool = is_bool(&rule.lhs);
     let ctx = if fast { &h.fast } else { &h.strict };
     let kind = if fast { Kind::Random } else { Kind::Specials };
@@ -719,7 +729,7 @@ fn check_application(h: &Harness, rule: &Rule) {
     }
 }
 
-fn check(h: &Harness, rule: &Rule) {
+pub(super) fn check(h: &Harness, rule: &Rule) {
     check_zp(rule);
     check_class(h, rule);
     check_application(h, rule);
@@ -731,13 +741,12 @@ fn check(h: &Harness, rule: &Rule) {
 // equality with simplify off against on, and by the instruction-count contract.
 // ---------------------------------------------------------------------------------------------
 
-struct Typed {
-    name: &'static str,
-    arms: &'static [&'static str],
+pub(super) struct Typed {
+    pub(super) name: &'static str,
     /// The rule makes the program strictly shorter; a non-rule keeps its length exactly.
     shortens: bool,
-    rule: bool,
-    run: fn(&Context) -> Vec<u32>,
+    pub(super) rule: bool,
+    pub(super) run: fn(&Context) -> Vec<u32>,
 }
 
 const X: [f32; 6] = [0.0, -0.0, f32::NAN, f32::INFINITY, -1.5, 3.0];
@@ -768,53 +777,53 @@ fn pending_complex(ctx: &Context) -> Array<crate::complex::C32> {
 }
 
 #[allow(clippy::erasing_op, clippy::modulo_one, clippy::eq_op)]
-fn typed_cases() -> Vec<Typed> {
+pub(super) fn typed_cases() -> Vec<Typed> {
     use crate::complex::C32;
-    let t = |name, arms, shortens, run: fn(&Context) -> Vec<u32>| Typed { name, arms, shortens, rule: true, run };
-    let not_a_rule = |name, run: fn(&Context) -> Vec<u32>| Typed { name, arms: &[], shortens: false, rule: false, run };
+    let t = |name, shortens, run: fn(&Context) -> Vec<u32>| Typed { name, shortens, rule: true, run };
+    let not_a_rule = |name, run: fn(&Context) -> Vec<u32>| Typed { name, shortens: false, rule: false, run };
     vec![
-        t("u32 add zero", &["add-neutral"], false, |c| mask(&(&pending_u32(c) + 0u32))),
-        t("u32 sub zero", &["sub-zero"], false, |c| mask(&(&pending_u32(c) - 0u32))),
-        t("u32 mul one", &["mul-one"], false, |c| mask(&(&pending_u32(c) * 1u32))),
-        t("u32 div one", &["div-one"], false, |c| mask(&(&pending_u32(c) / 1u32))),
-        t("u32 mul zero", &["mul-zero-int"], true, |c| mask(&(&pending_u32(c) * 0u32))),
-        t("u32 rem one", &["rem-one-int"], false, |c| mask(&(&pending_u32(c) % 1u32))),
-        t("u32 xor zero", &["xor-or-zero"], false, |c| mask(&(&pending_u32(c) ^ 0u32))),
-        t("u32 zero xor", &["xor-or-zero"], false, |c| mask(&(0u32 ^ &pending_u32(c)))),
-        t("u32 or zero", &["xor-or-zero"], false, |c| mask(&(&pending_u32(c) | 0u32))),
-        t("u32 and all ones", &["and-all-ones"], false, |c| mask(&(&pending_u32(c) & u32::MAX))),
-        t("u32 all ones and", &["and-all-ones"], false, |c| mask(&(u32::MAX & &pending_u32(c)))),
-        t("u32 and zero", &["and-zero"], true, |c| mask(&(&pending_u32(c) & 0u32))),
-        t("u32 shl zero", &["unary-shift-zero"], false, |c| mask(&(&pending_u32(c) << 0u32))),
-        t("u32 shr 32", &["unary-shift-zero"], false, |c| mask(&(&pending_u32(c) >> 32u32))),
-        t("u32 rotl 0", &["unary-shift-zero"], false, |c| mask(&pending_u32(c).rotate_left(0u32))),
-        t("u32 rotl 64", &["unary-shift-zero"], false, |c| mask(&pending_u32(c).rotate_left(64u32))),
-        t("u32 rotr 0", &["unary-shift-zero"], false, |c| mask(&pending_u32(c).rotate_right(0u32))),
-        t("u32 shl shl", &["shift-chain"], true, |c| mask(&(&(&pending_u32(c) << 1u32) << 2u32))),
-        t("u32 shr shr", &["shift-chain"], true, |c| mask(&(&(&pending_u32(c) >> 1u32) >> 2u32))),
-        t("u32 rotl rotl", &["shift-chain"], true, |c| mask(&pending_u32(c).rotate_left(5u32).rotate_left(30u32))),
-        t("u32 xor self", &["xor-same"], true, |c| {
+        t("u32 add zero", false, |c| mask(&(&pending_u32(c) + 0u32))),
+        t("u32 sub zero", false, |c| mask(&(&pending_u32(c) - 0u32))),
+        t("u32 mul one", false, |c| mask(&(&pending_u32(c) * 1u32))),
+        t("u32 div one", false, |c| mask(&(&pending_u32(c) / 1u32))),
+        t("u32 mul zero", true, |c| mask(&(&pending_u32(c) * 0u32))),
+        t("u32 rem one", false, |c| mask(&(&pending_u32(c) % 1u32))),
+        t("u32 xor zero", false, |c| mask(&(&pending_u32(c) ^ 0u32))),
+        t("u32 zero xor", false, |c| mask(&(0u32 ^ &pending_u32(c)))),
+        t("u32 or zero", false, |c| mask(&(&pending_u32(c) | 0u32))),
+        t("u32 and all ones", false, |c| mask(&(&pending_u32(c) & u32::MAX))),
+        t("u32 all ones and", false, |c| mask(&(u32::MAX & &pending_u32(c)))),
+        t("u32 and zero", true, |c| mask(&(&pending_u32(c) & 0u32))),
+        t("u32 shl zero", false, |c| mask(&(&pending_u32(c) << 0u32))),
+        t("u32 shr 32", false, |c| mask(&(&pending_u32(c) >> 32u32))),
+        t("u32 rotl 0", false, |c| mask(&pending_u32(c).rotate_left(0u32))),
+        t("u32 rotl 64", false, |c| mask(&pending_u32(c).rotate_left(64u32))),
+        t("u32 rotr 0", false, |c| mask(&pending_u32(c).rotate_right(0u32))),
+        t("u32 shl shl", true, |c| mask(&(&(&pending_u32(c) << 1u32) << 2u32))),
+        t("u32 shr shr", true, |c| mask(&(&(&pending_u32(c) >> 1u32) >> 2u32))),
+        t("u32 rotl rotl", true, |c| mask(&pending_u32(c).rotate_left(5u32).rotate_left(30u32))),
+        t("u32 xor self", true, |c| {
             let u = pending_u32(c);
             mask(&(&u ^ &u))
         }),
-        t("u32 and self", &["or-and-same"], false, |c| {
+        t("u32 and self", false, |c| {
             let u = pending_u32(c);
             mask(&(&u & &u))
         }),
-        t("u32 or self", &["or-and-same"], false, |c| {
+        t("u32 or self", false, |c| {
             let u = pending_u32(c);
             mask(&(&u | &u))
         }),
-        t("u32 sub self", &["sub-same-int"], true, |c| {
+        t("u32 sub self", true, |c| {
             let u = pending_u32(c);
             mask(&(&u - &u))
         }),
-        t("u32 not not", &["involution"], true, |c| mask(&!&!&pending_u32(c))),
-        t("u32 le self", &["compare-same"], true, |c| {
+        t("u32 not not", true, |c| mask(&!&!&pending_u32(c))),
+        t("u32 le self", true, |c| {
             let u = pending_u32(c);
             u.le(&u).to_u32().to_vec().unwrap()
         }),
-        t("u32 ne self", &["compare-same"], true, |c| {
+        t("u32 ne self", true, |c| {
             let u = pending_u32(c);
             u.ne(&u).to_u32().to_vec().unwrap()
         }),
@@ -822,22 +831,30 @@ fn typed_cases() -> Vec<Typed> {
         not_a_rule("u32 shl one", |c| mask(&(&pending_u32(c) << 1u32))),
         not_a_rule("u32 rotl 33", |c| mask(&pending_u32(c).rotate_left(33u32))),
         not_a_rule("u32 and mask", |c| mask(&(&pending_u32(c) & 0xFF00u32))),
-        t("select of a negated mask", &["select-not"], true, |c| {
+        t("select of a negated mask", true, |c| {
             let (b, d) = (pending_f32(c, &X), pending_f32(c, &Y));
             let m = d.lt(0.5);
             select(&!&m, &b, &d).to_vec().unwrap().into_iter().map(canonical).collect()
         }),
-        t("complex make of the parts", &["complex-make-of-parts"], true, |c| {
+        t("complex make of the parts", true, |c| {
             let w = pending_complex(c);
             complex_bits(Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap())
         }),
-        t("complex part of make", &["complex-part-of-make", "complex-make-of-parts"], true, |c| {
+        t("complex real of make", true, |c| {
+            let (re, im) = (pending_f32(c, &X), pending_f32(c, &Y));
+            Array::from_parts(&re, &im).real().to_vec().unwrap().into_iter().map(canonical).collect()
+        }),
+        t("complex imag of make", true, |c| {
+            let (re, im) = (pending_f32(c, &X), pending_f32(c, &Y));
+            Array::from_parts(&re, &im).imag().to_vec().unwrap().into_iter().map(canonical).collect()
+        }),
+        t("complex make of the parts under a conj", true, |c| {
             let w = pending_complex(c);
             complex_bits(Array::from_parts(&w.real(), &w.imag()).conj().to_vec().unwrap())
         }),
-        t("complex conj conj", &["involution"], true, |c| complex_bits(pending_complex(c).conj().conj().to_vec().unwrap())),
+        t("complex conj conj", true, |c| complex_bits(pending_complex(c).conj().conj().to_vec().unwrap())),
         not_a_rule("complex times one", |c| complex_bits((&pending_complex(c) * C32::ONE).to_vec().unwrap())),
-        t("cast through f64", &["cast-f64-round-trip"], true, |c| {
+        t("cast through f64", true, |c| {
             if !c.features().contains(luma_core::Features::SHADER_F64) {
                 return Vec::new();
             }
@@ -846,7 +863,7 @@ fn typed_cases() -> Vec<Typed> {
     ]
 }
 
-fn check_typed(ctx: &Context, case: &Typed) {
+pub(super) fn check_typed(ctx: &Context, case: &Typed) {
     let mut results = Vec::new();
     for simplify in [false, true] {
         ctx.jit().set_simplify(simplify);
@@ -894,37 +911,9 @@ fn typed_cases_hold() {
     }
 }
 
-#[test]
-fn every_arm_of_simplify_has_a_rule() {
-    let source = include_str!("../simplify.rs");
-    let mut covered: Vec<&str> = Vec::new();
-    let table = rules();
-    covered.extend(table.iter().flat_map(|r| r.arms.iter().copied()));
-    let typed = typed_cases();
-    covered.extend(typed.iter().flat_map(|t| t.arms.iter().copied()));
-    for (arm, test) in COVERED_BY_UNIT_TEST {
-        assert!(source.contains(&format!("fn {test}()")), "arm {arm}: the unit test {test} is gone");
-        covered.push(arm);
-    }
-    let tagged: Vec<&str> = source.lines().filter_map(|l| l.trim().strip_prefix("// arm: ")).flat_map(|l| l.split(',').map(str::trim)).collect();
-    for arm in EXACT_ARMS.iter().chain(FAST_ARMS) {
-        assert!(covered.contains(arm), "no rule covers the arm {arm} of simplify.rs");
-        assert!(tagged.contains(arm), "the arm {arm} is not tagged in simplify.rs");
-    }
-    for arm in covered {
-        assert!(EXACT_ARMS.contains(&arm) || FAST_ARMS.contains(&arm), "a rule names {arm}, which is not an arm of simplify.rs");
-    }
-    for arm in tagged {
-        assert!(EXACT_ARMS.contains(&arm) || FAST_ARMS.contains(&arm), "simplify.rs tags the unlisted arm {arm}");
-    }
-    for rule in &table {
-        assert_eq!(rule.gate == Gate::None, rule.arms.is_empty(), "{}: a rule of simplify.rs has a gate and arms", rule.name);
-    }
-}
-
 /// A rule seeded with a flaw, for the tests that prove the harness bites.
 fn seeded(name: &'static str, class: Class, lhs: E, rhs: E) -> Rule {
-    rule(name, class, lhs, rhs, V1, Some(1e-6), Some("seeded"), Gate::None, &[])
+    rule(name, class, lhs, rhs, V1, Some(1e-6), Some("seeded"), Gate::None)
 }
 
 fn run_seeded(rule: Rule) {
@@ -983,3 +972,102 @@ fn seeded_wrong_identity_fails_zp() {
     run_seeded(seeded("x + 1", Class::Reformulating, add(x(0), k(1.0)), x(0)));
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Golden programs: the length of the program and a hash of the bits of every rule's lhs and of
+// some compositions, under the default numerics and under fast math, as `integ` (c6140eb) made them:
+// the port of `simplify` to class passes must not change a program of any preset.
+// ---------------------------------------------------------------------------------------------
+
+fn fnv(bits: &[u32]) -> u64 {
+    bits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
+}
+
+type Case = (&'static str, fn(&Array<f32>, &Array<f32>) -> Array<f32>);
+
+/// Compositions that make several rules compete: the order of the passes decides.
+#[allow(clippy::eq_op)]
+fn golden_cases() -> Vec<Case> {
+    vec![
+        ("(x+1)+0", |x, _| &(x + 1.0) + 0.0),
+        ("(x+1)+(-0)", |x, _| &(x + 1.0) + -0.0),
+        ("0+(x+1)", |x, _| 0.0 + &(x + 1.0)),
+        ("(x*3)*0", |x, _| &(x * 3.0) * 0.0),
+        ("(x*3)*0.5", |x, _| &(x * 3.0) * 0.5),
+        ("((x+1)+2)-0", |x, _| &(&(x + 1.0) + 2.0) - 0.0),
+        ("((x-1)+3)+0", |x, _| &(&(x - 1.0) + 3.0) + 0.0),
+        ("(x-1)-2", |x, _| &(x - 1.0) - 2.0),
+        ("(x+5)-2", |x, _| &(x + 5.0) - 2.0),
+        ("x/x", |x, _| x / x),
+        ("(x*2)/(x*2)", |x, _| &(x * 2.0) / &(x * 2.0)),
+        ("(x/3)*2", |x, _| &(x / 3.0) * 2.0),
+        ("x/3/2", |x, _| &(x / 3.0) / 2.0),
+        ("x/1", |x, _| x / 1.0),
+        ("(x/1)+0", |x, _| &(x / 1.0) + 0.0),
+        ("x-x", |x, _| x - x),
+        ("(x-x)+y", |x, y| &(x - x) + y),
+        ("x+(-y)", |x, y| x + &(-y)),
+        ("(-x)+y", |x, y| &(-x) + y),
+        ("x-(-y)", |x, y| x - &(-y)),
+        ("(-x)+(-y)", |x, y| &(-x) + &(-y)),
+        ("-(-x)", |x, _| -&(-x)),
+        ("x.powf(2)", |x, _| x.powf(2.0)),
+        ("x.powf(-1)", |x, _| x.powf(-1.0)),
+        ("x.powf(0.5)", |x, _| x.powf(0.5)),
+        ("x.powf(1)", |x, _| x.powf(1.0)),
+        ("x.powf(0)", |x, _| x.powf(0.0)),
+        ("x.powf(3)", |x, _| x.powf(3.0)),
+        ("(x.powf(2))*0", |x, _| &x.powf(2.0) * 0.0),
+        ("x<=x", |x, _| select(&x.le(x), &(x * 2.0), &(x * 3.0))),
+        ("x!=x", |x, _| select(&x.ne(x), &(x * 2.0), &(x * 3.0))),
+        ("x<x", |x, _| select(&x.lt(x), &(x * 2.0), &(x * 3.0))),
+        ("min(x,x)+0", |x, _| &x.minimum(x) + 0.0),
+        ("(x*1)+0", |x, _| &(x * 1.0) + 0.0),
+        ("(x*-1)+y", |x, y| &(x * -1.0) + y),
+        ("((x*2)*3)*4", |x, _| &(&(x * 2.0) * 3.0) * 4.0),
+        ("(x+y)-(x+y)", |x, y| &(x + y) - &(x + y)),
+        ("(x*0)+y", |x, y| &(x * 0.0) + y),
+        ("(x/x)*y", |x, y| &(x / x) * y),
+    ]
+}
+
+/// `name|numerics|program length|hash of the bits`, one line per rule lhs (both gates' contexts) and per composition.
+pub(super) fn golden_dump() -> Vec<String> {
+    let h = Harness::new();
+    let mut lines = Vec::new();
+    for rule in rules().iter().filter(|r| format!("{:?}", r.gate) != "None") {
+        let flagged = format!("{:?}", rule.gate).starts_with('F');
+        let batch = batches(rule, if flagged { Kind::Random } else { Kind::Specials }).swap_remove(0);
+        for (label, ctx) in [("default", &h.strict), ("fast", &h.fast)] {
+            let (bits, len) = h.bits(ctx, &rule.lhs, rule, &batch, true, true);
+            lines.push(format!("rule {}|{label}|{len}|{:016x}", rule.name, fnv(&bits)));
+        }
+    }
+    for case in typed_cases().iter().filter(|c| c.rule) {
+        for (label, ctx) in [("default", &h.strict), ("fast", &h.fast)] {
+            ctx.jit().set_simplify(true);
+            let bits = (case.run)(ctx);
+            lines.push(format!("typed {}|{label}|{}|{:016x}", case.name, ctx.jit().last_program_len(), fnv(&bits)));
+        }
+    }
+    let open = |numerics: crate::Numerics| Context::with_options(ContextOptions::from_env().numerics(numerics)).unwrap();
+    for (label, ctx) in [("default", open(crate::Numerics::default())), ("fast", open(crate::Numerics::fast()))] {
+        let x = Array::from_slice_on(&ctx, &[0.5f32, -1.5, 3.0, 0.25, -2.0, 7.0, 0.0, -0.0], 8).unwrap();
+        let y = Array::from_slice_on(&ctx, &[1.0f32, 2.0, -3.0, 0.5, 4.0, -7.0, 9.0, 0.125], 8).unwrap();
+        for (name, case) in golden_cases() {
+            let out = case(&(&x * 2.0), &(&y * 2.0));
+            let bits: Vec<u32> = out.to_vec().unwrap().into_iter().map(canonical).collect();
+            lines.push(format!("case {name}|{label}|{}|{:016x}", ctx.jit().last_program_len(), fnv(&bits)));
+        }
+    }
+    lines
+}
+
+#[test]
+fn programs_are_what_integ_made_them() {
+    let want: Vec<&str> = include_str!("golden.txt").lines().collect();
+    let got = golden_dump();
+    assert_eq!(got.len(), want.len(), "the number of cases");
+    let wrong: Vec<String> = got.iter().zip(&want).filter(|(g, w)| g != w).map(|(g, w)| format!("{g}   (integ: {w})")).collect();
+    assert!(wrong.is_empty(), "{} programs differ from integ:\n{}", wrong.len(), wrong.join("\n"));
+}

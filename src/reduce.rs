@@ -15,6 +15,7 @@ use crate::jit::structured::select;
 use crate::jit::structured::strategy::{Output, PassMode, Subject};
 use crate::gpu::lock;
 use crate::jit::comprehension::{Algebra, Comprehension, OpTag};
+use crate::jit::rules;
 use crate::jit::structured::{Comp, Family, Launch, Meta, RunState, Structured};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
@@ -75,18 +76,17 @@ impl Structured {
     /// The form of the reduction (`None` under `LUMA_ALGEBRA=off`), built by the builder of its tag from what the value holds the
     /// first time it is asked for and kept: the registered reader node as the one access, the steps of `finish` as the epilogue.
     /// A copy: the lock is not held while a rule or the recogniser works on it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by recognition (R1), the rewrite engine (R3) and `explain`"))]
-    pub(crate) fn form(&self) -> Option<Comprehension> {
+    pub(crate) fn form(&self, ctx: &Context) -> Option<Comprehension> {
         if !Algebra::builds_forms() {
             return None;
         }
         let comp = self.comp();
         let mut slot = lock(&comp.form);
-        let form = slot.get_or_insert_with(|| Box::new(self.build_form()));
+        // The rules of tier 1 for comprehensions run once, where a context first meets the form (the builders are pure and have none).
+        let form = slot.get_or_insert_with(|| Box::new(rules::t1(self.build_form(), ctx)));
         Some(Comprehension::clone(form))
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by `Structured::form`"))]
     fn build_form(&self) -> Comprehension {
         let comp = self.comp();
         let RunState::Reduce { operand, finish, .. } = &comp.run;
@@ -320,7 +320,12 @@ impl Structured {
     /// [`strategies`]): on the host if it can run there, else on the GPU together with the reductions that are pending.
     pub(crate) fn record_reduce(&self, ctx: &Context) -> std::result::Result<Arc<Storage>, Arc<LumaError>> {
         self.forcing.store(true, Ordering::Relaxed);
-        let result = select::execute(ctx, &Subject::Comp(self)).map(Output::into_storage).map_err(|failure| Arc::new(failure.into_error()));
+        // The rewrite engine plans the value first (one load and a branch while no rule of tier 2 is allowed).
+        let planned = if ctx.jit().rules.t2_active { rules::plan(ctx, self) } else { None };
+        let result = match planned {
+            Some(planned) => rules::run_planned(ctx, self, &planned),
+            None => select::execute(ctx, &Subject::Comp(self)).map(Output::into_storage).map_err(|failure| Arc::new(failure.into_error())),
+        };
         self.forcing.store(false, Ordering::Relaxed);
         result
     }

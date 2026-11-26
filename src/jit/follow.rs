@@ -500,7 +500,9 @@ struct Fol {
     /// The outputs of the launches replayed so far.
     outs: Vec<Vec<Arc<Storage>>>,
     write_epoch: u64,
-    fast: bool,
+    /// The numerics the step is followed under: a context that allows a rule of the flagged passes (see `simplify::rewrite`) reads
+    /// every value, which `simplify::sensitive` does not cover, so the rewrites are tried at every call.
+    numerics: crate::numerics::Numerics,
     /// Entries below this are registered.
     registered: usize,
 }
@@ -761,7 +763,7 @@ impl State {
                 nodes: Vec::with_capacity(tape.entries.len()),
                 outs: Vec::with_capacity(tape.plan.steps.len()),
                 write_epoch: jit.write_epoch.load(Ordering::Relaxed),
-                fast: ctx.fast_math(),
+                numerics: *ctx.numerics_ref(),
                 registered: 0,
                 tape,
             };
@@ -856,12 +858,12 @@ impl State {
         // Rewrites depend on the values of some scalars: try them again where they could differ.
         let mut rewritten: Option<(Op, usize)> = None;
         let mut saved: Option<Args> = None;
-        if jit.simplify_enabled() && (e.rewrite || fol.fast) {
+        if jit.simplify_enabled() && (e.rewrite || fol.numerics.exact_finite || fol.numerics.reassociate || fol.numerics.reformulate) {
             saved = Some(args.clone());
             let mut rounds = 0u8;
             let mut now: Option<Op> = None;
             while rounds < 4
-                && let Some((next_op, operands)) = simplify::rewrite(now.as_ref().unwrap_or(op), args, fol.fast)
+                && let Some((next_op, operands)) = simplify::rewrite(now.as_ref().unwrap_or(op), args, &fol.numerics)
             {
                 now = Some(next_op);
                 *args = operands;
@@ -869,7 +871,7 @@ impl State {
             }
             if rounds != e.rounds {
                 if tracing() {
-                    note(&format!("entry {}: rewrites {rounds} vs {} recorded (fast {}, op {:?})", fol.pos, e.rounds, fol.fast, op.kind));
+                    note(&format!("entry {}: rewrites {rounds} vs {} recorded (numerics {}, op {:?})", fol.pos, e.rounds, fol.numerics, op.kind));
                 }
                 *args = saved.take().expect("saved above");
                 self.stop("a rewrite that is not the recorded one");

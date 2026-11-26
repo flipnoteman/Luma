@@ -63,6 +63,8 @@ default = ["wgpu", "metal", "cuda"]
 wgpu = ["dep:luma-wgpu"]
 metal = ["dep:luma-metal"]
 cuda = ["dep:luma-cuda"]
+# Counts the firings of the simplification rules per thread (tests and tooling; costs a thread-local access per rewrite).
+rule-trace = []
 
 [dependencies]
 luma-core.workspace = true

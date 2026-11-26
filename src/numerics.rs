@@ -19,8 +19,9 @@ impl Reduced {
     /// The trailing-update products of the factorisations (`lu`, `qr`, `cholesky`, ...) run in TF32
     /// where the device has tensor cores.
     pub const TF32_LINALG: Self = Self(1 << 1);
-    /// Value-changing algebraic rewrites and the cheaper `Df32` additions (see
-    /// [`ContextOptions::numerics`](crate::ContextOptions::numerics)).
+    /// The cheaper `Df32` additions (see [`ContextOptions::numerics`](crate::ContextOptions::numerics)). The algebraic rewrites
+    /// that change values are not this bit's: they are the flags [`Numerics::exact_finite`], [`Numerics::reassociate`] and
+    /// [`Numerics::reformulate`], which [`Numerics::fast`] and [`Numerics::algebraic`] set.
     pub const FAST_MATH: Self = Self(1 << 2);
 
     /// No feature.

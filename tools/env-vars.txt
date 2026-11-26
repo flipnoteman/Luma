@@ -1,7 +1,7 @@
 # NAME<TAB>kind<TAB>owner<TAB>removal<TAB>default
 # kind: user | dev (removed before 0.6.0) | test | internal. owner: spec id or RELEASE. removal: never | before-release | spec id.
 # A spec that adds or removes a LUMA_* variable edits its line here in the same PR; tools/envaudit.py checks.
-LUMA_ALGEBRA	dev	W2-R0	before-release	on (off | api | on: off builds no forms, api builds forms and lets only API origins lower, on adds recognition and rules; W2-R3 inserts t1 between api and on)
+LUMA_ALGEBRA	dev	W2-R0	before-release	on (off | api | t1 | on: off builds no forms, api builds forms and lets only API origins lower, t1 adds the rules of tier 1 that run when a form is built, on adds recognition and the normaliser that runs when a value is forced)
 LUMA_BACKEND	user	W0	never	auto
 LUMA_BACKENDS_EXPECT	test	W0	never	unset
 LUMA_BENCH_	internal	W0	never	prefix wildcard in docs (LUMA_BENCH_*)

@@ -15,7 +15,7 @@ Some items are deprecated (removed in 0.6) and have replacements already.
 | `ContextOptions::fast_math(true)` | `ContextOptions::numerics(Numerics::fast())` |
 | `ContextOptions::tf32_matmul(false)` | `ContextOptions::numerics(Numerics::strict())` |
 | `Context::tf32_matmul()` | `Context::numerics().tf32_matmul()` |
-| `LUMA_FAST_MATH=1` | `LUMA_NUMERICS=fast` (or `+fast-math`) |
+| `LUMA_FAST_MATH=1` | `LUMA_NUMERICS=fast` (`+fast-math` alone is only the cheaper `Df32` addition: the rewrites are the flags `+exact-finite+reassociate+reformulate`) |
 | `LUMA_TF32_MATMUL=0` | `LUMA_NUMERICS=strict` (or `-tf32-matmul`) |
 | `LUMA_LINALG_TF32=1` | `LUMA_NUMERICS=default+tf32-linalg` |
 

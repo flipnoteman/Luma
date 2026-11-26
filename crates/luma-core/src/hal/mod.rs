@@ -438,6 +438,10 @@ pub enum DecisionSite {
     /// A form without an API tag was specialised (`recognised-<form>`) or lowered by the generic strategies (`generic-contract`,
     /// `generic-reduce`, `generic-unrolled`). Never recorded for an API operation.
     Comprehension,
+    /// The rewrite engine changed a form: `chosen` is the rule (`t1`, when a form was built, or the normaliser of a forced value),
+    /// `before` and `after` the estimated nanoseconds of the scope where they were compared. Never recorded for an elementwise
+    /// rewrite (`simplify`).
+    Rewrite,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
 }

@@ -638,9 +638,9 @@ fn without_tf32_the_default_matmul_is_exact_and_matmul_tf32_falls_back() {
 #[test]
 #[allow(deprecated)]
 fn the_deprecated_numerics_options_apply_over_numerics() {
-    use crate::numerics::Reduced;
     let fast = ContextOptions::default().fast_math(true);
-    assert_eq!(fast.effective_numerics(), Numerics::default().with_reduced(Reduced::FAST_MATH, true));
+    // The one switch of the algebraic rewrites before the class flags existed: it still enables them.
+    assert_eq!(fast.effective_numerics(), Numerics::fast());
     let exact = ContextOptions::default().tf32_matmul(false);
     assert_eq!(exact.effective_numerics(), Numerics::strict());
     assert_eq!(ContextOptions::default().numerics(Numerics::fast()).effective_numerics(), Numerics::fast());

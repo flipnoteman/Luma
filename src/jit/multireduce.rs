@@ -107,6 +107,12 @@ impl JitState {
         lock(&self.structured).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
     }
 
+    /// The registered values that could be recorded together with `seed` (what `partner_of` says, no walk of their expressions), oldest
+    /// first, for the planning scope of the rewrite engine.
+    pub(crate) fn scope_partners(&self, seed: &Structured) -> Vec<Arc<Structured>> {
+        lock(&self.structured).iter().filter_map(Weak::upgrade).filter(|candidate| !std::ptr::eq(Arc::as_ptr(candidate), seed) && candidate.partner_of(seed)).take(super::rules::MAX_SCOPE_COMPS).collect()
+    }
+
     /// The registered reductions to record together with `seed` (see the module documentation), oldest first, leaving out
     /// the ones in `taken` (reductions already assigned to a kernel that is not recorded yet).
     /// Nothing for a `seed` that cannot be merged.

@@ -46,6 +46,8 @@ pub(crate) struct Structured {
     pub(crate) in_recording: bool,
     /// Set while the value is being recorded.
     pub(crate) forcing: AtomicBool,
+    /// What the rewrite engine made of the value when it was forced (see `rules::t2`); `None` inside: nothing to rewrite.
+    pub(crate) planned: OnceLock<Option<Arc<crate::jit::rules::Planned>>>,
     /// What failures are reported as, and where the value was asked for.
     pub(crate) name: &'static str,
     pub(crate) location: &'static Location<'static>,
@@ -64,7 +66,6 @@ pub(crate) struct Comp {
     /// `meta`, `run` and builder say all of it, and a form built for every value cost +22% host instructions on `jit/reduce_build`
     /// (nothing reads it before the value is forced). The lazy products of W2-LAZY, whose form is their record, set it when they are
     /// made, and a forced value that holds nothing of its operands takes it. Boxed, so that a value that has no form pays a word.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by `Structured::form`, which recognition (R1), the rewrite engine (R3) and `explain` call"))]
     pub(crate) form: Mutex<Option<Box<Comprehension>>>,
     /// What the hot predicates read without the lock.
     pub(crate) meta: Meta,
@@ -138,6 +139,7 @@ impl Structured {
             thread: std::thread::current().id(),
             in_recording,
             forcing: AtomicBool::new(false),
+            planned: OnceLock::new(),
             name,
             location,
         }
