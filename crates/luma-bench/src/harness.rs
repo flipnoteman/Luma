@@ -74,7 +74,8 @@ pub struct Harness {
     pub selected: usize,
     /// Inside a [`Harness::guarded`] group that was selected.
     in_group: bool,
-    warmed: bool,
+    /// The GPU was warmed up by [`Harness::warm_up`].
+    pub warmed: bool,
     json: Option<std::io::BufWriter<std::fs::File>>,
     /// `LUMA_BENCH_DECISIONS`: the decision log (see [`Harness::log_decisions`]).
     decisions: Option<std::io::BufWriter<std::fs::File>>,
@@ -221,23 +222,12 @@ impl Harness {
         }
     }
 
-    /// Keeps the GPU busy for a moment (once per process) so that the first cases do not time its clock ramp-up. The
-    /// kernel shares nothing with the cases (so their first-call costs stay theirs).
+    /// Keeps the GPU busy for a moment (once per process) so that the first cases do not time its clock ramp-up.
     pub fn warm_up(&mut self) {
-        if self.warmed || self.list || self.ctx.is_cpu() {
-            return;
+        if !self.warmed && !self.list {
+            warm_gpu(&self.ctx, 400);
         }
         self.warmed = true;
-        let x = Array::<f32>::linspace_on(&self.ctx, 0.0, 1.0, 1 << 24).unwrap();
-        let start = Instant::now();
-        while start.elapsed() < std::time::Duration::from_millis(400) {
-            let mut z = x.clone();
-            for _ in 0..6 {
-                z = (z * 1.0001 + 0.1).tan().cos();
-            }
-            z.eval().unwrap();
-            self.ctx.sync().unwrap();
-        }
     }
 
     /// Records that `case` was not run, and why.
@@ -417,6 +407,24 @@ impl Harness {
             let _ = json.flush();
         }
         self.records.push(rec);
+    }
+}
+
+/// Keeps the GPU busy for `ms` milliseconds so that what follows does not time its clock ramp-up. The kernel shares nothing with
+/// the cases (so their first-call costs stay theirs).
+pub fn warm_gpu(ctx: &Context, ms: u64) {
+    if ctx.is_cpu() {
+        return;
+    }
+    let x = Array::<f32>::linspace_on(ctx, 0.0, 1.0, 1 << 24).unwrap();
+    let start = Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(ms) {
+        let mut z = x.clone();
+        for _ in 0..6 {
+            z = (z * 1.0001 + 0.1).tan().cos();
+        }
+        z.eval().unwrap();
+        ctx.sync().unwrap();
     }
 }
 

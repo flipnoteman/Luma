@@ -8,7 +8,7 @@
 //! `--only` picks a group by `suite/group` and a case by `suite/group/case` or `group/case` (any substring of the full name
 //! picks cases inside a group that is selected); a run whose `--only` / `--group` selects no case exits 3.
 //! `--list-groups` prints the units (`suite/group`, or the `suite/prefix` of a case outside any group) of the selected suites,
-//! one per line, and runs nothing; `--group` runs only those units; `--warm` keeps the GPU busy for 400 ms first.
+//! one per line, and runs nothing; `--group` runs only those units; `--warm` keeps the GPU busy for 250 ms before the context opens (so that a calibration measures a warm GPU) and 400 ms after.
 //! `tools/benchab.sh` uses them to alternate two binaries unit by unit.
 //!
 //! `--iters N` times every selected case with exactly N calls (no calibration, no profile run); it is for
@@ -68,6 +68,11 @@ fn main() {
             std::env::set_var("LUMA_CALIBRATE", "0");
             std::env::set_var("LUMA_TELEMETRY", "off");
         }
+    }
+    if warm && !list_groups {
+        // Before the real context opens, so that a calibration it makes (an empty cache dir) measures a GPU at its working clocks.
+        let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).expect("no device");
+        harness::warm_gpu(&ctx, 250);
     }
     let ctx = Context::with_options(ContextOptions::from_env()).expect("no device");
     let banner = format!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());

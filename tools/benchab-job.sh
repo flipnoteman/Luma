@@ -46,7 +46,30 @@ sample_run() {
   rm -rf "$tmp"
 }
 
+# calibrate_once BACKEND: luma measures its cost model (launch cost, bandwidth, ...) once per cache dir, and the planner's choices
+# follow it, so two sides that each measured their own differ for the whole job by the noise of that one measurement (consistent
+# 5-15 % on small cases, the same in every round, which no interleaving cancels). The B binary measures once, on a warm GPU, in a
+# scratch dir; the model is copied into both side caches. Without a stored model (a contended measurement) both sides run on the
+# fixed fallback numbers (LUMA_CALIBRATE=0).
+calibrate_once() {
+  local cs
+  cs=$(mktemp -d)
+  rm -f "$CA"/cost-*.bin "$CA"/contended-*.bin "$CA"/fma-*.bin "$CB"/cost-*.bin "$CB"/contended-*.bin "$CB"/fma-*.bin
+  LUMA_BACKEND=$1 LUMA_CACHE_DIR=$cs "$B" --suite none --warm >/dev/null 2>>out/stderr-b.log \
+    || LUMA_BACKEND=$1 LUMA_CACHE_DIR=$cs "$B" --suite none >/dev/null 2>>out/stderr-b.log
+  if compgen -G "$cs/cost-*.bin" >/dev/null; then
+    cp "$cs"/cost-*.bin "$cs"/fma-*.bin "$CA"/ 2>/dev/null; cp "$cs"/cost-*.bin "$cs"/fma-*.bin "$CB"/ 2>/dev/null
+    echo "$(date +%T) $1: one cost model for both sides ($(ls "$cs" | tr '\n' ' '))"
+  else
+    export LUMA_CALIBRATE=0
+    echo "$(date +%T) $1: no cost model measured, both sides run on the fallback numbers"
+  fi
+  rm -rf "$cs"
+}
+
 for be in $BACKENDS; do
+  unset LUMA_CALIBRATE
+  calibrate_once "$be"
   command -v nvidia-smi >/dev/null && [ "$be" = cuda -o "$be" = wgpu ] \
     && echo "$(date +%T) $be GPU: $(nvidia-smi --query-gpu=name,pstate,clocks.sm,clocks.max.sm,temperature.gpu --format=csv,noheader 2>&1 | head -1)"
   for suite in ${SUITES//,/ }; do
