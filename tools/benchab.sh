@@ -32,7 +32,7 @@ base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,comp
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }
 here=$(cd "$(dirname "$0")/.." && pwd)
-PRIO=${PRIO:-0}   # gpuq priority of the job (0-9, lower runs first): PRIO=5 for a bench that may wait
+PRIO=${PRIO:-5}   # gpuq priority of the job (0-9, lower runs first): 5 by default (an A/B may wait); 1 is for short test suites and per-case confirmations
 GPUQ=${GPUQ:-$HOME/Documents/bowshock/tools/gpuq/gpuq}
 
 label_of() { if [ -d "$1" ]; then basename "$(cd "$1" && pwd)"; else echo "${1//\//_}"; fi; }
