@@ -363,6 +363,10 @@ fn a_shifted_step_runs_in_fewer_launches_than_steps_where_the_planner_fuses_them
         return;
     }
     let steps = 64;
+    // The depth of the unrolled body follows the host time the trace took, which a loaded machine
+    // stretches (seen as 32 launches for 64 steps while other tests ran): a context that pins the
+    // GPU's state assumes a fixed trace time, so the count is the planner's.
+    ctx.set_assume_idle(true);
     let xs = values(1 << 22, 25, 0.0, 1.0);
     let x = f32s_on(&ctx, &xs);
     iterate_all([&x], 2, |[u]| [stencil_step(u)])[0].eval().unwrap();

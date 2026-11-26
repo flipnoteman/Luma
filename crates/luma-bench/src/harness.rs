@@ -275,7 +275,18 @@ impl Harness {
         };
         let kernels = std::env::var_os("LUMA_BENCH_KERNELS").is_some();
         let mut profile = None;
-        let (launches, gpu_ms) = match self.ctx.profile(&mut *f) {
+        // `eval` postpones while the GPU is busy and the arrays the case drops are never computed, so
+        // the profiled call would launch nothing whenever the previous call's kernels still ran: treat
+        // the GPU as idle for this call only (a decision log has it so already for the whole run).
+        let pin = self.decisions.is_none();
+        if pin {
+            self.ctx.set_assume_idle(true);
+        }
+        let profiled = self.ctx.profile(&mut *f);
+        if pin {
+            self.ctx.set_assume_idle(false);
+        }
+        let (launches, gpu_ms) = match profiled {
             Ok(((), p)) => {
                 if kernels {
                     println!("  kernels of {} {size}:", self.full(case));
