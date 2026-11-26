@@ -29,6 +29,7 @@ use crate::array::{Array, Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, ReduceOp};
 use crate::context::Context;
 use crate::error::LumaError;
+use crate::gpu_type::Df32;
 use crate::jit::program::Ref;
 use crate::jit::structured::emit::Emit;
 use crate::jit::{self, ElemTy, Node, Op, OpKind, ShiftKind, Src};
@@ -269,7 +270,7 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
         return None;
     }
     let plan = Prepared { form, taps, axes, reduces, outer, folded, part };
-    (plan.tiles() <= MAX_TILES).then_some(plan)
+    (plan.tiles() <= if compensated { 1 } else { MAX_TILES }).then_some(plan)
 }
 
 /// Whether the generic strategies can run `form` (`build` refuses one that cannot).
@@ -311,6 +312,12 @@ impl Prepared {
 
     /// The body of the form over the tile as elementwise nodes: the node of the out.
     fn body(&self, ctx: &Context, origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<Arc<Node>, Failure> {
+        let (_, temps) = self.nodes(ctx, origin, extent, location)?;
+        Ok(Arc::clone(&temps[self.form.body.outs[0] as usize]))
+    }
+
+    /// The views of the accesses and the nodes of the instructions of the body over the tile.
+    fn nodes(&self, ctx: &Context, origin: &Origin6, extent: &[u64], location: &'static Location<'static>) -> Result<(Vec<Arc<Node>>, Vec<Arc<Node>>), Failure> {
         let views = (0..self.form.inputs.len()).map(|j| self.view(ctx, j, origin, extent, location)).collect::<Result<Vec<_>, _>>()?;
         let len: usize = extent.iter().map(|&e| e as usize).product();
         let mut temps: Vec<Arc<Node>> = Vec::with_capacity(self.form.body.instrs.len());
@@ -324,7 +331,7 @@ impl Prepared {
             let args = [arg(instr.args[0]), arg(instr.args[1]), arg(instr.args[2])];
             temps.push(jit::create(ctx, len, instr.op, args, "comprehension", location)?);
         }
-        Ok(Arc::clone(&temps[self.form.body.outs[0] as usize]))
+        Ok((views, temps))
     }
 
     /// The program of one tile with the taps fixed to every combination, combined in tap order.
@@ -456,10 +463,39 @@ impl Prepared {
         }
     }
 
-    /// A compensated whole reduction: the values as `Df32`, summed by the double-float library, rounded back (W2-R0 5.6).
+    /// A compensated whole reduction: the values as `Df32` (`Dot2`: both factors cast and multiplied with `df_mul`, so the product is
+    /// exact), summed by the double-float library (`df_add` is a two-sum), rounded back (W2-R0 5.6). About 44 bits at the cost of a
+    /// double-float operation per element.
     fn run_compensated(&self, ctx: &Context, location: &'static Location<'static>) -> Result<Arc<Storage>, Failure> {
-        let _ = (ctx, location);
-        Err(Failure::from(LumaError::Unsupported("compensated forms".into())))
+        let plan = self.tiling();
+        let origin = Origin6([0; MAX_DIMS]);
+        let (views, temps) = self.nodes(ctx, &origin, &plan.extent, location)?;
+        let len: usize = plan.extent.iter().map(|&e| e as usize).product();
+        let node_of = |r: Ref| match r {
+            Ref::Input(j) => Some(Src::Node(Arc::clone(&views[j as usize]))),
+            Ref::Tmp(t) => Some(Src::Node(Arc::clone(&temps[t as usize]))),
+            _ => None,
+        };
+        let to_df32 = |src: Src, from: ElemTy| jit::create(ctx, len, Op::new(OpKind::Cast(ElemTy::Df32), from), [src, Src::unused(), Src::unused()], "comprehension", location);
+        let out = &self.form.body.instrs[self.form.body.outs[0] as usize];
+        let values = match self.form.combiner.as_ref().map(|combiner| combiner.compensation) {
+            Some(Compensation::Dot2) => {
+                let (a, b) = match (out.op.kind, node_of(out.args[0]), node_of(out.args[1])) {
+                    (OpKind::Binary(BinOp::Mul), Some(a), Some(b)) => (a, b),
+                    _ => return Err(Failure::from(LumaError::Unsupported("a Dot2 form's body is a product of two loads".into()))),
+                };
+                let (a, b) = (to_df32(a, ElemTy::F32)?, to_df32(b, ElemTy::F32)?);
+                jit::create(ctx, len, Op::new(OpKind::Binary(BinOp::Mul), ElemTy::Df32), [Src::Node(a), Src::Node(b), Src::unused()], "comprehension", location)?
+            }
+            _ => to_df32(Src::Node(Arc::clone(&temps[self.form.body.outs[0] as usize])), ElemTy::F32)?,
+        };
+        let array = Array::<Df32>::from_node(ctx, Shape::from([len, 1, 1, 1]), values);
+        let sum = array.sum();
+        let rounded = jit::create(ctx, 1, Op::new(OpKind::Cast(ElemTy::F32), ElemTy::Df32), [sum.src()?, Src::unused(), Src::unused()], "comprehension", location)?;
+        match rounded.force() {
+            Ok(storage) => Ok(Arc::clone(storage)),
+            Err(error) => Err(Failure::Inherited(Arc::clone(error))),
+        }
     }
 }
 

@@ -355,3 +355,63 @@ fn an_api_form_never_reaches_the_generic_strategies() {
     let api = Comprehension::conv1d(x.src().ok().unwrap(), w.src().ok().unwrap(), 40, 5, 36, 1, 0).unwrap();
     assert!(build(&ctx, &api).to_vec().is_err(), "an API form runs through its own strategy");
 }
+
+// -- Compensation --
+
+use crate::jit::comprehension::Compensation;
+
+fn ulp(x: f64) -> f64 {
+    let x = x as f32;
+    (f32::from_bits(x.to_bits() + 1) - x).abs() as f64
+}
+
+/// A sum of `len` values that a plain `f32` accumulation rounds badly: of mixed magnitudes, all positive.
+fn lumpy(len: usize) -> Vec<f32> {
+    (0..len).map(|i| 0.1 + ((i.wrapping_mul(2654435761)) % 1000) as f32 / 1000.0).collect()
+}
+
+#[test]
+fn compensated_sums_are_accurate_to_an_ulp() {
+    let ctx = cpu();
+    let len = 10_000_000usize;
+    let values = lumpy(len);
+    let array = Array::<f32>::from_slice_on(&ctx, &values, len).unwrap();
+    let truth: f64 = values.iter().map(|&v| f64::from(v)).sum();
+    for compensation in [Compensation::None, Compensation::Neumaier] {
+        let mut f = Comprehension::reduce(array.src().ok().unwrap(), len, crate::builtin::ReduceList::new(&[crate::builtin::ReduceOp::Sum]), ElemTy::F32);
+        f.origin = Origin::Rewritten(RuleId(2));
+        f.combiner.as_mut().unwrap().compensation = compensation;
+        let got = f64::from(build(&ctx, &f).to_vec().unwrap()[0]);
+        let error = (got - truth).abs();
+        if compensation == Compensation::Neumaier {
+            assert!(error <= ulp(truth), "Neumaier: {got} vs {truth} (ulp {})", ulp(truth));
+        }
+        // The control (`Compensation::None`) rounds like the device's `f32` accumulation: bits of the CPU backend's blocked sum are
+        // as good as an ulp here, so it is asserted by the GPU gate (`tests/all/recognition.rs`), not here.
+    }
+}
+
+#[test]
+fn a_compensated_dot_product_multiplies_exactly() {
+    let ctx = cpu();
+    let len = 1_000_000usize;
+    let a: Vec<f32> = (0..len).map(|i| 1000.0 + (i % 977) as f32 * 0.37).collect();
+    let b: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 + (i % 31) as f32 * 1e-3 } else { -(1.0 + (i % 29) as f32 * 1e-3) }).collect();
+    let (sa, sb) = (Array::<f32>::from_slice_on(&ctx, &a, len).unwrap(), Array::<f32>::from_slice_on(&ctx, &b, len).unwrap());
+    let truth: f64 = a.iter().zip(&b).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
+    let dot = |c: Compensation| {
+        let mut f = Comprehension::dot(Array::<f32>::from_slice_on(&ctx, &vec![0f32; 1], 1).unwrap().src().ok().unwrap(), 1, ElemTy::F32);
+        // Two accesses over one reduce dim.
+        let access = |s: &Array<f32>| Access { src: s.src().ok().unwrap(), shape: [len as u32, 1, 1, 1], ty: ElemTy::F32, map: MapRef::owned(AffineMap::following([0])), edge: Edge::None, fill: None, indirect: None };
+        f.inputs = smallvec![access(&sa), access(&sb)];
+        f.space[0].extent = len as u64;
+        f.body = Body { instrs: std::sync::Arc::new(mul01()), scalars: smallvec![], outs: smallvec![0] };
+        f.origin = Origin::Rewritten(RuleId(3));
+        f.combiner.as_mut().unwrap().compensation = c;
+        f64::from(build(&ctx, &f).to_vec().unwrap()[0])
+    };
+    let got = dot(Compensation::Dot2);
+    assert!((got - truth).abs() <= ulp(truth), "Dot2: {got} vs {truth}");
+    let neumaier = dot(Compensation::Neumaier);
+    assert!((neumaier - truth).abs() <= 4.0 * ulp(truth), "Neumaier of f32 products: {neumaier} vs {truth}");
+}
