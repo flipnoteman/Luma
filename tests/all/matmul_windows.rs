@@ -7,9 +7,11 @@ use crate::common;
 use common::values;
 use luma::{Array, BackendKind, Context, ContextOptions, DecisionSite};
 
-/// A context whose products are `f32` on every backend.
+/// A context whose products are `f32` on every backend. On CUDA the ragged kernel is forced: the cost model may rather copy a small
+/// unaligned block into an aligned buffer (the padded kernel), which is not what these tests look at (where the forced strategy does
+/// not fit, the default selection runs).
 fn exact() -> Context {
-    Context::with_options(ContextOptions::from_env().numerics(luma::Numerics::strict())).unwrap()
+    Context::with_options(ContextOptions::from_env().numerics(luma::Numerics::strict()).strategy("contraction:gemm-f32-ragged")).unwrap()
 }
 
 /// `C[n + N m] = Σ_k A[k + K m] B[n + N k]` in `f64`.
