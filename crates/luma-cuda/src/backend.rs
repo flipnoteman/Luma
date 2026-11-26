@@ -2083,7 +2083,7 @@ mod tests {
             println!("SKIPPED: the device has no native matrix product kernels");
             return None;
         };
-        Some((backend, GemmSpec { rows, cols, lhs_transposed: false, rhs_transposed: false, exact: true }))
+        Some((backend, GemmSpec::new(rows, cols, false, false, true)))
     }
 
     fn wait_ready(kernel: &RawKernel) {

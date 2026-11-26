@@ -94,6 +94,12 @@ impl<'a> Emit<'a> {
         self.launches = other.launches;
     }
 
+    /// Whether the execution is one of the sampled ones.
+    #[inline(always)]
+    pub(crate) fn is_sampled(&self) -> bool {
+        self.sample.is_some()
+    }
+
     /// What the execution made, for `Telemetry::finish`: its sample and how many launches were timed.
     pub(crate) fn into_sample(self) -> Option<(SampleTag, u8)> {
         self.sample.map(|tag| (tag, self.launches))

@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use super::boundary::{CompactAttrs, MergeAttrs, ScanAttrs, ScanParams, ScatterAttrs, ScatterParams, SortAttrs, SortParams};
 use super::emit::Emit;
+use super::contraction::{ContractionParams, ContractionView};
 use super::Structured;
-use crate::array::{Failure, Storage};
+use crate::array::{Array, Failure, Storage};
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::kernel::KernelCore;
@@ -31,10 +32,11 @@ pub(crate) enum FamilyTag {
     Search,
     Compact,
     Merge,
+    Contraction,
 }
 
 /// How many families have a table.
-pub(crate) const FAMILY_COUNT: usize = 7;
+pub(crate) const FAMILY_COUNT: usize = 8;
 
 /// Most entries one family's table may have (the ranking cache keeps them in a `u32` mask and an array).
 pub(crate) const MAX_PER_FAMILY: usize = 12;
@@ -50,6 +52,7 @@ impl FamilyTag {
             FamilyTag::Search => 4,
             FamilyTag::Compact => 5,
             FamilyTag::Merge => 6,
+            FamilyTag::Contraction => 7,
         }
     }
 
@@ -62,6 +65,7 @@ impl FamilyTag {
             FamilyTag::Search => "search",
             FamilyTag::Compact => "compact",
             FamilyTag::Merge => "merge",
+            FamilyTag::Contraction => "contraction",
         }
     }
 
@@ -74,6 +78,7 @@ impl FamilyTag {
             "search" => Some(FamilyTag::Search),
             "compact" => Some(FamilyTag::Compact),
             "merge" => Some(FamilyTag::Merge),
+            "contraction" => Some(FamilyTag::Contraction),
             _ => None,
         }
     }
@@ -171,11 +176,12 @@ pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
 /// One table per family; the shared edit of a new family is one line here.
 ///
 /// Search, Compact and Merge are light ports (tag, site and `note`): their tables stay empty, so `LUMA_STRATEGY` refuses them.
-static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[]];
+static TABLES: [&[Strategy]; FAMILY_COUNT] = [&crate::reduce::REDUCE_STRATEGIES, &super::families::sort::SORT_STRATEGIES, &super::families::scan::SCAN_STRATEGIES, &super::families::scatter::SCATTER_STRATEGIES, &[], &[], &[], &super::contraction::CONTRACTION_STRATEGIES];
 
 /// What a strategy is asked about: one variant per kind of value.
 pub(crate) enum Subject<'a> {
     Reduce(&'a Structured),
+    Contraction(&'a ContractionView<'a>),
     Boundary(&'a Boundary<'a>),
 }
 
@@ -183,6 +189,7 @@ impl Subject<'_> {
     pub(crate) fn family(&self) -> FamilyTag {
         match self {
             Subject::Reduce(_) => FamilyTag::Reduce,
+            Subject::Contraction(_) => FamilyTag::Contraction,
             Subject::Boundary(boundary) => boundary.family,
         }
     }
@@ -191,6 +198,7 @@ impl Subject<'_> {
     pub(crate) fn dims(&self) -> [u32; 4] {
         match self {
             Subject::Reduce(reduced) => reduced.dims(),
+            Subject::Contraction(view) => view.dims(),
             Subject::Boundary(boundary) => boundary.dims,
         }
     }
@@ -199,6 +207,7 @@ impl Subject<'_> {
     pub(crate) fn site(&self) -> (&'static str, &'static Location<'static>) {
         match self {
             Subject::Reduce(reduced) => (reduced.name, reduced.location),
+            Subject::Contraction(view) => ("matmul", view.location),
             Subject::Boundary(boundary) => (boundary.op, boundary.location),
         }
     }
@@ -213,7 +222,13 @@ impl Subject<'_> {
             FamilyTag::Search => DecisionSite::SearchPlan,
             FamilyTag::Compact => DecisionSite::CompactPlan,
             FamilyTag::Merge => DecisionSite::MergePlan,
+            FamilyTag::Contraction => DecisionSite::MatmulPlan,
         }
+    }
+
+    /// Whether the caller asked for reduced precision itself (`matmul_tf32`), whatever the context's numerics allow.
+    pub(crate) fn requests_reduced(&self) -> bool {
+        matches!(self, Subject::Contraction(view) if view.attrs.tf32 == super::contraction::Tf32Request::Tf32)
     }
 }
 
@@ -224,16 +239,17 @@ pub(crate) enum Params {
     Sort(SortParams),
     Scan(ScanParams),
     Scatter(ScatterParams),
+    Contraction(ContractionParams),
 }
 
 impl Params {
     /// The Decision text of the strategy `id` run with these parameters: no ids or pointers.
-    pub(crate) fn label(&self, id: StrategyId) -> Cow<'static, str> {
-        self.label_of(id.name())
+    pub(crate) fn label(&self, id: StrategyId, subject: &Subject<'_>, ctx: &Context) -> Cow<'static, str> {
+        self.label_of(id.name(), subject, ctx)
     }
 
     /// [`Params::label`] of a strategy called `name`.
-    pub(crate) fn label_of(&self, name: &'static str) -> Cow<'static, str> {
+    pub(crate) fn label_of(&self, name: &'static str, subject: &Subject<'_>, ctx: &Context) -> Cow<'static, str> {
         match self {
             Params::Reduce(params) if params.groups > 1 => Cow::Owned(format!("{name} groups={}", params.groups)),
             Params::Reduce(_) => Cow::Borrowed(name),
@@ -246,6 +262,7 @@ impl Params {
             }),
             Params::Scan(params) if params.fused => Cow::Owned(format!("{name} prologue=fused")),
             Params::Scan(_) | Params::Scatter(_) => Cow::Borrowed(name),
+            Params::Contraction(params) => Cow::Owned(super::contraction::label(params, subject, ctx)),
         }
     }
 }
@@ -312,12 +329,16 @@ pub(crate) enum Lowered {
 /// What a lowered value is.
 pub(crate) enum Output {
     Storage(Arc<Storage>),
+    /// An array that is already a value of its own: `gemm-narrow-n`'s result is a lazy view of the product of a padded operand. Transitional
+    /// (W2-GEMM part B retires the strategy and the variant).
+    Array(Box<Array<f32>>),
 }
 
 impl Output {
     pub(crate) fn into_storage(self) -> Arc<Storage> {
         match self {
             Output::Storage(storage) => storage,
+            Output::Array(_) => unreachable!("only a contraction strategy returns an array"),
         }
     }
 }
@@ -438,7 +459,7 @@ pub(crate) fn note(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, p
 #[inline(never)]
 fn note_recorded(ctx: &Context, boundary: &Boundary<'_>, chosen: StrategyId, params: &Params, declined: &[StrategyId]) {
     let subject = Subject::Boundary(boundary);
-    let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen));
+    let mut decision = Decision::new(boundary.op, boundary.location, subject.decision_site(), params.label(chosen, &subject, ctx));
     for strategy in table(boundary.family) {
         if strategy.id == chosen {
             continue;

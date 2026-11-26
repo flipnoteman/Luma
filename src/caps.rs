@@ -45,6 +45,8 @@ impl Caps {
     pub(crate) const HOST_PATH: Self = Self(1 << 13);
     /// The backend can time single launches without profiling mode (`Backend::can_time_launches`).
     pub(crate) const TELEMETRY: Self = Self(1 << 14);
+    /// The backend has gemm tiles of its own (`Backend::gemm_tiles`, TF32 or `f32`).
+    pub(crate) const GEMM_TILES: Self = Self(1 << 15);
 
     /// Whether every capability of `other` is set.
     pub(crate) const fn contains(self, other: Self) -> bool {
@@ -91,6 +93,7 @@ impl Caps {
         set(info.zero_copy, Caps::UNIFIED_MEMORY);
         set(!info.cpu && info.zero_copy, Caps::HOST_PATH);
         set(backend.can_time_launches(), Caps::TELEMETRY);
+        set(!backend.gemm_tiles(false).is_empty() || !backend.gemm_tiles(true).is_empty(), Caps::GEMM_TILES);
         caps
     }
 }

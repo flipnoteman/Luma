@@ -582,7 +582,7 @@ impl<T: GpuType> Array<T> {
     }
 
     /// The error of a poisoned array, or of a lazy array whose evaluation failed.
-    fn failed(&self) -> Option<&Arc<LumaError>> {
+    pub(crate) fn failed(&self) -> Option<&Arc<LumaError>> {
         match &self.repr {
             Repr::Valid(_) => None,
             Repr::Lazy(held) => held.latest().failure(),

@@ -40,7 +40,7 @@ impl StrategyOverride {
         let mut forced = StrategyOverride::default();
         for item in text.split(',').map(str::trim).filter(|item| !item.is_empty()) {
             let (family, name) = item.split_once(':').ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: {item:?} is not <family>:<strategy>")))?;
-            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce, sort, scan, scatter)", family.trim())))?;
+            let family = FamilyTag::parse(family.trim()).ok_or_else(|| LumaError::InvalidOption(format!("LUMA_STRATEGY: unknown family {:?} (known: reduce, sort, scan, scatter, contraction)", family.trim())))?;
             if table(family).is_empty() {
                 return Err(LumaError::InvalidOption(format!("LUMA_STRATEGY: {}: family not ported (it records its Decision only)", family.name())));
             }
@@ -115,7 +115,7 @@ pub(crate) fn admit(strategy: &Strategy, subject: &Subject<'_>, ctx: &Context, r
     if !ctx.caps().contains(strategy.needs) {
         return Err(Skip::Caps);
     }
-    if strategy.numerics != NumClass::Exact && !numerics_allowed(strategy.numerics, &ctx.numerics()) {
+    if strategy.numerics != NumClass::Exact && !numerics_allowed(strategy.numerics, &ctx.numerics()) && !subject.requests_reduced() {
         return Err(Skip::Numerics);
     }
     (strategy.fits)(subject, ctx, res).ok_or(Skip::Shape)
@@ -147,6 +147,7 @@ fn signature(subject: &Subject<'_>) -> u64 {
     let mut hasher = FxHasher::default();
     match subject {
         Subject::Reduce(reduced) => reduced.signature(&mut hasher),
+        Subject::Contraction(view) => view.attrs.hash(&mut hasher),
         Subject::Boundary(boundary) => {
             boundary.op.hash(&mut hasher);
             boundary.attrs.hash(&mut hasher);
@@ -465,8 +466,12 @@ fn rank(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res: &Reside
 
 /// Selects a strategy for `subject` and lowers it, taking the next candidate while a `lower` declines; records the Decision.
 pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Failure> {
-    execute_in(table(subject.family()), ctx, subject, ctx.strategy_override(subject.family()))
+    let family = subject.family();
+    execute_with(table(family), PLAIN[family.index()], ctx, subject, ctx.strategy_override(family))
 }
+
+/// [`plain`] of every family's table, worked out once.
+static PLAIN: [bool; FAMILY_COUNT] = [plain(&crate::reduce::REDUCE_STRATEGIES), plain(&super::families::sort::SORT_STRATEGIES), plain(&super::families::scan::SCAN_STRATEGIES), plain(&super::families::scatter::SCATTER_STRATEGIES), true, true, true, plain(&super::contraction::CONTRACTION_STRATEGIES)];
 
 /// Whether every entry is a baseline without a cost: selection is the priority chain.
 const fn plain(entries: &[Strategy]) -> bool {
@@ -500,8 +505,14 @@ fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>) -> 
     Err(LumaError::Unsupported(format!("no {} strategy ran {}", subject.family().name(), subject.site().0)).into())
 }
 
+#[cfg(test)]
 pub(crate) fn execute_in(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
-    if forced.is_none() && plain(entries) && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
+    execute_with(entries, plain(entries), ctx, subject, forced)
+}
+
+#[inline]
+fn execute_with(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
+    if forced.is_none() && plain && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
         return execute_plain(entries, ctx, subject);
     }
     execute_ranked(entries, ctx, subject, forced)
@@ -585,7 +596,7 @@ fn rival(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, selection: 
 fn record(ctx: &Context, subject: &Subject<'_>, entries: &[Strategy], selection: &Selection, ran: StrategyId, params: &Params, declined: &[Option<StrategyId>]) {
     let (op, location) = subject.site();
     let ran_name = entries.iter().find(|strategy| strategy.id == ran).map_or("?", |strategy| strategy.name);
-    let mut decision = Decision::new(op, location, subject.decision_site(), params.label_of(ran_name));
+    let mut decision = Decision::new(op, location, subject.decision_site(), params.label_of(ran_name, subject, ctx));
     let res = &Residencies::DEVICE;
     for (at, strategy) in entries.iter().enumerate() {
         if strategy.id == ran {

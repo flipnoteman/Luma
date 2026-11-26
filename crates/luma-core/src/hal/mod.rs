@@ -1212,6 +1212,14 @@ pub struct GemmSpec {
     pub exact: bool,
 }
 
+impl GemmSpec {
+    /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
+    /// transposed, in `f32` (`exact`) or TF32. Build a spec with this, not with a struct literal: the struct grows fields.
+    pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, exact: bool) -> Self {
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact }
+    }
+}
+
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.

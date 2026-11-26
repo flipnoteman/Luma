@@ -193,7 +193,17 @@ impl Telemetry {
 
     /// Ends an execution: `done` is whether it produced its output. A host strategy's time goes into its cell now; a launching
     /// one's is completed by [`Telemetry::absorb`] once every launch has reported.
+    #[inline]
     pub(crate) fn finish(&self, ctx: &Context, begun: Begun<'_>, done: bool) {
+        // The common case, one execution in `telemetry_every` aside: nothing was timed.
+        if begun.timer.is_none() && !begun.emit.is_sampled() {
+            return;
+        }
+        self.finish_sampled(ctx, begun, done);
+    }
+
+    #[cold]
+    fn finish_sampled(&self, ctx: &Context, begun: Begun<'_>, done: bool) {
         if let Some((cell, start)) = begun.timer {
             if done {
                 self.complete(ctx.tuning().telemetry_min, cell, start.elapsed().as_nanos() as f64);

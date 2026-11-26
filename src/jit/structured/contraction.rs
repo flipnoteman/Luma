@@ -1,0 +1,1226 @@
+//! The contraction family's strategies: the branches `matmul::run` chose between with `if`s, one strategy each, and the plan
+//! functions they run with (moved here from `matmul.rs`). Table order is the old priority chain: host, narrow `N` (padded), tensor
+//! cores in TF32, the backend's own `f32` tiles, the CPU's native product, skinny, tiled. Every one is a baseline (it exists at
+//! f0e5723) and its own rank group; none has a cost in this part, so selection is the priority chain (checked by the Decision log).
+
+use std::panic::Location;
+use std::sync::Arc;
+
+use super::emit::Emit;
+use super::strategy::{BitClass, FamilyTag, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+use crate::array::{Array, Failure, Storage};
+use crate::builtin::Builtin;
+use crate::caps::Caps;
+use crate::context::{Context, RawArg, Scratch};
+use crate::error::LumaError;
+use crate::gpu_type::ElemLayout;
+use crate::jit::structured::select;
+use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
+use crate::matmul::{MatmulTile, Plan, SLICE};
+use crate::numerics::Reduced;
+use crate::ops::{fold_grid, Outcome};
+use crate::shape::Shape;
+use crate::tuning::Tuning;
+
+// -- the value --
+
+/// Which precision a product asks for: the context's numerics (`Default`, `matmul`), full `f32` (`matmul_f32`, batched products), or
+/// TF32 whatever the numerics say (`matmul_tf32`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Tf32Request {
+    Default,
+    Exact,
+    Tf32,
+}
+
+/// What a contraction's `fits` reads besides the operands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ContractionAttrs {
+    pub(crate) tf32: Tf32Request,
+}
+
+/// The extents of a product: `lhs` is `[K, M]`, `rhs` `[N, K]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Geometry {
+    pub(crate) m: u32,
+    pub(crate) n: u32,
+    pub(crate) k: u32,
+}
+
+/// A matrix product asked for, as the strategies see it (eager in this part: the operands may be pending expressions).
+pub(crate) struct ContractionView<'a> {
+    pub(crate) lhs: &'a Array<f32>,
+    pub(crate) rhs: &'a Array<f32>,
+    pub(crate) attrs: ContractionAttrs,
+    pub(crate) location: &'static Location<'static>,
+}
+
+impl ContractionView<'_> {
+    /// The extents, if the operands are of one context and their shapes are those of a product that fits `u32`.
+    fn geometry(&self) -> Option<Geometry> {
+        let (ld, rd) = (self.lhs.shape().dims(), self.rhs.shape().dims());
+        if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) || !self.lhs.context().same_as(self.rhs.context()) {
+            return None;
+        }
+        Some(Geometry { m: u32::try_from(ld[1]).ok()?, n: u32::try_from(rd[0]).ok()?, k: u32::try_from(ld[0]).ok()? })
+    }
+
+    /// The shape that picks the plan (`[N, M, K]`), whatever the operands are.
+    pub(crate) fn dims(&self) -> [u32; 4] {
+        let (ld, rd) = (self.lhs.shape().dims(), self.rhs.shape().dims());
+        let word = |extent: usize| u32::try_from(extent).unwrap_or(u32::MAX);
+        [word(rd[0]), word(ld[1]), word(ld[0]), 1]
+    }
+
+    /// Whether the product runs in TF32 where the device has tensor cores: the request, else the context's numerics.
+    fn wants_tf32(&self, ctx: &Context) -> bool {
+        match self.attrs.tf32 {
+            Tf32Request::Tf32 => true,
+            Tf32Request::Exact => false,
+            Tf32Request::Default => ctx.numerics().tf32_matmul(),
+        }
+    }
+
+    /// The errors of a product in the order `run` reported them: a poisoned operand's own, a context mismatch, a shape mismatch,
+    /// an extent above `u32`, an operand split over several buffers.
+    pub(crate) fn check(&self) -> Result<Geometry, Failure> {
+        let (lhs, rhs) = (self.lhs, self.rhs);
+        for array in [lhs, rhs] {
+            if let Some(error) = array.failed() {
+                return Err(Failure::Inherited(Arc::clone(error)));
+            }
+        }
+        let ctx = lhs.context();
+        if !ctx.same_as(rhs.context()) {
+            return Err(LumaError::ContextMismatch.into());
+        }
+        let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+        if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
+            return Err(LumaError::ShapeMismatch { lhs: ld, rhs: rd }.into());
+        }
+        let (k, m, n) = (ld[0], ld[1], rd[0]);
+        let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: [n, m, 1, 1] }));
+        let geom = Geometry { m: too_large(m)?, n: too_large(n)?, k: too_large(k)? };
+        for array in [lhs, rhs] {
+            if array.pending().is_some_and(|node| node.len() as u64 * 4 > ctx.segment_bytes()) {
+                return Err(LumaError::Chunked("a matrix product of an array split over several buffers").into());
+            }
+        }
+        Ok(geom)
+    }
+}
+
+/// The product of `lhs` and `rhs` through the registry (the body of `matmul`, `matmul_tf32`, `matmul_f32`): an evaluated array.
+pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, location: &'static Location<'static>) -> Outcome<Array<f32>> {
+    let view = ContractionView { lhs, rhs, attrs, location };
+    let geom = view.check()?;
+    let ctx = lhs.context();
+    match select::execute(ctx, &Subject::Contraction(&view))? {
+        Output::Storage(storage) => Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage)),
+        Output::Array(array) => Ok(*array),
+    }
+}
+
+// -- what a strategy runs with --
+
+/// What `fits` worked out and `lower` runs with: small, because it is copied through the registry's frames (a reduction forces
+/// another through `execute`, and deep expressions recurse). The plan itself is computed once, by `lower` ([`plan_of`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ContractionParams {
+    /// The strategy these are for.
+    pub(crate) by: StrategyId,
+    pub(crate) geom: Geometry,
+}
+
+/// The plan of the strategy `params.by` for its product, `transposed` saying which operands are read as the transpose of the buffer
+/// they are views of (see [`transposed_source`]; it is the tile's, not the cut's): `None` where the strategy has none (the host,
+/// the padding), the error of the plan function (a grid too large) otherwise. Pure.
+fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams, transposed: [bool; 2]) -> Option<Result<Plan, LumaError>> {
+    let Geometry { m, n, k } = params.geom;
+    let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
+    match params.by {
+        StrategyId::GEMM_TF32 => Some(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(false), transposed, false, groups, bytes)),
+        StrategyId::GEMM_F32 => Some(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(true), transposed, true, groups, bytes)),
+        StrategyId::CONTRACTION_NATIVE_CPU => Some(native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)),
+        StrategyId::CONTRACTION_SKINNY => skinny_plan(m, n, k, along_k(view.lhs, params.geom), groups, bytes).map(Ok),
+        StrategyId::CONTRACTION_TILED => Some(tiled_plan(ctx.tuning(), m, n, k, groups, bytes)),
+        _ => None,
+    }
+}
+
+/// The stable label of the Decision of a strategy run with `params`.
+pub(crate) fn label(params: &ContractionParams, subject: &Subject<'_>, ctx: &Context) -> String {
+    match params.by {
+        StrategyId::CONTRACTION_HOST => "host".to_string(),
+        StrategyId::GEMM_NARROW_N => format!("padded n={} to {}", params.geom.n, params.geom.n.next_multiple_of(4)),
+        _ => match view(subject).and_then(|view| plan_of(view, ctx, params, [false; 2])) {
+            Some(Ok(plan)) => plan_label(&plan),
+            Some(Err(_)) => "grid too large".to_string(),
+            None => params.by.name().to_string(),
+        },
+    }
+}
+
+fn params(by: StrategyId, geom: Geometry) -> Params {
+    Params::Contraction(ContractionParams { by, geom })
+}
+
+fn view<'a>(subject: &Subject<'a>) -> Option<&'a ContractionView<'a>> {
+    match subject {
+        Subject::Contraction(view) => Some(view),
+        _ => None,
+    }
+}
+
+/// Whether the elements of the left operand along `K` are neighbours in memory (not a transposed view).
+fn along_k(lhs: &Array<f32>, geom: Geometry) -> bool {
+    lhs.pending().is_none_or(|node| jit::stored_along_k(&MatmulSide::Pending(Arc::clone(node)), [geom.k, geom.m]))
+}
+
+/// The tensor-core tiles the product runs on, if it is one that does.
+fn tensor_tiles<'c>(view: &ContractionView<'_>, ctx: &'c Context) -> &'c [(u32, u32)] {
+    if view.wants_tf32(ctx) && ctx.caps().contains(Caps::TF32) && gemm_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(false) } else { &[] }
+}
+
+// -- the table --
+
+impl StrategyId {
+    pub(crate) const CONTRACTION_HOST: StrategyId = StrategyId(FamilyTag::Contraction, 0);
+    pub(crate) const GEMM_NARROW_N: StrategyId = StrategyId(FamilyTag::Contraction, 1);
+    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 2);
+    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 3);
+    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 4);
+    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 5);
+    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
+}
+
+/// The products' table, in preference order.
+pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 7] = [
+    // The host's sums differ from the device's: its own bit class.
+    entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, NumClass::Exact, 1, fits_host, lower_host),
+    entry(StrategyId::GEMM_NARROW_N, "gemm-narrow-n", Caps::GEMM_TILES, NumClass::Exact, 2, fits_narrow_n, lower_narrow_n),
+    entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, fits_gemm_tf32, lower_gemm),
+    entry(StrategyId::GEMM_F32, "gemm-f32", Caps::GEMM_TILES, NumClass::Exact, 4, fits_gemm_f32, lower_gemm),
+    entry(StrategyId::CONTRACTION_NATIVE_CPU, "native-cpu", Caps::NATIVE_GEMM, NumClass::Exact, 5, fits_native_cpu, lower_gemm),
+    entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), NumClass::Exact, 6, fits_skinny, lower_skinny),
+    entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), NumClass::Exact, 7, fits_tiled, lower_tiled),
+];
+
+const fn entry(
+    id: StrategyId,
+    name: &'static str,
+    needs: Caps,
+    numerics: NumClass,
+    bits: u16,
+    fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
+    lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
+) -> Strategy {
+    // Every entry is its own group (`group` = its place in the table): the first that fits runs.
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group: id.1, prologue: false, epilogue: false, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+}
+
+fn split_global(_: &Subject<'_>, _: &Params) -> SplitClass {
+    SplitClass::Global
+}
+
+/// Baseline strategies are never warmed (they may block on their own compile, as before).
+fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
+    Ok(Warm { kernels: Vec::new() })
+}
+
+fn done(storage: Arc<Storage>) -> Result<Lowered, Failure> {
+    Ok(Lowered::Done(Output::Storage(storage)))
+}
+
+/// What every `lower` starts from: its view and its parameters, and a way to get the plan of its strategy once the operands are
+/// known (`Err` for a grid too large, `None` where there is no plan to run: the strategy is declined).
+fn lowering<'a>(subject: &Subject<'a>, params: &Params) -> Option<(&'a ContractionView<'a>, ContractionParams)> {
+    let (Some(view), Params::Contraction(params)) = (view(subject), params) else { return None };
+    Some((view, *params))
+}
+
+/// [`plan_of`] as a `Failure`.
+fn plan_or_decline(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams, transposed: [bool; 2]) -> Result<Option<Plan>, Failure> {
+    match plan_of(view, ctx, params, transposed) {
+        Some(Ok(plan)) => Ok(Some(plan)),
+        Some(Err(error)) => Err(error.into()),
+        None => Ok(None),
+    }
+}
+
+// -- host --
+
+/// `host_product`'s checks: a small product whose operands are on the host (not `try_matmul` itself, which evaluates).
+fn fits_host(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    if !ctx.can_run_on_host() {
+        return None;
+    }
+    let geom = view.geometry()?;
+    let (m, n, k) = (u64::from(geom.m), u64::from(geom.n), u64::from(geom.k));
+    let limit = crate::host::MAX_HOST_ELEMS as u64;
+    if m * n * k > crate::host::MAX_MATMUL_FMAS || m * k > limit || k * n > limit || m * n > limit {
+        return None;
+    }
+    Some(params(StrategyId::CONTRACTION_HOST, geom))
+}
+
+/// The product on the host; `None` from it (it did not work out) is `Declined`.
+fn lower_host(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let (Some(view), Params::Contraction(params)) = (view(subject), params) else { return Ok(Lowered::Declined) };
+    let geom = params.geom;
+    match crate::host::try_matmul(emit.ctx(), view.lhs, view.rhs, geom.m as usize, geom.n as usize, geom.k as usize) {
+        Some(out) => done(Arc::clone(out.storage()?)),
+        None => Ok(Lowered::Declined),
+    }
+}
+
+// -- narrow N --
+
+/// The product of a few columns that is not a multiple of 4 (the 10 classes of a classifier head), padded with zero columns up
+/// to one on the backend's own kernels and sliced back.
+fn fits_narrow_n(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF {
+        return None;
+    }
+    let geom = view.geometry()?;
+    let (k, m, n) = (geom.k as usize, geom.m as usize, geom.n as usize);
+    if n.is_multiple_of(4) || !(2..GEMM_MIN_EXTENT).contains(&n) || !(SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) || !m.is_multiple_of(4) || k < GEMM_MIN_EXTENT || !k.is_multiple_of(4) {
+        return None;
+    }
+    if if view.wants_tf32(ctx) { !ctx.caps().contains(Caps::TF32) } else { ctx.hal().gemm_tiles(true).is_empty() } {
+        return None;
+    }
+    Some(params(StrategyId::GEMM_NARROW_N, geom))
+}
+
+/// Pads the right operand with zero columns (an expression, evaluated first like any other: a copy of a few thousand elements),
+/// runs the product again (which now takes the backend's kernels) and returns a lazy view of the columns that are not padding.
+fn lower_narrow_n(subject: &Subject<'_>, params: &Params, _: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let (Some(view), Params::Contraction(params)) = (view(subject), params) else { return Ok(Lowered::Declined) };
+    let n = params.geom.n as usize;
+    let wide = crate::matmul::with_zero_columns(view.rhs, n.next_multiple_of(4) - n);
+    let out = run(view.lhs, &wide, view.attrs, view.location)?;
+    Ok(Lowered::Done(Output::Array(Box::new(out.slice(0, ..n)))))
+}
+
+// -- the backend's own kernels --
+
+fn fits_gemm_tf32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    if tensor_tiles(view, ctx).is_empty() {
+        return None;
+    }
+    Some(params(StrategyId::GEMM_TF32, view.geometry()?))
+}
+
+/// The default product runs on the backend's own `f32` kernels when it reads its operands as they are stored and is not one of
+/// the skinny shapes (see [`skinny_plan`]).
+fn fits_gemm_f32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    if ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF {
+        return None;
+    }
+    let geom = view.geometry()?;
+    if gemm_shape(view.lhs, view.rhs).is_none() || !tensor_tiles(view, ctx).is_empty() {
+        return None;
+    }
+    if !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
+        return None;
+    }
+    if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() || ctx.hal().gemm_tiles(true).is_empty() {
+        return None;
+    }
+    Some(params(StrategyId::GEMM_F32, geom))
+}
+
+/// The CPU's native product.
+fn fits_native_cpu(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    if ctx.tuning().native_gemm == 0 {
+        return None;
+    }
+    Some(params(StrategyId::CONTRACTION_NATIVE_CPU, view.geometry()?))
+}
+
+/// A product the backend multiplies as native code (its own tiles, or the CPU's): the operands are evaluated first and read as
+/// stored.
+fn lower_gemm(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let ctx = emit.ctx();
+    let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
+    let (sides, transposed) = native_sides(ctx, view.lhs, view.rhs)?;
+    let Some(plan) = plan_or_decline(view, ctx, &params, transposed)? else { return Ok(Lowered::Declined) };
+    done(launch(ctx, sides, plan, params.geom)?)
+}
+
+// -- the shader kernels --
+
+/// A small output over a long K, from global memory without staging. An operand that is a fused expression read a few times by the
+/// tiles would be recomputed at each read: the staged tiles then do better, so the strategy does not fit.
+fn fits_skinny(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    let geom = view.geometry()?;
+    let plan = skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?;
+    if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
+        let reads = [geom.n.div_ceil(u32::from(cols)), geom.m.div_ceil(u32::from(rows))];
+        let costly = [view.lhs, view.rhs].into_iter().zip(reads).any(|(array, reads)| (SKINNY_FUSED_READS..SKINNY_EVALUATE_READS).contains(&reads) && array.pending().is_some_and(jit::is_recomputed));
+        if costly {
+            return None;
+        }
+    }
+    Some(params(StrategyId::CONTRACTION_SKINNY, geom))
+}
+
+/// A skinny kernel computes a fused operand once per tile that reads it; past [`SKINNY_EVALUATE_READS`] reads storing the
+/// expression first is cheaper (a side effect, so here and not in `fits`).
+fn lower_skinny(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let ctx = emit.ctx();
+    let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
+    let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
+    let geom = params.geom;
+    let mut sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
+    if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
+        let reads = [geom.n.div_ceil(u32::from(cols)), geom.m.div_ceil(u32::from(rows))];
+        let mut evaluated = false;
+        for (array, reads) in [view.lhs, view.rhs].into_iter().zip(reads) {
+            if reads >= SKINNY_EVALUATE_READS && let Some(node) = array.pending() {
+                evaluated |= jit::evaluate_for_reuse(node)?;
+            }
+        }
+        if evaluated {
+            sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
+        }
+    }
+    done(launch(ctx, sides, plan, geom)?)
+}
+
+/// The staged tiles: always (the plan fails only when the grid is too large, which `lower` reports).
+fn fits_tiled(subject: &Subject<'_>, _: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    Some(params(StrategyId::CONTRACTION_TILED, view.geometry()?))
+}
+
+fn lower_tiled(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let ctx = emit.ctx();
+    let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
+    let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
+    let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
+    done(launch(ctx, sides, plan, params.geom)?)
+}
+
+// -- launch --
+
+/// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
+fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry) -> Result<Arc<Storage>, Failure> {
+    let Geometry { m: m32, n: n32, k: k32 } = geom;
+    let len = Shape::from([n32 as usize, m32 as usize, 1, 1]).validate()?;
+    let out_storage = Arc::new(Storage::new(ctx, len, ElemLayout::plain(4)));
+    let out_pin = out_storage.pin_single()?;
+    let out_bytes = out_storage.byte_len();
+    let mut scratch = Scratch::new(ctx);
+    let partial = if plan.slices > 1 { Some(scratch.take(u64::from(plan.slices) * out_bytes)?) } else { None };
+    let (target, target_bytes) = match &partial {
+        Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
+        None => (out_pin.buffer(), out_bytes),
+    };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split };
+    jit::matmul(ctx, sides, kernel, [m32, n32, k32, plan.kc], plan.groups, RawArg::write(target, target_bytes))?;
+    if let Some(partial) = &partial {
+        let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
+        let slices = [plan.slices];
+        let sum_groups = crate::ops::fold_workgroups(ctx, (m32 * n32).div_ceil(32))?;
+        ctx.launch(
+            &sum,
+            sum_groups,
+            [m32 * n32, 1, 1],
+            &[RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(partial, target_bytes), RawArg::Uniform(bytemuck::bytes_of(&slices))],
+        )?;
+    }
+    drop(scratch);
+    jit::check_finite(ctx, &out_storage, jit::ElemTy::F32)?;
+    Ok(out_storage)
+}
+
+// -- plans --
+
+/// Output tiles below which a long K is split (see [`split_of`]); like [`SPLIT_GROUPS`] a count
+/// for the 82 multiprocessors of an RTX 3090, raised for bigger devices ([`Tuning::scaled_up`]).
+const SPLIT_TILES: u32 = 128;
+/// Shortest K that is split.
+const SPLIT_MIN_K: u32 = 4096;
+/// Workgroups a split product aims for. The 4 tiles of a 64x64 product over 2^20 take 3.0 ms
+/// with 256 (3 workgroups per multiprocessor of an RTX 3090, which cannot hide the latency of
+/// the slices), 2.5 with 512, 2.3 with 1024, 2.27 with 2048. Raised in proportion to the
+/// multiprocessors of bigger devices ([`Tuning::scaled_up`]), never lowered: unchanged on the
+/// 3090, and on an RTX 3080 Laptop (48) 1024 groups beat the proportional 599 by 2.7 %.
+const SPLIT_GROUPS: u32 = 1024;
+/// Smallest K a slice of a split product covers.
+const SPLIT_MIN_SLICE: u32 = 1024;
+
+/// Most outputs of a product that runs as a skinny kernel when its `K` is at least
+/// [`SKINNY_LONG_K`]: a 96x96 Gram matrix over 65536 samples takes 0.29 ms on an RTX 3090 against
+/// 0.38 for the staged tiles, a 128x128 one 0.35 against 0.22.
+const SKINNY_MAX_OUTPUTS: u32 = 9216;
+/// Most outputs for which a `K` of [`SKINNY_MIN_K`] is long enough (a 32x32 product is 2.5x
+/// faster at 4096, 16 x 16 at 1M 2.4x; 64x64 over 16384 is 60% slower).
+const SKINNY_SMALL_OUTPUTS: u32 = 512;
+/// Shortest K of the products with up to [`SKINNY_MAX_OUTPUTS`] outputs.
+const SKINNY_LONG_K: u32 = 65536;
+/// Most outputs of one that reads its left operand along `K` (a matrix times a few vectors).
+const SKINNY_MAX_OUTPUTS_ALONG_K: u32 = 1 << 22;
+/// Shortest K of a skinny product.
+const SKINNY_MIN_K: u32 = 2048;
+/// Workgroups a skinny product aims for: one-hot 1M x 32 on an RTX 3090 takes 0.19 ms with 256 or
+/// 1024, 0.18 with 512, 0.21 with 2048.
+const SKINNY_GROUPS: u32 = 512;
+/// Smallest K a workgroup of a skinny product covers: a 64x64 product over 65536 takes 0.14 ms
+/// with 256 and 0.11 with 128 or 64 (at most 512 workgroups of 256 each otherwise).
+const SKINNY_MIN_SLICE: u32 = 128;
+/// Most accumulators an invocation of a skinny kernel holds.
+const SKINNY_ACCUMULATORS: u32 = 80;
+/// Most `f32` of workgroup memory a skinny kernel's reduction across groups uses (16 KiB, the
+/// smallest limit of the backends).
+const SKINNY_PART: u32 = 4096;
+/// Tiles that read the same operand element from which a pending operand is evaluated first.
+const SKINNY_EVALUATE_READS: u32 = 8;
+/// Tiles that read the same element of a pending operand of several buffers from which the staged
+/// tiles are preferred to a skinny kernel (below [`SKINNY_EVALUATE_READS`]).
+const SKINNY_FUSED_READS: u32 = 4;
+
+/// The slices a product of `tiles` output tiles over `k` is split into, and the elements of K
+/// per slice (a multiple of the staged slice). Few tiles and a long K: about
+/// [`SPLIT_GROUPS`] workgroups, each slice at least [`SPLIT_MIN_SLICE`] long. `None` if not split.
+fn split_of(tuning: &Tuning, tiles: u32, k: u32) -> Option<(u32, u32)> {
+    if tiles >= tuning.scaled_up(SPLIT_TILES) || k < SPLIT_MIN_K {
+        return None;
+    }
+    let wanted = tuning.scaled_up(SPLIT_GROUPS).div_ceil(tiles).min(k / SPLIT_MIN_SLICE);
+    if wanted < 2 {
+        return None;
+    }
+    let kc = k.div_ceil(wanted).next_multiple_of(SLICE);
+    let slices = k.div_ceil(kc);
+    (slices >= 2).then_some((slices, kc))
+}
+
+/// The skinny kernel of an `m x n` output and the workgroups that cover its tiles: the
+/// invocation tile (at most [`SKINNY_ACCUMULATORS`] outputs, up to 10 rows by 8 columns) that
+/// costs the least per `k`, counting a fused multiply-add as 1 and a load as 2, over all the lanes
+/// of the workgroups.
+///
+/// A workgroup is 64 invocations, or the next power of two of the tiles if there are more (up to
+/// 256); with fewer tiles than that the surplus invocations form groups that take the `k` in turn
+/// (a power of two of them, so that the groups reduce pairwise). `along_k` is for a left operand
+/// stored along `K`: neighbouring invocations then take neighbouring `k` (32 or 64 groups of a
+/// workgroup), and the output tiles are as many workgroups as they need; the right operand is
+/// then read along `K` too if it has at most 8 columns, which is all of them.
+fn skinny_tile(m: u32, n: u32, along_k: bool) -> Option<(MatmulTile, u32)> {
+    let mut best: Option<((u32, u32), (MatmulTile, u32))> = None;
+    let min_cols = if along_k { n } else { 1 };
+    // Memory bound along `K`: a tile of at most 8 rows and 64 outputs, whose right operand's
+    // columns weigh more (each is a load of its own, strided by the columns).
+    let (max_rows, max_outputs) = if along_k { (8, 64) } else { (10, SKINNY_ACCUMULATORS) };
+    for cols in min_cols..=n.min(8) {
+        for rows in 1..=m.min(max_rows) {
+            if rows * cols > max_outputs {
+                continue;
+            }
+            let tiles = m.div_ceil(rows) * n.div_ceil(cols);
+            let (width, groups) = if along_k {
+                (64, if tiles >= 2 { 32 } else { 64 })
+            } else {
+                let width = tiles.next_power_of_two().max(64);
+                if width > 256 {
+                    continue;
+                }
+                (width, 1 << (width / tiles).ilog2())
+            };
+            let tile_groups = tiles.div_ceil(width / groups);
+            if groups > 1 && rows * cols * width / 2 > SKINNY_PART {
+                continue;
+            }
+            let loads = 2 * rows + if along_k && cols > 1 { 2 * cols * cols } else { 2 * cols };
+            let cost = tile_groups * (width / groups) * (rows * cols + loads);
+            let key = (cost, u32::MAX - rows * cols);
+            if best.is_none_or(|(k, _)| key < k) {
+                let tile = MatmulTile::Skinny { rows: rows as u8, cols: cols as u8, groups: groups as u8, width: width as u16, along_k };
+                best = Some((key, (tile, tile_groups)));
+            }
+        }
+    }
+    best.map(|(_, tile)| tile)
+}
+
+/// Most rows of a skinny product of more than 8 columns: above, the staged tiles are faster (`Xᵀ R` of
+/// 1M samples, 128 features and 20 classes on an RTX 3090: 0.78 ms tiled against 1.30 skinny; 128 x 32
+/// 0.81 against 1.53; 64 x 20 1.15 tiled against 0.69 skinny, 64 x 64 2.26 against 1.53).
+const SKINNY_MAX_ROWS: u32 = 96;
+
+/// The plan of a small output over a long K (a Gram matrix, one-hot labels times features, a
+/// gradient `Xᵀ r`, a matrix times a few vectors) as a skinny kernel: `slices` of K, each its
+/// own workgroups, about [`SKINNY_GROUPS`] workgroups in all, no slice shorter than
+/// [`SKINNY_MIN_SLICE`]. `along_k`: the left operand is stored along `K` (see [`skinny_tile`]).
+/// `None` if the product is not of that kind.
+fn skinny_plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Option<Plan> {
+    let along_k = along_k && n <= 8;
+    let outputs = u64::from(m) * u64::from(n);
+    let few = if along_k {
+        outputs <= u64::from(SKINNY_MAX_OUTPUTS_ALONG_K)
+    } else {
+        (outputs <= u64::from(SKINNY_SMALL_OUTPUTS) || (outputs <= u64::from(SKINNY_MAX_OUTPUTS) && k >= SKINNY_LONG_K)) && (m <= SKINNY_MAX_ROWS || n <= 8)
+    };
+    if m == 0 || n == 0 || k < SKINNY_MIN_K || !few {
+        return None;
+    }
+    let (tile, tile_groups) = skinny_tile(m, n, along_k)?;
+    let mut wanted = SKINNY_GROUPS.div_ceil(tile_groups).min(k / SKINNY_MIN_SLICE).clamp(1, max_groups);
+    loop {
+        let kc = k.div_ceil(wanted);
+        let slices = k.div_ceil(kc);
+        if wanted == 1 || u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes {
+            if tile_groups > max_groups {
+                return None;
+            }
+            return Some(Plan { tile, aligned: false, split: true, slices, kc, groups: [slices, tile_groups, 1] });
+        }
+        wanted /= 2;
+    }
+}
+
+/// The plan of an `m x k` by `k x n` product. `along_k`: the left operand's elements along `K` are
+/// neighbours in memory (not a transposed view). `max_groups` is the most workgroups per grid
+/// dimension, `max_bytes` the most a buffer may hold (the split product's partial sums have to
+/// fit one).
+#[cfg(test)]
+fn plan(tuning: &Tuning, m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    if let Some(plan) = skinny_plan(m, n, k, along_k, max_groups, max_bytes) {
+        return Ok(plan);
+    }
+    tiled_plan(tuning, m, n, k, max_groups, max_bytes)
+}
+
+/// [`plan`] with the staged tiles (never a skinny kernel).
+fn tiled_plan(tuning: &Tuning, m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let tile = match (m >= 128, n >= 128) {
+        (true, true) => MatmulTile::T128,
+        (true, false) => MatmulTile::T128x32,
+        (false, true) => MatmulTile::T32x128,
+        (false, false) => MatmulTile::T32,
+    };
+    let (row_edge, col_edge) = tile.edges();
+    let aligned = m.is_multiple_of(row_edge) && n.is_multiple_of(col_edge) && k.is_multiple_of(SLICE);
+    let (columns, rows) = (n.div_ceil(col_edge), m.div_ceil(row_edge));
+    let tiles = columns.saturating_mul(rows);
+    let (slices, kc) = split_of(tuning, tiles, k)
+        .filter(|&(slices, _)| u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
+        .unwrap_or((1, k));
+    // Row-major tile numbers (see `body`): the grid is `[columns, rows]` if that fits, else the
+    // tiles are folded over it, the groups past the last tile exiting at once.
+    let [x, y, _] = if columns <= max_groups && rows <= max_groups { [columns, rows, 1] } else { fold_grid(tiles, max_groups) };
+    let groups = [x, y, slices];
+    if groups.iter().any(|&count| count > max_groups) {
+        return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
+    }
+    Ok(Plan { tile, aligned, split: slices > 1, slices, kc, groups })
+}
+
+/// Output tile edges a native product chooses from, largest first (see [`native_plan`]).
+const NATIVE_EDGES: [u32; 3] = [128, 64, 32];
+/// Output tiles per core a native product aims for: the cores take them as they free up.
+const NATIVE_TILES_PER_CORE: u32 = 2;
+/// Smallest K a slice of a split native product covers.
+const NATIVE_SPLIT_SLICE: u32 = 1024;
+
+/// The plan of an `m x k` by `k x n` product the backend multiplies as native code on `cores`
+/// cores: the largest tile of [`NATIVE_EDGES`] that leaves [`NATIVE_TILES_PER_CORE`] tiles per
+/// core, else the smallest; with fewer tiles than that and a long K, K is split over the third
+/// grid dimension like [`split_of`] does (partial products summed by a second launch).
+fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let wanted = cores.max(1).saturating_mul(NATIVE_TILES_PER_CORE);
+    let tiles_at = |edge: u32| m.div_ceil(edge).saturating_mul(n.div_ceil(edge));
+    let edge = NATIVE_EDGES.into_iter().find(|&edge| tiles_at(edge) >= wanted).unwrap_or(NATIVE_EDGES[NATIVE_EDGES.len() - 1]);
+    let (columns, rows) = (n.div_ceil(edge), m.div_ceil(edge));
+    let tiles = columns.saturating_mul(rows);
+    let split = (tiles < wanted && k >= 2 * NATIVE_SPLIT_SLICE).then(|| {
+        let kc = k.div_ceil(wanted.div_ceil(tiles).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
+        (k.div_ceil(kc), kc)
+    });
+    let (slices, kc) = split
+        .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
+        .unwrap_or((1, k));
+    let [x, y, _] = if columns <= max_groups && rows <= max_groups { [columns, rows, 1] } else { fold_grid(tiles, max_groups) };
+    let groups = [x, y, slices];
+    if groups.iter().any(|&count| count > max_groups) {
+        return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
+    }
+    Ok(Plan { tile: MatmulTile::Native { edge, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, split: slices > 1, slices, kc, groups })
+}
+
+/// `LUMA_OWN_GEMM=off` keeps the `f32` products on the shader kernels even where the backend has
+/// its own (see [`run`]).
+static OWN_F32_KERNELS_OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("LUMA_OWN_GEMM").is_ok_and(|v| v.trim() == "off"));
+
+/// Tiles per multiprocessor a tensor-core product aims for.
+const GEMM_HALF_TILES_PER_SM: u32 = 4;
+/// Smallest `M` and `K` of a product of the backend's own kernels (below it the tiles are mostly
+/// padding), and of its `N`, except for a product of at most [`SMALL_N_MAX_M`] rows, whose few
+/// columns (the classes of a classifier head) fill part of a 32-wide tile but still beat the
+/// shader kernels, which launch two workgroups for them.
+const GEMM_MIN_EXTENT: usize = 32;
+/// Smallest `N` of a product of at most [`SMALL_N_MAX_M`] rows.
+const SMALL_N_MIN: usize = 4;
+/// Most rows of a product with `N` below [`GEMM_MIN_EXTENT`] that runs on the backend's own
+/// kernels (more rows have enough tiles for the shader kernels' skinny and staged plans).
+const SMALL_N_MAX_M: usize = 4096;
+/// Fewest rows of such a product: with 64 rows the extra launches (the padded operand) cost more than the shader kernels
+/// (`train/sgd_small`, `adam_small` of the `ml` suite, batch 64, 11 % slower on an RTX 3080 Laptop).
+const SMALL_N_MIN_M: usize = 128;
+
+/// The `M`, `N` and `K` of the product of `lhs` and `rhs` if the backend's own kernels take its
+/// shapes: all multiples of 4 and at least [`GEMM_MIN_EXTENT`] (the extents are checked again by
+/// [`run`]).
+fn gemm_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> Option<[u32; 3]> {
+    let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+    let ok = |extent: usize, least: usize| u32::try_from(extent).ok().filter(|_| extent >= least && extent.is_multiple_of(4));
+    if ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
+        return None;
+    }
+    let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&ld[1]) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
+    Some([ok(ld[1], GEMM_MIN_EXTENT)?, ok(rd[0], few_columns)?, ok(ld[0], GEMM_MIN_EXTENT)?])
+}
+
+/// Whether the backend's own kernels can take `array` as an operand: they read buffers (or the
+/// transpose of one), so an operand that is an expression is evaluated first, once, which beats
+/// fusing it into the old shader kernels (`relu(z) W` of 256 x 512 x 512 takes 85 us fused and 3 + 20
+/// evaluated first on an RTX 3090) and lets its other readers use the buffer. Arrays split over
+/// several buffers are left to the shader kernels.
+fn gemm_operand(ctx: &Context, array: &Array<f32>) -> bool {
+    array.pending().is_none_or(|node| node.len() as u64 * 4 <= ctx.segment_bytes())
+}
+
+/// Output tiles below which a long K of an `f32` product of the backend's own kernels is split
+/// (a count for the 82 multiprocessors of an RTX 3090, see [`Tuning::scaled_up`]), the workgroups
+/// it aims for and the shortest slice. `32 x 4096 x 4096` (the weights of a small batch) takes
+/// 0.16 ms split in 4 slices of 1024 by the shader kernels and 0.23 ms in 4 of 32 x 64 tiles;
+/// `128 x 262144 x 128` 0.63 ms with 1024 workgroups, 1.4 with 124.
+const F32_SPLIT_TILES: u32 = 128;
+const F32_SPLIT_GROUPS: u32 = 1024;
+/// Longest slice of K a split product of the backend's own kernels covers at least: an eighth of K
+/// between [`GEMM_SPLIT_SLICE_MIN`] and `..._MAX` (measured on an RTX 3090 for `f32` / TF32: 256 x 512 x 12
+/// 18.4 / 19.2 us unsplit, 9.2 in 4 slices of 128; 2048 x 2048 x 64 95 us unsplit, 70 in 8 slices of
+/// 256, 83 in 16 of 128; 128 x 4096 x 4096 236 us in 8 slices of 512, 258 in 16 of 256; 64 x 8192 x 64
+/// TF32 34 us unsplit, 10 in slices of 128; 256 x 784 x 512 28 / 28 us, 24 / 20 split).
+const GEMM_SPLIT_SLICE_DIV: u32 = 8;
+const GEMM_SPLIT_SLICE_MIN: u32 = 128;
+const F32_SPLIT_SLICE_MAX: u32 = 512;
+const GEMM_TF32_SPLIT_SLICE_MAX: u32 = 1024;
+/// Shortest K that is split: 512 for a product of at most [`GEMM_SPLIT_FEW_TILES`] output tiles (a
+/// few workgroups would idle most of the device and the fold of the slices is cheap against their
+/// share of K), else 4096 (`f32`) / 2048 and slices of 1024 (TF32): a product of 32 to 128 tiles over
+/// a K of 512 to 2048 is 5 to 40 % slower split (256 x 512 x 512 20 us unsplit, 24 split; 256 x 1024 x
+/// 1024 TF32 35 us, 44 split).
+const GEMM_SPLIT_MIN_K: u32 = 512;
+const GEMM_SPLIT_FEW_TILES: u32 = 16;
+const F32_SPLIT_MIN_K: u32 = 4096;
+
+/// The slices an `f32` product of `tiles` output tiles over `k` is split into and their length.
+fn f32_split(tuning: &Tuning, tiles: u32, k: u32, bytes: u64, max_bytes: u64) -> Option<(u32, u32)> {
+    let min_k = if tiles <= tuning.scaled_up(GEMM_SPLIT_FEW_TILES) { GEMM_SPLIT_MIN_K } else { F32_SPLIT_MIN_K };
+    if tiles >= tuning.scaled_up(F32_SPLIT_TILES) || k < min_k {
+        return None;
+    }
+    let slice = (k / GEMM_SPLIT_SLICE_DIV).clamp(GEMM_SPLIT_SLICE_MIN, F32_SPLIT_SLICE_MAX);
+    let wanted = tuning.scaled_up(F32_SPLIT_GROUPS).div_ceil(tiles).min(k / slice);
+    if wanted < 2 {
+        return None;
+    }
+    let kc = k.div_ceil(wanted).next_multiple_of(SLICE);
+    let slices = k.div_ceil(kc);
+    (slices >= 2 && u64::from(slices) * bytes <= max_bytes).then_some((slices, kc))
+}
+
+/// The rate of an `f32` kernel of `tile` (relative to the largest, at full occupancy) times the
+/// share of the device `workgroups` of it fill and the share of its outputs that are not padding.
+/// Measured on an RTX 3090 at 4096^3: 64 x 128 22.9 TFLOP/s, 128 x 64 and 64 x 64 21.8, 64 x 32 and
+/// 32 x 64 16.5-17.3, 32 x 32 13.8 (an RTX 3080 Laptop: 9.3, 8.3-8.8, 6.0-6.7, 5.2); a workgroup is
+/// 4 warps up to 128 x 64, else 2, and it takes about 8 resident warps per multiprocessor to keep
+/// the multiply-add units busy (a 1024^3 product with 128 tiles of 64 x 128 runs at 18.5, with 256
+/// of 64 x 64 at 16.8, with 256 of 32 x 32 at 12.5, with 64 of 64 x 128 at 6.5).
+fn f32_tile_rate(tile: (u32, u32), workgroups: u32, units: u32, useful: f64) -> f64 {
+    let area = tile.0 * tile.1;
+    let (rate, warps) = match area {
+        8192.. => (1.0, 4.0),
+        4096.. => (0.95, 2.0),
+        2048.. => (0.74, 2.0),
+        _ => (0.6, 2.0),
+    };
+    rate * useful * (f64::from(workgroups) * warps / (f64::from(units.max(1)) * 8.0)).min(1.0)
+}
+
+/// The plan of an `m x k` by `k x n` product on the backend's own kernels (tensor cores, or with
+/// `exact` the ordinary cores) with one of `tiles` (largest first). Tensor-core tiles: the largest
+/// that gives `half_per_sm` half tiles per multiprocessor, else the smallest; few tiles over a
+/// long K split K (see [`native_plan`]). `f32` tiles: the one with the best rate, K split as
+/// [`f32_split`] says (see [`f32_tile_rate`]).
+#[allow(clippy::too_many_arguments)]
+fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], exact: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let units = tuning.compute_units;
+    let wanted = units.max(1).saturating_mul(half_per_sm).div_ceil(2);
+    let count = |&(rows, cols): &(u32, u32)| m.div_ceil(rows).saturating_mul(n.div_ceil(cols));
+    let out_bytes = u64::from(m) * u64::from(n) * 4;
+    let pick = || {
+        if !exact {
+            return tiles.iter().find(|tile| count(tile) >= wanted).or(tiles.last()).copied();
+        }
+        tiles
+            .iter()
+            .copied()
+            .fold(None::<((u32, u32), f64)>, |best, tile| {
+                let tile_count = count(&tile);
+                let slices = f32_split(tuning, tile_count, k, out_bytes, max_bytes).map_or(1, |(slices, _)| slices);
+                let useful = f64::from(m) * f64::from(n) / (f64::from(tile_count) * f64::from(tile.0 * tile.1));
+                let rate = f32_tile_rate(tile, tile_count.saturating_mul(slices), units, useful);
+                if best.is_none_or(|(_, top)| rate > top * 1.0001) { Some((tile, rate)) } else { best }
+            })
+            .map(|(tile, _)| tile)
+    };
+    let (rows, cols) = pick().unwrap_or((128, 128));
+    let (columns, row_tiles) = (n.div_ceil(cols), m.div_ceil(rows));
+    let tile_count = columns.saturating_mul(row_tiles);
+    let split = if exact {
+        f32_split(tuning, tile_count, k, out_bytes, max_bytes)
+    } else {
+        let few = tile_count <= tuning.scaled_up(GEMM_SPLIT_FEW_TILES);
+        let slice = if few { (k / GEMM_SPLIT_SLICE_DIV).clamp(GEMM_SPLIT_SLICE_MIN, GEMM_TF32_SPLIT_SLICE_MAX) } else { NATIVE_SPLIT_SLICE };
+        let min_k = if few { GEMM_SPLIT_MIN_K } else { 2 * NATIVE_SPLIT_SLICE };
+        (tile_count < wanted && k >= min_k)
+            .then(|| {
+                let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / slice)).next_multiple_of(SLICE);
+                (k.div_ceil(kc), kc)
+            })
+            .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * out_bytes <= max_bytes)
+    };
+    let (slices, kc) = split.unwrap_or((1, k));
+    let groups = [columns, row_tiles, slices];
+    if groups.iter().any(|&count| count > max_groups) {
+        return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
+    }
+    Ok(Plan { tile: MatmulTile::Gemm { rows, cols, lhs_t: transposed[0], rhs_t: transposed[1], exact }, aligned: false, split: slices > 1, slices, kc, groups })
+}
+
+/// The operand of a native product that is a transposed view (a swap of axes 0 and 1, see
+/// `host::transposed_source`): what it is the transpose of, so that the product reads that
+/// buffer through its strides instead of the view being copied.
+fn transposed_source(array: &Array<f32>) -> Option<Src> {
+    let node = array.pending()?;
+    let op = node.op();
+    let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = op.kind else { return None };
+    let unit = |from: u8| AxisMap { from, start: 0, step: 1 };
+    let swaps = op.ty == ElemTy::F32
+        && map.axes[0] == unit(1)
+        && map.axes[1] == unit(0)
+        && map.axes[2] == unit(2)
+        && map.axes[3] == unit(3)
+        && map.src[0] == map.out[1]
+        && map.src[1] == map.out[0]
+        && map.src[2..] == [1, 1]
+        && map.out[2..] == [1, 1];
+    if !swaps || node.failure().is_some() || node.is_looped() {
+        return None;
+    }
+    let [source, ..] = node.operands()?;
+    matches!(source, Src::Buffer(_) | Src::Node(_)).then_some(source)
+}
+
+/// The operands of a product that is multiplied natively, with whether each is read transposed:
+/// the native product reads buffers, so the operands that are expressions (or the expressions a
+/// transposed view reads) are evaluated first, together, sharing what they read.
+fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([MatmulSide; 2], [bool; 2])> {
+    // A poisoned operand reports its own error.
+    let mut sources = [None, None];
+    for (array, source) in [lhs, rhs].into_iter().zip(&mut sources) {
+        *source = transposed_source(array);
+        match (&*source, array.pending()) {
+            (Some(Src::Node(node)), _) if node.is_pending() => array.context().jit().request(node),
+            (Some(_), _) => {}
+            (None, Some(node)) => array.context().jit().request(node),
+            (None, None) => drop(array.ready()?),
+        }
+    }
+    if !ctx.same_as(rhs.context()) {
+        return Err(LumaError::ContextMismatch.into());
+    }
+    ctx.jit().evaluate_requested();
+    let mut sides = Vec::with_capacity(2);
+    for (array, source) in [lhs, rhs].into_iter().zip(sources) {
+        let (storage, transposed) = match source {
+            Some(Src::Buffer(storage)) => (storage, true),
+            Some(Src::Node(node)) => (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), true),
+            _ => {
+                let (pin, bytes) = array.ready()?;
+                sides.push((MatmulSide::Ready(pin, bytes), false));
+                continue;
+            }
+        };
+        sides.push((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), transposed));
+    }
+    let [(lhs_side, lhs_t), (rhs_side, rhs_t)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
+    Ok(([lhs_side, rhs_side], [lhs_t, rhs_t]))
+}
+
+/// The side of the product `array` stands for: its expression if it is pending (so it may be
+/// fused), else its buffer.
+fn side(ctx: &Context, array: &Array<f32>) -> Outcome<MatmulSide> {
+    match array.pending() {
+        Some(node) => {
+            if node.len() as u64 * 4 > ctx.segment_bytes() {
+                return Err(LumaError::Chunked("a matrix product of an array split over several buffers").into());
+            }
+            Ok(MatmulSide::Pending(Arc::clone(node)))
+        }
+        None => {
+            let (pin, bytes) = array.ready()?;
+            Ok(MatmulSide::Ready(pin, bytes))
+        }
+    }
+}
+
+/// The stable label of a plan, for the decision log.
+fn plan_label(plan: &Plan) -> String {
+    let tile = match plan.tile {
+        MatmulTile::T128 => "tiled 128x128".to_string(),
+        MatmulTile::T128x32 => "tiled 128x32".to_string(),
+        MatmulTile::T32x128 => "tiled 32x128".to_string(),
+        MatmulTile::T32 => "tiled 32x32".to_string(),
+        MatmulTile::Native { edge, .. } => format!("native {edge}"),
+        MatmulTile::Gemm { rows, cols, exact, .. } => format!("gemm {rows}x{cols}{}", if exact { " exact" } else { "" }),
+        MatmulTile::Skinny { rows, cols, groups, width, along_k } => format!("skinny {rows}x{cols} groups={groups} width={width}{}", if along_k { " along-k" } else { "" }),
+    };
+    format!("{tile} split={}{}", plan.slices, if plan.aligned { " aligned" } else { "" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_product_of_few_tiles_is_split_in_slices_of_whole_k_steps() {
+        let t = Tuning::for_tests();
+        // The Gram matrix of 64 features over 2^20 samples: 4 tiles of 32x32.
+        let (slices, kc) = split_of(&t, 4, 1 << 20).unwrap();
+        assert_eq!((slices, kc), (256, 4096));
+        for k in [4096u32, 5000, 100_000, 1 << 20] {
+            for tiles in [1u32, 4, 70, 127] {
+                let Some((slices, kc)) = split_of(&t, tiles, k) else { continue };
+                assert!(slices >= 2 && kc % SLICE == 0, "{tiles} tiles, k {k}");
+                assert_eq!(slices, k.div_ceil(kc), "no empty slice");
+            }
+        }
+        assert_eq!(split_of(&t, 128, 1 << 20), None);
+        assert_eq!(split_of(&t, 4, 4095), None);
+        assert_eq!(split_of(&t, 4, 4096), Some((4, 1024)));
+    }
+
+    #[test]
+    fn the_split_aims_for_a_device_full_of_workgroups() {
+        // The reference device (82 multiprocessors) keeps the constants measured on it.
+        let reference = Tuning { compute_units: 82, ..Tuning::for_tests() };
+        assert_eq!(split_of(&reference, 4, 1 << 20), Some((256, 4096)));
+        assert_eq!(split_of(&reference, 127, 1 << 20), Some((9, 116_512)));
+        assert_eq!(split_of(&reference, 128, 1 << 20), None);
+        // A smaller device keeps them (measured on an RTX 3080 Laptop, 48 multiprocessors).
+        let laptop = Tuning { compute_units: 48, ..Tuning::for_tests() };
+        assert_eq!(split_of(&laptop, 4, 1 << 20), Some((256, 4096)));
+        assert_eq!(split_of(&laptop, 128, 1 << 20), None);
+        // A bigger one more.
+        let big = Tuning { compute_units: 128, ..Tuning::for_tests() };
+        assert_eq!(split_of(&big, 4, 1 << 20).map(|s| s.0), Some(400));
+        assert!(split_of(&big, 199, 1 << 20).is_some());
+    }
+
+    #[test]
+    fn the_plan_picks_the_tile_alignment_and_grid() {
+        let t = Tuning::for_tests();
+        let p = plan(&t, 1024, 2048, 1024, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T128, true, 1, [16, 8, 1]));
+        let p = plan(&t, 1000, 1000, 1000, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.aligned, p.groups), (MatmulTile::T128, false, [8, 8, 1]));
+        let p = plan(&t, 64, 64, 1024, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 1, [2, 2, 1]));
+        // Tall products stay on the rectangular tile; the grid folds once row tiles exceed it.
+        let p = plan(&t, 1 << 22, 8, 16, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.groups), (MatmulTile::T128x32, [1, 1 << 15, 1]));
+        let p = plan(&t, 8, 1 << 22, 16, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.groups), (MatmulTile::T32x128, [1 << 15, 1, 1]));
+        let p = plan(&t, 1 << 22, 1 << 6, 16, false, 65535, u64::MAX).unwrap();
+        assert_eq!(p.tile, MatmulTile::T128x32);
+        let p = plan(&t, 1 << 22, 8, 16, false, 1 << 12, u64::MAX).unwrap();
+        assert!(p.groups[0] * p.groups[1] >= 1 << 15);
+        assert!(plan(&t, 1 << 22, 64, 16, false, 65535, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_small_output_over_a_long_k_is_a_skinny_product() {
+        let skinny = |m, n, k, along_k, max_bytes| plan(&Tuning::for_tests(), m, n, k, along_k, 65535, max_bytes).unwrap();
+        // One-hot labels times 32 features: 4 tiles of 10x8, 16 groups of them in a workgroup.
+        let p = skinny(10, 32, 1_000_000, false, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 10, cols: 8, groups: 16, width: 64, along_k: false });
+        assert!(p.split && !p.aligned && p.groups[1] == 1 && p.groups[0] == p.slices && p.slices * p.kc >= 1_000_000);
+        // A Gram matrix of 64 features: 64 tiles of 8x8, one group.
+        let p = skinny(64, 64, 1 << 20, false, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 8, cols: 8, groups: 1, width: 64, along_k: false });
+        // A dot product: one tile, every invocation of the workgroup a group.
+        let p = skinny(1, 1, 1 << 20, true, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 1, cols: 1, groups: 64, width: 64, along_k: true });
+        // Slices are whole `k` and none is empty.
+        for (m, n, k) in [(10, 32, 100_003), (1, 1, 2048), (64, 64, 70_000), (33, 7, 1 << 20), (2000, 1, 70_001)] {
+            for along_k in [false, true] {
+                let p = skinny(m, n, k, along_k, u64::MAX);
+                assert!(matches!(p.tile, MatmulTile::Skinny { .. }), "{m} {n} {k}");
+                assert_eq!(p.slices, k.div_ceil(p.kc), "no empty slice");
+                assert!(p.slices >= 1 && p.groups[0] == p.slices);
+            }
+        }
+        // The partial sums must fit a buffer.
+        assert_eq!(skinny(64, 64, 1 << 20, false, 1000).slices, 1);
+        // A matrix times a vector reads the matrix along `K`: its row tiles are workgroups.
+        let p = skinny(8192, 1, 8192, true, u64::MAX);
+        assert!(matches!(p.tile, MatmulTile::Skinny { along_k: true, .. }));
+        assert!(p.groups[1] > 1);
+        // Not skinny: too short, or too many outputs.
+        assert!(!matches!(skinny(10, 32, 1000, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(256, 256, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(64, 64, 16384, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(128, 128, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        // More than 96 rows of more than 8 columns (a softmax gradient of 128 features and 20 classes) take the staged tiles.
+        assert!(!matches!(skinny(128, 20, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(matches!(skinny(64, 20, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(matches!(skinny(128, 8, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+    }
+
+    fn native(edge: u32) -> MatmulTile {
+        MatmulTile::Native { edge, lhs_t: false, rhs_t: false }
+    }
+
+    #[test]
+    fn a_native_plan_keeps_the_cores_busy() {
+        let plan = |m, n, k, cores| native_plan(m, n, k, cores, [false; 2], 65535, u64::MAX).unwrap();
+        // The largest tile that leaves two tiles per core.
+        let p = plan(4096, 4096, 4096, 32);
+        assert_eq!((p.tile, p.slices, p.groups), (native(128), 1, [32, 32, 1]));
+        let p = plan(512, 512, 512, 32);
+        assert_eq!((p.tile, p.groups), (native(64), [8, 8, 1]));
+        let p = plan(100, 100, 100, 32);
+        assert_eq!((p.tile, p.slices, p.groups), (native(32), 1, [4, 4, 1]));
+        // Few tiles and a long K: sliced, every slice a multiple of 16 that covers K.
+        let p = plan(64, 64, 4099, 32);
+        assert_eq!((p.tile, p.groups[..2].to_vec()), (native(32), vec![2, 2]));
+        assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 4099 && (p.slices - 1) * p.kc < 4099, "{p:?}");
+        assert_eq!(plan(64, 64, 1 << 20, 1).slices, 1);
+        // The partial sums must fit a buffer.
+        assert_eq!(native_plan(64, 64, 1 << 20, 32, [false; 2], 65535, 1000).unwrap().slices, 1);
+        // The transposed operands are the tile's.
+        let p = native_plan(512, 512, 512, 32, [true, false], 65535, u64::MAX).unwrap();
+        assert_eq!(p.tile, MatmulTile::Native { edge: 64, lhs_t: true, rhs_t: false });
+        // Tall products fold over the grid.
+        let p = native_plan(1 << 22, 8, 16, 32, [false; 2], 1 << 12, u64::MAX).unwrap();
+        assert!(p.groups[0] <= 1 << 12 && p.groups[1] <= 1 << 12 && p.groups[0] * p.groups[1] >= 1 << 15, "{p:?}");
+    }
+
+    #[test]
+    fn a_tensor_plan_picks_the_largest_tile_that_fills_the_device() {
+        const TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
+        let plan = |m, n, k, transposed| gemm_plan(m, n, k, &Tuning::for_tests(), 4, &TILES, transposed, false, 65535, u64::MAX).unwrap();
+        let tensor = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: false };
+        // Two tiles per multiprocessor, the largest tile that gets them.
+        let p = plan(4096, 4096, 4096, [false; 2]);
+        assert_eq!((p.tile, p.slices, p.groups), (tensor(128, 128), 1, [32, 32, 1]));
+        let p = plan(2048, 2048, 2048, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(128, 128), [16, 16, 1]));
+        let p = plan(1024, 1024, 1024, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(64, 64), [16, 16, 1]));
+        // Never fewer than the smallest tile: `[columns, rows, slices]`, with columns along `N`.
+        let p = plan(256, 1024, 1024, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(64, 64), [16, 4, 1]));
+        // Few tiles and a long K: sliced in whole stages, every slice non-empty.
+        let p = plan(64, 64, 1 << 20, [false; 2]);
+        assert_eq!((p.tile, p.groups[..2].to_vec()), (tensor(64, 64), vec![1, 1]));
+        assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 1 << 20 && (p.slices - 1) * p.kc < 1 << 20, "{p:?}");
+        // The partial sums must fit a buffer.
+        assert_eq!(gemm_plan(64, 64, 1 << 20, &Tuning::for_tests(), 4, &TILES, [false; 2], false, 65535, 1000).unwrap().slices, 1);
+        // The transposed operands are the tile's.
+        let p = plan(4096, 4096, 4096, [true, false]);
+        assert_eq!(p.tile, MatmulTile::Gemm { rows: 128, cols: 128, lhs_t: true, rhs_t: false, exact: false });
+    }
+
+    #[test]
+    fn an_f32_gemm_plan_picks_the_tile_with_the_best_predicted_rate() {
+        const TILES: [(u32, u32); 6] = [(64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)];
+        let plan = |m, n, k, units: u32| gemm_plan(m, n, k, &Tuning { compute_units: units, ..Tuning::for_tests() }, GEMM_HALF_TILES_PER_SM, &TILES, [false; 2], true, 65535, u64::MAX).unwrap();
+        let tile = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: true };
+        assert_eq!(plan(4096, 4096, 4096, 82).tile, tile(64, 128));
+        // 128 tiles of 64 x 128 fill 78 % of the device, 256 of 64 x 64 78 % at 95 % of the rate.
+        let p = plan(1024, 1024, 1024, 82);
+        assert_eq!((p.tile, p.groups), (tile(64, 128), [8, 16, 1]));
+        // On 48 multiprocessors the same product gets the same tile; 256 x 1024 outputs take the smallest.
+        assert_eq!(plan(1024, 1024, 1024, 48).tile, tile(64, 128));
+        assert_eq!(plan(256, 1024, 1024, 82).tile, tile(32, 32));
+        // Few output tiles over a K of 512 or more are split too (an attention `P V` of 2048 x 2048 x 64 takes 95 us unsplit, 70 in 8 slices of 256);
+        // a short K over more tiles is not (256 x 1024 x 1024 has 256 tiles of 32 x 32).
+        let p = plan(2048, 64, 2048, 82);
+        assert_eq!((p.tile, p.slices), (tile(128, 64), 8));
+        assert_eq!(plan(256, 1024, 1024, 82).slices, 1);
+        assert_eq!(plan(256, 12, 512, 82).slices, 4);
+        // Long K over few outputs splits to about a thousand workgroups, a few times the multiprocessors' worth.
+        assert!(plan(64, 64, 1 << 20, 82).slices > 1);
+        let p = plan(32, 4096, 4096, 82);
+        assert!(p.slices >= 4 && p.groups.iter().product::<u32>() >= 256, "{p:?}");
+        let p = plan(128, 128, 1 << 18, 82);
+        assert!(p.groups.iter().product::<u32>() >= 900, "{p:?}");
+    }
+
+    // -- the table --
+
+    use crate::context::ContextOptions;
+    use crate::jit::structured::select::admit;
+    use luma_core::BackendKind;
+
+    fn cpu_with(cores: u32, forced: Option<&'static str>) -> Context {
+        let options = ContextOptions::default().backend(BackendKind::Cpu).calibrate(false);
+        let options = if let Some(forced) = forced { options.strategy(forced) } else { options };
+        Context::with_tuning(options, |tuning| tuning.native_gemm = cores).unwrap()
+    }
+
+    /// The operands of an `m x k` by `k x n` product, stored or as views of the transposes of stored arrays.
+    fn operands(ctx: &Context, (m, n, k): (usize, usize, usize), transposed: [bool; 2]) -> [Array<f32>; 2] {
+        let lhs = if transposed[0] { Array::<f32>::zeros_on(ctx, [m, k]).unwrap().transpose() } else { Array::<f32>::zeros_on(ctx, [k, m]).unwrap() };
+        let rhs = if transposed[1] { Array::<f32>::zeros_on(ctx, [k, n]).unwrap().transpose() } else { Array::<f32>::zeros_on(ctx, [n, k]).unwrap() };
+        [lhs, rhs]
+    }
+
+    #[track_caller]
+    fn selected(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request) -> StrategyId {
+        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32 }, location: Location::caller() };
+        select::select(ctx, &Subject::Contraction(&view), &Residencies::DEVICE).expect("the staged tiles always fit").id
+    }
+
+    /// `matmul::run`'s branches as they were, for the shapes a CPU context reaches: the CPU's native product when it has cores, else
+    /// `plan` (a skinny kernel, or the staged tiles) with the demotion of a recomputed operand a skinny kernel would read often.
+    /// (The host path, the narrow-`N` padding and the backend's own tiles need a GPU context: their conditions are not reachable here.)
+    fn old_branch(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> StrategyId {
+        let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+        let (k, m, n) = (ld[0] as u32, ld[1] as u32, rd[0] as u32);
+        if ctx.tuning().native_gemm > 0 {
+            return StrategyId::CONTRACTION_NATIVE_CPU;
+        }
+        let along_k = lhs.pending().is_none_or(|node| jit::stored_along_k(&MatmulSide::Pending(Arc::clone(node)), [k, m]));
+        let plan = plan(ctx.tuning(), m, n, k, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).unwrap();
+        if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
+            let reads = [n.div_ceil(u32::from(cols)), m.div_ceil(u32::from(rows))];
+            let costly = [lhs, rhs].into_iter().zip(reads).any(|(array, reads)| (SKINNY_FUSED_READS..SKINNY_EVALUATE_READS).contains(&reads) && array.pending().is_some_and(jit::is_recomputed));
+            return if costly { StrategyId::CONTRACTION_TILED } else { StrategyId::CONTRACTION_SKINNY };
+        }
+        StrategyId::CONTRACTION_TILED
+    }
+
+    #[test]
+    fn the_table_is_well_formed() {
+        let entries = super::super::strategy::table(FamilyTag::Contraction);
+        assert!(entries.len() <= super::super::strategy::MAX_PER_FAMILY);
+        for (at, strategy) in entries.iter().enumerate() {
+            assert_eq!(usize::from(strategy.id.1), at, "{} sits at its id", strategy.name);
+            assert_eq!(strategy.id.family(), FamilyTag::Contraction);
+            assert!(strategy.baseline && strategy.cost.is_none() && strategy.lower.is_some());
+            assert_eq!(StrategyId::parse(FamilyTag::Contraction, strategy.name), Some(strategy.id));
+            assert_eq!(entries.iter().filter(|other| other.group == strategy.group).count(), 1, "every entry is its own group");
+        }
+        let names: Vec<&str> = entries.iter().map(|strategy| strategy.name).collect();
+        assert_eq!(names, ["host", "gemm-narrow-n", "gemm-tf32", "gemm-f32", "native-cpu", "skinny", "tiled"]);
+    }
+
+    #[test]
+    fn each_strategy_fits_exactly_where_the_old_branch_ran() {
+        let shapes = [(10, 32, 1 << 20), (10, 32, 4096), (64, 64, 1 << 20), (1, 1, 2048), (256, 256, 256), (100, 100, 100), (33, 7, 5000), (4096, 4, 64), (8192, 1, 8192), (128, 20, 1 << 20), (3, 5, 7), (2000, 1, 70_001)];
+        for cores in [0, 8] {
+            let ctx = cpu_with(cores, None);
+            for shape in shapes {
+                for transposed in [[false; 2], [true, false], [false, true], [true; 2]] {
+                    let [lhs, rhs] = operands(&ctx, shape, transposed);
+                    for tf32 in [Tf32Request::Default, Tf32Request::Exact, Tf32Request::Tf32] {
+                        let expected = old_branch(&ctx, &lhs, &rhs);
+                        assert_eq!(selected(&ctx, &lhs, &rhs, tf32), expected, "cores {cores} shape {shape:?} transposed {transposed:?} {tf32:?}");
+                    }
+                }
+            }
+            // A CPU context has neither the host path nor the backend's own tiles: those strategies do not apply.
+            let [lhs, rhs] = operands(&ctx, (64, 12, 64), [false; 2]);
+            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32 }, location: Location::caller() };
+            for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_NARROW_N, StrategyId::GEMM_TF32, StrategyId::GEMM_F32] {
+                let strategy = &CONTRACTION_STRATEGIES[usize::from(id.1)];
+                assert!(admit(strategy, &Subject::Contraction(&view), &ctx, &Residencies::DEVICE).is_err(), "{}", strategy.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_skinny_plan_with_a_recomputed_operand_falls_to_tiled() {
+        let ctx = cpu_with(0, None);
+        // One-hot labels times features: 10 x 32 outputs over a long K are skinny tiles of 10 x 8, so the left operand is read 4 times.
+        let (k, m, n) = (4096, 10, 32);
+        let rhs = Array::<f32>::zeros_on(&ctx, [n, k]).unwrap();
+        let stored = Array::<f32>::zeros_on(&ctx, [k, m]).unwrap();
+        assert_eq!(selected(&ctx, &stored, &rhs, Tf32Request::Exact), StrategyId::CONTRACTION_SKINNY);
+        // The same operand as an expression of two buffers is recomputed at every read.
+        let other = Array::<f32>::zeros_on(&ctx, [k, m]).unwrap();
+        let fused = &stored * &other;
+        assert_eq!(selected(&ctx, &fused, &rhs, Tf32Request::Exact), StrategyId::CONTRACTION_TILED);
+        assert_eq!(old_branch(&ctx, &fused, &rhs), StrategyId::CONTRACTION_TILED);
+    }
+
+    #[test]
+    fn forcing_each_strategy_with_luma_strategy_matches_the_default_where_the_bit_class_is_equal() {
+        let values = |len: usize, seed: u32| -> Vec<f32> { (0..len).map(|i| (((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) >> 8) % 2001) as f32 / 1000.0 - 1.0).collect() };
+        let run_on = |ctx: &Context, (m, n, k): (usize, usize, usize)| {
+            let a = Array::from_slice_on(ctx, &values(k * m, 1), [k, m]).unwrap();
+            let b = Array::from_slice_on(ctx, &values(n * k, 2), [n, k]).unwrap();
+            a.matmul_f32(&b).to_vec().unwrap()
+        };
+        let default = cpu_with(8, None);
+        for shape in [(10, 32, 4096), (37, 41, 29), (64, 64, 3000)] {
+            let reference = run_on(&default, shape);
+            for name in ["contraction:native-cpu", "contraction:skinny", "contraction:tiled"] {
+                let forced = cpu_with(8, Some(name));
+                let got = run_on(&forced, shape);
+                if name == "contraction:native-cpu" {
+                    assert_eq!(got, reference, "{name} {shape:?}: the default selection is this strategy: same bits");
+                }
+                let scale = reference.iter().fold(0.0f32, |top, v| top.max(v.abs())).max(1.0);
+                assert!(got.iter().zip(&reference).all(|(a, b)| (a - b).abs() <= 1e-4 * scale), "{name} {shape:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn check_reports_errors_in_the_old_order() {
+        let first = cpu_with(0, None);
+        let second = cpu_with(0, None);
+        let attrs = ContractionAttrs { tf32: Tf32Request::Default };
+        let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller() }.check();
+        let a = Array::<f32>::zeros_on(&first, [4, 3]).unwrap();
+        let b = Array::<f32>::zeros_on(&first, [5, 4]).unwrap();
+        assert!(matches!(check(&a, &b), Ok(Geometry { m: 3, n: 5, k: 4 })));
+        // A shape mismatch, then a context mismatch before it, then a poisoned operand before both.
+        let wrong = Array::<f32>::zeros_on(&first, [5, 6]).unwrap();
+        assert!(matches!(check(&a, &wrong), Err(Failure::New(LumaError::ShapeMismatch { .. }))));
+        let elsewhere = Array::<f32>::zeros_on(&second, [5, 6]).unwrap();
+        assert!(matches!(check(&a, &elsewhere), Err(Failure::New(LumaError::ContextMismatch))));
+        let poisoned = Array::<f32>::zeros_on(&second, [5, 6]).unwrap().matmul(&Array::zeros_on(&second, [9, 9]).unwrap());
+        let Err(Failure::Inherited(error)) = check(&a, &poisoned) else { panic!("a poisoned operand reports its own error") };
+        assert_eq!(error.to_string(), poisoned.error().unwrap().to_string());
+        let Err(Failure::Inherited(_)) = check(&poisoned, &a) else { panic!("either operand") };
+        // Extents past the third axis make no product.
+        let cube = Array::<f32>::zeros_on(&first, [4, 4, 2]).unwrap();
+        assert!(matches!(check(&cube, &a), Err(Failure::New(LumaError::ShapeMismatch { .. }))));
+    }
+}

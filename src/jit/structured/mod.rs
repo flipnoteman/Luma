@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(crate) mod boundary;
+pub(crate) mod contraction;
 pub(crate) mod emit;
 pub(crate) mod families;
 pub(crate) mod select;

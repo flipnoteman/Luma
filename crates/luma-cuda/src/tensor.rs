@@ -409,7 +409,7 @@ mod tests {
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in [(128, 128), (128, 64), (64, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
-                let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: false });
+                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false));
                 let text = ptx(&config);
                 assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
                 let (warp_rows, warp_cols) = (rows / config.wm, cols / config.wn);
@@ -431,7 +431,7 @@ mod tests {
         };
         for (rows, cols) in [(128, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, true)] {
-                let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: false });
+                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false));
                 let (sa, sb) = (config.a_stride(), config.b_stride());
                 assert!(if lhs_transposed { banks(sa, 1, sa) } else { banks(sa, sa, 1) }, "A stride {sa}");
                 assert!(if rhs_transposed { banks(sb, sb, 1) } else { banks(sb, 1, sb) }, "B stride {sb}");

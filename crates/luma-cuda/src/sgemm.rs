@@ -441,7 +441,7 @@ mod tests {
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in TILES.into_iter().chain([(128, 128)]) {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
-                let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: true });
+                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true));
                 let text = ptx(&config);
                 assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
                 // One multiply-add per output per `k` of a stage.
