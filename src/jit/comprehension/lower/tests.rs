@@ -1,7 +1,6 @@
 //! The generic lowering against the f64 reference of the form (W2-R0 §5.3-5.6, "fallback tests"). Forms are `Origin::Rewritten`, so
 //! no recogniser can take them.
 
-use luma_core::{BackendKind, DeviceKind};
 use smallvec::{SmallVec, smallvec};
 
 use super::{build, lowerable, prepare, tile_budget, TEST_BUDGET};
@@ -12,9 +11,9 @@ use crate::jit::comprehension::{AffineMap, AffineRow, Access, Body, CombineOp, C
 use crate::jit::program::{Instr, Ref};
 use crate::jit::{Edge, ElemTy, Op, OpKind, Scalar};
 
-pub(super) fn cpu() -> Context {
-    let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
-    Context::with_tuning(options, |tuning| tuning.reduce_multi_after = 0).unwrap()
+/// The context of the environment (`LUMA_BACKEND`, `LUMA_DEVICE`): the GPU gate runs these tests on the GPU backends.
+pub(super) fn device() -> Context {
+    Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap()
 }
 
 /// A source of `shape` of small integers (exact in `f32` and `f64` for any sum of these tests) and its values.
@@ -133,7 +132,7 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
 /// both orders of the output, with a broadcast axis of extent 1 on the operands: G-B1 against the f64 reference.
 #[test]
 fn a_product_sum_over_every_permutation_of_axes() {
-    let ctx = cpu();
+    let ctx = device();
     let (n, m) = (5u64, 3u64);
     for k in [1u64, 2, 31, 40] {
         let extents = [n, m, k];
@@ -173,7 +172,7 @@ fn a_product_sum_over_every_permutation_of_axes() {
 
 #[test]
 fn reversed_and_sliced_maps_read_the_right_elements() {
-    let ctx = cpu();
+    let ctx = device();
     // lhs is a slice of a wider source (offset 2, step 1), rhs reads k reversed.
     let (n, m, k) = (4u64, 3u64, 33u64);
     let dims = [(n, false), (m, false), (k, true)];
@@ -187,7 +186,7 @@ fn reversed_and_sliced_maps_read_the_right_elements() {
 
 #[test]
 fn a_k_of_4097_and_prime_extents() {
-    let ctx = cpu();
+    let ctx = device();
     for (n, m, k) in [(7u64, 11u64, 4097u64), (1, 13, 4097), (2, 1, 17)] {
         let dims = [(n, false), (m, false), (k, true)];
         let reads = [
@@ -201,7 +200,7 @@ fn a_k_of_4097_and_prime_extents() {
 
 #[test]
 fn min_max_and_prod_combiners_and_bodies_of_one_access() {
-    let ctx = cpu();
+    let ctx = device();
     let dims = [(5u64, false), (3, false), (9, true)];
     let reads = [
         Read::plain([9, 3, 1, 1], vec![row(&[(2, 1)], 0), row(&[(1, 1)], 0)]),
@@ -223,7 +222,7 @@ fn min_max_and_prod_combiners_and_bodies_of_one_access() {
 
 #[test]
 fn a_budget_smaller_than_the_space_tiles_it() {
-    let ctx = cpu();
+    let ctx = device();
     let (n, m, k) = (6u64, 5u64, 40u64);
     let dims = [(n, false), (m, false), (k, true)];
     let reads = [
@@ -268,7 +267,7 @@ fn stored(ctx: &Context, len: usize, seed: usize) -> Array<f32> {
 
 #[test]
 fn a_correlation_with_few_taps_is_unrolled() {
-    let ctx = cpu();
+    let ctx = device();
     for taps in [3usize, 9, 64] {
         for (stride, padding) in [(1usize, 0usize), (1, taps / 2), (2, 1)] {
             let len = 100usize;
@@ -290,7 +289,7 @@ fn geom2(src: [u32; 2], k: [u32; 2], before: [u32; 2], out: [u32; 2]) -> WindowG
 
 #[test]
 fn a_2d_correlation_matches_conv2_for_every_border() {
-    let ctx = cpu();
+    let ctx = device();
     let (w, h, kw, kh) = (13u32, 9u32, 3u32, 5u32);
     let x = stored(&ctx, (w * h) as usize, 3).reshape([w as usize, h as usize]);
     let kernel = stored(&ctx, (kw * kh) as usize, 4).reshape([kw as usize, kh as usize]);
@@ -307,7 +306,7 @@ fn a_2d_correlation_matches_conv2_for_every_border() {
 
 #[test]
 fn more_than_the_unroll_limit_has_no_lowering() {
-    let ctx = cpu();
+    let ctx = device();
     let taps = 65usize;
     let len = 200usize;
     let (x, w) = (stored(&ctx, len, 1), stored(&ctx, taps, 2));
@@ -325,7 +324,7 @@ fn more_than_the_unroll_limit_has_no_lowering() {
 
 #[test]
 fn the_generic_strategies_record_their_decision() {
-    let ctx = cpu();
+    let ctx = device();
     ctx.record_decisions(true);
     let dims = [(5u64, false), (3, false), (9, true)];
     let reads = [
@@ -351,7 +350,7 @@ fn the_generic_strategies_record_their_decision() {
 
 #[test]
 fn an_api_form_never_reaches_the_generic_strategies() {
-    let ctx = cpu();
+    let ctx = device();
     let (x, w) = (stored(&ctx, 40, 1), stored(&ctx, 5, 2));
     let api = Comprehension::conv1d(x.src().ok().unwrap(), w.src().ok().unwrap(), 40, 5, 36, 1, 0).unwrap();
     assert!(build(&ctx, &api).to_vec().is_err(), "an API form runs through its own strategy");
@@ -373,7 +372,7 @@ fn lumpy(len: usize) -> Vec<f32> {
 
 #[test]
 fn compensated_sums_are_accurate_to_an_ulp() {
-    let ctx = cpu();
+    let ctx = device();
     let len = 10_000_000usize;
     let values = lumpy(len);
     let array = Array::<f32>::from_slice_on(&ctx, &values, len).unwrap();
@@ -394,7 +393,7 @@ fn compensated_sums_are_accurate_to_an_ulp() {
 
 #[test]
 fn a_compensated_dot_product_multiplies_exactly() {
-    let ctx = cpu();
+    let ctx = device();
     let len = 1_000_000usize;
     let a: Vec<f32> = (0..len).map(|i| 1000.0 + (i % 977) as f32 * 0.37).collect();
     let b: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 + (i % 31) as f32 * 1e-3 } else { -(1.0 + (i % 29) as f32 * 1e-3) }).collect();
@@ -446,7 +445,7 @@ fn product_reads(n: u64, m: u64, k: u64) -> [Read; 2] {
 
 #[test]
 fn contractions_of_other_bodies_and_combiners() {
-    let ctx = cpu();
+    let ctx = device();
     // Aligned (32, 32, 32) and every kind of unaligned shape (the k guard: K = 17 pads the last slice).
     for (n, m, k) in [(32u64, 32u64, 32u64), (33, 35, 17), (5, 3, 9), (64, 1, 40), (1, 7, 3)] {
         let dims = [(n, false), (m, false), (k, true)];
@@ -470,7 +469,7 @@ fn contractions_of_other_bodies_and_combiners() {
 #[test]
 fn contractions_with_the_operands_exchanged() {
     // The output has `m` faster than `n`: the sides are exchanged, and an asymmetric body reads its arguments in the right order.
-    let ctx = cpu();
+    let ctx = device();
     let (n, m, k) = (6u64, 5u64, 19u64);
     let dims = [(n, false), (m, false), (k, true)];
     let reads = product_reads(n, m, k);
@@ -482,7 +481,7 @@ fn contractions_with_the_operands_exchanged() {
 
 #[test]
 fn batched_contractions_share_or_do_not_share_operands() {
-    let ctx = cpu();
+    let ctx = device();
     let (n, m, k, b) = (7u64, 5u64, 18u64, 3u64);
     // dims: n, m, b, k.
     let dims = [(n, false), (m, false), (b, false), (k, true)];
@@ -511,7 +510,7 @@ fn batched_contractions_share_or_do_not_share_operands() {
 #[test]
 fn a_body_of_three_inputs_is_two_operand_expressions() {
     // sum_k (a(k, m) * s(k)) * b(n, k): the scale rides with one side.
-    let ctx = cpu();
+    let ctx = device();
     let (n, m, k) = (5u64, 4u64, 21u64);
     let dims = [(n, false), (m, false), (k, true)];
     let reads = [
@@ -527,7 +526,7 @@ fn a_body_of_three_inputs_is_two_operand_expressions() {
 
 #[test]
 fn the_registry_picks_the_contraction_tail_for_a_big_product() {
-    let ctx = cpu();
+    let ctx = device();
     ctx.record_decisions(true);
     let (n, m, k) = (64u64, 64u64, 64u64);
     let dims = [(n, false), (m, false), (k, true)];
@@ -547,7 +546,7 @@ use crate::jit::comprehension::Indirect;
 #[test]
 fn a_gathered_access_reads_the_elements_an_index_names() {
     // y[i] = sum_j x[col[j, i]] * val[j, i]: the rows of a sparse matrix, dense in `j`.
-    let ctx = cpu();
+    let ctx = device();
     let (rows, per, columns) = (6u64, 4u64, 11u64);
     let col_values: Vec<u32> = (0..rows * per).map(|e| ((e * 5 + 3) % columns) as u32).collect();
     let col = Array::<u32>::from_slice_on(&ctx, &col_values, [per as usize, rows as usize]).unwrap().src().ok().unwrap();
