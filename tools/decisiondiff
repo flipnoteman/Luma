@@ -10,9 +10,10 @@ every planning decision) and `warm` (the cache replays: `PlanReplay`), and one `
 launches per kernel label of the harness's profile run). Both passes and the kernels line are
 compared per case; the exit status is 1 on any difference.
 
-  --allow-added-site  the named sites (the variant name: `ReducePlan`, `Cut`, ...) may appear in NEW
-                      without appearing in OLD for that case and pass; any other difference fails,
-                      and a site OLD has that NEW lacks always fails.
+  --allow-added-site  records of the named sites (the variant name: `ReducePlan`, `Cut`, ...) that NEW
+                      has and OLD does not may be added, also in a case where OLD already has records of
+                      that site; any other difference fails: a record OLD has that NEW lacks (removed, or
+                      changed: the new form is an added record, the old form a removed one) always fails.
   --exact             compare the decisions of a pass as sorted lists, with how often each occurs, and the launch
                       count of every kernel label. By default a pass is the set of its distinct decisions and the
                       kernels are their labels: the repeats of a case that runs many steps per call (replays,
@@ -115,8 +116,8 @@ def diff(old, new, allowed):
             continue
         o, n = old[case], new[case]
         for p in ("cold", "warm"):
-            have = {site_name(d[0]) for d in o[p]}
-            keep = [d for d in n[p] if site_name(d[0]) not in allowed or site_name(d[0]) in have]
+            have = set(o[p])
+            keep = [d for d in n[p] if site_name(d[0]) not in allowed or d in have]
             if canon(o[p]) != canon(keep):
                 out.append(f"{case} [{p}]:")
                 out += describe(o[p], keep)
@@ -168,6 +169,20 @@ def self_test():
     assert diff(load(a, False), load(e, False), set()), "an added site must differ"
     assert not diff(load(a, False), load(e, False), {"ReducePlan"}), "an allowed added site must not"
     assert diff(load(e, False), load(a, False), {"ReducePlan"}), "a removed site must differ"
+    # An added record of an allowed site is forgiven in a case that already has some; a removed or
+    # changed one is not, and neither is an added record of another site.
+    more = added + [dict(added[-1], op="prod", chosen="y")]
+    e2 = write("e2", more)
+    assert not diff(load(e, False), load(e2, False), {"ReducePlan"}), "an added record of a site the case has is forgiven"
+    assert diff(load(e, False), load(e2, False), set()), "... only when the site is allowed"
+    assert diff(load(e2, False), load(e, False), {"ReducePlan"}), "a removed record of an allowed site differs"
+    chg = [dict(r) for r in added]
+    chg[-1]["chosen"] = "z"
+    e3 = write("e3", chg)
+    assert diff(load(e, False), load(e3, False), {"ReducePlan"}), "a changed record of an allowed site differs"
+    other = added + [dict(added[-1], site="Cut(Nodes { nodes: 1, limit: 2 })")]
+    e4 = write("e4", other)
+    assert diff(load(e, False), load(e4, False), {"ReducePlan"}), "an added record of another site differs"
     moved = [dict(r) for r in rows]
     moved[1]["location"] = "src/jit/mod.rs:5:5"
     moved2 = [dict(r) for r in rows]
