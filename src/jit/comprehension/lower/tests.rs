@@ -586,3 +586,35 @@ fn a_product_sum_equals_the_hand_written_broadcast_sum() {
     let by_hand = (&a.broadcast_to([k as usize, m as usize, n as usize]) * &b.broadcast_to([k as usize, m as usize, n as usize])).sum_axis(0).to_vec().unwrap();
     assert_eq!(build(&ctx, &f).to_vec().unwrap(), by_hand);
 }
+
+// -- segments --
+
+#[test]
+fn a_segmented_dim_reduces_the_entries_of_each_segment() {
+    let ctx = device();
+    let offsets = [0u32, 2, 2, 6, 7, 10];
+    let (rows, entries) = (5u64, 10u64);
+    let ptr = Array::<u32>::from_slice_on(&ctx, &offsets, offsets.len()).unwrap().src().ok().unwrap();
+    for part in [CombinePart::Add, CombinePart::Min, CombinePart::Max] {
+        // Dims: r (P, the rows), j (the entries, segmented by r).
+        let dims = [(rows, false), (entries, true)];
+        let reads = [Read::plain([entries as u32, 1, 1, 1], vec![row(&[(1, 1)], 0)]), Read::plain([entries as u32, 1, 1, 1], vec![row(&[(1, 1)], 0)])];
+        let (mut f, data) = form(&ctx, &dims, &[0], &reads, mul01(), part);
+        f.space[1].kind = crate::jit::comprehension::DimKind::Segmented { offsets: Box::new(ptr.clone()), selector: 0 };
+        f.validate().unwrap();
+        let products: Vec<f64> = data[0].iter().zip(&data[1]).map(|(a, b)| a * b).collect();
+        let expected: Vec<f64> = offsets
+            .windows(2)
+            .map(|w| {
+                let segment = &products[w[0] as usize..w[1] as usize];
+                match part {
+                    CombinePart::Add => segment.iter().sum(),
+                    CombinePart::Min => segment.iter().copied().fold(f64::INFINITY, f64::min),
+                    _ => segment.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                }
+            })
+            .collect();
+        assert!(lowerable(&f));
+        assert_eq!(values(&build(&ctx, &f)), expected, "{part:?}");
+    }
+}

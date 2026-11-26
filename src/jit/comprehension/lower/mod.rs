@@ -101,6 +101,9 @@ pub(crate) struct Prepared {
     /// Reduce dims that are not on the axis: a host loop whose partial results combine.
     folded: SmallVec<[usize; 2]>,
     part: Option<CombinePart>,
+    /// A segmented reduction: the CSR row pointers of the dim, which is the one axis of the node (the tail is the library's segmented
+    /// reduction of the node's values).
+    segments: Option<Arc<Src>>,
 }
 
 impl Prepared {
@@ -178,7 +181,7 @@ pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
         let mut merged = None;
         'pairs: for &slow in &live {
             for &fast in &live {
-                if slow == fast || form.space[slow].is_reduce() != form.space[fast].is_reduce() || matches!(form.space[slow].kind, DimKind::Segmented { .. }) {
+                if slow == fast || form.space[slow].is_reduce() != form.space[fast].is_reduce() || matches!(form.space[slow].kind, DimKind::Segmented { .. }) || matches!(form.space[fast].kind, DimKind::Segmented { .. }) {
                     continue;
                 }
                 let extent = form.space[fast].extent;
@@ -227,6 +230,32 @@ pub(super) fn coalesce(form: &Comprehension) -> Comprehension {
     }
 }
 
+/// A segmented reduction: one segmented dim over the entries `j`, selected by a parallel dim `r` no access reads, one of `Sum`, `Min`
+/// and `Max` of a body over the entries. The node is the body over `j`; the library reduces its segments (`Pass::Segments`).
+fn prepare_segments(form: &Comprehension) -> Option<Prepared> {
+    let mut segmented = form.space.iter().enumerate().filter_map(|(d, dim)| match &dim.kind {
+        DimKind::Segmented { offsets, selector } => Some((d, offsets.as_ref().clone(), usize::from(*selector))),
+        _ => None,
+    });
+    let (j, offsets, selector) = segmented.next()?;
+    if segmented.next().is_some() {
+        return None;
+    }
+    let part = match form.combiner.as_ref().map(|combiner| &combiner.op) {
+        Some(CombineOp::Single(part @ (CombinePart::Add | CombinePart::Min | CombinePart::Max))) => *part,
+        _ => return None,
+    };
+    let live = |d: usize| form.space[d].extent > 1;
+    let others_dead = (0..form.space.len()).all(|d| d == j || d == selector || !live(d));
+    let selector_read = form.inputs.iter().any(|a| super::roles::uses(a, selector));
+    let output_ok = form.output.dim_of_axis.iter().flatten().all(|&d| usize::from(d) == selector);
+    if !others_dead || selector_read || !output_ok || matches!(offsets, Src::Scalar(_)) {
+        return None;
+    }
+    let plan = Prepared { form: form.clone(), taps: SmallVec::new(), axes: SmallVec::from_slice(&[j]), reduces: false, outer: SmallVec::new(), folded: SmallVec::new(), part: Some(part), segments: Some(Arc::new(offsets)) };
+    (plan.tiles() == 1).then_some(plan)
+}
+
 /// The rows of an access that read dims: its map's and, for a gather, those of its index.
 fn all_rows(access: &Access) -> impl Iterator<Item = &AffineRow> {
     access.map.rows.iter().chain(access.indirect.iter().flat_map(|indirect| indirect.index_map.rows.iter()))
@@ -237,8 +266,11 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     if form.ty != ElemTy::F32 || !matches!(form.epilogue, Epilogue::None) || form.output.order != super::OutMap::IDENTITY || form.validate().is_err() {
         return None;
     }
-    if form.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) || form.inputs.iter().any(|a| (a.indirect.is_some() && !gathers(a)) || matches!(a.src, Src::Scalar(_))) {
+    if form.inputs.iter().any(|a| (a.indirect.is_some() && !gathers(a)) || matches!(a.src, Src::Scalar(_))) {
         return None;
+    }
+    if form.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) {
+        return prepare_segments(form);
     }
     let part = match form.combiner.as_ref().map(|combiner| &combiner.op) {
         None => None,
@@ -283,7 +315,7 @@ pub(crate) fn prepare(form: &Comprehension) -> Option<Prepared> {
     if compensated && (!parallel.is_empty() || !folded.is_empty() || !taps.is_empty() || part != Some(CombinePart::Add)) {
         return None;
     }
-    let plan = Prepared { form, taps, axes, reduces, outer, folded, part };
+    let plan = Prepared { form, taps, axes, reduces, outer, folded, part, segments: None };
     (plan.tiles() <= if compensated { 1 } else { MAX_TILES }).then_some(plan)
 }
 
@@ -429,6 +461,9 @@ impl Prepared {
         if self.form.combiner.as_ref().is_some_and(|combiner| combiner.compensation != Compensation::None) {
             return self.run_compensated(ctx, location);
         }
+        if let Some(offsets) = &self.segments {
+            return self.run_segments(ctx, offsets, location);
+        }
         let plan = self.tiling();
         let len: u64 = self.form.output.dim_of_axis.iter().flatten().map(|&d| self.form.space[usize::from(d)].extent).product();
         if plan.slabs * plan.chunks * plan.loops == 1 {
@@ -469,6 +504,24 @@ impl Prepared {
         }
         debug_assert_eq!(slab_at, len);
         Ok(out)
+    }
+
+    /// A segmented reduction: the values of the body over the entries, reduced by the library over the segments `offsets` names.
+    fn run_segments(&self, ctx: &Context, offsets: &Src, location: &'static Location<'static>) -> Result<Arc<Storage>, Failure> {
+        let entries = self.form.space[self.axes[0]].extent;
+        let root = self.tile_node(ctx, &Origin6([0; MAX_DIMS]), &[entries], location)?;
+        let values = Array::<f32>::from_node(ctx, Shape::from([entries as usize, 1, 1, 1]), root);
+        let offsets = match offsets {
+            Src::Buffer(storage) => Array::<u32>::from_storage(ctx, Shape::from(storage.len()), Arc::clone(storage)),
+            Src::Node(node) => Array::<u32>::from_node(ctx, Shape::from(node.len()), Arc::clone(node)),
+            Src::Scalar(_) => return Err(Failure::from(LumaError::Unsupported("the offsets of a segmented reduction are an array".into()))),
+        };
+        let result = match self.part {
+            Some(CombinePart::Add) => values.sum_segments(&offsets),
+            Some(CombinePart::Min) => values.min_segments(&offsets),
+            _ => values.max_segments(&offsets),
+        };
+        Ok(Arc::clone(result.storage()?))
     }
 
     /// One slab: the combination, in chunk order, of the partial results of its chunks of the reduce axis and its loops.
