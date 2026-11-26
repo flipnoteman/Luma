@@ -3886,6 +3886,25 @@ impl JitState {
         requested.nodes.push(Arc::downgrade(node));
     }
 
+    /// Takes the requested nodes that read node `id` out of the list, for a lazy product being recorded: it asks for the expressions
+    /// waiting to be evaluated, and one that reads the product would wait for it forever. [`JitState::release_requested`] puts them back.
+    pub(crate) fn hold_requested_reading(&self, id: u64) -> Vec<Weak<Node>> {
+        let mut requested = lock(&self.requested);
+        if requested.nodes.is_empty() {
+            return Vec::new();
+        }
+        let (held, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut requested.nodes).into_iter().partition(|weak| weak.upgrade().is_some_and(|node| node.thread == current_thread() && node.below_contains(id)));
+        requested.nodes = kept;
+        held
+    }
+
+    /// Puts back what [`JitState::hold_requested_reading`] took.
+    pub(crate) fn release_requested(&self, held: Vec<Weak<Node>>) {
+        if !held.is_empty() {
+            lock(&self.requested).nodes.extend(held);
+        }
+    }
+
     /// Whether one of the newest requested nodes reads other expressions through views and
     /// depends on a requested node that is still pending: a stencil step whose input is the
     /// postponed result of the step before. Postponing such steps chains them into one expression
@@ -3907,15 +3926,12 @@ impl JitState {
     /// [`Node::thread`]).
     pub(crate) fn evaluate_requested(&self) {
         let me = current_thread();
-        // A node that reads one this thread is computing right now would wait for it forever (a lazy product being recorded asks for
-        // the expressions waiting to be evaluated, one of which may read the product): it stays requested.
-        let computing = COMPUTING.with_borrow(|computing| if computing.is_empty() { Vec::new() } else { computing.clone() });
         let requested = std::mem::take(&mut lock(&self.requested).nodes);
         let mut others = Vec::new();
         let mut pending: Vec<Arc<Node>> = Vec::with_capacity(requested.len());
         for weak in requested {
             let Some(node) = weak.upgrade() else { continue };
-            if node.thread != me || computing.iter().any(|&id| node.below_contains(id)) {
+            if node.thread != me {
                 others.push(weak);
                 continue;
             }

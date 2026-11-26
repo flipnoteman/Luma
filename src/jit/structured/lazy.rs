@@ -180,7 +180,11 @@ impl Structured {
             return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(LumaError::Gpu("a lazy product was recorded twice".into())) }));
         };
         self.forcing.store(true, Ordering::Relaxed);
-        let computing = Computing::enter(run.leaf_id.load(Ordering::Relaxed));
+        let leaf_id = run.leaf_id.load(Ordering::Relaxed);
+        // Expressions waiting to be evaluated that read this product stay where they are until it is recorded: recording asks for the
+        // others, and one that reads the product would wait for it forever.
+        let held = ctx.jit().hold_requested_reading(leaf_id);
+        let computing = Computing::enter(leaf_id);
         let outcome = match &run.kind {
             ContractionKind::Matmul { attrs, .. } => {
                 let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location };
@@ -193,6 +197,7 @@ impl Structured {
             ContractionKind::Batched { geom, launch } => bmm::execute(ctx, &lhs, &rhs, geom, *launch),
         };
         drop(computing);
+        ctx.jit().release_requested(held);
         self.forcing.store(false, Ordering::Relaxed);
         // The form holds sources of the operands: a forced product keeps neither.
         drop(lock(&self.comp().form).take());
