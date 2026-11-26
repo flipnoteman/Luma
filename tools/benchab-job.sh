@@ -11,7 +11,13 @@ mkdir -p out
 A=$(cd "$(dirname "$A")" && pwd)/$(basename "$A") B=$(cd "$(dirname "$B")" && pwd)/$(basename "$B")
 CA=$(mktemp -d) CB=$(mktemp -d)   # a kernel/pipeline cache per side, empty at the start of the job (a shared one near its size cap
                                   # makes context creation cost ~1 ms per cached MB and vary with whatever runs left in it)
-pin=(); [ -n "${PIN:-}" ] && pin=(taskset -c "$PIN")
+# Runs are pinned to the first thread of the first 8 cores (PIN=cpu list overrides, PIN=off does not pin): the host side of a small
+# case (30 us of submit + sync) moves by 10-25 % with the core and complex the scheduler puts a process on, and that differed
+# between the two sides of a job often enough to be a consistent "regression" of one side in every round.
+if [ -z "${PIN:-}" ] && command -v taskset >/dev/null && command -v lscpu >/dev/null; then
+  PIN=$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -t, -k3,3n -k2,2n -k1,1n | awk -F, '!seen[$3 "," $2]++ {print $1}' | head -8 | paste -sd,)
+fi
+pin=(); [ -n "${PIN:-}" ] && [ "$PIN" != off ] && pin=(taskset -c "$PIN") && echo "benchab: runs pinned to cpus $PIN"
 extra=(); [ -n "${QUICK:-}" ] && extra+=(--quick); [ -n "${ONLY:-}" ] && extra+=(--only "$ONLY")
 total_units=0 ran=0 failed=0
 

@@ -3,6 +3,8 @@
 # the two alternate unit by unit (a unit is a luma-bench group of cases, `luma-bench --list-groups`): A B B A for one unit, B A A B
 # for the next, ..., each run after a 400 ms GPU warm-up, so the clock, thermal and host-load drift of a long job hits both sides
 # alike (alternating whole suites let it hit whichever side ran in the slow state: 10-30 unrelated 1.05-1.5x "regressions").
+# Both sides share one cost model (calibrated once on the warm GPU; a model measured per side differs for the whole job by the noise
+# of one measurement) and every run is pinned to the same 8 cores (BENCHAB_PIN=cpu list | off).
 # Usage: benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--quick] [--timeout SECS] [--only SUBSTR] [--chunk N] [--aa]
 #   BASE/NEW  git refs of this repo or paths to luma trees
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
@@ -25,7 +27,7 @@ while [ $# -gt 0 ]; do
   case $1 in --quick) quick=1 ;; --only) only=$2; shift ;; --chunk) chunk=$2; shift ;; --rounds) rounds=$2; shift ;; --aa) aa=1 ;; --timeout) timeout=$2; shift ;; *) pos+=("$1") ;; esac
   shift
 done
-[ ${#pos[@]} -ge 3 ] || { sed -n 2,23p "$0"; exit 2; }
+[ ${#pos[@]} -ge 3 ] || { sed -n 2,25p "$0"; exit 2; }
 base=${pos[0]} new=${pos[1]} host=${pos[2]} suites=${pos[3]:-ml,cfd,datasci,compute,jit,sparse} backends=${pos[4]:-cuda wgpu}
 [ "$suites" = - ] && suites=ml,cfd,datasci,compute,jit,sparse
 backends=${backends//,/ }

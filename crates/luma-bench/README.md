@@ -26,7 +26,7 @@ tools/benchcmp.py --base base-a.jsonl base-b.jsonl --new 'new-*.jsonl'   # media
 
 A/B of two refs: `tools/benchab.sh BASE NEW HOST [SUITES] [BACKENDS] [--rounds N] [--only PATTERN] [--chunk N]` builds both
 binaries and alternates them group by group (`--list-groups`, `--group`; `--warm` warms the GPU first) in one queue job: A B B A for
-one group, B A A B for the next, so power-state and clock drift hits both sides alike. Sample n of a side lands in
+one group, B A A B for the next, so power-state and clock drift hits both sides alike (both share one cost model, calibrated once, and run pinned to the same cores; `--aa` runs a binary against itself to show the noise floor). Sample n of a side lands in
 `<label>-<backend>-<suite>-<side><n>.jsonl`; `benchcmp.py` pairs sample n of both sides.
 `--only` picks a group by `suite/group`, a case by `suite/group/case` or `group/case`; a run that selects no case exits 3.
 
