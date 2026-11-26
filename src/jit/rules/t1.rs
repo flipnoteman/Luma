@@ -9,10 +9,14 @@ use std::panic::Location;
 use super::registry::RuleInfo;
 #[cfg(test)]
 use super::registry::RuleId;
+#[cfg(debug_assertions)]
 use super::scope::same_src;
 use crate::context::Context;
-use crate::jit::comprehension::lower::{lowerable, output_dims};
-use crate::jit::comprehension::{Comprehension, DimKind, Origin};
+use crate::jit::comprehension::lower::{lowers, output_dims};
+#[cfg(debug_assertions)]
+use crate::jit::comprehension::DimKind;
+use crate::jit::comprehension::{Comprehension, Origin};
+#[cfg(debug_assertions)]
 use crate::jit::Src;
 use crate::numerics::Numerics;
 use crate::profile::{Decision, DecisionSite, Verdict};
@@ -65,7 +69,7 @@ fn first<'a>(form: &Comprehension, rules: &'a [T1Rule], numerics: &Numerics, ctx
         if new.validate().is_err() {
             debug_assert!(false, "{}: a rewrite made an invalid form: {:?}", rule.info.name, new.validate());
             rejected.push((rule.info.name, "invalid"));
-        } else if !lowerable(&new) {
+        } else if !lowers(&new) {
             rejected.push((rule.info.name, "not lowerable"));
         } else {
             found = Some((rule, new));

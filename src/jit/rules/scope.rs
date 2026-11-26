@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 
 use super::t2::Rewrite;
 use crate::context::Context;
-use crate::jit::comprehension::lower::{lowerable, output_dims};
+use crate::jit::comprehension::lower::{lowers, output_dims};
 use crate::jit::comprehension::{Comprehension, DimKind, Origin};
 use crate::jit::structured::Structured;
 use crate::jit::{Node, Scalar, Src};
@@ -281,7 +281,7 @@ impl Scope {
             if form.validate().is_err() {
                 return Err("invalid");
             }
-            if !lowerable(form) {
+            if !lowers(form) {
                 return Err("not lowerable");
             }
         }

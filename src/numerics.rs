@@ -72,11 +72,14 @@ impl std::ops::BitOrAssign for Reduced {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Numerics {
-    /// Float sums may change their order.
+    /// Rewrites that change how an expression rounds are allowed: the constants of a chain fold (`(x * a) * b`), `x / c` becomes
+    /// `x * (1 / c)`, a power becomes a product, a quotient or a root. Float sums may change their order.
     pub reassociate: bool,
-    /// Rewrites that compute something mathematically equal in a different way are allowed.
+    /// Rewrites that compute something mathematically equal in a different way are allowed (`x + 0`, `x * 0`, `x / x`,
+    /// `x.powf(0)`): the two sides differ at a signed zero, an infinity or NaN.
     pub reformulate: bool,
-    /// Rewrites that are exact unless an input is infinite or NaN are allowed.
+    /// Rewrites that are exact unless an input is infinite or NaN are allowed (`x - x`, `x == x`, `x + (-y)`): the two sides are
+    /// bit-equal on every finite input, signed zeros included.
     pub exact_finite: bool,
     /// The reduced-precision features in use.
     pub reduced: Reduced,

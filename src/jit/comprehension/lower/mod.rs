@@ -324,6 +324,12 @@ pub(crate) fn lowerable(form: &Comprehension) -> bool {
     prepare(form).is_some()
 }
 
+/// Whether some generic strategy, the reduction tail or the contraction tail, can run `form`: what the rewrite engine requires of
+/// the form it makes.
+pub(crate) fn lowers(form: &Comprehension) -> bool {
+    lowerable(form) || contract::prepare(form).is_some()
+}
+
 /// The values the dims of a tile start at.
 #[derive(Clone, Copy)]
 pub(super) struct Origin6(pub(super) [i64; MAX_DIMS]);
@@ -607,7 +613,7 @@ pub(crate) fn build(ctx: &Context, form: &Comprehension) -> Array<f32> {
     let shape = Shape::from(output_dims(form));
     let result = match &form.origin {
         Origin::Api(_) => Err(Failure::from(LumaError::Unsupported("an API form runs through its own strategy".into()))),
-        _ if !lowerable(form) && !contract::prepare(form).is_some() => Err(Failure::from(LumaError::InvalidShape("the form has no lowering".into()))),
+        _ if !lowers(form) => Err(Failure::from(LumaError::InvalidShape("the form has no lowering".into()))),
         _ => crate::jit::structured::select::execute(ctx, &crate::jit::structured::strategy::Subject::Form(form, location)).map(|output| Array::from_storage(ctx, shape, output.into_storage())),
     };
     Array::resolve(ctx, shape, result, "comprehension", location)
