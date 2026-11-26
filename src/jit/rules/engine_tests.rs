@@ -327,6 +327,9 @@ fn generic_cost(scope: &Scope) -> Measure {
 
 #[test]
 fn a_planned_root_gives_the_same_result_and_leaves_the_value_alone() {
+    if !Algebra::builds_forms() {
+        return; // LUMA_ALGEBRA=off: no value has a form to plan
+    }
     let ctx = cpu();
     let x = data(&ctx, 1000);
     let sum = (&x * 2.0f32).sum();
@@ -350,6 +353,9 @@ fn a_planned_root_gives_the_same_result_and_leaves_the_value_alone() {
 
 #[test]
 fn the_second_force_of_a_structure_replays_the_first_and_a_stale_program_runs_again() {
+    if !Algebra::builds_forms() {
+        return; // LUMA_ALGEBRA=off: no value has a form to plan
+    }
     let ctx = cpu();
     ctx.record_decisions(true);
     let rules = [rule(&GENERIC, generic)];
@@ -383,6 +389,9 @@ fn the_second_force_of_a_structure_replays_the_first_and_a_stale_program_runs_ag
 
 #[test]
 fn a_scope_over_the_bound_records_that_it_is_too_large() {
+    if !Algebra::builds_forms() {
+        return; // LUMA_ALGEBRA=off: no value has a form to plan
+    }
     let ctx = deferring();
     ctx.record_decisions(true);
     let x = volume(&ctx);
@@ -404,6 +413,9 @@ fn a_scope_over_the_bound_records_that_it_is_too_large() {
 
 #[test]
 fn a_producer_of_the_same_thread_is_in_the_scope_and_one_of_another_thread_or_a_recording_is_not() {
+    if !Algebra::builds_forms() {
+        return; // LUMA_ALGEBRA=off: no value has a form to plan
+    }
     let ctx = deferring();
     let x = volume(&ctx);
     let near = x.max_axis(1);
