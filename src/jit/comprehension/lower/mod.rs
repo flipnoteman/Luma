@@ -1,11 +1,11 @@
 //! The generic lowering of a form (W2-R0 §5.3-5.6): what runs a `Recognised` or `Rewritten` form that no recogniser specialised.
 //!
-//! * **G-B** ([`reduce`], this file): the existing axis-reduce tail over a *transient program of the tile*. For every tile of the
+//! * **G-B** (this file): the existing axis-reduce tail over a *transient program of the tile*. For every tile of the
 //!   virtual space each access is one view node over its source (the `ViewMap` of the tile), the body's instructions are
 //!   elementwise nodes over those views, and the reduce dim is one axis of the node, so [`Array::run_axis_reduce`] runs it exactly
 //!   as it runs a hand-written `(bcast(a) * bcast(b)).sum_axis(k)`. Rows that read two dims (`o + t`, a window) cannot be views:
 //!   when their reduce dims have at most [`UNROLL_MAX`] taps those dims are unrolled, one program per tap, combined in tap order.
-//! * **G-A** ([`contract`]): the fused matmul tail for any separable body (`Mac::Body`).
+//! * **G-A** (`contract`): the fused matmul tail for any separable body (`Mac::Body`).
 //! * **Tiling**: the space is `u64`; every node of a tile has at most [`tile_budget`] points, so every index in a kernel fits `u32`.
 //!   The tiles that cover a slab of the output are partial results combined in tile order.
 //!
