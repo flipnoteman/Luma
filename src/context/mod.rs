@@ -671,6 +671,13 @@ impl Context {
         self.inner.numerics.fast_math()
     }
 
+    /// Whether the numerics allow a rule of a flagged pass of `simplify` (anything but the exact rules).
+    #[inline(always)]
+    pub(crate) fn rules_flagged(&self) -> bool {
+        let n = &self.inner.numerics;
+        n.exact_finite || n.reassociate || n.reformulate
+    }
+
     /// The numerics policy, by reference: what the hot paths read.
     #[inline(always)]
     pub(crate) fn numerics_ref(&self) -> &Numerics {

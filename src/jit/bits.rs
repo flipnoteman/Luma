@@ -50,6 +50,7 @@ pub(super) fn zeroed(len: usize) -> Box<[u64]> {
 }
 
 /// Keeps the buffer of a node that is dropped for [`zeroed`], unless the thread holds enough.
+#[inline]
 pub(super) fn recycle(buffer: Box<[u64]>) {
     let len = buffer.len();
     if len == 0 || len > POOL_MAX_LEN {

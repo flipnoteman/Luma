@@ -223,6 +223,7 @@ impl Node {
 }
 
 impl Drop for Node {
+    #[inline]
     fn drop(&mut self) {
         if let Some((plan, j)) = self.looped.get() {
             plan.release(*j);

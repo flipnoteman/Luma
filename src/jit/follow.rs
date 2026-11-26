@@ -500,9 +500,9 @@ struct Fol {
     /// The outputs of the launches replayed so far.
     outs: Vec<Vec<Arc<Storage>>>,
     write_epoch: u64,
-    /// The numerics the step is followed under: a context that allows a rule of the flagged passes (see `simplify::rewrite`) reads
-    /// every value, which `simplify::sensitive` does not cover, so the rewrites are tried at every call.
-    numerics: crate::numerics::Numerics,
+    /// Whether the context allows a rule of the flagged passes of `simplify::rewrite`: those read any value, which
+    /// `simplify::sensitive` does not cover, so the rewrites are tried at every call.
+    fast: bool,
     /// Entries below this are registered.
     registered: usize,
 }
@@ -708,6 +708,7 @@ enum Entered {
 }
 
 impl State {
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     fn enter(&mut self, ctx: &Context, len: usize, op: &Op, args: &mut Args, arity: usize, name: &'static str, location: &'static std::panic::Location<'static>) -> Entered {
         let jit = ctx.jit();
@@ -763,7 +764,7 @@ impl State {
                 nodes: Vec::with_capacity(tape.entries.len()),
                 outs: Vec::with_capacity(tape.plan.steps.len()),
                 write_epoch: jit.write_epoch.load(Ordering::Relaxed),
-                numerics: *ctx.numerics_ref(),
+                fast: ctx.rules_flagged(),
                 registered: 0,
                 tape,
             };
@@ -858,12 +859,12 @@ impl State {
         // Rewrites depend on the values of some scalars: try them again where they could differ.
         let mut rewritten: Option<(Op, usize)> = None;
         let mut saved: Option<Args> = None;
-        if jit.simplify_enabled() && (e.rewrite || fol.numerics.exact_finite || fol.numerics.reassociate || fol.numerics.reformulate) {
+        if jit.simplify_enabled() && (e.rewrite || fol.fast) {
             saved = Some(args.clone());
             let mut rounds = 0u8;
             let mut now: Option<Op> = None;
             while rounds < 4
-                && let Some((next_op, operands)) = simplify::rewrite(now.as_ref().unwrap_or(op), args, &fol.numerics)
+                && let Some((next_op, operands)) = simplify::rewrite(now.as_ref().unwrap_or(op), args, ctx.numerics_ref())
             {
                 now = Some(next_op);
                 *args = operands;
@@ -871,7 +872,7 @@ impl State {
             }
             if rounds != e.rounds {
                 if tracing() {
-                    note(&format!("entry {}: rewrites {rounds} vs {} recorded (numerics {}, op {:?})", fol.pos, e.rounds, fol.numerics, op.kind));
+                    note(&format!("entry {}: rewrites {rounds} vs {} recorded (fast {}, op {:?})", fol.pos, e.rounds, fol.fast, op.kind));
                 }
                 *args = saved.take().expect("saved above");
                 self.stop("a rewrite that is not the recorded one");
@@ -1137,14 +1138,17 @@ struct View<'a> {
 }
 
 impl Rebind for View<'_> {
+    #[inline]
     fn leaf(&self, at: u32) -> Option<Arc<Storage>> {
         self.leaves.get(at as usize)?.upgrade()
     }
 
+    #[inline]
     fn word(&self, class: u32) -> u32 {
         self.classes[class as usize].1 as u32
     }
 
+    #[inline]
     fn node(&self, at: u32) -> Option<Arc<Node>> {
         self.nodes.get(at as usize)?.upgrade()
     }

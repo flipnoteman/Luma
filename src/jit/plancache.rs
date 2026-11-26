@@ -1030,6 +1030,7 @@ impl Plan {
 
 /// Replays `step` over what `with` rebinds. `outs` holds the outputs of the steps before it (and
 /// gets its own).
+#[inline]
 pub(super) fn run_step(ctx: &Context, step: &Step, outs: &mut Vec<Vec<Arc<Storage>>>, with: &dyn Rebind) -> Result<(), ()> {
     let mut inputs: Vec<Arc<Storage>> = Vec::with_capacity(step.inputs.len());
     for input in &step.inputs {
