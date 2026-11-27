@@ -563,14 +563,12 @@ struct State {
     /// otherwise never back off: each kind has its own backoff).
     streak: u32,
     quiet: u32,
-    /// The kind whose `cooldown` left the step that is skipped now alone: the step after it is taken to be of that kind (see
-    /// [`eval_begin`]).
-    cooling: Option<u64>,
+    // (a step kind's `cooldown` is not skipped at the end of an `eval` the way `quiet` is: the next step is not known to be of that kind)
     phase: Phase,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, cooling: None, phase: Phase::Idle }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, phase: Phase::Idle }) };
     /// Whether the calls of this thread need to be looked at: false while the step is neither
     /// recorded nor followed, which is all a call costs then.
     static GATE: Cell<bool> = const { Cell::new(true) };
@@ -746,7 +744,6 @@ impl State {
             Phase::Idle => {}
         }
         // A step begins.
-        self.cooling = None;
         if !jit.follow.claim() {
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
@@ -760,7 +757,6 @@ impl State {
         let kind = self.kind(key);
         if kind.cooldown > 0 {
             kind.cooldown -= 1;
-            self.cooling = Some(key);
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
@@ -1437,11 +1433,16 @@ pub(super) struct Recording {
 pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     jit.follow.foreign_use();
     let fol = STATE.with_borrow_mut(|state| {
-        if state.jit != jit.id {
-            return Err(Eval::Normal(None));
-        }
         if pending.is_empty() {
             // Nothing to compute (an `eval` of arrays that are evaluated): not the end of a step.
+            return Err(Eval::Normal(None));
+        }
+        if state.jit != jit.id {
+            // The thread left the context whose steps it was leaving alone (its `Skip` would stay: no call looks at the state while
+            // the gate is shut, and the evaluations of this context are not the state's).
+            if matches!(state.phase, Phase::Skip) {
+                state.set(Phase::Idle);
+            }
             return Err(Eval::Normal(None));
         }
         // The common end of an `eval`: nothing is recorded or followed (a skipped step just ends). While the thread leaves steps
@@ -1452,14 +1453,7 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
             Phase::Skip => {
                 if state.quiet > 0 {
                     state.quiet -= 1;
-                } else if let Some(key) = state.cooling
-                    && let Some(kind) = state.kinds.iter_mut().find(|kind| kind.key == key)
-                    && kind.cooldown > 0
-                {
-                    // The next step is taken to be of the kind that was left alone: it is left alone too.
-                    kind.cooldown -= 1;
                 } else {
-                    state.cooling = None;
                     state.set(Phase::Idle);
                 }
                 return Err(Eval::Normal(None));
