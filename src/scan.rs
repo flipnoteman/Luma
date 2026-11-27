@@ -24,7 +24,7 @@
 
 use std::fmt::Write;
 use std::panic::Location;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use luma_core::Buffer;
 
@@ -924,6 +924,8 @@ pub(crate) struct Lines<'a> {
     cores: Vec<(Pass, Arc<KernelCore>)>,
     reduce_cores: Vec<(AxisPass, Arc<KernelCore>)>,
     ty: &'static str,
+    /// The operator lives as long as the process ([`add_operator`], [`Array::sum_operator`]), so its kernels are found by its address.
+    shared: bool,
     /// Where the passes launch.
     emit: Emit<'a>,
 }
@@ -1060,19 +1062,27 @@ fn lookback_window() -> u32 {
     WORKGROUP
 }
 
-/// The operator `+` on `u32`, for [`Lines::words`].
-pub(crate) fn add_operator(ctx: &Context) -> Outcome<Operator> {
-    Array::<u32>::alloc(ctx, Shape::from(1usize))?.trace_operator(&add)
+/// The operator `+` on `u32`, for [`Lines::words`]: traced on the first call, the same text on every device and kept for the
+/// life of the process (so [`Lines::words`] finds its kernels by its address).
+pub(crate) fn add_operator(ctx: &Context) -> Outcome<&'static Operator> {
+    static ADD: OnceLock<Operator> = OnceLock::new();
+    if let Some(op) = ADD.get() {
+        return Ok(op);
+    }
+    let op = Array::<u32>::trace_operator_on(ctx, &add)?;
+    Ok(ADD.get_or_init(|| op))
 }
 
 impl<'a> Lines<'a> {
     fn new(ctx: &'a Context, op: &'a Operator, ty: &'static str) -> Self {
-        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty, emit: Emit::now(ctx) }
+        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty, shared: false, emit: Emit::now(ctx) }
     }
 
-    /// The scan kernels of `op`, which must be [`add_operator`] or another operator on `u32`.
-    pub(crate) fn words(ctx: &'a Context, op: &'a Operator) -> Self {
-        Lines::new(ctx, op, "u32")
+    /// The scan kernels of `op`, which must be [`add_operator`].
+    pub(crate) fn words(ctx: &'a Context, op: &'static Operator) -> Self {
+        let mut lines = Lines::new(ctx, op, "u32");
+        lines.shared = true;
+        lines
     }
 
     fn core(&mut self, pass: Pass) -> Result<Arc<KernelCore>> {
@@ -1080,8 +1090,11 @@ impl<'a> Lines<'a> {
             return Ok(Arc::clone(core));
         }
         let workgroup = self.ctx.tuning().elementwise_workgroup;
-        let key = format!("{pass:?} {} {workgroup} {:?} {}", self.ty, self.op.scalar_tys, self.op.source);
-        let core = self.ctx.jit().scan_kernel(self.ctx, key, pass.label(), || source(pass, self.ty, self.op, workgroup))?;
+        let build = || {
+            let key = format!("{pass:?} {} {workgroup} {:?} {}", self.ty, self.op.scalar_tys, self.op.source);
+            self.ctx.jit().scan_kernel(self.ctx, key, pass.label(), || source(pass, self.ty, self.op, workgroup))
+        };
+        let core = if self.shared { self.ctx.jit().shared_scan_kernel(std::ptr::from_ref(self.op) as usize, pass, workgroup, build)? } else { build()? };
         self.cores.push((pass, Arc::clone(&core)));
         Ok(core)
     }
@@ -1336,7 +1349,11 @@ fn not_elementwise() -> Failure {
 impl<T: ScalarType> Array<T> {
     /// `op` traced on two one-element placeholders as a WGSL function.
     pub(crate) fn trace_operator(&self, op: &ScanOp<'_, T>) -> Outcome<Operator> {
-        let ctx = self.context();
+        Self::trace_operator_on(self.context(), op)
+    }
+
+    /// [`Array::trace_operator`] on the context `ctx`.
+    pub(crate) fn trace_operator_on(ctx: &Context, op: &ScanOp<'_, T>) -> Outcome<Operator> {
         let a = Array::<T>::alloc(ctx, Shape::from(1usize))?;
         let b = Array::<T>::alloc(ctx, Shape::from(1usize))?;
         let r = op(&a, &b);
@@ -1350,7 +1367,7 @@ impl<T: ScalarType> Array<T> {
     /// `+` as an [`Operator`], traced on the first call for the element type: the trace allocates
     /// two arrays and builds, flattens and prints an expression, which takes a few microseconds
     /// of a `cumsum` that a bandwidth-bound kernel of 0.17 ms leaves idle. The operator is
-    /// the same text on every device.
+    /// the same text on every device, and the one returned lives as long as the process.
     fn sum_operator(&self) -> Outcome<Arc<Operator>> {
         static SUMS: LazyLock<SumOperators> = LazyLock::new(Mutex::default);
         let ty = T::wgsl_type();
@@ -1380,6 +1397,7 @@ impl<T: ScalarType> Array<T> {
         let out_pin = out_storage.pin_single()?;
         let (n, stride, lines) = self.line_geometry(axis)?;
         let mut run = Lines::new(ctx, &operator, T::wgsl_type());
+        run.shared = sum;
         // The sum of a pending operand computes it in the scan's own kernels (a mask or a cast feeding a `cumsum` is never written);
         // any other operator needs the operand in a buffer.
         let ready;

@@ -664,7 +664,7 @@ impl<T: SortKey> Array<T> {
         let tile_groups = fold_workgroups(ctx, tiles)?;
         ctx.launch(&count, tile_groups, [tiles, 1, 1], &[RawArg::write(counts_pin.buffer(), counts_bytes), a_arg, b_arg, RawArg::read(split_pin.buffer(), split_bytes), uniform])?;
         let operator = add_operator(ctx)?;
-        let mut lines = Lines::words(ctx, &operator);
+        let mut lines = Lines::words(ctx, operator);
         lines.scan(Bound { buffer: counts_pin.buffer(), bytes: counts_bytes }, tiles, 1, 1, Bound { buffer: scanned_pin.buffer(), bytes: scanned_bytes })?;
         drop(lines);
         let kept = scanned.slice(0, tiles as usize - 1..).item().map_err(Failure::New)? as usize;

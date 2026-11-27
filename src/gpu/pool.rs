@@ -1,11 +1,13 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use crate::gpu::hash::FxMap;
 
 use luma_core::{Buffer, BufferUsage};
 
 /// Free lists of idle buffers keyed by (size class, usage flags), each oldest first.
 #[derive(Debug)]
 pub(crate) struct BufferPool {
-    free: HashMap<(u64, BufferUsage), VecDeque<(u64, Buffer)>>,
+    free: FxMap<(u64, BufferUsage), VecDeque<(u64, Buffer)>>,
     pooled_bytes: u64,
     /// Stamps buffers in the order they were returned.
     clock: u64,
@@ -18,7 +20,7 @@ pub(crate) struct BufferPool {
 impl BufferPool {
     /// An empty pool that keeps at most `cap` bytes of idle buffers.
     pub(crate) fn new(cap: u64) -> Self {
-        BufferPool { free: HashMap::new(), pooled_bytes: 0, clock: 0, cap }
+        BufferPool { free: FxMap::default(), pooled_bytes: 0, clock: 0, cap }
     }
 
     /// Takes the most recently returned idle buffer with exactly `usage` of `class` bytes or, if

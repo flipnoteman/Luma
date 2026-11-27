@@ -134,7 +134,16 @@ thread_local! {
 
 impl Context {
     /// Runs `f` on this thread's entry for this context (if it has one) in [`RECORDINGS`].
+    #[inline]
     fn with_entry<R>(&self, f: impl FnOnce(&mut RecState) -> R) -> Option<R> {
+        // No recording is open on the context, on any thread (the common case): no table to look in.
+        if !self.jit().selcache.recordings_open() {
+            return None;
+        }
+        self.with_entry_slow(f)
+    }
+
+    fn with_entry_slow<R>(&self, f: impl FnOnce(&mut RecState) -> R) -> Option<R> {
         let id = self.inner.id;
         // A thread that is being torn down has no recordings left to look at.
         RECORDINGS

@@ -990,7 +990,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
     let out_pay_pin = out_pay.as_ref().map(|storage| storage.pin_single()).transpose()?;
 
     let operator = add_operator(ctx)?;
-    let mut lines = Lines::words(ctx, &operator);
+    let mut lines = Lines::words(ctx, operator);
     let mut scratch = Scratch::new(ctx);
     let counts = scratch.take(count_bytes)?;
     let scanned = scratch.take(count_bytes)?;

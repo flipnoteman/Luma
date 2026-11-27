@@ -251,6 +251,12 @@ impl SelState {
         self.bump();
     }
 
+    /// Whether any thread has a recording open on the context: false means no thread has an entry in the recordings table for it.
+    #[inline(always)]
+    pub(crate) fn recordings_open(&self) -> bool {
+        self.gate.load(Ordering::Relaxed) & !GATE_MODE != 0
+    }
+
     /// How this context was told to cache (tests).
     #[cfg(test)]
     pub(crate) fn mode(&self) -> CacheMode {

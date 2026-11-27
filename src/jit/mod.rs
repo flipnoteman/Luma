@@ -3141,6 +3141,9 @@ pub(crate) struct JitState {
     /// The kernels of `scan` (see [`JitState::scan_kernel`]) by what their source is made of, so
     /// that a call does not generate and hash the source of a kernel it has run before.
     scans: BuildCache<String, Arc<KernelCore>>,
+    /// The kernels of the scans whose operator lives as long as the process (the shared `+`, see [`JitState::shared_scan_kernel`]),
+    /// by the operator's address, the pass and the workgroup size: a lookup hashes three words, not the operator's source.
+    shared_scans: Mutex<FxMap<(usize, crate::scan::Pass, u32), Arc<KernelCore>>>,
     /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
     /// (register loops, stencils; see [`JitState::module_kernel`]).
     modules: BuildCache<String, Arc<KernelCore>>,
@@ -3304,6 +3307,7 @@ impl JitState {
             fused: transpose::FusedCache::default(),
             stencils: BuildCache::default(),
             scans: BuildCache::default(),
+            shared_scans: Mutex::new(FxMap::default()),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             sites: structured::sites::Sites::default(),
@@ -4371,6 +4375,18 @@ impl JitState {
     /// `source` runs, and the kernel compiles, on first use of the key.
     pub(crate) fn scan_kernel(&self, ctx: &Context, key: String, label: &str, source: impl FnOnce() -> String) -> Result<Arc<KernelCore>> {
         self.scans.get_or_build(&key, || self.stencil_kernel(ctx, source(), label)).map(|(core, _)| core)
+    }
+
+    /// [`JitState::scan_kernel`] of an operator that is never freed (`op` is its address): the kernel of `(op, pass, workgroup)`,
+    /// built by `build` (which asks `scan_kernel` as usual) on the first use.
+    pub(crate) fn shared_scan_kernel(&self, op: usize, pass: crate::scan::Pass, workgroup: u32, build: impl FnOnce() -> Result<Arc<KernelCore>>) -> Result<Arc<KernelCore>> {
+        let key = (op, pass, workgroup);
+        if let Some(core) = lock(&self.shared_scans).get(&key) {
+            return Ok(Arc::clone(core));
+        }
+        let core = build()?;
+        lock(&self.shared_scans).insert(key, Arc::clone(&core));
+        Ok(core)
     }
 
     /// The kernel built as Kernel IR by `build`, compiled on first use; `key` names what the

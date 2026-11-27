@@ -949,6 +949,16 @@ impl CompiledKernel {
     /// within its buffer and starts at a multiple of `align` (the device's
     /// [`Backend::storage_offset_align`]; `0` allows no offset).
     pub fn check_offsets(&self, args: &[RawArg<'_>], align: u64) -> Result<(), BackendError> {
+        // Almost no launch binds a view: one pass over the arguments that finds none.
+        if args.iter().all(|arg| !matches!(arg, RawArg::Storage { buffer, .. } if buffer.offset() != 0)) {
+            return Ok(());
+        }
+        self.check_offsets_of_views(args, align)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn check_offsets_of_views(&self, args: &[RawArg<'_>], align: u64) -> Result<(), BackendError> {
         for (position, arg) in self.bound(args) {
             let RawArg::Storage { buffer, bytes, .. } = arg else { continue };
             let offset = buffer.offset();
@@ -975,24 +985,38 @@ impl CompiledKernel {
     /// Checks that each argument the kernel binds is of the kind of its binding, for the same
     /// reason as [`check_count`](Self::check_count).
     pub fn check_kinds(&self, args: &[RawArg<'_>]) -> Result<(), BackendError> {
-        for ((position, arg), info) in self.bound(args).zip(&self.bindings) {
+        let mut infos = self.bindings.iter();
+        for (position, arg) in args.iter().enumerate() {
+            if self.used.as_ref().is_some_and(|used| !used[position]) {
+                continue;
+            }
+            let Some(info) = infos.next() else { break };
             // Whether a storage buffer is passed for reading or writing does not matter to the
             // layout; a uniform where a storage buffer is expected (or the reverse) does.
-            let (passed, fits) = match arg {
-                RawArg::Uniform(_) => ("uniform", info.kind == BindingKind::Uniform),
-                RawArg::Storage { buffer, .. } if buffer.usage().contains(BufferUsage::TEXTURE) => {
-                    ("texture", matches!(info.kind, BindingKind::Texture2d | BindingKind::Sampler))
-                }
-                RawArg::Storage { .. } => ("storage buffer", matches!(info.kind, BindingKind::StorageRead | BindingKind::StorageReadWrite)),
+            let fits = match arg {
+                RawArg::Uniform(_) => info.kind == BindingKind::Uniform,
+                RawArg::Storage { buffer, .. } if buffer.usage().contains(BufferUsage::TEXTURE) => matches!(info.kind, BindingKind::Texture2d | BindingKind::Sampler),
+                RawArg::Storage { .. } => matches!(info.kind, BindingKind::StorageRead | BindingKind::StorageReadWrite),
             };
             if !fits {
-                return Err(BackendError::KernelBinding(format!(
-                    "kernel `{}` argument {position} (`{}`) is a {}, but the launch passes a {passed}",
-                    self.label, info.name, info.kind
-                )));
+                return Err(self.kind_error(position as u32, arg, info));
             }
         }
         Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn kind_error(&self, position: u32, arg: &RawArg<'_>, info: &BindingInfo) -> BackendError {
+        let passed = match arg {
+            RawArg::Uniform(_) => "uniform",
+            RawArg::Storage { buffer, .. } if buffer.usage().contains(BufferUsage::TEXTURE) => "texture",
+            RawArg::Storage { .. } => "storage buffer",
+        };
+        BackendError::KernelBinding(format!(
+            "kernel `{}` argument {position} (`{}`) is a {}, but the launch passes a {passed}",
+            self.label, info.name, info.kind
+        ))
     }
 }
 
