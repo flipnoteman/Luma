@@ -1133,16 +1133,30 @@ impl<'a> Lines<'a> {
         pre: Option<Bound<'_>>,
     ) -> Result<()> {
         let core = self.core(pass)?;
-        let mut words = geometry.to_vec();
-        words.extend_from_slice(&self.op.scalars);
-        let mut args = vec![RawArg::write(out.buffer, out.bytes), RawArg::read(input.buffer, input.bytes)];
-        if let Some(pre) = pre {
-            // The statuses of a look-back are written by the chunks that wait for each other.
-            args.push(if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) });
-        }
-        args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+        // The geometry and the operator's scalars (none, for `+`), then the arguments, on the stack.
+        let scalars = &self.op.scalars;
+        let mut inline = [0u32; 16];
+        let heap;
+        let words: &[u32] = if scalars.len() + 5 <= inline.len() {
+            inline[..5].copy_from_slice(&geometry);
+            inline[5..5 + scalars.len()].copy_from_slice(scalars);
+            &inline[..5 + scalars.len()]
+        } else {
+            heap = [geometry.as_slice(), scalars].concat();
+            &heap
+        };
+        let uniform = RawArg::Uniform(bytemuck::cast_slice(words));
+        let write = RawArg::write(out.buffer, out.bytes);
+        let read = RawArg::read(input.buffer, input.bytes);
         let (workgroups, size) = self.grid(pass, geometry)?;
-        self.emit.launch(&core, workgroups, size, &args)
+        match pre {
+            // The statuses of a look-back are written by the chunks that wait for each other.
+            Some(pre) => {
+                let pre = if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) };
+                self.emit.launch(&core, workgroups, size, &[write, read, pre, uniform])
+            }
+            None => self.emit.launch(&core, workgroups, size, &[write, read, uniform]),
+        }
     }
 
     /// Whether a scan with this operator gives the same result however it groups its operands, so
