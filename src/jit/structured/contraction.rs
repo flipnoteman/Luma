@@ -566,11 +566,26 @@ fn fits_native_cpu(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Opt
 fn lower_gemm(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
     let ctx = emit.ctx();
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
+    if is_padded(params.by) {
+        return lower_padded(ctx, view, &params);
+    }
+    gemm(ctx, view, &params, view.lhs, view.rhs)
+}
+
+/// [`lower_gemm`] for a padded strategy: the operands its 16-byte copies cannot read are copied first.
+#[inline(never)]
+fn lower_padded(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams) -> Result<Lowered, Failure> {
     let copied = copies(view, params.by);
     let (lhs_copy, rhs_copy) = (copied[0].then(|| padded_copy(view.lhs)), copied[1].then(|| padded_copy(view.rhs)));
     let (lhs, rhs) = (lhs_copy.as_ref().unwrap_or(view.lhs), rhs_copy.as_ref().unwrap_or(view.rhs));
+    gemm(ctx, view, params, lhs, rhs)
+}
+
+/// The product of `lhs` and `rhs` (the view's operands, or their padded copies) as a native launch: their sides and layouts, the plan
+/// of the strategy, one launch.
+fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, lhs: &Array<f32>, rhs: &Array<f32>) -> Result<Lowered, Failure> {
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
-    let Some(plan) = plan_or_decline(view, ctx, &params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
+    let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
     done(launch(ctx, sides, plan, params.geom, Some(layouts))?)
 }
 
@@ -682,7 +697,15 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         }
         None => &uniform[..4],
     };
-    jit::matmul(ctx, sides, kernel, words, plan.groups, RawArg::write(target, target_bytes))?;
+    let out = RawArg::write(target, target_bytes);
+    match sides {
+        // Both operands evaluated: nothing to fuse, the kernel reads their buffers (what `jit::matmul` does for such sides).
+        [MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)] => {
+            let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;
+            ctx.launch(&core, plan.groups, [n32, m32, 1], &[out, RawArg::read(a.buffer(), a_bytes), RawArg::read(b.buffer(), b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
+        }
+        sides => jit::matmul(ctx, sides, kernel, words, plan.groups, out)?,
+    }
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
         let slices = [plan.slices];
@@ -1120,23 +1143,25 @@ fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([
         return Err(LumaError::ContextMismatch.into());
     }
     ctx.jit().evaluate_requested();
-    let mut sides = Vec::with_capacity(2);
-    for (array, window) in [lhs, rhs].into_iter().zip(windows) {
-        let (storage, layout) = match window {
-            Some(MatrixWindow { src: Src::Buffer(storage), offset, ld, transposed }) => (storage, Layout { transposed, ld, off: offset }),
-            Some(MatrixWindow { src: Src::Node(node), offset, ld, transposed }) => {
-                (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), Layout { transposed, ld, off: offset })
-            }
-            _ => {
-                let (pin, bytes) = array.ready()?;
-                sides.push((MatmulSide::Ready(pin, bytes), Layout { transposed: false, ld: first_axis(array), off: 0 }));
-                continue;
-            }
-        };
-        sides.push((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), layout));
-    }
-    let [(lhs_side, lhs_layout), (rhs_side, rhs_layout)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
+    let [lhs_window, rhs_window] = windows;
+    let (lhs_side, lhs_layout) = native_side(lhs, lhs_window)?;
+    let (rhs_side, rhs_layout) = native_side(rhs, rhs_window)?;
     Ok(([lhs_side, rhs_side], [lhs_layout, rhs_layout]))
+}
+
+/// One operand of [`native_sides`], once what it reads is evaluated.
+fn native_side(array: &Array<f32>, window: Option<MatrixWindow>) -> Outcome<(MatmulSide, Layout)> {
+    let (storage, layout) = match window {
+        Some(MatrixWindow { src: Src::Buffer(storage), offset, ld, transposed }) => (storage, Layout { transposed, ld, off: offset }),
+        Some(MatrixWindow { src: Src::Node(node), offset, ld, transposed }) => {
+            (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), Layout { transposed, ld, off: offset })
+        }
+        _ => {
+            let (pin, bytes) = array.ready()?;
+            return Ok((MatmulSide::Ready(pin, bytes), Layout { transposed: false, ld: first_axis(array), off: 0 }));
+        }
+    };
+    Ok((MatmulSide::Ready(storage.pin_single_read()?, storage.byte_len()), layout))
 }
 
 /// The side of the product `array` stands for: its expression if it is pending (so it may be
