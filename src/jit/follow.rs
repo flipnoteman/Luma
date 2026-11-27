@@ -198,12 +198,20 @@ impl Shared {
     }
 }
 
+/// The calling thread's ordinal (a `const` cell: no lazy-initialisation check on the hot paths that ask whose call it is).
+#[inline]
 fn thread_ordinal() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     thread_local! {
-        static ORDINAL: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+        static ORDINAL: Cell<u64> = const { Cell::new(0) };
     }
-    ORDINAL.with(|ordinal| *ordinal)
+    let known = ORDINAL.get();
+    if known != 0 {
+        return known;
+    }
+    let fresh = NEXT.fetch_add(1, Ordering::Relaxed);
+    ORDINAL.set(fresh);
+    fresh
 }
 
 /// Called when `jit` is written to: a write by a thread that does not follow ends following.
@@ -555,11 +563,14 @@ struct State {
     /// otherwise never back off: each kind has its own backoff).
     streak: u32,
     quiet: u32,
+    /// The kind whose `cooldown` left the step that is skipped now alone: the step after it is taken to be of that kind (see
+    /// [`eval_begin`]).
+    cooling: Option<u64>,
     phase: Phase,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, phase: Phase::Idle }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, cooling: None, phase: Phase::Idle }) };
     /// Whether the calls of this thread need to be looked at: false while the step is neither
     /// recorded nor followed, which is all a call costs then.
     static GATE: Cell<bool> = const { Cell::new(true) };
@@ -735,6 +746,7 @@ impl State {
             Phase::Idle => {}
         }
         // A step begins.
+        self.cooling = None;
         if !jit.follow.claim() {
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
@@ -748,6 +760,7 @@ impl State {
         let kind = self.kind(key);
         if kind.cooldown > 0 {
             kind.cooldown -= 1;
+            self.cooling = Some(key);
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
@@ -1431,11 +1444,29 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
             // Nothing to compute (an `eval` of arrays that are evaluated): not the end of a step.
             return Err(Eval::Normal(None));
         }
-        match std::mem::replace(&mut state.phase, Phase::Idle) {
-            Phase::Idle | Phase::Skip => {
-                state.set(Phase::Idle);
-                Err(Eval::Normal(None))
+        // The common end of an `eval`: nothing is recorded or followed (a skipped step just ends). While the thread leaves steps
+        // alone (`quiet`), the next one is left alone right here: that is what its first call would conclude (see `State::enter`),
+        // without `begin` running for it.
+        match &state.phase {
+            Phase::Idle => return Err(Eval::Normal(None)),
+            Phase::Skip => {
+                if state.quiet > 0 {
+                    state.quiet -= 1;
+                } else if let Some(key) = state.cooling
+                    && let Some(kind) = state.kinds.iter_mut().find(|kind| kind.key == key)
+                    && kind.cooldown > 0
+                {
+                    // The next step is taken to be of the kind that was left alone: it is left alone too.
+                    kind.cooldown -= 1;
+                } else {
+                    state.cooling = None;
+                    state.set(Phase::Idle);
+                }
+                return Err(Eval::Normal(None));
             }
+            Phase::Rec(_) | Phase::Fol(_) => {}
+        }
+        match std::mem::replace(&mut state.phase, Phase::Idle) {
             Phase::Rec(rec) => {
                 state.set(Phase::Skip);
                 Err(state.record_end(jit, rec, pending))
@@ -1444,6 +1475,7 @@ pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
                 state.set(Phase::Skip);
                 Ok(fol)
             }
+            Phase::Idle | Phase::Skip => Err(Eval::Normal(None)),
         }
     })
     ;
@@ -1728,6 +1760,9 @@ pub(super) fn interrupt(jit: &JitState) {
 
 /// [`interrupt`] for a caller that has no context at hand (and so does not look whether following is on).
 pub(super) fn interrupt_thread() {
+    if !gate() {
+        return;
+    }
     let _ = STATE.try_with(|state| {
         let Ok(mut state) = state.try_borrow_mut() else { return };
         if matches!(state.phase, Phase::Fol(_) | Phase::Rec(_)) {
@@ -1795,6 +1830,10 @@ pub(super) fn note_boundary(jit: &JitState, prev: &[(Option<Arc<Node>>, u64)], e
 /// for a step like it, if the arrays of the step before relate to the leaves of this one as they
 /// did. `prev` is the history of the step before.
 pub(super) fn boundary_exit(jit: &JitState, prev: &[(Option<Arc<Node>>, u64)]) -> Option<Exit> {
+    // A skipped step has no tape to relate to (see [`gate`]).
+    if !gate() {
+        return None;
+    }
     if !jit.follow_on() {
         return None;
     }
