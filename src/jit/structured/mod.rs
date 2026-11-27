@@ -10,7 +10,7 @@
 //! is in its payload ([`Comp`]).
 
 use std::panic::Location;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(crate) mod boundary;
@@ -53,6 +53,8 @@ pub(crate) struct Structured {
     /// The nodes that stand for the value in expressions (see [`Structured::leaf`]): they get the buffer when the value is
     /// recorded for any other reason, so that what reads them is a reader of that buffer (a write into it evaluates it first).
     leaves: Mutex<Vec<Weak<Node>>>,
+    /// Whether a leaf was ever made (most values are recorded without one: handing over then takes no lock).
+    has_leaves: AtomicBool,
     /// The thread that made the value: only that one's values are recorded together (see [`crate::jit`]'s `multireduce`).
     pub(crate) thread: std::thread::ThreadId,
     /// Whether it was made while this thread was recording a step, whose values are never taken along.
@@ -158,6 +160,7 @@ impl Structured {
             family,
             result: OnceLock::new(),
             leaves: Mutex::new(Vec::new()),
+            has_leaves: AtomicBool::new(false),
             thread: std::thread::current().id(),
             in_recording,
             forcing: AtomicBool::new(false),
@@ -211,6 +214,7 @@ impl Structured {
     pub(crate) fn leaf(self: &Arc<Self>, ctx: &Context, len: usize) -> Arc<Node> {
         let leaf = super::deferred_value(ctx, len, self.ty(), Arc::clone(self), self.name, self.location);
         let mut leaves = crate::gpu::lock(&self.leaves);
+        self.has_leaves.store(true, Ordering::Release);
         // Dead leaves (their expressions were dropped) are pruned as the list doubles.
         if leaves.len() >= 32 && leaves.len().is_power_of_two() {
             leaves.retain(|weak| weak.strong_count() > 0);
@@ -260,6 +264,9 @@ impl Structured {
     /// Gives the leaves that stand for the value in expressions its buffer.
     #[inline]
     fn hand_over(&self, storage: &Arc<Storage>) {
+        if !self.has_leaves.load(Ordering::Acquire) {
+            return;
+        }
         for leaf in std::mem::take(&mut *crate::gpu::lock(&self.leaves)) {
             if let Some(leaf) = leaf.upgrade() {
                 leaf.finish_shared(Arc::clone(storage));
