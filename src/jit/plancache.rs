@@ -543,7 +543,7 @@ thread_local! {
     /// The recording of a whole step that trace following is making (see [`super::follow`]): the
     /// launches of its creates and of its evaluation, by position in the tape.
     static TAPE: RefCell<Option<Recorder>> = const { RefCell::new(None) };
-    static SCRATCH: RefCell<Walk> = RefCell::new(Walk::default());
+    static SCRATCH: RefCell<Option<Walk>> = const { RefCell::new(None) };
     /// The step of a structured value that is being replayed.
     static REPLAY: RefCell<Option<ReplayCmd>> = const { RefCell::new(None) };
 }
@@ -1358,7 +1358,7 @@ fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Ve
         taint_tape("other arrays are pending");
         return run(pending);
     }
-    let mut walk = SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()));
+    let mut walk = SCRATCH.with(|scratch| scratch.borrow_mut().take()).unwrap_or_default();
     let found = walk.run(jit, &ctx, &pending).map(|key| (key, lock(&jit.plans).find(key)));
     match found {
         // Not a graph the cache can handle: nothing is remembered.
@@ -1440,7 +1440,7 @@ fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Ve
         }
     }
     walk.clear();
-    SCRATCH.with(|scratch| *scratch.borrow_mut() = walk);
+    SCRATCH.with(|scratch| *scratch.borrow_mut() = Some(walk));
 }
 
 /// The recording of this thread, which ends when this is dropped, whatever happens in between.
@@ -1669,9 +1669,9 @@ pub(super) fn run_step(ctx: &Context, step: &Step, outs: &mut Vec<Vec<Arc<Storag
 
 /// The key a walk of `pending` makes (what `follow` checks its tapes against, see `LUMA_TRACE_FOLLOW=verify`).
 pub(super) fn walk_key(jit: &JitState, ctx: &Context, pending: &[Arc<Node>]) -> Option<[u64; 2]> {
-    let mut walk = SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()));
+    let mut walk = SCRATCH.with(|scratch| scratch.borrow_mut().take()).unwrap_or_default();
     let key = walk.run(jit, ctx, pending);
     walk.clear();
-    SCRATCH.with(|scratch| *scratch.borrow_mut() = walk);
+    SCRATCH.with(|scratch| *scratch.borrow_mut() = Some(walk));
     key
 }
