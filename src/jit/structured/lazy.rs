@@ -86,7 +86,7 @@ pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttr
         match view.check() {
             Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
             Ok(geom) => {
-                let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), || contraction::narrow_n_fits(&view, ctx));
+                let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here());
                 if laziness == Laziness::Lazy {
                     return lazy_product(ctx, &view, geom, slot, shape);
                 }
@@ -116,7 +116,7 @@ pub(crate) fn batched(lhs: &Array<f32>, rhs: &Array<f32>, g: &bmm::Geometry, sha
         return None;
     }
     let Ok(Some(launch)) = bmm::plan(lhs, rhs, g) else { return None };
-    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), || false);
+    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here());
     if laziness == Laziness::Eager {
         return None;
     }
@@ -188,11 +188,7 @@ impl Structured {
         let outcome = match &run.kind {
             ContractionKind::Matmul { attrs, .. } => {
                 let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location };
-                select::execute(ctx, &Subject::Contraction(&view)).and_then(|output| match output {
-                    Output::Storage(storage) => Ok(storage),
-                    // `GemmNarrowN` returns a lazy view and is never a lazy product's strategy (`Sites::decide`); a forced one is still right.
-                    Output::Array(array) => array.storage().map(Arc::clone),
-                })
+                select::execute(ctx, &Subject::Contraction(&view)).map(Output::into_storage)
             }
             ContractionKind::Batched { geom, launch } => bmm::execute(ctx, &lhs, &rhs, geom, *launch),
         };

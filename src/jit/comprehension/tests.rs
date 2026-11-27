@@ -753,7 +753,7 @@ fn a_lazy_product_holds_no_form_until_it_is_asked_and_then_remembers_it() {
     assert_eq!(value.comp().meta.launch, Launch::AtForce);
     assert_eq!(value.comp().meta.tag, OpTag::Matmul { tf32: None });
     assert!(crate::gpu::lock(&value.comp().form).is_none(), "no form is built per product");
-    let Some(form) = value.form() else {
+    let Some(form) = value.form(&ctx) else {
         assert!(!Algebra::builds_forms());
         return;
     };
@@ -761,15 +761,15 @@ fn a_lazy_product_holds_no_form_until_it_is_asked_and_then_remembers_it() {
     assert_eq!(form.origin, Origin::Api(OpTag::Matmul { tf32: None }));
     form.validate().unwrap();
     assert!(crate::gpu::lock(&value.comp().form).is_some(), "asked once, kept");
-    assert_eq!(value.form().unwrap().structure_hash(), form.structure_hash());
+    assert_eq!(value.form(&ctx).unwrap().structure_hash(), form.structure_hash());
     // Used, the product holds neither its operands nor a form that holds them.
     c.to_vec().unwrap();
     assert!(crate::gpu::lock(&value.comp().form).is_none());
-    assert!(value.form().is_none(), "a forced product has no operands to say a form of");
+    assert!(value.form(&ctx).is_none(), "a forced product has no operands to say a form of");
     // The transposed forms are the same product over views.
     let transposed = Array::<f32>::from_slice_on(&ctx, &(0..20).map(|i| (i % 7) as f32).collect::<Vec<_>>(), [5, 4]).unwrap();
     let nt = lhs.matmul_nt(&transposed);
-    assert_eq!(nt.structured().unwrap().form().unwrap().structure_hash(), form.structure_hash(), "a transposed operand has the same maps");
+    assert_eq!(nt.structured().unwrap().form(&ctx).unwrap().structure_hash(), form.structure_hash(), "a transposed operand has the same maps");
 }
 
 #[test]
@@ -780,7 +780,7 @@ fn a_lazy_batched_product_holds_the_batched_form() {
     let c = lhs.matmul_batched(&rhs);
     let value = c.structured().expect("a batch of one launch at a lazy site is a structured value");
     assert_eq!(value.comp().meta.tag, OpTag::MatmulBatched);
-    let Some(form) = value.form() else {
+    let Some(form) = value.form(&ctx) else {
         assert!(!Algebra::builds_forms());
         return;
     };

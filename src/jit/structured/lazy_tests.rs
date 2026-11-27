@@ -606,15 +606,14 @@ fn in_site_mode_the_probe_makes_the_first_call_and_every_nth_lazy() {
 }
 
 #[test]
-fn a_narrow_n_product_is_never_lazy() {
-    // 10 classes over 256 rows and 64 features: the padded strategy of the backend's own kernels takes it where there are any.
+fn a_narrow_n_product_is_lazy() {
+    // 10 classes over 256 rows and 64 features: a narrow-N product is lazy like any other.
     let ctx = context(LazyMode::Always);
     let (k, m, n) = (64, 256, 10);
     let a = A::from_slice_on(&ctx, &ints(k * m, 1), [k, m]).unwrap();
     let b = A::from_slice_on(&ctx, &ints(n * k, 2), [n, k]).unwrap();
     let c = a.matmul(&b);
-    let narrow = super::contraction::narrow_n_fits(&super::contraction::ContractionView { lhs: &a, rhs: &b, attrs: super::contraction::ContractionAttrs { tf32: super::contraction::Tf32Request::Default }, location: Location::caller() }, &ctx);
-    assert_eq!(is_lazy(&c), !narrow, "lazy unless the padded strategy takes it");
+    assert!(is_lazy(&c));
     assert_eq!(c.to_vec().unwrap(), host(&ints(k * m, 1), &ints(n * k, 2), k, m, n));
 }
 

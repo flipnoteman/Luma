@@ -141,13 +141,12 @@ impl Sites {
     /// Whether the call at `location` launches now or when its value is used, and the slot to tell [`Sites::note_forced_alone`] about.
     ///
     /// A recording is always eager: a launch made for a loop body is part of the loop, and a lazy one would be recorded wherever it is
-    /// first used. `narrow_n` (the call is one `GemmNarrowN` takes, which returns a lazy view and has no lazy form) is eager in every
-    /// mode, `Always` included; it is only asked for in the modes that could be lazy. `Never` is eager and `Always` lazy whatever the
+    /// first used. `Never` is eager and `Always` lazy whatever the
     /// slot says; `Site` is lazy where the slot absorbed or partnered, and for the probe of every `tuning.lazy_probe_every`-th call
     /// (counted before it is incremented, so the first call of a site probes).
     #[inline]
-    pub(crate) fn decide(&self, location: &'static Location<'static>, tuning: &Tuning, recording: bool, narrow_n: impl FnOnce() -> bool) -> (Laziness, SiteSlot) {
-        if recording || tuning.lazy == LazyMode::Never || narrow_n() {
+    pub(crate) fn decide(&self, location: &'static Location<'static>, tuning: &Tuning, recording: bool) -> (Laziness, SiteSlot) {
+        if recording || tuning.lazy == LazyMode::Never {
             return (Laziness::Eager, SiteSlot::NONE);
         }
         match tuning.lazy {
@@ -205,7 +204,7 @@ mod tests {
     #[test]
     fn an_unseen_site_is_eager() {
         let sites = Sites::default();
-        let (laziness, slot) = sites.decide(here(), &tuned(LazyMode::Site, 0), false, || false);
+        let (laziness, slot) = sites.decide(here(), &tuned(LazyMode::Site, 0), false);
         assert_eq!(laziness, Laziness::Eager);
         assert_ne!(slot, SiteSlot::NONE);
     }
@@ -264,11 +263,11 @@ mod tests {
         let sites = Sites::default();
         let location = here();
         sites.set_attached(SiteKey::of(location), 1, 1);
-        assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 1), false, || false).0, Laziness::Eager);
+        assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 1), false).0, Laziness::Eager);
         let fresh = Sites::default();
-        assert_eq!(fresh.decide(location, &tuned(LazyMode::Always, 0), false, || false).0, Laziness::Lazy);
+        assert_eq!(fresh.decide(location, &tuned(LazyMode::Always, 0), false).0, Laziness::Lazy);
         // `Site` reads the slot.
-        assert_eq!(sites.decide(location, &tuned(LazyMode::Site, 0), false, || false).0, Laziness::Lazy);
+        assert_eq!(sites.decide(location, &tuned(LazyMode::Site, 0), false).0, Laziness::Lazy);
     }
 
     #[test]
@@ -277,25 +276,8 @@ mod tests {
         let location = here();
         sites.set_attached(SiteKey::of(location), 1, 1);
         for mode in [LazyMode::Never, LazyMode::Site, LazyMode::Always] {
-            assert_eq!(sites.decide(location, &tuned(mode, 1), true, || false).0, Laziness::Eager, "{mode:?}");
+            assert_eq!(sites.decide(location, &tuned(mode, 1), true).0, Laziness::Eager, "{mode:?}");
         }
-    }
-
-    #[test]
-    fn a_narrow_n_product_is_eager_even_under_always() {
-        let sites = Sites::default();
-        let location = here();
-        sites.set_attached(SiteKey::of(location), 1, 1);
-        for mode in [LazyMode::Never, LazyMode::Site, LazyMode::Always] {
-            assert_eq!(sites.decide(location, &tuned(mode, 1), false, || true).0, Laziness::Eager, "{mode:?}");
-        }
-        // The question is not asked where the answer cannot matter.
-        let asked = std::cell::Cell::new(false);
-        let _ = sites.decide(location, &tuned(LazyMode::Never, 0), false, || {
-            asked.set(true);
-            true
-        });
-        assert!(!asked.get());
     }
 
     /// The calls (counted from 1) of `calls` that are lazy at a fresh site with probes every `probe_every`.

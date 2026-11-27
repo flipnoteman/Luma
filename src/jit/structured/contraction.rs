@@ -133,12 +133,6 @@ pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, l
     Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage))
 }
 
-/// Whether the product is one the padded strategy `GemmNarrowN` takes. Pure (no graph is read, nothing happens): the lazy sites ask it
-/// before they decide, because that strategy returns a lazy view and has no lazy form (W2-GEMM part B retires it).
-pub(crate) fn narrow_n_fits(view: &ContractionView<'_>, ctx: &Context) -> bool {
-    ctx.caps().contains(Caps::GEMM_TILES) && fits_narrow_n(&Subject::Contraction(view), ctx, &Residencies::DEVICE).is_some()
-}
-
 /// Whether the host strategy takes the product (a small one, on a backend whose memory the host reads). Pure.
 pub(crate) fn host_fits(view: &ContractionView<'_>, ctx: &Context) -> bool {
     ctx.caps().contains(Caps::HOST_PATH) && fits_host(&Subject::Contraction(view), ctx, &Residencies::DEVICE).is_some()
