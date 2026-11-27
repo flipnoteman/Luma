@@ -492,19 +492,35 @@ impl Walk {
 /// What of the environment decides how a graph is planned (see [`JitState::plan_epoch`] for the
 /// settings that only tests change).
 pub(super) fn stamp(jit: &JitState, ctx: &Context) -> u64 {
-    let mut mix = Mix::new(jit.plan_epoch.load(Ordering::Relaxed));
-    mix.word(jit.max_nodes() as u64);
-    mix.word(jit.max_inputs() as u64);
-    mix.word(jit.max_live(ctx.tuning()) as u64);
-    mix.word(jit.max_inlined(ctx.tuning()) as u64);
-    mix.word(u64::from(ctx.fast_math()));
     // The cost model decides where expressions are cut and what is stored (it is measured when
     // the context opens, or set by tests).
     let cost = ctx.cost_model();
-    for number in [cost.launch_us, cost.bandwidth_gbs, cost.f32_ops_per_ns, cost.df32_factor, cost.f64_factor.unwrap_or(-1.0)] {
-        mix.word(number.to_bits());
+    let words = [
+        jit.plan_epoch.load(Ordering::Relaxed),
+        jit.max_nodes() as u64,
+        jit.max_inputs() as u64,
+        jit.max_live(ctx.tuning()) as u64,
+        jit.max_inlined(ctx.tuning()) as u64,
+        u64::from(ctx.fast_math()),
+        cost.launch_us.to_bits(),
+        cost.bandwidth_gbs.to_bits(),
+        cost.f32_ops_per_ns.to_bits(),
+        cost.df32_factor.to_bits(),
+        cost.f64_factor.unwrap_or(-1.0).to_bits(),
+    ];
+    // The words change when a setting does, not from one call to the next: the last stamp stays while they are the same.
+    if let Some((known, stamp)) = STAMP.get()
+        && known == words
+    {
+        return stamp;
     }
-    mix.a ^ mix.b
+    let mut mix = Mix::new(words[0]);
+    for &word in &words[1..] {
+        mix.word(word);
+    }
+    let stamp = mix.a ^ mix.b;
+    STAMP.set(Some((words, stamp)));
+    stamp
 }
 
 /// Whether evaluations of `ctx` may use the cache now (the cheapest checks first: this runs for
@@ -519,6 +535,8 @@ pub(super) fn usable(jit: &JitState, ctx: &Context) -> bool {
 }
 
 thread_local! {
+    /// The words of the last [`stamp`] of this thread and what they made.
+    static STAMP: Cell<Option<([u64; 11], u64)>> = const { Cell::new(None) };
     /// Which recordings this thread has under way: [`WALKING`] and [`TAPING`].
     static RECORDING: Cell<u8> = const { Cell::new(0) };
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
