@@ -83,8 +83,13 @@ fn a_block_of_a_stored_matrix_is_read_in_place() {
         let b = window(&s.b_data, b_dims[0], (b_at.0, n), (b_at.1, k));
         let want = host(&a, &b, k, m, n);
         if ctx.profiling_supported() {
-            // (The arrays the closure builds are dropped before the profile ends: it computes the lazy arrays still alive.)
-            let (c, profile) = ctx.profile(product).unwrap();
+            // (The product is evaluated by itself: the profile ends by computing the lazy arrays still alive, and a lazy product holds its operands.)
+            let (c, profile) = ctx.profile(|| {
+            let c = product();
+            c.eval().unwrap();
+            c
+        })
+        .unwrap();
             assert_eq!(profile.launches(), 1, "{a_at:?} {b_at:?}: {profile}");
             close(&c.to_vec().unwrap(), &want, k, "block times block");
         } else {
@@ -116,7 +121,12 @@ fn a_transposed_block_is_read_in_place() {
     let b = transpose(&window(&b_data, b_dims[0], (b_at.0, k), (b_at.1, n)), k, n);
     let want = host(&a, &b, k, m, n);
     if ctx.profiling_supported() {
-        let (c, profile) = ctx.profile(product).unwrap();
+        let (c, profile) = ctx.profile(|| {
+            let c = product();
+            c.eval().unwrap();
+            c
+        })
+        .unwrap();
         assert_eq!(profile.launches(), 1, "{profile}");
         close(&c.to_vec().unwrap(), &want, k, "transposed blocks");
     } else {
@@ -139,7 +149,12 @@ fn a_block_of_a_view_of_a_block() {
     let b = window(&s.b_data, b_dims[0], (1 + 3, n), (3 + 2, k));
     let want = host(&a, &b, k, m, n);
     if ctx.profiling_supported() {
-        let (c, profile) = ctx.profile(product).unwrap();
+        let (c, profile) = ctx.profile(|| {
+            let c = product();
+            c.eval().unwrap();
+            c
+        })
+        .unwrap();
         assert_eq!(profile.launches(), 1, "{profile}");
         close(&c.to_vec().unwrap(), &want, k, "block of a block");
     } else {
