@@ -172,6 +172,39 @@ fn big(h: &mut Harness, cpu: &luma::Context) {
     }
 }
 
+/// Spilled operands: a context whose budget holds two and a half segments, a pair of arrays that the fillers push to host memory,
+/// and the result of a host-exact program over them. Compare with `LUMA_HOST_EXEC=off` (upload and run).
+fn spilled(h: &mut Harness) {
+    if h.ctx.is_cpu() {
+        return;
+    }
+    let mibs: &[usize] = if h.quick { &[16] } else { &[16, 64] };
+    for &mib in mibs {
+        let seg = (mib as u64) << 20;
+        let options = luma::ContextOptions::from_env().chunk_bytes(seg).memory_budget(seg * 5 / 2);
+        let Ok(ctx) = luma::Context::with_options(options) else { continue };
+        let n = (seg / 4) as usize;
+        let xh = values(n, 24, 0.5, 1.5);
+        let yh = values(n, 25, 0.5, 1.5);
+        let want: Vec<f32> = xh.iter().zip(&yh).map(|(x, y)| (x - y).abs()).collect();
+        let run = || {
+            let a = A::from_slice_on(&ctx, &xh, n).unwrap();
+            let b = A::from_slice_on(&ctx, &yh, n).unwrap();
+            let f1 = A::from_slice_on(&ctx, &xh, n).unwrap();
+            let f2 = A::from_slice_on(&ctx, &yh, n).unwrap();
+            force(&f1);
+            force(&f2);
+            let c = (&a - &b).abs();
+            force(&c);
+            c
+        };
+        check("hostexec/spilled_map", &run().to_vec().unwrap()[..1024], &want[..1024], 0.0, 0.0);
+        h.transfer_case("hostexec/spilled_map", &format!("{mib}MiB"), Work::Bytes(12.0 * n as f64), &mut || {
+            std::hint::black_box(run());
+        });
+    }
+}
+
 pub fn run(h: &mut Harness) {
     h.guarded("hostexec", |h| {
         let cpu = match luma::Context::cpu() {
@@ -183,5 +216,6 @@ pub fn run(h: &mut Harness) {
         };
         small(h, &cpu);
         big(h, &cpu);
+        spilled(h);
     });
 }
