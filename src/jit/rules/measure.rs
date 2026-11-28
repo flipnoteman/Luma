@@ -129,7 +129,6 @@ pub(crate) fn estimate(form: &Comprehension, models: &Models) -> f64 {
     let out: f64 = form.output.dim_of_axis.iter().flatten().map(|&d| form.space[usize::from(d)].extent as f64).product();
     let epilogue = match &form.epilogue {
         Epilogue::None => 0.0,
-        Epilogue::Steps(finish) => out * finish.epilogue.steps().count() as f64,
         Epilogue::Program(program) => out * program.instrs.iter().map(|instr| op_weight(&instr.op, cost)).sum::<f64>(),
     };
     let flops = space * (body + combiner_weight(form) + prologues) + epilogue;

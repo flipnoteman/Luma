@@ -8,7 +8,7 @@ use smallvec::{smallvec, SmallVec};
 
 use super::map::{AffineMap, AffineRow, MapRef};
 use super::{Access, Body, CombineOp, CombinePart, Combiner, Comprehension, Dim, DimKind, Epilogue, FormError, OpTag, Origin, OutMap, Props, MAX_DIMS};
-use crate::builtin::{BinOp, CmpOp, Finish, ReduceList, ReduceOp, UnOp};
+use crate::builtin::{BinOp, CmpOp, ReduceList, ReduceOp, UnOp};
 use crate::image::window::Op as WindowOp;
 use crate::image::{Border, ConvSpec};
 use crate::jit::program::{Instr, Ref};
@@ -595,12 +595,6 @@ impl Comprehension {
         let mut form = Comprehension::window_form(geom, layout, inputs, body, &[CombinePart::Add, CombinePart::Add], ty, OpTag::Window(WindowOp::Bilateral));
         form.epilogue = program(|asm| asm.binary(BinOp::Div, ty, Ref::Input(0), Ref::Input(1)));
         Ok(form)
-    }
-
-    /// The form of a reduction with a finished value: `self` with the steps of `finish` as its epilogue (what `fuse_step` makes).
-    pub(crate) fn with_steps(mut self, finish: Finish) -> Comprehension {
-        self.epilogue = if finish.epilogue.is_empty() { Epilogue::None } else { Epilogue::Steps(finish) };
-        self
     }
 }
 

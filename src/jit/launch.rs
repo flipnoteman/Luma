@@ -9,7 +9,8 @@ use luma_core::Buffer;
 use crate::array::{Failure, Storage};
 use crate::gpu_type::ElemLayout;
 use crate::gpu::pager::Pin;
-use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp};
+use crate::builtin::{Builtin, GateId, ReduceList, ReduceOp};
+use crate::jit::structured::epilogue::{EpiId, EpiProgram};
 use crate::context::{RawArg, Scratch};
 use super::structured::emit::Emit;
 use super::structured::strategy::PassMode;
@@ -1907,11 +1908,11 @@ impl Runs {
 /// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
 /// there are per op, or `None` if the node has already been evaluated or is better evaluated
 /// first (reduce its buffer instead). With one segment and one group per op the partials are
-/// the final values and are written into `target` when it is given; `finish` is applied to them
+/// the final values and are written into `target` when it is given; the epilogue `epi` is applied to them
 /// then, inside the pass (the caller sees that this happened: one segment and one group), and
 /// not otherwise. With `Tuning::single_pass_reduce` a pass of one segment and several workgroups
 /// finishes the reduction itself (see `ReduceList::single_pass`): the one partial result per op
-/// is then the final value, with `finish` applied, in `target` when it is given.
+/// is then the final value, with `epi` applied, in `target` when it is given.
 pub(crate) fn reduce_first_pass(
     emit: &mut Emit<'_>,
     mode: PassMode,
@@ -1919,7 +1920,7 @@ pub(crate) fn reduce_first_pass(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
 ) -> Result<Option<Vec<(Buffer, u32)>>, Failure> {
     if !node.is_pending() {
         return Ok(None);
@@ -1933,7 +1934,7 @@ pub(crate) fn reduce_first_pass(
     if !fused.key.inlines() && fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
         return Ok(None);
     }
-    reduce_fused(emit, mode, node.len(), fused, ops, scratch, target, finish).map(Some)
+    reduce_fused(emit, mode, node.len(), fused, ops, scratch, target, epi).map(Some)
 }
 
 /// The first pass of a reduction as canonical blocks (see [`ReduceList::blocked`]) over the expression behind `node`, ready to run a
@@ -2011,7 +2012,7 @@ pub(crate) fn reduce_blocks_slab<I: AsSeg>(
 }
 
 /// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements,
-/// applying `finish` if the pass is the last. With [`Tuning::single_pass_reduce`], one segment
+/// applying `epi` if the pass is the last. With [`Tuning::single_pass_reduce`], one segment
 /// and more than one group, the pass finishes the reduction itself (see
 /// [`ReduceList::single_pass`]) and the one partial result it returns is the final value.
 #[allow(clippy::too_many_arguments)]
@@ -2023,7 +2024,7 @@ pub(super) fn reduce_fused(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
 ) -> Result<Vec<(Buffer, u32)>, Failure> {
     let ctx = emit.ctx();
     fused.mark_fused();
@@ -2036,11 +2037,11 @@ pub(super) fn reduce_fused(
     // One segment: a pass of one group, or one that finishes itself, leaves the final values, so
     // the epilogue goes in it.
     let single_pass = mode.single(ctx) && only_groups.is_some_and(|groups| groups > 1);
-    let last = !finish.epilogue.is_empty() && only_groups == Some(1);
+    let last = epi.is_some() && only_groups == Some(1);
     if single_pass {
-        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue).single_pass());
+        key.tail = Tail::Reduce(ops.with_epilogue(EpiId::of(epi)).single_pass());
     } else if last {
-        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
+        key.tail = Tail::Reduce(ops.with_epilogue(EpiId::of(epi)));
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
@@ -2068,7 +2069,7 @@ pub(super) fn reduce_fused(
         let ids = segment_ids(shifted.as_ref(), j)?;
         let mut params = params(&key, ids, Some(n), range.start, len, None, &scalars)?;
         if last || single_pass {
-            params.to_mut().extend(finish.uniform_words());
+            params.to_mut().extend(epi.iter().flat_map(|epi| epi.words()));
         }
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
@@ -2093,7 +2094,7 @@ pub(super) fn reduce_fused(
 /// [`reduce_fused`] of one segment and one unsplit program that also stores the instructions
 /// `store_outs` in the same kernel, one new buffer each. Returns them, the buffer of partial
 /// results and how many there are (with `Tuning::single_pass_reduce` and several workgroups the
-/// pass finishes the reduction itself: one value per op, the final one). `finish` is applied
+/// pass finishes the reduction itself: one value per op, the final one). `epi` is applied
 /// inside the pass when it leaves the final values (one group, or a single pass: one partial
 /// result is returned then), which go to `target` if it is given. With a `gate` (its id and the
 /// arguments of its buffers, see `ReduceList::with_gate`) the pass also runs the gate on the
@@ -2108,7 +2109,7 @@ pub(super) fn reduce_and_store_fused(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
     gate: Option<(GateId, &[RawArg<'_>])>,
 ) -> Result<(Vec<Storage>, Buffer, u32), Failure> {
     let ctx = emit.ctx();
@@ -2127,14 +2128,14 @@ pub(super) fn reduce_and_store_fused(
     let n = len_u32(first.range(0).len())?;
     let groups = ctx.tuning().reduce_groups(n);
     let single_pass = mode.single(ctx) && groups > 1;
-    let finished = !finish.epilogue.is_empty() && (single_pass || groups == 1);
+    let finished = epi.is_some() && (single_pass || groups == 1);
     if gate.is_some() && !single_pass && groups != 1 {
         return Err(LumaError::Chunked("a gate on a reduction that does not finish in its first pass").into());
     }
     if single_pass {
-        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue).single_pass());
+        key.tail = Tail::Reduce(ops.with_epilogue(EpiId::of(epi)).single_pass());
     } else if finished {
-        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
+        key.tail = Tail::Reduce(ops.with_epilogue(EpiId::of(epi)));
     }
     if let (Some((id, _)), Tail::Reduce(list)) = (&gate, key.tail) {
         key.tail = Tail::Reduce(list.with_gate(*id));
@@ -2165,7 +2166,7 @@ pub(super) fn reduce_and_store_fused(
     };
     let mut params = params(&key, None, Some(n), first.range(0).start, len, None, &scalars)?;
     if finished {
-        params.to_mut().extend(finish.uniform_words());
+        params.to_mut().extend(epi.iter().flat_map(|epi| epi.words()));
     }
     let pins = pin_inputs(&key, &inputs, None, 0, n)?;
     let store_pins = stored.iter().map(|out| out.pin(0).map(|pin| (pin, out.segment_byte_len(0)))).collect::<Result<Vec<_>, _>>()?;
@@ -2198,7 +2199,7 @@ pub(super) fn reduce_and_store_fused(
 pub(crate) struct Member<'a> {
     pub(crate) operand: &'a Arc<Node>,
     pub(crate) ops: ReduceList,
-    pub(crate) finish: Finish,
+    pub(crate) epi: Option<&'a EpiProgram>,
 }
 
 /// What [`reduce_many`] does with the kernel it builds.
@@ -2284,8 +2285,8 @@ pub(crate) fn reduce_many(emit: &mut Emit<'_>, members: &[Member<'_>], ty: ElemT
         for &op in member.ops.as_slice() {
             ops.push(op);
             op_roots.push(u8::try_from(root_of_operand[root]).map_err(|_| LumaError::Chunked("too many roots"))?);
-            epilogues.push(member.finish.epilogue);
-            scalars_of_ops.extend(member.finish.uniform_words());
+            epilogues.push(EpiId::of(member.epi));
+            scalars_of_ops.extend(member.epi.iter().flat_map(|epi| epi.words()));
         }
     }
     let mut key = fused.key.clone();
@@ -2301,8 +2302,8 @@ pub(crate) fn reduce_many(emit: &mut Emit<'_>, members: &[Member<'_>], ty: ElemT
     let single_pass = pass.single(ctx) && groups > 1;
     let last = groups == 1;
     key.tail = Tail::Reduce(match (single_pass, last) {
-        (true, _) => first_pass.finished(Default::default()).single_pass(),
-        (false, true) => first_pass.finished(Default::default()),
+        (true, _) => first_pass.finished(EpiId::default()).single_pass(),
+        (false, true) => first_pass.finished(EpiId::default()),
         (false, false) => first_pass,
     });
     if plan_shifts(ctx, &mut key, inputs, &scalars, len)?.is_some() {
@@ -2383,7 +2384,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
         let pin = storage.pin_read(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;
         launch_1d(ctx, &core, words, &[RawArg::write(&flags, u64::from(words) * 4), RawArg::read(pin.buffer(), bytes)])?;
-        let result = crate::reduce::finish_passes(&mut Emit::now(ctx), PassMode::Auto, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;
+        let result = crate::reduce::finish_passes(&mut Emit::now(ctx), PassMode::Auto, &mut scratch, max, "u32", 4, flags, words, false, None, None)?;
         if ctx.read::<u32>(&result, 4)?.first().is_some_and(|&flag| flag != 0) {
             return Err(LumaError::NonFinite);
         }

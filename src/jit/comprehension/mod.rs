@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::builtin::{Finish, ReduceList, ReduceOp};
+use crate::builtin::{ReduceList, ReduceOp};
 use crate::gpu::hash::FxHasher;
 use crate::image::window::Op as WindowOp;
 use crate::image::ConvSpec;
@@ -180,8 +180,6 @@ pub(crate) struct Body {
 #[derive(Clone, Debug)]
 pub(crate) enum Epilogue {
     None,
-    /// Today's reduce epilogue (`reduce::Finish`), so that `fuse_step` keeps working on a comprehension value. W3-U4 adds `Program`.
-    Steps(Finish),
     /// A program over the combined values: `Ref::Input(j)` is combined part `j`, its last instruction the result (the bilateral
     /// division of the two sums, the Sobel magnitude). W3-U4 absorbs consumers into it.
     Program(Arc<EpiProgram>),
@@ -557,10 +555,6 @@ impl Comprehension {
         }
         match &self.epilogue {
             Epilogue::None => h.write_u8(0),
-            Epilogue::Steps(finish) => {
-                h.write_u8(1);
-                finish.epilogue.hash(&mut h);
-            }
             Epilogue::Program(program) => {
                 h.write_u8(2);
                 program.hash_structure(&mut h);

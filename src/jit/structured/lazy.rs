@@ -298,17 +298,16 @@ impl Structured {
         comp.meta.ty.hash(hasher);
         comp.meta.len.hash(hasher);
         match &comp.run {
-            RunState::Reduce { operand, wgsl, buffer, finish, layout, epi, .. } => {
+            RunState::Reduce { operand, wgsl, buffer, layout, epi, .. } => {
                 if let Some(geom) = comp.meta.geom {
                     [geom.n, geom.stride, geom.lines].hash(hasher);
                 }
                 wgsl.hash(hasher);
                 buffer.hash(hasher);
                 layout.is_packed().hash(hasher);
-                finish.epilogue.is_empty().hash(hasher);
                 let mut sources = SmallVec::new();
                 sources.push(Src::Node(Arc::clone(operand)));
-                // The epilogue of an axis reduction (W3-U4 D1): its structure, what it reads (the arrays, as they are read) and its scalars (as classes).
+                // The epilogue (W3-U4 D1, D2): its structure, what it reads (the arrays, as they are read) and its scalars (as classes).
                 epi.is_some().hash(hasher);
                 if let Some(program) = epi {
                     program.instrs.hash(hasher);

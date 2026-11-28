@@ -1072,7 +1072,7 @@ pub(crate) fn reduce_axis_planned(emit: &mut Emit<'_>, plan: &jit::AxisPlan, geo
     let mut run = Lines::new(emit.ctx(), &operator, "f32");
     run.emit = emit.clone();
     run.epi = epi;
-    let list = ReduceList::merged(ops, plan.roots(), &vec![crate::builtin::Epilogue::default(); ops.len()]);
+    let list = ReduceList::merged(ops, plan.roots(), &vec![crate::jit::structured::epilogue::EpiId::default(); ops.len()]);
     let result = run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs);
     emit.absorb(&run.emit);
     result

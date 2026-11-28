@@ -309,3 +309,90 @@ impl AxisEpiId {
         out
     }
 }
+
+// -- Whole reductions (W3-U4 D2) --
+
+/// The most steps (instructions) a reduction of the whole array absorbs: the limit of the `Finish` this program form replaced.
+pub(crate) const MAX_REDUCE_STEPS: usize = 4;
+
+/// The epilogue of a whole reduction in a kernel's cache key: a program over `Ref::Acc` of unary and binary `f32` operations whose
+/// binary operands are scalars (the words of the scalars are uniforms of the last pass, not part of the key), by handle, so that a
+/// [`ReduceList`](crate::builtin::ReduceList) stays a small `Copy` value. Interned by structure (see [`EpiKey`]); the default is none.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(crate) struct EpiId(Option<std::num::NonZeroU32>);
+
+#[derive(Default)]
+struct WholeEpis {
+    keys: Vec<Arc<EpiKey>>,
+    ids: crate::gpu::hash::FxMap<EpiKey, u32>,
+}
+
+static WHOLE_EPIS: std::sync::LazyLock<std::sync::Mutex<WholeEpis>> = std::sync::LazyLock::new(Default::default);
+
+impl EpiId {
+    /// The handle of `program`, none for no program.
+    pub(crate) fn of(program: Option<&EpiProgram>) -> EpiId {
+        let Some(program) = program else { return EpiId(None) };
+        let key = program.key();
+        let mut table = crate::gpu::lock(&WHOLE_EPIS);
+        if let Some(&id) = table.ids.get(&key) {
+            return EpiId(std::num::NonZeroU32::new(id));
+        }
+        table.keys.push(Arc::new(key.clone()));
+        let id = table.keys.len() as u32;
+        table.ids.insert(key, id);
+        EpiId(std::num::NonZeroU32::new(id))
+    }
+
+    pub(crate) fn is_none(self) -> bool {
+        self.0.is_none()
+    }
+
+    fn key(self) -> Option<Arc<EpiKey>> {
+        let id = self.0?.get() as usize;
+        Some(Arc::clone(&crate::gpu::lock(&WHOLE_EPIS).keys[id - 1]))
+    }
+
+    /// The fields of the `Params` uniform that hold the scalars: `e{tag}{k}: f32,` for scalar `k`.
+    pub(crate) fn fields(self, tag: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for k in 0..self.key().map_or(0, |key| key.scalars.len()) {
+            let _ = write!(out, "e{tag}{k}: f32, ");
+        }
+        out
+    }
+
+    /// WGSL statements applying the program to the `f32` expression `value` (`let {prefix}{n}` is the result of instruction `n`) and
+    /// the name of the final result (`value` if there is no program); scalar `k` is named `field(k)`.
+    pub(crate) fn statements(self, value: &str, prefix: &str, field: impl Fn(usize) -> String) -> (String, String) {
+        use std::fmt::Write;
+        let Some(key) = self.key() else { return (String::new(), value.to_owned()) };
+        let name = |arg: Ref| -> String {
+            match arg {
+                Ref::Acc => value.to_owned(),
+                Ref::Tmp(t) => format!("{prefix}{t}"),
+                Ref::Scalar(k) => field(k as usize),
+                Ref::Input(_) | Ref::Unused | Ref::Sub(_) => unreachable!("a whole reduction's epilogue reads the value, scalars and temporaries"),
+            }
+        };
+        let mut out = String::new();
+        for (n, instr) in key.instrs.iter().enumerate() {
+            let expr = match instr.op.kind {
+                OpKind::Unary(op) => crate::builtin::substitute(op.expr(), &name(instr.args[0]), ""),
+                OpKind::Binary(op) => crate::builtin::substitute(op.expr(), &name(instr.args[0]), &name(instr.args[1])),
+                _ => unreachable!("a whole reduction's epilogue has unary and binary operations"),
+            };
+            let _ = writeln!(out, "        let {prefix}{n}: f32 = {expr};");
+        }
+        let last = key.outputs.first().copied().unwrap_or(key.instrs.len() as u32 - 1);
+        (out, format!("{prefix}{last}"))
+    }
+}
+
+impl EpiProgram {
+    /// The words of the scalars (`f32` bits), in order: what a last pass is given after its fixed uniform fields.
+    pub(crate) fn words(&self) -> impl Iterator<Item = u32> + '_ {
+        self.scalars.iter().map(|scalar| scalar.words()[0])
+    }
+}

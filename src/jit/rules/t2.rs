@@ -368,7 +368,7 @@ fn run_form(ctx: &Context, form: &Comprehension, location: &'static std::panic::
     use crate::jit::structured::epilogue::EpiMap;
     use crate::jit::structured::strategy::Output;
     let Epilogue::Program(program) = &form.epilogue else { return select::execute(ctx, &Subject::Form(form, location)) };
-    if !program.uses_acc() {
+    if !super::scope::moved_into(form, program) {
         return select::execute(ctx, &Subject::Form(form, location));
     }
     let mut plain = form.clone();

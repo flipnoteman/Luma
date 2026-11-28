@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
+use crate::builtin::{BinOp, Builtin, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
 use crate::jit::structured::emit::Emit;
-use crate::jit::structured::epilogue::{self, AxisEpiId, EpiInput, EpiMap, EpiProgram, MAX_EPILOGUE_INSTRS, MAX_EPI_INPUTS, MAX_EPI_SCALARS};
+use crate::jit::structured::epilogue::{self, AxisEpiId, EpiId, EpiInput, EpiMap, EpiProgram, StepOperand, MAX_EPILOGUE_INSTRS, MAX_EPI_INPUTS, MAX_EPI_SCALARS, MAX_REDUCE_STEPS};
 use crate::profile::{Decision, DecisionSite};
 use smallvec::SmallVec;
 use crate::jit::structured::select;
@@ -32,7 +32,7 @@ use crate::shape::Shape;
 //
 // Elementwise operations with scalars on the result (`(x.sum() / n).sqrt()`) do not create
 // expressions: they extend the reduction by an epilogue that its last pass applies, so the
-// whole is as many launches as the reduction alone (see [`Array::fuse_step`]). Such a reduction
+// whole is as many launches as the reduction alone (see [`Array::absorb_epilogue`]). Such a reduction
 // shares the operand with the one it extends but never reads its buffer (which a write through
 // another array may change): if both are used they run in one kernel with the others that are
 // pending (see `jit::multireduce`), or separately where that is not possible.
@@ -109,7 +109,7 @@ impl Structured {
     }
 
     /// The form of the reduction (`None` under `LUMA_ALGEBRA=off`), built by the builder of its tag from what the value holds the
-    /// first time it is asked for and kept: the registered reader node as the one access, the steps of `finish` as the epilogue.
+    /// first time it is asked for and kept: the registered reader node as the one access, the absorbed program as the epilogue.
     /// A copy: the lock is not held while a rule or the recogniser works on it.
     pub(crate) fn form(&self, ctx: &Context) -> Option<Comprehension> {
         if !Algebra::builds_forms() {
@@ -131,17 +131,16 @@ impl Structured {
 
     fn build_form(&self) -> Comprehension {
         let comp = self.comp();
-        let RunState::Reduce { operand, finish, epi, .. } = &comp.run else { unreachable!("a reduction") };
+        let RunState::Reduce { operand, epi, .. } = &comp.run else { unreachable!("a reduction") };
         let (src, len, ty) = (Src::Node(Arc::clone(operand)), comp.meta.len, comp.meta.ty);
-        let form = match (&comp.meta.tag, comp.meta.geom) {
+        let mut form = match (&comp.meta.tag, comp.meta.geom) {
             (OpTag::Reduce(ops), None) => Comprehension::reduce(src, len, *ops, ty),
             (OpTag::Dot, None) => Comprehension::dot(src, len, ty),
             (OpTag::ReduceAxis(ops), Some(geom)) => Comprehension::reduce_axis(src, geom, ops.as_slice()[0], ty),
             (tag, geom) => unreachable!("a structured value is a reduction, not {tag:?} over {geom:?}"),
         };
-        let mut form = form.with_steps(*finish);
         if let Some(program) = epi {
-            // The epilogue of an axis reduction (`Ref::Acc` is the value of the line): a form with an epilogue is not lowered by the rules.
+            // The epilogue (`Ref::Acc` is the value of the reduction, or of the line of an axis reduction): a form with an epilogue is not lowered by the rules.
             form.epilogue = crate::jit::comprehension::Epilogue::Program(Arc::clone(program));
         }
         // The guarantee of 07 §4.1: an API form is well formed and of the class its tag says.
@@ -160,7 +159,7 @@ impl Structured {
         wgsl
     }
 
-    /// The epilogue of an axis reduction (see [`RunState::Reduce`]).
+    /// The epilogue of the reduction (see [`RunState::Reduce`]).
     pub(crate) fn epi(&self) -> Option<&Arc<EpiProgram>> {
         let RunState::Reduce { epi, .. } = &self.comp().run else { return None };
         epi.as_ref()
@@ -168,12 +167,7 @@ impl Structured {
 
     /// Whether this is an axis reduction that applies an absorbed epilogue.
     pub(crate) fn has_epilogue(&self) -> bool {
-        self.epi().is_some()
-    }
-
-    pub(crate) fn finish(&self) -> Finish {
-        let RunState::Reduce { finish, .. } = &self.comp().run else { unreachable!("a reduction") };
-        *finish
+        self.is_axis() && self.epi().is_some()
     }
 
     pub(crate) fn layout(&self) -> ElemLayout {
@@ -184,10 +178,10 @@ impl Structured {
     /// What a kernel that reduces `operand` itself needs to run this reduction (see
     /// `jit::until::force_with_record`): the operand, the ops, what is applied to their values.
     /// `None` unless it is a reduction of `f32`s that has not been recorded, and has not failed.
-    pub(crate) fn fusable(&self) -> Option<(&Arc<Node>, ReduceList, Finish)> {
+    pub(crate) fn fusable(&self) -> Option<(&Arc<Node>, ReduceList, Option<&EpiProgram>)> {
         let comp = self.comp();
-        let RunState::Reduce { operand, wgsl, finish, .. } = &comp.run else { return None };
-        (comp.meta.tag.is_whole_reduce() && *wgsl == "f32" && comp.meta.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then(|| (operand, self.ops(), *finish))
+        let RunState::Reduce { operand, wgsl, epi, .. } = &comp.run else { return None };
+        (comp.meta.tag.is_whole_reduce() && *wgsl == "f32" && comp.meta.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then(|| (operand, self.ops(), epi.as_deref()))
     }
 
     /// Whether this reduction may be recorded together with others: a plain `f32`, `u32` or `i32` reduction of an
@@ -291,7 +285,7 @@ impl Structured {
     pub(crate) fn record_merged(&self, emit: &mut Emit<'_>, partners: &[Arc<Structured>]) -> Option<Arc<Storage>> {
         let ctx = emit.ctx();
         let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
-        let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), finish: reduced.finish() }).collect();
+        let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), epi: reduced.epi().map(|epi| &**epi) }).collect();
         let ahead = || self.build_ahead(ctx, partners);
         let deferred = std::cell::Cell::new(false);
         let pack = match jit::reduce_many(emit, &members, self.ty(), ctx.tuning().reduce_multi, PassMode::Auto, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
@@ -347,7 +341,7 @@ impl Structured {
                 continue;
             }
             let members: Vec<jit::Member<'_>> =
-                std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), finish: reduced.finish() }).collect();
+                std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: reduced.operand(), ops: reduced.ops(), epi: reduced.epi().map(|epi| &**epi) }).collect();
             // A program that does not fit is left to the reductions' own turn.
             let _ = jit::reduce_many(&mut Emit::now(ctx), &members, seed.ty(), ctx.tuning().reduce_multi, PassMode::Auto, jit::ManyMode::BuildOnly);
         }
@@ -417,7 +411,7 @@ impl Structured {
     pub(crate) fn record_canonical(&self, emit: &mut Emit<'_>, strategy: StrategyId, params: Params) -> std::result::Result<Arc<Storage>, Failure> {
         let ctx = emit.ctx();
         let comp = self.comp();
-        let RunState::Reduce { operand, wgsl, elem, layout, finish, .. } = &comp.run else { unreachable!("a reduction") };
+        let RunState::Reduce { operand, wgsl, elem, layout, epi, .. } = &comp.run else { unreachable!("a reduction") };
         let ops = self.ops();
         let result = Arc::new(Storage::new(ctx, ops.as_slice().len(), *layout));
         let array = Array::<u32>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
@@ -426,7 +420,7 @@ impl Structured {
             None => None,
         };
         let origin = jit::split::Origin::Structured { value: ctx.jit().registered(self), strategy, params };
-        let spec = jit::split::Spec { ops, wgsl, cell: *elem, finish: *finish };
+        let spec = jit::split::Spec { ops, wgsl, cell: *elem, epi: epi.clone() };
         jit::split::record_reduction(ctx, fused, || array.storage().map(Arc::clone), spec, &result, jit::split::deferred_reduction(ctx), origin, (self.name, self.location))?;
         Ok(result)
     }
@@ -435,13 +429,13 @@ impl Structured {
     pub(crate) fn record_alone(&self, emit: &mut Emit<'_>, mode: PassMode, bits: bool) -> std::result::Result<Arc<Storage>, Failure> {
         let ctx = emit.ctx();
         let comp = self.comp();
-        let RunState::Reduce { operand, wgsl, elem, layout, finish, .. } = &comp.run else { unreachable!("a reduction") };
+        let RunState::Reduce { operand, wgsl, elem, layout, epi, .. } = &comp.run else { unreachable!("a reduction") };
         let ops = self.ops();
         let storage = Arc::new(Storage::new(ctx, ops.as_slice().len(), *layout));
         let pin = storage.pin(0)?;
         let array = Array::<u32>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
         let mut scratch = emit.scratch();
-        reduce_into(emit, &array, bits, *elem, wgsl, ops, mode, &mut scratch, Some(pin.buffer()), *finish)?;
+        reduce_into(emit, &array, bits, *elem, wgsl, ops, mode, &mut scratch, Some(pin.buffer()), epi.as_deref())?;
         Ok(storage)
     }
 
@@ -546,9 +540,9 @@ impl Structured {
                 return Ok(values);
             }
         }
-        let RunState::Reduce { operand, wgsl, buffer, finish, .. } = &comp.run else { unreachable!("a reduction") };
+        let RunState::Reduce { operand, wgsl, buffer, epi, .. } = &comp.run else { unreachable!("a reduction") };
         let array = Array::<T>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
-        reduce_array(&array, wgsl, self.ops(), *finish, !*buffer)
+        reduce_array(&array, wgsl, self.ops(), epi.as_deref(), !*buffer)
     }
 }
 
@@ -646,7 +640,7 @@ impl Array<bool> {
         let storage = Arc::new(Storage::new(ctx, 1, R::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(&mut Emit::now(ctx), self, true, R::LAYOUT.stride() as u64, "u32", ReduceList::new(&[op]), PassMode::Auto, &mut scratch, Some(pin.buffer()), Finish::default())?;
+        reduce_into(&mut Emit::now(ctx), self, true, R::LAYOUT.stride() as u64, "u32", ReduceList::new(&[op]), PassMode::Auto, &mut scratch, Some(pin.buffer()), None)?;
         Ok(Array::from_storage(ctx, Shape::from(1usize), storage))
     }
 
@@ -754,7 +748,7 @@ impl<T: ScalarType> Array<T> {
                 Family::Comprehension(Comp {
                     form: Mutex::new(None),
                     meta: Meta { ty, len, tag, geom: None, launch: Launch::Now },
-                    run: RunState::Reduce { operand: reader, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
+                    run: RunState::Reduce { operand: reader, wgsl, elem, layout: T::LAYOUT, buffer, epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
                 }),
                 ctx.recording_here(),
                 name,
@@ -768,7 +762,7 @@ impl<T: ScalarType> Array<T> {
         let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(&mut Emit::now(ctx), self, T::LAYOUT.is_packed(), elem, wgsl, ops, PassMode::Auto, &mut scratch, Some(pin.buffer()), Finish::default())?;
+        reduce_into(&mut Emit::now(ctx), self, T::LAYOUT.is_packed(), elem, wgsl, ops, PassMode::Auto, &mut scratch, Some(pin.buffer()), None)?;
         Ok(Array::from_storage(ctx, shape, storage))
     }
 
@@ -805,7 +799,7 @@ impl<T: ScalarType> Array<T> {
                 let comp = Comp {
                     form: Mutex::new(None),
                     meta: Meta { ty: ElemTy::F32, len: reader.len(), tag: OpTag::ReduceAxis(ops), geom: Some(geom), launch: Launch::Now },
-                    run: RunState::Reduce { operand: Arc::clone(&reader), wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, finish: Finish::default(), epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
+                    run: RunState::Reduce { operand: Arc::clone(&reader), wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
                 };
                 let reduced = Arc::new(Structured::new(Family::Comprehension(comp), false, name, location));
                 ctx.jit().register_reduction(&reduced);
@@ -815,42 +809,47 @@ impl<T: ScalarType> Array<T> {
         Some(arrays)
     }
 
-    /// This array, a reduction that has not been recorded yet, extended by `step` (with the
-    /// value `word` of its scalar operand, as `f32` bits), as an array of `O`; `None` if the
-    /// step cannot run inside the reduction's last pass: the array is not such a reduction of
-    /// `f32`, or it has run or failed, or it has [`MAX_EPILOGUE`] steps already.
-    pub(crate) fn fuse_step<O: ScalarType>(&self, step: EpilogueStep, word: u32) -> Option<Array<O>> {
+    /// This array, a reduction that has not been recorded yet, extended by the elementwise operation `kind` (with the scalar operand
+    /// of `operand`, if it is binary) as an array of `O`: a derived reduction whose last pass applies the operation (W3-U4 §A, the
+    /// reduction case of the absorption of an epilogue). `None` if the operation cannot run inside the reduction's last pass: the
+    /// array is not such a reduction of `f32`, or it has run or failed, or it has [`MAX_REDUCE_STEPS`] steps already, or the operation
+    /// needs a helper function. An axis reduction takes it as [`Array::absorb_axis`] says.
+    pub(crate) fn absorb_epilogue<O: ScalarType>(&self, kind: OpKind, operand: StepOperand) -> Option<Array<O>> {
         let reduced = self.structured()?;
         if reduced.is_axis() {
-            return match step {
-                EpilogueStep::Unary(op) => self.absorb_axis(reduced, OpKind::Unary(op), true, AxisRhs::None),
-                EpilogueStep::Binary { op, scalar_left } => self.absorb_axis(reduced, OpKind::Binary(op), !scalar_left, AxisRhs::Scalar(word)),
+            let (acc_left, rhs) = match operand {
+                StepOperand::None => (true, AxisRhs::None),
+                StepOperand::Scalar { value, scalar_left } => (!scalar_left, AxisRhs::Scalar(value.words()[0])),
+                StepOperand::Input(_) => return None,
             };
+            return self.absorb_axis(reduced, kind, acc_left, rhs);
         }
         let comp = reduced.comp();
-        let RunState::Reduce { operand, wgsl, elem, layout, buffer, finish, .. } = &comp.run else { return None };
+        let RunState::Reduce { operand: node, wgsl, elem, layout, buffer, epi, .. } = &comp.run else { return None };
         if !comp.meta.tag.is_whole_reduce() || *wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
             return None;
         }
-        if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
+        if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || matches!(kind, OpKind::Unary(UnOp::Id)) {
             return None;
         }
-        let helper = match step {
-            EpilogueStep::Unary(op) => op.needs_helper(),
-            EpilogueStep::Binary { op, .. } => op.needs_helper() || op == BinOp::Mod,
+        let helper = match kind {
+            OpKind::Unary(op) => op.needs_helper(),
+            OpKind::Binary(op) => op.needs_helper() || op == BinOp::Mod,
+            _ => return None,
         };
         if helper {
             return None;
         }
-        let mut finish = *finish;
-        let at = finish.epilogue.steps().count();
-        finish.epilogue = finish.epilogue.then(step)?;
-        debug_assert!(at < MAX_EPILOGUE);
-        finish.words[at] = word;
+        let step = EpiProgram::step(kind, operand);
+        let program = match epi {
+            Some(program) if program.instrs.len() < MAX_REDUCE_STEPS => program.then(&step)?,
+            Some(_) => return None,
+            None => step,
+        };
         let derived = Comp {
             form: Mutex::new(None),
             meta: Meta { ty: comp.meta.ty, len: comp.meta.len, tag: comp.meta.tag.clone(), geom: None, launch: Launch::Now },
-            run: RunState::Reduce { operand: Arc::clone(operand), wgsl, elem: *elem, layout: *layout, buffer: *buffer, finish, epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
+            run: RunState::Reduce { operand: Arc::clone(node), wgsl, elem: *elem, layout: *layout, buffer: *buffer, epi: Some(Arc::new(program)), solo: AtomicBool::new(false), pack: OnceLock::new() },
         };
         let derived = Arc::new(Structured::new(Family::Comprehension(derived), self.context().recording_here(), reduced.name, reduced.location));
         self.context().jit().register_reduction(&derived);
@@ -878,7 +877,7 @@ impl<T: ScalarType> Array<T> {
     pub(crate) fn absorb_axis<O: ScalarType>(&self, reduced: &Arc<Structured>, kind: OpKind, acc_left: bool, rhs: AxisRhs<'_, T>) -> Option<Array<O>> {
         let ctx = self.context();
         let comp = reduced.comp();
-        let RunState::Reduce { operand, wgsl, elem, layout, buffer, finish, epi, .. } = &comp.run else { return None };
+        let RunState::Reduce { operand, wgsl, elem, layout, buffer, epi, .. } = &comp.run else { return None };
         if *wgsl != "f32"
             || comp.meta.ty != ElemTy::F32
             || !reduced.is_unforced()
@@ -964,7 +963,6 @@ impl<T: ScalarType> Array<T> {
                 elem: *elem,
                 layout: *layout,
                 buffer: *buffer,
-                finish: *finish,
                 epi: Some(Arc::new(program)),
                 solo: AtomicBool::new(false),
                 pack: OnceLock::new(),
@@ -1061,7 +1059,7 @@ impl Reduction {
 
 fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, ops: [Reduction; N]) -> Result<[T; N]> {
     const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
-    let values = reduce_array(array, wgsl, ReduceList::new(&ops.map(Reduction::op)), Finish::default(), true)?;
+    let values = reduce_array(array, wgsl, ReduceList::new(&ops.map(Reduction::op)), None, true)?;
     let mut out = [T::zeroed(); N];
     for (slot, value) in out.iter_mut().zip(values) {
         *slot = value;
@@ -1071,24 +1069,24 @@ fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, op
 
 /// Reduces the whole array on the GPU, once per op of `ops`: the first pass leaves at most
 /// `Tuning::reduce_max_groups` partial results per op, the next one workgroup's worth of them,
-/// until one element per op is left; those are read back together, with `finish` applied.
+/// until one element per op is left; those are read back together, with `epi` applied.
 /// The first pass reads the data once for all ops; if the array is a pending lazy expression, it
 /// computes it on the fly instead of reading a materialized buffer. `wgsl` is the WGSL type of
 /// the elements; for vectors (which are never lazy) the operations act on every component
-/// separately. A reduction without `finish` of an expression may be answered by the speculation
+/// separately. A reduction without `epi` of an expression may be answered by the speculation
 /// of [`crate::jit`] if `speculate`. Synchronizes.
-fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Result<Vec<T>> {
+fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, epi: Option<&EpiProgram>, speculate: bool) -> Result<Vec<T>> {
     let ctx = array.context();
     let elem = T::LAYOUT.stride() as u64;
     let bits = T::LAYOUT.is_packed();
     let count = ops.as_slice().len() as u64;
     // The results of a bit-packed type are the words of a one-element array (see `Structured`).
     debug_assert!(!bits || count == 1);
-    if let Some(values) = speculated(array, wgsl, ops, finish, speculate) {
+    if let Some(values) = speculated(array, wgsl, ops, epi, speculate) {
         return values;
     }
     let mut scratch = Scratch::new(ctx);
-    let current = reduce_into(&mut Emit::now(ctx), array, bits, elem, wgsl, ops, PassMode::Auto, &mut scratch, None, finish)?;
+    let current = reduce_into(&mut Emit::now(ctx), array, bits, elem, wgsl, ops, PassMode::Auto, &mut scratch, None, epi)?;
     let values = T::from_repr(ctx.read::<T::Repr>(&current, elem * count)?, count as usize);
     if values.len() as u64 != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
@@ -1097,15 +1095,15 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
 }
 
 /// The values of the reduction of `array` that the speculation of [`crate::jit`] has ready (see [`reduce_array`]), if it has.
-fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Option<Result<Vec<T>>> {
+fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, epi: Option<&EpiProgram>, speculate: bool) -> Option<Result<Vec<T>>> {
     let elem = T::LAYOUT.stride() as u64;
     let bits = T::LAYOUT.is_packed();
     let count = ops.as_slice().len();
     if let Some(node) = array.pending()
         && speculate
-        && finish.epilogue.is_empty()
+        && epi.is_none()
         && matches!(wgsl, "f32" | "u32")
-        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(&mut Emit::now(array.context()), array, bits, elem, wgsl, ops, PassMode::Auto, scratch, None, finish))
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(&mut Emit::now(array.context()), array, bits, elem, wgsl, ops, PassMode::Auto, scratch, None, epi))
     {
         return Some(words.map(|words| T::from_repr(bytemuck::cast_slice(&words).to_vec(), count)));
     }
@@ -1113,7 +1111,7 @@ fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList,
 }
 
 /// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
-/// op is left, and returns the buffer holding them. The last pass applies `finish`. A first pass
+/// op is left, and returns the buffer holding them. The last pass applies `epi`. A first pass
 /// over more than one workgroup's share is one launch that also finishes the reduction with
 /// [`Tuning::single_pass_reduce`] (see [`ReduceList::single_pass`]).
 #[allow(clippy::too_many_arguments)]
@@ -1128,9 +1126,9 @@ pub(crate) fn finish_passes(
     n: u32,
     per_op: bool,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
 ) -> Result<luma_core::Buffer> {
-    finish_passes_gated(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish, None)
+    finish_passes_gated(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, epi, None)
 }
 
 /// [`finish_passes`] where the last pass also runs a gate (its id and the arguments of its
@@ -1148,16 +1146,16 @@ pub(crate) fn finish_passes_gated(
     n: u32,
     per_op: bool,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
     gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
 ) -> Result<luma_core::Buffer> {
-    let mut scalars = [0u32; MAX_EPILOGUE];
+    let mut scalars = [0u32; MAX_REDUCE_STEPS];
     let mut used = 0;
-    for word in finish.uniform_words() {
+    for word in epi.iter().flat_map(|epi| epi.words()) {
         scalars[used] = word;
         used += 1;
     }
-    passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish.epilogue, &scalars[..used], gate)
+    passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, EpiId::of(epi), &scalars[..used], gate)
 }
 
 /// [`finish_passes`] for the partial results of a first pass of a [merged](ReduceList::merged)
@@ -1175,7 +1173,7 @@ pub(crate) fn finish_passes_merged(
     target: &luma_core::Buffer,
     scalars: &[u32],
 ) -> Result<luma_core::Buffer> {
-    passes(emit, PassMode::Auto, scratch, ops, wgsl, elem, current, n, true, Some(target), Epilogue::default(), scalars, None)
+    passes(emit, PassMode::Auto, scratch, ops, wgsl, elem, current, n, true, Some(target), EpiId::default(), scalars, None)
 }
 
 /// The passes of [`finish_passes`]: the last one applies `epilogue` (the epilogues of a merged list)
@@ -1193,7 +1191,7 @@ fn passes(
     mut n: u32,
     mut per_op: bool,
     target: Option<&luma_core::Buffer>,
-    epilogue: Epilogue,
+    epilogue: EpiId,
     scalars: &[u32],
     gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
 ) -> Result<luma_core::Buffer> {
@@ -1222,7 +1220,7 @@ fn passes(
         let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
         // The uniform: `n`; the double-float pass has a second field, the guard of its arithmetic
         // (always 0); the last pass the scalars of the epilogue.
-        let mut words = [0u32; 2 + MAX_ACCS * MAX_EPILOGUE];
+        let mut words = [0u32; 2 + MAX_ACCS * MAX_REDUCE_STEPS];
         words[0] = n;
         let mut used = if wgsl == "df32" { 2 } else { 1 };
         if last {
@@ -1266,7 +1264,7 @@ fn passes(
 
 /// The reduction of `array` as a buffer holding one element per op; see [`reduce_array`]. `elem`
 /// is the size of an element in bytes. The values end up in `target` when it is given (a buffer
-/// of at least `elem` bytes per op), without any copy. `finish` is applied by the last pass.
+/// of at least `elem` bytes per op), without any copy. `epi` is applied by the last pass.
 /// With `bits` the array holds bit-packed `bool`s: an evaluated one is reduced a word at a time
 /// (see [`Builtin::ReduceBits`]) by the one op of `ops`.
 #[allow(clippy::too_many_arguments)]
@@ -1280,7 +1278,7 @@ fn reduce_into<T: GpuType>(
     mode: PassMode,
     scratch: &mut Scratch<'_>,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
 ) -> Result<luma_core::Buffer> {
     let count = ops.as_slice().len() as u64;
     if emit.ctx().split_mode() != jit::split::SplitMode::Off
@@ -1288,14 +1286,14 @@ fn reduce_into<T: GpuType>(
         && !ops.as_slice().iter().any(|op| op.is_arg())
         && jit::split::reduces_in_blocks(emit.ctx(), array.len(), T::LAYOUT)
     {
-        return reduce_in_blocks(emit, array, elem, wgsl, ops, scratch, target, finish);
+        return reduce_in_blocks(emit, array, elem, wgsl, ops, scratch, target, epi);
     }
-    let run_passes = |emit: &mut Emit<'_>, scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
-        finish_passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
+    let run_passes = |emit: &mut Emit<'_>, scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, epi: Option<&EpiProgram>| {
+        finish_passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, epi)
     };
 
     let fused = match array.pending() {
-        Some(node) => jit::reduce_first_pass(emit, mode, node, ops, scratch, target, finish).map_err(Failure::into_error)?,
+        Some(node) => jit::reduce_first_pass(emit, mode, node, ops, scratch, target, epi).map_err(Failure::into_error)?,
         None => None,
     };
     let mut results = Vec::new();
@@ -1305,8 +1303,8 @@ fn reduce_into<T: GpuType>(
             let target = target.filter(|_| partials.len() == 1);
             let single = partials.len() == 1;
             for (partial, groups) in partials {
-                // A first pass with one segment and one group applied `finish` itself.
-                let rest = if single && groups != 1 { finish } else { Finish::default() };
+                // A first pass with one segment and one group applied `epi` itself.
+                let rest = if single && groups != 1 { epi } else { None };
                 results.push(run_passes(emit, scratch, partial, groups, true, target, rest)?);
             }
         }
@@ -1318,7 +1316,7 @@ fn reduce_into<T: GpuType>(
                 let n = len_u32(storage.range(j).len())?;
                 // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
                 let pin = storage.pin_read(j)?;
-                let rest = if single { finish } else { Finish::default() };
+                let rest = if single { epi } else { None };
                 if bits {
                     let (words, groups) = bits_first_pass(emit, scratch, ops, pin.buffer(), n, target)?;
                     results.push(run_passes(emit, scratch, words, groups, true, target, rest)?);
@@ -1339,7 +1337,7 @@ fn reduce_into<T: GpuType>(
             emit.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
         }
     }
-    run_passes(emit, scratch, collect, len_u32(results.len())?, true, target, finish)
+    run_passes(emit, scratch, collect, len_u32(results.len())?, true, target, epi)
 }
 
 
@@ -1355,7 +1353,7 @@ fn reduce_in_blocks<T: GpuType>(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epi: Option<&EpiProgram>,
 ) -> Result<luma_core::Buffer> {
     let ctx = emit.ctx();
     let count = ops.as_slice().len() as u64;
@@ -1365,7 +1363,7 @@ fn reduce_in_blocks<T: GpuType>(
         None => None,
     };
     let origin = jit::split::Origin::Structured { value: None, strategy: StrategyId::REDUCE_CANONICAL_BLOCKS, params: Params::Reduce(crate::jit::structured::strategy::ReduceParams { pass: PassMode::TwoPass, groups: 1 }) };
-    jit::split::record_reduction(ctx, fused, || array.storage().map(Arc::clone), jit::split::Spec { ops, wgsl, cell: elem, finish }, &result, false, origin, ("reduce", Location::caller()))
+    jit::split::record_reduction(ctx, fused, || array.storage().map(Arc::clone), jit::split::Spec { ops, wgsl, cell: elem, epi: epi.map(|epi| Arc::new(epi.clone())) }, &result, false, origin, ("reduce", Location::caller()))
         .map_err(Failure::into_error)?;
     let pin = result.pin(0)?;
     let out = match target {

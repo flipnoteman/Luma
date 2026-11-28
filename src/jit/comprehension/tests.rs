@@ -13,6 +13,7 @@ use crate::image::{Border, ConvSpec};
 use crate::jit::structured::contraction::{ContractionAttrs, Geometry, Tf32Request};
 use crate::builtin::{BinOp, UnOp};
 use crate::jit::{AxisMap, OpKind, ViewMap};
+use std::sync::Arc;
 use crate::reduce::{AxisGeom, Reduction};
 
 fn cpu() -> Context {
@@ -623,9 +624,9 @@ fn a_step_on_a_reduction_extends_its_epilogue() {
         assert!(!Algebra::builds_forms());
         return;
     };
-    let Epilogue::Steps(finish) = &form.epilogue else { panic!("steps on the result are the epilogue") };
-    assert_eq!(finish.epilogue.steps().count(), 2);
-    assert_eq!(mean.structured().unwrap().finish().epilogue, finish.epilogue, "the value and its form say the same steps");
+    let Epilogue::Program(program) = &form.epilogue else { panic!("steps on the result are the epilogue") };
+    assert_eq!(program.instrs.len(), 2);
+    assert!(Arc::ptr_eq(mean.structured().unwrap().epi().unwrap(), program), "the value and its form say the same steps");
     assert_eq!(form.origin, Origin::Api(OpTag::Reduce(ReduceList::new(&[ReduceOp::Sum]))));
     form.validate().unwrap();
 }

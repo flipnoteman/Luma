@@ -366,11 +366,17 @@ impl Scope {
     }
 }
 
+/// Whether `program`, the epilogue of `form`, is one a rewrite moved into it (a program over `Ref::Acc`), not the absorbed epilogue
+/// of a reduction of the whole array (W3-U4 D2: its last pass applies it, and the rules never lower such a form).
+pub(super) fn moved_into(form: &Comprehension, program: &crate::jit::structured::epilogue::EpiProgram) -> bool {
+    program.uses_acc() && !matches!(&form.origin, Origin::Api(tag) if tag.is_whole_reduce())
+}
+
 /// The form without the epilogue a rewrite moved into it (a program over `Ref::Acc`): what the strategies lower, the epilogue then runs
 /// over its output as a separate pass ([`super::t2::run`]).
 pub(super) fn plain(form: &Comprehension) -> std::borrow::Cow<'_, Comprehension> {
     match &form.epilogue {
-        Epilogue::Program(program) if program.uses_acc() => {
+        Epilogue::Program(program) if moved_into(form, program) => {
             let mut plain = form.clone();
             plain.epilogue = Epilogue::None;
             std::borrow::Cow::Owned(plain)

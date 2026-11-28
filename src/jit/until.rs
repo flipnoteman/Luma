@@ -13,7 +13,7 @@ use luma_core::{Buffer, BufferUsage};
 
 use crate::array::{Array, Failure, Storage};
 use crate::gpu_type::{ElemLayout, GpuType};
-use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp, GATE_BINDINGS};
+use crate::builtin::{Builtin, GateId, ReduceList, ReduceOp, GATE_BINDINGS};
 use crate::context::{Context, RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d, len_u32, workgroups_1d};
@@ -119,7 +119,7 @@ pub(crate) fn force_with_record<T: GpuType>(
     if SEPARATE_RECORD.with(std::cell::Cell::get) {
         return None;
     }
-    let (operand, ops, finish) = record.structured()?.fusable()?;
+    let (operand, ops, epi) = record.structured()?.fusable()?;
     if ops.as_slice().len() != 1 || ctx.check_finite() || !operand.is_pending() {
         return None;
     }
@@ -164,9 +164,9 @@ pub(crate) fn force_with_record<T: GpuType>(
     let mut scratch = Scratch::new(ctx);
     let mut own = ctx.recorded();
     let first_gate = gate.as_ref().filter(|_| finishes).map(|gate| (gate.id, gate.args));
-    let (storages, partial, groups) = launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, fused, &stored, ops, &mut scratch, Some(value), finish, first_gate).ok()?;
+    let (storages, partial, groups) = launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, fused, &stored, ops, &mut scratch, Some(value), epi, first_gate).ok()?;
     // Past a first pass that did not finish (several groups, no single pass): the rest, ending in `value`.
-    let rest = if groups > 1 { finish } else { Finish::default() };
+    let rest = if groups > 1 { epi } else { None };
     let last_gate = gate.as_ref().filter(|_| !finishes).map(|gate| (gate.id, gate.args));
     if let Err(error) = finish_passes_gated(&mut Emit::now(ctx), PassMode::Auto, &mut scratch, ops, "f32", ELEMENT_BYTES, partial, groups, true, Some(value), rest, last_gate) {
         return Some(Err(Failure::New(error)));

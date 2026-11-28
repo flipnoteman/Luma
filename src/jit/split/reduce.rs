@@ -13,7 +13,8 @@ use luma_core::Buffer;
 
 use super::{defer, Open, Origin, Reach, SegRef, Space, Step, StepKernel};
 use crate::array::{Failure, Storage};
-use crate::builtin::{Builtin, Finish, ReduceList};
+use crate::builtin::{Builtin, ReduceList};
+use crate::jit::structured::epilogue::{EpiId, EpiProgram};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::jit::launch::{canonical_block, reduce_blocks_slab, BlockSource};
@@ -35,7 +36,8 @@ pub(crate) struct Blocks {
     first: First,
     /// The first pass's list (it names the block).
     ops: ReduceList,
-    finish: Finish,
+    /// The epilogue the last fold applies (a whole reduction's program, scalars only).
+    epi: Option<Arc<EpiProgram>>,
     wgsl: &'static str,
     /// Bytes of one state (of one op).
     cell: u64,
@@ -48,13 +50,13 @@ impl Blocks {
 }
 
 /// What the reduction is of, besides where its elements come from.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Spec {
     pub(crate) ops: ReduceList,
     pub(crate) wgsl: &'static str,
     /// Bytes of one value of one op.
     pub(crate) cell: u64,
-    pub(crate) finish: Finish,
+    pub(crate) epi: Option<Arc<EpiProgram>>,
 }
 
 /// Whether a reduction over `len` elements of `layout` in `ctx` is done in canonical blocks: the context splits (`LUMA_SPLIT` is not
@@ -105,7 +107,7 @@ pub(crate) fn record(
             ops = blocked;
         }
     }
-    let blocks = Blocks { first, ops, finish: spec.finish, wgsl: spec.wgsl, cell: spec.cell };
+    let blocks = Blocks { first, ops, epi: spec.epi, wgsl: spec.wgsl, cell: spec.cell };
     let step = Step {
         origin,
         class: SplitClass::Reduce,
@@ -177,7 +179,7 @@ impl<'a> Carries<'a> {
             let full = (step.space.seg_len.min(step.space.len) as u64).div_ceil(u64::from(blocks.block())) as u32;
             let slabs = step.space.slabs() as u32;
             let merge = ctx.builtin(Builtin::Reduce(blocks.ops.balanced(), true), blocks.wgsl)?;
-            let last = ctx.builtin(Builtin::Reduce(blocks.ops.balanced().with_epilogue(blocks.finish.epilogue), true), blocks.wgsl)?;
+            let last = ctx.builtin(Builtin::Reduce(blocks.ops.balanced().with_epilogue(EpiId::of(blocks.epi.as_deref())), true), blocks.wgsl)?;
             let blocks_buffer = ctx.alloc_buffer(count * u64::from(full) * blocks.cell, STORAGE_USAGE)?;
             // Pushed before the next allocation so that a failure gives both back.
             let carry = ctx.alloc_buffer(count * u64::from(slabs) * blocks.cell, STORAGE_USAGE);
@@ -254,7 +256,7 @@ impl<'a> Carries<'a> {
         if blocks.wgsl == "df32" {
             words.push(0);
         } else {
-            words.extend(blocks.finish.uniform_words());
+            words.extend(blocks.epi.iter().flat_map(|epi| epi.words()));
         }
         ctx.launch(
             &carry.last,

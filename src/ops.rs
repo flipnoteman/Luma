@@ -10,13 +10,14 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, Part, UnOp};
+use crate::builtin::{BinOp, Builtin, Class, CmpOp, Part, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
 use crate::complex::C32;
 use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::comprehension::Props;
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
+use crate::jit::structured::epilogue::StepOperand;
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
 
@@ -249,7 +250,7 @@ impl<T: ScalarType> Array<T> {
             return Ok(absorbed);
         }
         // A reduction that has not run takes the operation into its last pass.
-        if let Some(fused) = self.fuse_step::<T>(EpilogueStep::Unary(op), 0) {
+        if let Some(fused) = self.absorb_epilogue::<T>(OpKind::Unary(op), StepOperand::None) {
             return Ok(fused);
         }
         let operand = self.src()?;
@@ -425,7 +426,7 @@ impl<T: ScalarType> Array<T> {
         }
         if let Rhs::Scalar(value) = &rhs
             && let Ok(scalar) = Scalar::of(*value)
-            && let Some(fused) = self.fuse_step::<T>(EpilogueStep::Binary { op, scalar_left }, scalar.words()[0])
+            && let Some(fused) = self.absorb_epilogue::<T>(OpKind::Binary(op), StepOperand::Scalar { value: scalar, scalar_left })
         {
             return fused;
         }

@@ -37,7 +37,6 @@ mod lazy_tests;
 use super::comprehension::{Comprehension, OpTag};
 use super::{ElemTy, Node};
 use crate::array::Storage;
-use crate::builtin::Finish;
 use crate::context::Context;
 use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
@@ -122,10 +121,9 @@ pub(crate) enum RunState {
         /// Whether the operand only reads a buffer (the reduction of an array that is already evaluated), which no speculation of
         /// readbacks concerns.
         buffer: bool,
-        /// The operations applied to the reduction's values (none for a plain reduction); mirrored as the form's epilogue.
-        finish: Finish,
-        /// The epilogue of an axis reduction (W3-U4 D1): the elementwise consumers of its values that its last pass applies as it
-        /// stores them. `None` for a plain reduction and for reductions of the whole array (their `finish` is the epilogue).
+        /// The epilogue (W3-U4 D1, D2): the elementwise consumers of the reduction's values that its last pass applies as it stores
+        /// them (`Ref::Acc` is the value; for a reduction of the whole array only unary operations and operations with scalars, at
+        /// most `MAX_REDUCE_STEPS`); mirrored as the form's epilogue. `None` for a plain reduction.
         epi: Option<Arc<EpiProgram>>,
         /// Set when the group this reduction was recorded in was not recorded in one kernel because that was not due or ready (see
         /// `Tuning::reduce_multi_after`): it is recorded alone, so that the others do not form other groups.
@@ -144,8 +142,8 @@ impl std::fmt::Debug for Structured {
             Family::Comprehension(comp) => {
                 let mut debug = f.debug_struct("Structured");
                 debug.field("tag", &comp.meta.tag).field("launch", &comp.meta.launch);
-                if let RunState::Reduce { finish, .. } = &comp.run {
-                    debug.field("steps", &finish.epilogue);
+                if let RunState::Reduce { epi, .. } = &comp.run {
+                    debug.field("steps", &epi.as_ref().map(|epi| epi.instrs.len()));
                 }
                 debug.field("forced", &self.result.get().is_some()).finish()
             }

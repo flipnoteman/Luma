@@ -15,6 +15,7 @@ use luma_core::kir::{BarrierScope, BuiltinVar, FnBuilder, KernelModule, KirType,
 use luma_core::LineSolveSpec;
 
 use crate::gpu::lower::finish;
+use crate::jit::structured::epilogue::EpiId;
 use crate::jit::ElemTy;
 use crate::solve::Io;
 use crate::tuning::{Tuning, TuningProfile};
@@ -955,102 +956,6 @@ impl ReduceOp {
 /// Most reductions computed in one pass over the input.
 pub(crate) const MAX_REDUCTIONS: usize = 4;
 
-/// Most elementwise operations fused behind the reduction passes (see [`Epilogue`]).
-pub(crate) const MAX_EPILOGUE: usize = 4;
-
-/// One elementwise operation on the result of a reduction, with a scalar operand if binary.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum EpilogueStep {
-    /// `op(value)`.
-    Unary(UnOp),
-    /// `value op scalar`, or `scalar op value` if `scalar_left`.
-    Binary { op: BinOp, scalar_left: bool },
-}
-
-/// Elementwise operations on `f32` applied to every value a reduction leaves, inside its last
-/// pass: `sqrt(sum / n)` is the reduction and two steps. Only the operations are part of the
-/// kernel (a kernel cache key); the values of the scalar operands are uniforms (see [`Finish`]).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub(crate) struct Epilogue {
-    steps: [Option<EpilogueStep>; MAX_EPILOGUE],
-    len: u8,
-}
-
-impl Epilogue {
-    /// This epilogue followed by `step`, `None` if it has [`MAX_EPILOGUE`] steps already.
-    pub(crate) fn then(self, step: EpilogueStep) -> Option<Self> {
-        let at = usize::from(self.len);
-        let mut next = self;
-        *next.steps.get_mut(at)? = Some(step);
-        next.len += 1;
-        Some(next)
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The steps in order.
-    pub(crate) fn steps(&self) -> impl Iterator<Item = EpilogueStep> + '_ {
-        self.steps[..usize::from(self.len)].iter().flatten().copied()
-    }
-
-    /// The fields of the `Params` uniform that hold the scalar operands: `e{k}: f32,` for every
-    /// binary step `k`.
-    pub(crate) fn fields(&self) -> String {
-        self.fields_tagged("")
-    }
-
-    /// [`Epilogue::fields`] with `tag` between the `e` and the step's number.
-    fn fields_tagged(&self, tag: &str) -> String {
-        let mut out = String::new();
-        for (k, step) in self.steps().enumerate() {
-            if matches!(step, EpilogueStep::Binary { .. }) {
-                let _ = write!(out, "e{tag}{k}: f32, ");
-            }
-        }
-        out
-    }
-
-    /// WGSL statements applying the steps to the `f32` expression `value` (`let {prefix}{k}` is
-    /// the result of step `k`) and the name of the final result (`value` if there are none).
-    pub(crate) fn statements(&self, value: &str, prefix: &str) -> (String, String) {
-        self.statements_with(value, prefix, |k| format!("p.e{k}"))
-    }
-
-    /// [`Epilogue::statements`] with the scalar operand of binary step `k` named `field(k)`.
-    fn statements_with(&self, value: &str, prefix: &str, field: impl Fn(usize) -> String) -> (String, String) {
-        let mut out = String::new();
-        let mut last = value.to_owned();
-        for (k, step) in self.steps().enumerate() {
-            let expr = match step {
-                EpilogueStep::Unary(op) => substitute(op.expr(), &last, ""),
-                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &field(k)),
-                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &field(k), &last),
-            };
-            let _ = writeln!(out, "        let {prefix}{k}: f32 = {expr};");
-            last = format!("{prefix}{k}");
-        }
-        (out, last)
-    }
-}
-
-/// An [`Epilogue`] with the values of its scalar operands (the bit patterns of `f32`s).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Finish {
-    pub(crate) epilogue: Epilogue,
-    /// The value of the scalar of step `k`, for a binary step `k`.
-    pub(crate) words: [u32; MAX_EPILOGUE],
-}
-
-impl Finish {
-    /// The words the `Params` uniform holds after the fixed fields, in the order of
-    /// [`Epilogue::fields`].
-    pub(crate) fn uniform_words(&self) -> impl Iterator<Item = u32> + '_ {
-        self.epilogue.steps().enumerate().filter(|(_, step)| matches!(step, EpilogueStep::Binary { .. })).map(|(k, _)| self.words[k])
-    }
-}
-
 /// A gate folded into a reduction kernel: WGSL text, registered once and named in a kernel's cache
 /// key by this handle (see [`ReduceList::with_gate`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1109,14 +1014,14 @@ struct MergedSpec {
     /// first, which reduce partial results.
     roots: Vec<u8>,
     /// The epilogue of every op.
-    epilogues: Vec<Epilogue>,
+    epilogues: Vec<EpiId>,
 }
 
 /// The registered merged specs: by handle, and the handles by spec.
 #[derive(Default)]
 struct MergedSpecs {
     specs: Vec<std::sync::Arc<MergedSpec>>,
-    ids: crate::gpu::hash::FxMap<(Vec<u8>, Vec<Epilogue>), u32>,
+    ids: crate::gpu::hash::FxMap<(Vec<u8>, Vec<EpiId>), u32>,
 }
 
 static MERGED_SPECS: std::sync::LazyLock<std::sync::Mutex<MergedSpecs>> = std::sync::LazyLock::new(Default::default);
@@ -1126,7 +1031,7 @@ static MERGED_SPECS: std::sync::LazyLock<std::sync::Mutex<MergedSpecs>> = std::s
 struct MergedId(u32);
 
 impl MergedId {
-    fn intern(roots: &[u8], epilogues: &[Epilogue]) -> MergedId {
+    fn intern(roots: &[u8], epilogues: &[EpiId]) -> MergedId {
         let mut specs = crate::gpu::lock(&MERGED_SPECS);
         let key = (roots.to_vec(), epilogues.to_vec());
         if let Some(&id) = specs.ids.get(&key) {
@@ -1159,7 +1064,7 @@ pub(crate) struct ReduceList {
     len: u8,
     /// Applied to every value of the pass's output; only a pass that is the last (one group,
     /// or the last workgroup of a [single-pass](ReduceList::single_pass) kernel) has one.
-    epilogue: Epilogue,
+    epilogue: EpiId,
     /// Whether the kernel finishes the reduction itself (see [`ReduceList::single_pass`]).
     single_pass: bool,
     /// The gate the workgroup that has the final values runs on them (see [`ReduceList::with_gate`]).
@@ -1198,7 +1103,7 @@ impl ReduceList {
     }
 
     fn with_ops(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_ACCS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None, merged: None, block: 0, balanced: false };
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_ACCS], len: 0, epilogue: EpiId::default(), single_pass: false, gate: None, merged: None, block: 0, balanced: false };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
@@ -1209,7 +1114,7 @@ impl ReduceList {
     /// The ops `ops` (at most [`MAX_ACCS`]), op `j` reducing the root `roots[j]` of the kernel's
     /// program (all of one element type), with the epilogue `epilogues[j]` applied once the
     /// pass is the last (see [`ReduceList::finished`]).
-    pub(crate) fn merged(ops: &[ReduceOp], roots: &[u8], epilogues: &[Epilogue]) -> Self {
+    pub(crate) fn merged(ops: &[ReduceOp], roots: &[u8], epilogues: &[EpiId]) -> Self {
         debug_assert!(ops.len() == roots.len() && ops.len() == epilogues.len() && ops.len() <= MAX_ACCS);
         let mut list = Self::with_ops(ops);
         list.merged = Some(Merged { id: MergedId::intern(roots, epilogues), applied: false });
@@ -1265,14 +1170,14 @@ impl ReduceList {
     /// These reductions with `epilogue` applied to the results. The kernel must run as a single
     /// group (the last pass), or be [single-pass](ReduceList::single_pass): its output is the
     /// final value. Not for a [merged](ReduceList::merged) list (see [`ReduceList::finished`]).
-    pub(crate) fn with_epilogue(self, epilogue: Epilogue) -> Self {
+    pub(crate) fn with_epilogue(self, epilogue: EpiId) -> Self {
         debug_assert!(self.merged.is_none());
         ReduceList { epilogue, ..self }
     }
 
     /// This list as the last pass applying `epilogue` to every op's value: a merged list applies
     /// the epilogues it was made with instead.
-    pub(crate) fn finished(self, epilogue: Epilogue) -> Self {
+    pub(crate) fn finished(self, epilogue: EpiId) -> Self {
         match self.merged {
             Some(merged) => ReduceList { merged: Some(Merged { applied: true, ..merged }), ..self },
             None => self.with_epilogue(epilogue),
@@ -1315,29 +1220,29 @@ impl ReduceList {
     }
 
     /// The epilogue op `j` applies to its value, if this is the pass that applies it.
-    fn epilogue_of(&self, j: usize) -> Epilogue {
+    fn epilogue_of(&self, j: usize) -> EpiId {
         match self.merged {
             Some(Merged { id, applied: true }) => id.spec().epilogues[j],
-            Some(_) => Epilogue::default(),
+            Some(_) => EpiId::default(),
             None => self.epilogue,
         }
     }
 
     /// The fields of the `Params` uniform that hold the scalar operands of the epilogues, in the
-    /// order of the words the pass is given (see [`Epilogue::fields`]; op `j`'s step `k` is `e{j}_{k}` of a merged list).
+    /// order of the words the pass is given (see [`EpiId::fields`]; op `j`'s scalar `k` is `e{j}_{k}` of a merged list).
     pub(crate) fn epilogue_fields(&self) -> String {
         match self.merged {
-            None => self.epilogue.fields(),
-            Some(_) => (0..self.as_slice().len()).map(|j| self.epilogue_of(j).fields_tagged(&format!("{j}_"))).collect(),
+            None => self.epilogue.fields(""),
+            Some(_) => (0..self.as_slice().len()).map(|j| self.epilogue_of(j).fields(&format!("{j}_"))).collect(),
         }
     }
 
     /// WGSL statements applying the epilogue of op `j` to the `f32` expression `value`, and the name
-    /// of the result (see [`Epilogue::statements`]).
+    /// of the result (see [`EpiId::statements`]).
     fn epilogue_statements(&self, j: usize, value: &str, prefix: &str) -> (String, String) {
         match self.merged {
-            None => self.epilogue.statements(value, prefix),
-            Some(_) => self.epilogue_of(j).statements_with(value, prefix, |k| format!("p.e{j}_{k}")),
+            None => self.epilogue.statements(value, prefix, |k| format!("p.e{k}")),
+            Some(_) => self.epilogue_of(j).statements(value, prefix, |k| format!("p.e{j}_{k}")),
         }
     }
 }
@@ -3329,7 +3234,10 @@ mod tests {
     /// operations and without.
     #[test]
     fn reduction_kernels_validate() {
-        let sqrt = Epilogue::default().then(EpilogueStep::Unary(UnOp::Sqrt)).unwrap();
+        let sqrt = {
+            use crate::jit::structured::epilogue::{EpiProgram, StepOperand};
+            EpiId::of(Some(&EpiProgram::step(crate::jit::OpKind::Unary(UnOp::Sqrt), StepOperand::None)))
+        };
         let lists = [
             ReduceList::new(&[ReduceOp::Sum]),
             ReduceList::new(&[ReduceOp::Min]),
@@ -3344,7 +3252,7 @@ mod tests {
             let features = if subgroups { luma_core::Features::SUBGROUP } else { luma_core::Features::empty() };
             for ty in ["f32", "u32", "i32", "vec4<f32>", "df32"] {
                 for list in lists {
-                    let list = if ty == "f32" { list } else { list.with_epilogue(Epilogue::default()) };
+                    let list = if ty == "f32" { list } else { list.with_epilogue(EpiId::default()) };
                     let kernels = [
                         ("first", reduce(ty, list, false, &tuning)),
                         ("single-pass", reduce(ty, list.single_pass(), false, &tuning)),

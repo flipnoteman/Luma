@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use crate::array::{Array, Storage};
-use crate::builtin::{BinOp, Class, CmpOp, EpilogueStep, ReduceList, ReduceOp, UnOp};
+use crate::builtin::{BinOp, Class, CmpOp, ReduceList, ReduceOp, UnOp};
 use crate::context::Context;
 use crate::gpu::hash::FxMap;
 use crate::gpu_type::{ElemLayout, GpuType, ScalarType};
-use crate::jit::{AxisMap, Edge, ElemTy, Gen, Node, OpKind, Scalar, ShiftKind, Src, ViewMap};
+use crate::jit::{AxisMap, Edge, ElemTy, Gen, Node, OpKind, Ref, Scalar, ShiftKind, Src, ViewMap};
 use crate::ops::Rhs;
 use crate::jit::structured::Structured;
 use crate::shape::Shape;
@@ -711,7 +711,7 @@ pub(crate) fn reduced_fits(reduced: &Structured, ctx: &Context) -> bool {
         return false;
     }
     let ty = reduced.ty();
-    supported(ty) && (ty == ElemTy::F32 || reduced.finish().epilogue.is_empty())
+    supported(ty) && (ty == ElemTy::F32 || reduced.epi().is_none())
 }
 
 /// The words a reduction leaves (one per op; the bit of a `bool`'s word), epilogue applied.
@@ -721,17 +721,28 @@ pub(crate) fn reduced_words(reduced: &Structured, ctx: &Context) -> Option<Vec<u
     }
     let operand = reduced.operand();
     let ty = reduced.ty();
-    let finish = reduced.finish();
+    let epi = reduced.epi();
     let words = Eval::new(ctx).node(operand)?;
     let mut out = Vec::with_capacity(reduced.ops().as_slice().len());
     for &op in reduced.ops().as_slice() {
         let mut value = fold(ty, op, words.iter().copied())?;
-        for (k, step) in finish.epilogue.steps().enumerate() {
-            value = match step {
-                EpilogueStep::Unary(u) => unary(u, ElemTy::F32, value),
-                EpilogueStep::Binary { op, scalar_left: false } => binary(op, ElemTy::F32, value, finish.words[k]),
-                EpilogueStep::Binary { op, scalar_left: true } => binary(op, ElemTy::F32, finish.words[k], value),
-            };
+        if let Some(epi) = epi {
+            // A program over the value and scalars (see `Array::absorb_epilogue`): each instruction is a unary or binary operation.
+            let mut temps: Vec<u32> = Vec::with_capacity(epi.instrs.len());
+            for instr in epi.instrs.iter() {
+                let arg = |r: Ref| match r {
+                    Ref::Acc => value,
+                    Ref::Tmp(t) => temps[t as usize],
+                    Ref::Scalar(k) => epi.scalars[k as usize].words()[0],
+                    other => unreachable!("a whole reduction's epilogue reads the value, scalars and temporaries, not {other:?}"),
+                };
+                temps.push(match instr.op.kind {
+                    OpKind::Unary(u) => unary(u, ElemTy::F32, arg(instr.args[0])),
+                    OpKind::Binary(op) => binary(op, ElemTy::F32, arg(instr.args[0]), arg(instr.args[1])),
+                    _ => unreachable!("a whole reduction's epilogue has unary and binary operations"),
+                });
+            }
+            value = temps[epi.outputs.first().map_or(temps.len() - 1, |&at| at as usize)];
         }
         out.push(value);
     }
