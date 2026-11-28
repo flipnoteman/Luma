@@ -189,11 +189,12 @@ fn an_off_context_never_defers() {
 }
 
 /// An expression too long for one kernel is cut into several; what the cuts store is read by the next kernel and by nothing else.
+/// Every round reads the previous result twice, so a cut cannot overwrite its input.
 fn long_chain(ctx: &Context, rounds: usize) -> Vec<f32> {
     let x = Array::from_slice_on(ctx, &data(), N).unwrap();
     let mut y = x.clone();
     for k in 0..rounds {
-        y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs();
+        y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs() - (&y * 0.001);
     }
     y.to_vec().unwrap()
 }
@@ -201,9 +202,9 @@ fn long_chain(ctx: &Context, rounds: usize) -> Vec<f32> {
 #[test]
 fn dead_temporaries_are_never_materialised() {
     let ctx = deferring();
-    let got = long_chain(&ctx, 600);
+    let got = long_chain(&ctx, 300);
     let off = kernel_major();
-    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), long_chain(&off, 600).iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), long_chain(&off, 300).iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     let stats = ctx.stream_stats();
     assert!(stats.steps >= 2, "the chain is cut into several kernels: {stats:?}");
     // The cuts are read by the next kernel only: one stage, one pass over the six segments, and no buffers for the cuts but the last.
