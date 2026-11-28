@@ -233,3 +233,36 @@ fn a_reductions_epilogue_prints_as_its_steps_always_did() {
     let other = EpiProgram::step(OpKind::Binary(BinOp::Div), StepOperand::Scalar { value: Scalar::f32(3.0), scalar_left: true });
     assert_eq!(EpiId::of(Some(&sqrt.then(&other).unwrap())), EpiId::of(Some(&program)));
 }
+
+// -- split K (B2) --
+
+#[test]
+fn a_product_split_over_k_applies_its_epilogue_in_the_sum_kernel_with_the_bits_of_the_separate_pass() {
+    // A long K over few output tiles is cut into slices of K (summed by their own kernel); the absorbed epilogue runs there.
+    let (m, n, k) = (64usize, 64usize, 16384usize);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let real = |len: usize, seed: u64| {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / (1u64 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect::<Vec<f32>>()
+    };
+    let run = |ctx: &Context| {
+        let a = A::from_slice_on(ctx, &real(k * m, 1), [k, m]).unwrap();
+        let b = A::from_slice_on(ctx, &real(n * k, 2), [n, k]).unwrap();
+        let bias = A::from_slice_on(ctx, &real(n, 3), [n, 1]).unwrap();
+        let out = (&a.matmul(&b) + &bias).maximum(0.0);
+        (is_lazy(&out), out.to_vec().unwrap())
+    };
+    let eager = context(LazyMode::Never);
+    let (_, want) = run(&eager);
+    let ctx = context(LazyMode::Always);
+    ctx.record_decisions(true);
+    let (lazy, got) = run(&ctx);
+    assert!(lazy, "the consumers were absorbed");
+    assert_eq!(bits(&got), bits(&want));
+    assert!(epilogues(&ctx).iter().any(|d| d.chosen == "absorbed 2 ops"));
+}

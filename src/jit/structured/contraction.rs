@@ -710,12 +710,32 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
     let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, layouts) } else { 0 };
+    // Split over K: the hook cannot run per slice, the kernel that sums the slices applies the epilogue (W3-U4 B3).
+    let sides = if view.epilogue.is_some() && plan.slices > 1 {
+        match gemm_split_epilogue(ctx, view, params, sides, layouts, &plan, tri)? {
+            Err(sides) => sides,
+            Ok(lowered) => return Ok(lowered),
+        }
+    } else {
+        sides
+    };
     if let Some(program) = view.epilogue.filter(|_| takes_epilogue(params.by))
         && let Some(storage) = launch_hooked(ctx, &sides, &plan, params.geom, (layouts, tri), program)?
     {
         return Ok(Lowered::Done(Output::Epilogued(smallvec::smallvec![storage])));
     }
     done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)), None)?)
+}
+
+/// [`gemm`] of a product with an epilogue over a split `K` (W3-U4 B3), off the path of the plain product: the plain partial products
+/// and the kernel that sums them with the epilogue. `Err` gives the sides back: run as one product.
+#[cold]
+#[inline(never)]
+fn gemm_split_epilogue(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, sides: [MatmulSide; 2], layouts: [Layout; 2], plan: &Plan, tri: u32) -> Result<Result<Lowered, [MatmulSide; 2]>, Failure> {
+    if let Some(applied) = epilogue_of(view, params.geom)? {
+        return Ok(Ok(finish(launch(ctx, sides, *plan, params.geom, Some((layouts, tri)), Some(&applied))?, true)?));
+    }
+    Ok(Err(sides))
 }
 
 /// `array` in a buffer of its own whose leading dimension is a multiple of 4: zero columns appended to its first axis (an expression,
@@ -917,7 +937,7 @@ fn lower_skinny(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> 
             sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
         }
     }
-    let applied = epilogue_of(view, geom, &plan)?;
+    let applied = epilogue_of(view, geom)?;
     finish(launch(ctx, sides, plan, geom, None, applied.as_ref())?, applied.is_some())
 }
 
@@ -932,7 +952,7 @@ fn lower_tiled(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> R
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
     let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
     let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
-    let applied = epilogue_of(view, params.geom, &plan)?;
+    let applied = epilogue_of(view, params.geom)?;
     finish(launch(ctx, sides, plan, params.geom, None, applied.as_ref())?, applied.is_some())
 }
 
@@ -979,12 +999,12 @@ fn epilogue_fits(program: &EpiProgram) -> bool {
         && program.scalars.iter().all(|scalar| scalar.ty == ElemTy::F32)
 }
 
-/// The epilogue of `view` as `plan` can apply it: the plan writes its output once (K is not split into slices summed after), the program
-/// is one the kernels take ([`epilogue_fits`]) and its inputs are evaluated arrays of the extent their map reads. `None` runs the product
+/// The epilogue of `view` as `plan` can apply it: at the stores of the product, or, split over K, in the kernel that sums the slices
+/// ([`Builtin::MatmulSumEpilogue`]); the program is one the kernels take ([`epilogue_fits`]) and its inputs are evaluated arrays of the extent their map reads. `None` runs the product
 /// plain, for the caller to apply the program as a separate pass.
-fn epilogue_of(view: &ContractionView<'_>, geom: Geometry, plan: &Plan) -> Result<Option<Applied>, Failure> {
+fn epilogue_of(view: &ContractionView<'_>, geom: Geometry) -> Result<Option<Applied>, Failure> {
     let Some(program) = view.epilogue else { return Ok(None) };
-    if plan.slices > 1 || !epilogue_fits(program) {
+    if !epilogue_fits(program) {
         return Ok(None);
     }
     let (m, n) = (u64::from(geom.m), u64::from(geom.n));
@@ -1090,6 +1110,22 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     Ok(Some(out_storage))
 }
 
+/// The kernel that sums the `slices` partial products of a split product and applies `epilogue` to every sum
+/// ([`Builtin::MatmulSumEpilogue`]); `[m, n, slices]` are the product's.
+#[inline(never)]
+fn launch_sum_applied(ctx: &Context, groups: [u32; 3], [m, n, slices]: [u32; 3], out: RawArg<'_>, partial: RawArg<'_>, applied: &Applied) -> Result<(), Failure> {
+    let input_pins = applied.inputs.iter().map(|input| input.pin_single_read().map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let core = ctx.builtin(Builtin::MatmulSumEpilogue { form: applied.form }, "f32")?;
+    let mut words = vec![slices, m, n];
+    words.extend_from_slice(&applied.scalars);
+    let mut args: Vec<RawArg<'_>> = Vec::with_capacity(3 + input_pins.len());
+    args.extend([out, partial]);
+    args.extend(input_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    ctx.launch(&core, groups, [m * n, 1, 1], &args)?;
+    Ok(())
+}
+
 /// The kernel of a product that applies `epilogue` at its stores, recorded: its inputs stay pinned while it is.
 #[inline(never)]
 fn launch_applied(ctx: &Context, sides: [MatmulSide; 2], kernel: jit::MatmulKernel, words: &[u32], plan: &Plan, out: RawArg<'_>, applied: &Applied) -> Result<(), Failure> {
@@ -1128,7 +1164,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
         None => (out_pin.buffer(), out_bytes),
     };
-    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: epilogue.map_or(0, |applied| applied.form) };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: epilogue.filter(|_| plan.slices == 1).map_or(0, |applied| applied.form) };
     let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0];
     let words = match words {
         Some((extra, tri)) => {
@@ -1140,7 +1176,8 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         None => &uniform[..4],
     };
     let out = RawArg::write(target, target_bytes);
-    if let Some(applied) = epilogue {
+    // Split over K, the slices are plain partial products and the epilogue runs in the kernel that sums them.
+    if let Some(applied) = epilogue.filter(|_| plan.slices == 1) {
         launch_applied(ctx, sides, kernel, words, &plan, out, applied)?;
     } else {
         match sides {
@@ -1153,15 +1190,15 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         }
     }
     if let Some(partial) = &partial {
-        let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
-        let slices = [plan.slices];
         let sum_groups = crate::ops::fold_workgroups(ctx, (m32 * n32).div_ceil(32))?;
-        ctx.launch(
-            &sum,
-            sum_groups,
-            [m32 * n32, 1, 1],
-            &[RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(partial, target_bytes), RawArg::Uniform(bytemuck::bytes_of(&slices))],
-        )?;
+        match epilogue {
+            Some(applied) => launch_sum_applied(ctx, sum_groups, [m32, n32, plan.slices], RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(partial, target_bytes), applied)?,
+            None => {
+                let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
+                let slices = [plan.slices];
+                ctx.launch(&sum, sum_groups, [m32 * n32, 1, 1], &[RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(partial, target_bytes), RawArg::Uniform(bytemuck::bytes_of(&slices))])?;
+            }
+        }
     }
     drop(scratch);
     jit::check_finite(ctx, &out_storage, jit::ElemTy::F32)?;

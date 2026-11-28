@@ -274,15 +274,20 @@ mod tests {
     }
 
     #[test]
-    fn a_split_product_takes_no_epilogue() {
+    fn a_split_product_applies_the_epilogue_in_the_kernel_that_sums_the_slices() {
         let Some(ctx) = context() else { return };
-        // A long K on a small output is cut into slices of K, which the epilogue could not follow.
-        let shape = (64, 64, 32768);
-        let [lhs, rhs] = operands(&ctx, shape);
-        let epi = program(vec![unary(UnOp::Id, Ref::Acc)], &[], &[]);
-        for _ in 0..40 {
-            assert!(matches!(product(&ctx, &lhs, &rhs, Some(&epi)), Output::Storage(_)));
-            std::thread::sleep(Duration::from_millis(10));
+        // A long K on a small output is cut into slices of K: the hook cannot follow, the sum kernel applies the program.
+        for shape in [(64, 64, 32768), (96, 40, 20000)] {
+            let (m, n, _) = shape;
+            let [lhs, rhs] = operands(&ctx, shape);
+            let bias = Array::from_slice_on(&ctx, &values(n, 3), [n]).unwrap();
+            let epi = program(vec![binary(BinOp::Add, Ref::Acc, Ref::Input(0)), binary(BinOp::Max, Ref::Tmp(0), Ref::Scalar(0))], &[(&bias, EpiMap::AlongCols)], &[0.0]);
+            let plain = read(&ctx, product(&ctx, &lhs, &rhs, None), m, n);
+            let bias = bias.to_vec().unwrap();
+            let expected: Vec<u32> = plain.iter().enumerate().map(|(at, acc)| (acc + bias[at % n]).max(0.0).to_bits()).collect();
+            let Output::Epilogued(storages) = product(&ctx, &lhs, &rhs, Some(&epi)) else { panic!("{shape:?}: the split product did not apply the epilogue") };
+            let got = read(&ctx, Output::Storage(Arc::clone(&storages[0])), m, n);
+            assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected, "{shape:?}");
         }
     }
 

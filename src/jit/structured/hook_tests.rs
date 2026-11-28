@@ -214,11 +214,11 @@ fn operands_that_are_expressions_and_operands_that_are_buffers_both_apply_the_ep
 }
 
 #[test]
-fn a_split_product_a_long_program_and_an_unfit_input_run_plain() {
+fn a_long_program_and_an_unfit_input_run_plain_and_a_split_product_applies_the_epilogue_in_its_sum() {
     let ctx = context();
-    // 64 x 64 over a long K is split: the slices are summed after, the epilogue is the caller's.
+    // 64 x 64 over a long K is split: the kernel that sums the slices applies the epilogue (W3-U4 B2), bit for bit.
     let (relu, reference) = bias_relu(&ctx, 64, 64);
-    assert!(!check(&ctx, (8192, 64, 64), StrategyId::CONTRACTION_TILED, &relu, &reference), "a split product does not apply the epilogue");
+    assert!(check(&ctx, (8192, 64, 64), StrategyId::CONTRACTION_TILED, &relu, &reference), "a split product applies the epilogue in its sum");
     // Seventeen instructions are over the limit.
     let long = program((0..17).map(|k| bin(BinOp::Add, if k == 0 { Ref::Acc } else { Ref::Tmp(k - 1) }, Ref::Scalar(0))).collect(), vec![], vec![1.0]);
     assert!(!check(&ctx, (16, 32, 32), StrategyId::CONTRACTION_TILED, &long, |c| {
@@ -239,15 +239,15 @@ fn a_split_product_a_long_program_and_an_unfit_input_run_plain() {
 }
 
 #[test]
-fn a_skinny_product_that_is_not_split_applies_the_epilogue() {
+fn a_skinny_product_applies_the_epilogue_split_or_not() {
     let ctx = context();
     // A tall output over a long K, left operand along K: one slice of K per workgroup tile, no sum after.
     let (k, m, n) = (2048, 8192, 8);
     let (relu, reference) = bias_relu(&ctx, n, m);
     assert!(check(&ctx, (k, m, n), StrategyId::CONTRACTION_SKINNY, &relu, reference), "the skinny kernel applies the epilogue");
-    // The common skinny plan is split over K: plain.
+    // The common skinny plan is split over K: the sum kernel applies it.
     let (relu, reference) = bias_relu(&ctx, 8, 8);
-    assert!(!check(&ctx, (8192, 8, 8), StrategyId::CONTRACTION_SKINNY, &relu, reference));
+    assert!(check(&ctx, (8192, 8, 8), StrategyId::CONTRACTION_SKINNY, &relu, reference));
 }
 
 #[test]

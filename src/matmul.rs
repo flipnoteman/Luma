@@ -371,6 +371,49 @@ pub(crate) fn builtin_epilogue_source(tile: MatmulTile, aligned: bool, split: bo
     src
 }
 
+/// The kernel of [`Builtin::MatmulSumEpilogue`]: the sum of [`Builtin::MatmulSum`] (a workgroup of 32x8 covers 32 outputs, row `ty` of it
+/// summing every eighth slice from `ty`, the eight partial sums added as `(a + b) + (c + d)`: the same additions in the same order) with
+/// the epilogue of the interned form `form` applied to every total before it is stored. Its inputs are the buffers `e0, ..` after
+/// `part`, its scalars the fields of the uniform after `{s, m, n}`.
+pub(crate) fn sum_epilogue_source(form: u16) -> String {
+    let form = crate::jit::comprehension::lower::contract::form(form);
+    let mut binding = 2;
+    let inputs = crate::jit::epilogue_bindings(&form, &mut binding);
+    format!(
+        "struct Params {{ s: u32, m: u32, n: u32, {} }}
+@group(1) @binding(0) var<storage, read_write> out: array<f32>;
+@group(1) @binding(1) var<storage, read> part: array<f32>;
+{inputs}@group(1) @binding({binding}) var<uniform> p: Params;
+var<workgroup> tile: array<f32, 256>;
+{}
+@compute @workgroup_size(32, 8, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let group = wid.x + wid.y * nwg.x;
+    let i = group * 32u + lid.x;
+    let mn = p.m * p.n;
+    var acc = 0.0;
+    if (i < mn) {{
+        for (var z = lid.y; z < p.s; z += 8u) {{
+            acc = acc + part[z * mn + i];
+        }}
+    }}
+    tile[lid.y * 32u + lid.x] = acc;
+    workgroupBarrier();
+    if (lid.y == 0u && i < mn) {{
+        let a = tile[lid.x] + tile[lid.x + 32u];
+        let b = tile[lid.x + 64u] + tile[lid.x + 96u];
+        let c = tile[lid.x + 128u] + tile[lid.x + 160u];
+        let d = tile[lid.x + 192u] + tile[lid.x + 224u];
+        let total = (a + b) + (c + d);
+        out[i] = luma_store(i / p.n, i % p.n, total);
+    }}
+}}
+",
+        crate::jit::epilogue_fields(&form, 0),
+        crate::jit::epilogue_function(&form, 0),
+    )
+}
+
 /// How the kernel reads one operand.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum MatmulOperand {

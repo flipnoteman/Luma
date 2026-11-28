@@ -1320,6 +1320,9 @@ pub(crate) enum Builtin {
     /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
     /// elements of `out`.
     MatmulSum,
+    /// [`Builtin::MatmulSum`] that applies an epilogue to every sum (W3-U4 B2): `form` is the interned form that holds it. Arguments:
+    /// out, part, the epilogue's inputs, uniform `{s, m, n}` and its scalars; `luma.size.x` is the elements of `out`.
+    MatmulSumEpilogue { form: u16 },
     /// Counts the set bits of every tile of a bit-packed mask; see [`crate::filter`]. Arguments:
     /// counts, mask, uniform `{len, nwords, tiles}`. Element type `"u32"`.
     FilterCount,
@@ -3183,6 +3186,7 @@ impl Builtin {
             Builtin::MatmulEpilogue { tile, aligned, split, form } => wgsl(crate::matmul::builtin_epilogue_source(tile, aligned, split, form)),
             Builtin::Bmm(kernel) => wgsl(crate::bmm::source(kernel)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
+            Builtin::MatmulSumEpilogue { form } => wgsl(crate::matmul::sum_epilogue_source(form)),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
             Builtin::Transpose => wgsl(crate::jit::transpose::source(ty)),
