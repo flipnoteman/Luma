@@ -341,6 +341,9 @@ const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64
 
 /// The matrix product of `spec` (tensor cores, or `f32` on the CUDA cores), loaded from its PTX.
 fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, BackendError> {
+    if spec.half && !spec.exact {
+        return Err(BackendError::Unsupported("a half-work product on tensor cores".into()));
+    }
     let (source, threads, bytes) = if spec.exact {
         let config = crate::sgemm::Config::of(spec);
         (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
@@ -1572,6 +1575,11 @@ impl Backend for CudaBackend {
     }
 
     fn gemm_ragged(&self) -> bool {
+        self.shared.cc.0 >= 8
+    }
+
+    /// The `f32` kernels have a half-work variant (`GemmSpec::half`); the tensor-core ones do not (yet).
+    fn gemm_half(&self) -> bool {
         self.shared.cc.0 >= 8
     }
 

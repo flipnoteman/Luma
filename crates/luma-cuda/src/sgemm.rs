@@ -40,6 +40,9 @@ pub(crate) struct Config {
     pub group: u32,
     /// How the copies guard the edges of the matrices.
     pub mode: Mode,
+    /// A half-work product of a matrix with itself (square tiles): grid `[T (T + 1) / 2, 1, 1]`, workgroup `w` the tile `(ty, tx)`,
+    /// `tx <= ty`, of `luma_core::triangle_tile`; the epilogue stores every output of an off-diagonal tile at its transpose too.
+    pub half: bool,
 }
 
 /// The tiles of the kernels the planner picks from, largest first: `(rows, cols)`. A 128 x 128 tile
@@ -64,7 +67,7 @@ impl Config {
         // read `B` along `n` and for the smallest one (a short K); 8 where the transposing copies
         // of `B` or a 64-thread workgroup's registers make the deeper stage lose.
         let bk = if (spec.rows, spec.cols) == (32, 32) || ((spec.rows, spec.cols) == (64, 128) && !spec.rhs_transposed) { 16 } else { 8 };
-        Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, mode: Mode::of(spec.lanes) }
+        Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, mode: Mode::of(spec.lanes), half: spec.half }
     }
 
     pub(crate) fn threads(&self) -> u32 {
@@ -173,8 +176,9 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32, mode: Mode) {
 
 /// The PTX of the kernel `main` for `config`.
 pub(crate) fn ptx(config: &Config) -> String {
-    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group, mode } = *config;
+    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group, mode, half } = *config;
     assert!(bk == 8 || bk == 16);
+    assert!(!half || bm == bn, "a half-work product has square tiles");
     let threads = config.threads();
     let (warp_rows, warp_cols) = (8 * tm, 4 * tn);
     let (ga, gb) = (tm / 4, tn / 4);
@@ -195,7 +199,7 @@ pub(crate) fn ptx(config: &Config) -> String {
     ));
     w.text.push_str(&format!(".maxntid {threads}, 1, 1\n"));
     w.text.push_str("{\n    .reg .pred %p<16>;\n    .reg .b32 %r<80>;\n    .reg .b64 %rd<64>;\n");
-    w.text.push_str(&format!("    .reg .f32 %c<{}>;\n", tm * tn));
+    w.text.push_str(&format!("    .reg .f32 %c<{}>;\n    .reg .f32 %hf<3>;\n", tm * tn));
     for buffer in 0..2 {
         w.text.push_str(&format!("    .reg .f32 %fa{buffer}x<{tm}>;\n    .reg .f32 %fb{buffer}x<{tn}>;\n"));
     }
@@ -223,7 +227,32 @@ pub(crate) fn ptx(config: &Config) -> String {
     p!(w, "and.b32 %r8, %r5, 3;");
     p!(w, "div.u32 %r9, %r6, {wn};");
     p!(w, "rem.u32 %r10, %r6, {wn};");
-    if group == 0 {
+    if half {
+        // Workgroup `w` is the tile `(ty, tx)` of the lower triangle of tiles: `ty = floor((sqrt(8 w + 1) - 1) / 2)` corrected in
+        // integers, `tx = w - ty (ty + 1) / 2` (the float root is exact only below 2^24).
+        p!(w, "mov.u32 %r27, %ctaid.x;");
+        p!(w, "cvt.rn.f32.u32 %hf0, %r27;");
+        p!(w, "fma.rn.f32 %hf0, %hf0, 0f41000000, 0f3F800000;"); // 8 w + 1
+        p!(w, "sqrt.rn.f32 %hf0, %hf0;");
+        p!(w, "sub.f32 %hf0, %hf0, 0f3F800000;");
+        p!(w, "mul.f32 %hf0, %hf0, 0f3F000000;");
+        p!(w, "cvt.rzi.u32.f32 %r25, %hf0;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "mul.lo.u32 %r29, %r25, %r28;");
+        p!(w, "shr.u32 %r29, %r29, 1;"); // ty (ty + 1) / 2
+        p!(w, "setp.gt.u32 %p14, %r29, %r27;");
+        p!(w, "@%p14 sub.u32 %r25, %r25, 1;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "add.u32 %r30, %r25, 2;");
+        p!(w, "mul.lo.u32 %r30, %r28, %r30;");
+        p!(w, "shr.u32 %r30, %r30, 1;"); // (ty + 1) (ty + 2) / 2
+        p!(w, "setp.le.u32 %p14, %r30, %r27;");
+        p!(w, "@%p14 add.u32 %r25, %r25, 1;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "mul.lo.u32 %r29, %r25, %r28;");
+        p!(w, "shr.u32 %r29, %r29, 1;");
+        p!(w, "sub.u32 %r26, %r27, %r29;");
+    } else if group == 0 {
         p!(w, "mov.u32 %r25, %ctaid.y;");
         p!(w, "mov.u32 %r26, %ctaid.x;");
     } else {
@@ -476,6 +505,30 @@ pub(crate) fn ptx(config: &Config) -> String {
             }
         }
     }
+    if half {
+        // The same outputs at their transposes `C[col * n + row]`, for the tiles off the diagonal (a diagonal tile holds both of
+        // its triangles already, bit-equal: a fused multiply-add is commutative in its factors and the `k` order is the same).
+        p!(w, "setp.ne.u32 %p11, %r11, %r12;");
+        for g in 0..ga {
+            for ii in 0..4u32 {
+                let i = g * 4 + ii;
+                p!(w, "add.u32 %r60, %r27, {};", g * 32 + ii);
+                p!(w, "setp.lt.u32 %p12, %r60, %r0;");
+                p!(w, "and.pred %p12, %p12, %p11;");
+                for h in 0..gb {
+                    for e in 0..4u32 {
+                        p!(w, "add.u32 %r61, %r28, {};", h * 16 + e);
+                        p!(w, "setp.lt.u32 %p13, %r61, %r1;");
+                        p!(w, "and.pred %p13, %p13, %p12;");
+                        p!(w, "mad.lo.u32 %r62, %r61, %r1, %r60;");
+                        p!(w, "mul.wide.u32 %rd20, %r62, 4;");
+                        p!(w, "add.u64 %rd20, %rd20, %rd0;");
+                        p!(w, "@%p13 st.global.f32 [%rd20], %c{};", i * tn + h * 4 + e);
+                    }
+                }
+            }
+        }
+    }
     p!(w, "ret;");
     w.text.push_str("}\n");
     w.text
@@ -492,6 +545,11 @@ mod tests {
                 for lanes in [luma_core::GemmLanes::Vec4, luma_core::GemmLanes::Vec4Tails, luma_core::GemmLanes::Scalar] {
                     let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true).with_lanes(lanes));
                     let text = ptx(&config);
+                    if rows == cols {
+                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true).with_lanes(lanes).with_half()));
+                        assert!(half.contains("sqrt.rn.f32") && half.contains("st.global.f32 [%rd20]"), "{rows}x{cols}");
+                        assert_eq!(half.matches("fma.rn.f32").count() as u32, config.tm * config.tn * config.bk + 1, "{rows}x{cols}");
+                    }
                     assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
                     // One multiply-add per output per `k` of a stage.
                     assert_eq!(text.matches("fma.rn.f32").count() as u32, config.tm * config.tn * config.bk, "{rows}x{cols}");
