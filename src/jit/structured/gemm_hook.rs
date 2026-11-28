@@ -181,7 +181,7 @@ mod tests {
             match product(ctx, lhs, rhs, Some(program)) {
                 Output::Epilogued(storages) => return read(ctx, Output::Storage(Arc::clone(&storages[0])), m, n),
                 Output::Storage(_) => {
-                    assert!(start.elapsed() < Duration::from_secs(120), "the hooked kernel never became ready");
+                    assert!(start.elapsed() < Duration::from_secs(30), "the hooked kernel never became ready");
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
