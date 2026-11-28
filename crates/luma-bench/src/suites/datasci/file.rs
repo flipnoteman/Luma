@@ -176,11 +176,15 @@ pub(super) fn run(h: &mut Harness) {
         let piece = n.min(1 << 26);
         let host: Vec<f32> = (0..piece).map(|i| (i % 1021) as f32 * 0.125).collect();
         let pieces = n / piece;
+        // A context of its own: the file segments the rows before left resident in `ctx` would be evicted by every piece (3-6x slower than a bare upload, for the
+        // read side alone as for the write side), which is not the ceiling this row stands for.
+        let bare = Context::with_options(ContextOptions::from_env().memory_budget(budget)).expect("no device");
         h.transfer_case("file/h2d_pinned", &size, Work::Bytes((pieces * piece * 4) as f64), &mut || {
             for _ in 0..pieces {
-                Array::from_slice_on(&ctx, &host, piece).unwrap().eval().unwrap();
+                Array::from_slice_on(&bare, &host, piece).unwrap().eval().unwrap();
             }
         });
+        drop(bare);
     }
 
     // Three passes that each need the result of the one before: the file is read three times.
