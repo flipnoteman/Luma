@@ -1018,8 +1018,7 @@ fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
 
 /// The product of `sides` with the epilogue `program` applied by the hooked native kernel, `None` where that is not possible and the
 /// plain product runs (the caller applies the program as a separate pass, bit for bit the same): a split product (the epilogue
-/// cannot run per slice), operands that are not evaluated, a kernel that is still compiling or that the backend cannot build, an
-/// epilogue operand that is a window of another array, a program that is not one the hook computes.
+/// cannot run per slice), operands that are not evaluated, a kernel that is still compiling or that the backend cannot build, a program that is not one the hook computes.
 fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geometry, layouts: [Layout; 2], program: &EpiProgram) -> Result<Option<Arc<Storage>>, Failure> {
     let (MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)) = (&sides[0], &sides[1]) else { return Ok(None) };
     if plan.slices != 1 {
@@ -1049,7 +1048,7 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
             Src::Node(node) => Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?),
             Src::Scalar(_) => return Ok(None),
         };
-        if storage.window().is_some() || storage.segments() != 1 {
+        if storage.segments() != 1 {
             return Ok(None);
         }
         operands.push(storage);
@@ -1067,14 +1066,15 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     let out_storage = Arc::new(Storage::new(ctx, len, ElemLayout::plain(4)));
     let out_pin = out_storage.pin_single()?;
     let out_bytes = out_storage.byte_len();
-    let pins = operands.iter().map(|storage| storage.pin_read(0).map(|pin| (pin, storage.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    // A small operand is a window of a pack: bound as the range of the pack's buffer that it is (or copied out, see `InPin::of`).
+    let pins = operands.iter().map(|storage| jit::launch::InPin::of(storage.as_seg())).collect::<Result<Vec<_>, _>>()?;
     let mut words: Vec<u32> = vec![m, n, k, plan.kc, lhs.ld, rhs.ld, lhs.off, rhs.off];
     words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
     let mut args: Vec<RawArg<'_>> = Vec::with_capacity(5 + pins.len());
     args.push(RawArg::write(out_pin.buffer(), out_bytes));
     args.push(RawArg::read(a.buffer(), *a_bytes));
     args.push(RawArg::read(b.buffer(), *b_bytes));
-    args.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    args.extend(pins.iter().map(jit::launch::InPin::raw));
     args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
     ctx.launch(&core, plan.groups, [n, m, 1], &args)?;
     drop(args);

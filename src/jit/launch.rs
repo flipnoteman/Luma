@@ -1133,7 +1133,7 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
 
 /// What a launch binds to read an input: the pinned buffer, or a view of it that starts at the
 /// input's window (see [`Buffer::at`]), and the bytes of it.
-pub(super) struct InPin {
+pub(crate) struct InPin {
     pin: Held,
     view: Option<Buffer>,
     bytes: u64,
@@ -1149,7 +1149,7 @@ impl InPin {
     /// recording captures buffers whole (its commands are replayed with other buffers swapped
     /// in), so it keeps copying.
     #[inline(always)]
-    fn of(input: SegRef<'_>) -> Result<Self, LumaError> {
+    pub(crate) fn of(input: SegRef<'_>) -> Result<Self, LumaError> {
         let ctx = input.ctx();
         if let Some((pack, at)) = input.window()
             && !ctx.recording_here()
@@ -1174,7 +1174,7 @@ impl InPin {
         Ok(InPin { pin, view, bytes: input.layout().bytes(slab.n) })
     }
 
-    pub(super) fn raw(&self) -> RawArg<'_> {
+    pub(crate) fn raw(&self) -> RawArg<'_> {
         RawArg::read(self.view.as_ref().unwrap_or(self.pin.buffer()), self.bytes)
     }
 }
