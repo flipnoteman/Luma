@@ -43,7 +43,8 @@ fn cases() -> impl Strategy<Value = Case> {
 
 thread_local! {
     static CONTEXTS: [Context; 2] = [
-        Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap(),
+        // The first is the default numerics whatever `LUMA_NUMERICS` says: the chains are compared bit for bit with their pairwise matmuls.
+        Context::with_options(ContextOptions::from_env().calibrate(false).numerics(Numerics::default())).unwrap(),
         Context::with_options(ContextOptions::from_env().calibrate(false).numerics(Numerics::algebraic())).unwrap(),
     ];
 }
