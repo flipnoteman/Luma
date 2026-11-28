@@ -24,7 +24,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use super::map::{AffineMap, AffineRow};
-use super::{Access, CombineOp, CombinePart, Compensation, Comprehension, DimKind, Epilogue, MAX_DIMS, Origin};
+use super::{Access, CombineOp, CombinePart, Compensation, Comprehension, DimKind, Epilogue, MAX_DIMS, OpTag, Origin};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, ReduceOp};
 use crate::context::Context;
@@ -612,7 +612,7 @@ pub(crate) fn build(ctx: &Context, form: &Comprehension) -> Array<f32> {
     let location = Location::caller();
     let shape = Shape::from(output_dims(form));
     let result = match &form.origin {
-        Origin::Api(_) => Err(Failure::from(LumaError::Unsupported("an API form runs through its own strategy".into()))),
+        Origin::Api(tag) if *tag != OpTag::Einsum => Err(Failure::from(LumaError::Unsupported("an API form runs through its own strategy".into()))),
         _ if !lowers(form) => Err(Failure::from(LumaError::InvalidShape("the form has no lowering".into()))),
         _ => crate::jit::structured::select::execute(ctx, &crate::jit::structured::strategy::Subject::Form(form, location)).map(|output| Array::from_storage(ctx, shape, output.into_storage())),
     };

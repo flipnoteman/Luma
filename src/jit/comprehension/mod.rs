@@ -304,6 +304,9 @@ pub(crate) enum OpTag {
     Conv(Box<ConvSpec>, bool),
     ConvSep,
     Window(WindowOp),
+    /// One pair of an `einsum` that no `matmul` fits (W3-R4R5 §4): a product of two operands, summed over the labels that only they
+    /// share. Unlike the other API tags it has no strategy of its own: the generic lowering runs it.
+    Einsum,
 }
 
 impl OpTag {
@@ -362,6 +365,7 @@ impl OpTag {
             OpTag::Dot => &[Form::Dot, Form::Reduce, Form::Elementwise],
             OpTag::Matmul { .. } | OpTag::MatmulBatched => &[Form::Gemm, Form::Gemv, Form::Dot, Form::Outer, Form::Elementwise],
             OpTag::Conv1d | OpTag::Conv(..) | OpTag::ConvSep | OpTag::Window(_) => &[Form::Window, Form::Elementwise, Form::Outer, Form::Dot, Form::Gemv, Form::Reduce],
+            OpTag::Einsum => &[Form::Gemm, Form::Gemv, Form::Dot, Form::Outer, Form::Reduce, Form::Window, Form::Elementwise, Form::Generic],
         }
     }
 }

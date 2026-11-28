@@ -163,6 +163,7 @@ mod generate;
 mod gpu;
 mod complex;
 mod dft_kernel;
+mod einsum;
 mod gpu_type;
 mod group;
 mod halves;
@@ -238,6 +239,7 @@ pub use linalg::{
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use bmm::matmul_batched;
+pub use einsum::einsum;
 pub use dense::lu::Lu;
 pub use dense::eigh::Eigh;
 pub use dense::svd::Svd;

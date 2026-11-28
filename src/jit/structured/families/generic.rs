@@ -1,5 +1,5 @@
 //! `FamilyTag::Generic`: the lowering of a form that no API tag and no recogniser took (W2-R0 §5.3-5.6). Three strategies, last in
-//! the order of the families and never reached by an `Origin::Api` form (the 07 §9 guard): their `fits` returns `None` for it.
+//! the order of the families and never reached by an `Origin::Api` form (the 07 §9 guard): their `fits` returns `None` for it. The one exception is `OpTag::Einsum`, which has no strategy of its own.
 //!
 //! * `generic-contract` (G-A): the fused matmul tail with the body as the multiply-add, for a separable body and the roles of a
 //!   contraction.
@@ -16,7 +16,7 @@ use crate::array::Failure;
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::comprehension::lower::{self, contract, Prepared};
-use crate::jit::comprehension::Origin;
+use crate::jit::comprehension::{OpTag, Origin};
 
 impl StrategyId {
     pub(crate) const GENERIC_CONTRACT: StrategyId = StrategyId(FamilyTag::Generic, 0);
@@ -63,7 +63,7 @@ fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
 /// The form of a subject that is not an API form.
 fn form<'a>(subject: &Subject<'a>) -> Option<(&'a crate::jit::comprehension::Comprehension, &'static std::panic::Location<'static>)> {
     match subject {
-        Subject::Form(form, location) if !matches!(form.origin, Origin::Api(_)) => Some((form, location)),
+        Subject::Form(form, location) if !matches!(&form.origin, Origin::Api(tag) if *tag != OpTag::Einsum) => Some((form, location)),
         _ => None,
     }
 }
