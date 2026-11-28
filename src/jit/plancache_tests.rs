@@ -589,13 +589,15 @@ fn a_step_with_a_reduction_hits() {
 
 #[test]
 fn a_step_with_a_matmul_replays_one_plan() {
+    // Big enough for the tiled kernels of the GPUs (a tiny product runs a strategy a replay does not take: skinny or tiled).
+    const M: usize = 64;
     for ctx in [ctx(), lazy_ctx()] {
-        let w = A::from_slice_on(&ctx, &data(W * W, 41), [W, W]).unwrap();
+        let w = A::from_slice_on(&ctx, &data(M * M, 41), [M, M]).unwrap();
         let step = move |u: &A, t: usize| (u.matmul(&w).cbrt() * (1.0 + 0.01 * t as f32) + u * 0.5).clamp(-4.0, 4.0);
-        let start = data(W * W, 43);
-        let (want, _) = run_steps(&ctx, false, 10, &start, [W, W], &step);
+        let start = data(M * M, 43);
+        let (want, _) = run_steps(&ctx, false, 10, &start, [M, M], &step);
         let before = ctx.jit().plan_stats();
-        let (got, _) = run_steps(&ctx, true, 10, &start, [W, W], &step);
+        let (got, _) = run_steps(&ctx, true, 10, &start, [M, M], &step);
         assert_eq!(got, want);
         let after = ctx.jit().plan_stats();
         if !ctx.can_run_on_host() && !ctx.caps().contains(crate::caps::Caps::HOST_PATH) {
