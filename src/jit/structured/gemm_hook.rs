@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use luma_core::{BindingInfo, BindingKind, CompiledKernel, GemmSpec, GemmUnit};
+use luma_core::{BindingInfo, BindingKind, CompiledKernel, GemmSpec, GemmUnit, MatmulSpec};
 
 use super::epilogue::EpiProgram;
 use crate::builtin::Builtin;
@@ -21,6 +21,9 @@ use crate::matmul::MatmulTile;
 /// Words of the uniform before the hook's scalars: the product's own (`gemm_copy::UNIFORM_BYTES / 4` in luma-cuda): the eight
 /// of the layout, the triangular word and the three reserved ones (W3-R6).
 pub(crate) const PRODUCT_WORDS: usize = 12;
+
+/// Words of the uniform of the backend's native product before the hook's scalars: its eight.
+pub(crate) const NATIVE_PRODUCT_WORDS: usize = 8;
 
 /// Hooked kernels per context.
 pub(crate) const MAX_HOOKED: usize = 64;
@@ -67,13 +70,15 @@ fn spec_of(tile: MatmulTile) -> Option<GemmSpec> {
     }
 }
 
-/// The kernel of the plain product `plain` (a `Builtin::Matmul` on a TF32 tile) with the epilogue `program`, started compiling on
-/// first use. `None`: no such kernel (not a TF32 tile, the backend has no hooks, the hook does not compile on it, the program is not
-/// one a hook computes). The caller checks `raw.is_ready()` before it launches: a kernel still compiling is not waited for.
+/// The kernel of the plain product `plain` (a `Builtin::Matmul` on a TF32 tile, or on the backend's native tile) with the epilogue
+/// `program`, started compiling on first use. `None`: no such kernel (not such a tile, the backend has no hooks, the hook does not
+/// compile on it, the program is not one a hook computes). The caller checks `raw.is_ready()` before it launches: a kernel still
+/// compiling is not waited for.
 pub(crate) fn kernel(ctx: &Context, plain: Builtin, program: &EpiProgram) -> Result<Option<Arc<KernelCore>>> {
     let Builtin::Matmul { tile, .. } = plain else { return Ok(None) };
-    let Some(spec) = spec_of(tile) else { return Ok(None) };
-    if !ctx.hal().gemm_hooks() || !epi_hook::hookable(program) {
+    let native = matches!(tile, MatmulTile::Native { .. });
+    let spec = spec_of(tile);
+    if (spec.is_none() && !native) || (spec.is_some() && !ctx.hal().gemm_hooks()) || !epi_hook::hookable(program) {
         return Ok(None);
     }
     let id = epi_hook::hook_id(program);
@@ -85,16 +90,27 @@ pub(crate) fn kernel(ctx: &Context, plain: Builtin, program: &EpiProgram) -> Res
     Ok(crate::gpu::lock(ctx.hooked_gemms()).insert(key, built))
 }
 
-fn build(ctx: &Context, plain: Builtin, spec: GemmSpec, id: luma_core::HookId, program: &EpiProgram) -> Result<Option<Arc<KernelCore>>> {
+/// `spec`: the tensor-core product; `None`: the backend's native one (`Builtin::Matmul` of a `MatmulTile::Native`).
+fn build(ctx: &Context, plain: Builtin, spec: Option<GemmSpec>, id: luma_core::HookId, program: &EpiProgram) -> Result<Option<Arc<KernelCore>>> {
     // The shader of the plain product gives the bindings (`c`, `a`, `b`, the uniform) the hooked kernel keeps.
     let base = ctx.builtin(plain, "f32")?;
-    let module = Arc::new(epi_hook::hook_module(program, ctx.tuning())?);
-    let Some(raw) = ctx.hal().compile_gemm(&spec.with_hook(id), Some(&module)) else { return Ok(None) };
+    let (raw, product_words) = match (spec, plain) {
+        (Some(spec), _) => {
+            let module = Arc::new(epi_hook::hook_module(program, ctx.tuning())?);
+            (ctx.hal().compile_gemm(&spec.with_hook(id), Some(&module)), PRODUCT_WORDS)
+        }
+        (None, Builtin::Matmul { tile: MatmulTile::Native { edge, lhs_t, rhs_t }, .. }) => {
+            let module = Arc::new(epi_hook::tile_module(program, ctx.tuning())?);
+            (ctx.hal().compile_matmul_epilogue(&MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: false }, &module), NATIVE_PRODUCT_WORDS)
+        }
+        _ => return Ok(None),
+    };
+    let Some(raw) = raw else { return Ok(None) };
     let operands = program.inputs.len();
     let mut bindings: Vec<BindingInfo> = base.bindings[..3].to_vec();
     bindings.extend((0..operands).map(|k| BindingInfo { name: format!("e{k}"), kind: BindingKind::StorageRead, element_stride: Some(4), min_size: None }));
     let mut uniform = base.bindings[3].clone();
-    uniform.min_size = Some(4 * (PRODUCT_WORDS + program.scalars.len()) as u32);
+    uniform.min_size = Some(4 * (product_words + program.scalars.len()) as u32);
     bindings.push(uniform);
     let label: Arc<str> = Arc::from(format!("{} + epilogue {:08x}", base.label, id.0 as u32));
     Ok(Some(Arc::new(CompiledKernel::new(label, raw, bindings, 4 + operands, None, base.workgroup))))

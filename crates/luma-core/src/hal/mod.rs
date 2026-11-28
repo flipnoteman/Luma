@@ -1712,6 +1712,15 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
         None
     }
+    /// The native product of `spec` ([`Backend::compile_matmul`]) with an epilogue applied to each output tile right after the
+    /// tile's sum (W3-U4 B3). `tile` is the KIR module of the epilogue over one tile (`luma`'s `epi_hook::tile_module`): bindings
+    /// `e0..e(E-1)` (read-only operands), `c` (read-write, the whole output) and the uniform `p` of words `rows, cols, row, col, n`
+    /// (the tile and the output's width), three zero words, then the epilogue's scalars; one workgroup applies the epilogue to the
+    /// tile. The launch passes `c, a, b, e0..e(E-1)` and the uniform (the product's eight words, then the scalars). `None` if the
+    /// backend has no such kernel; the kernel may still be compiling (see [`RawKernel::spawn`]).
+    fn compile_matmul_epilogue(&self, _spec: &MatmulSpec, _tile: &Arc<crate::kir::KernelModule>) -> Option<RawKernel> {
+        None
+    }
     /// The output tiles (rows, columns) of the products ([`Backend::compile_gemm`]) the backend
     /// runs on `unit`, largest first; empty if it has none.
     fn gemm_tiles(&self, _unit: GemmUnit) -> &[(u32, u32)] {

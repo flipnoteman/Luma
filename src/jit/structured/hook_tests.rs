@@ -262,3 +262,45 @@ fn an_input_is_a_buffer_or_an_expression() {
     assert!(check(&ctx, (k, m, n), StrategyId::CONTRACTION_TILED, &epilogue, |c| c + &full));
     assert!(matches!(epilogue.inputs[0].src, Src::Node(_) | Src::Buffer(_)));
 }
+
+// -- the CPU's native product: the epilogue runs over each tile after its sum (W3-U4 B3) --
+
+/// [`check_on`] for the native CPU product, whose hook compiles in the background: the plain product and the pass stay until it did.
+fn check_native(ctx: &Context, dims: (usize, usize, usize), program: &EpiProgram, reference: impl Fn(&A) -> A) {
+    let (k, m, n) = dims;
+    let (a, b) = (A::from_slice_on(ctx, &floats(k * m, 1), [k, m]).unwrap(), A::from_slice_on(ctx, &floats(n * k, 2), [n, k]).unwrap());
+    let start = std::time::Instant::now();
+    while !product(ctx, &a, &b, StrategyId::CONTRACTION_NATIVE_CPU, Some(program)).1 {
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "the native product did not apply its epilogue");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(check_on(ctx, (&a, &b), StrategyId::CONTRACTION_NATIVE_CPU, program, reference));
+}
+
+#[test]
+fn the_native_cpu_product_applies_the_epilogue_over_each_tile_bit_for_bit() {
+    let ctx = context();
+    if ctx.hal().native_matmul().is_none() {
+        return;
+    }
+    // Shapes that are whole tiles, ragged ones and a few that are tiny; the tile edge is the backend's (32, 64 or 128).
+    for (k, m, n) in [(64, 128, 128), (37, 130, 131), (33, 20, 300), (5, 17, 19), (200, 257, 129)] {
+        let (relu, reference) = bias_relu(&ctx, n, m);
+        check_native(&ctx, (k, m, n), &relu, reference);
+    }
+    let (k, m, n) = (33, 70, 71);
+    let residual = A::from_slice_on(&ctx, &floats(n * m, 4), [n, m]).unwrap();
+    let rows = floats(m, 5);
+    let cols = floats(n, 6);
+    let (row_array, col_array) = (A::from_slice_on(&ctx, &rows, [m]).unwrap(), A::from_slice_on(&ctx, &cols, [n]).unwrap());
+    let one = A::from_slice_on(&ctx, &[0.75], [1]).unwrap();
+    let point = program(vec![bin(BinOp::Mul, Ref::Acc, Ref::Scalar(0)), bin(BinOp::Add, Ref::Tmp(0), Ref::Input(0))], vec![(&residual, EpiMap::Point)], vec![0.5]);
+    check_native(&ctx, (k, m, n), &point, |c| &(c * 0.5) + &residual);
+    let mixed = program(
+        vec![bin(BinOp::Add, Ref::Acc, Ref::Input(0)), bin(BinOp::Mul, Ref::Tmp(0), Ref::Input(1)), bin(BinOp::Sub, Ref::Tmp(1), Ref::Input(2)), un(UnOp::Tanh, Ref::Tmp(2))],
+        vec![(&row_array, EpiMap::AlongRows), (&col_array, EpiMap::AlongCols), (&one, EpiMap::Scalar)],
+        vec![],
+    );
+    let (row_full, col_full) = (along_rows(&ctx, &rows, n), along_cols(&ctx, &cols, m));
+    check_native(&ctx, (k, m, n), &mixed, |c| (&(&(c + &row_full) * &col_full) - 0.75).tanh());
+}

@@ -846,6 +846,26 @@ impl Backend for CpuBackend {
         NativeMatmul::new(spec).map(RawKernel::new)
     }
 
+    fn compile_matmul_epilogue(&self, spec: &MatmulSpec, tile: &Arc<KernelModule>) -> Option<RawKernel> {
+        if spec.half || self.check_module(tile, None, &tile.label).is_err() {
+            return None;
+        }
+        let (spec, tile, disk) = (*spec, Arc::clone(tile), Arc::clone(&self.disk));
+        let max_shared = self.info.limits.max_workgroup_storage_bytes;
+        // The tile kernel compiles on a worker thread, like the elementwise kernels: the launch that needs it waits (or runs the product
+        // plain while it compiles, which is the caller's choice, see `RawKernel::is_ready`).
+        Some(RawKernel::spawn(move || {
+            let bindings = tile.bindings.len();
+            // The uniform is the last binding; its scalars are the words after the eight of the tile's own.
+            let scalars = match tile.bindings.last().map(|binding| &binding.elem_ty) {
+                Some(luma_core::kir::KirType::Struct(at)) => tile.structs[*at as usize].fields.len().saturating_sub(8),
+                _ => 0,
+            };
+            let compiled = compile_native(&disk, max_shared, &tile, None, &tile.label, luma_core::KernelTrust::Trusted)?;
+            NativeMatmul::with_epilogue(&spec, compiled, bindings, scalars).ok_or_else(|| BackendError::Unsupported("the epilogue of a native product does not fit a tile".into()))
+        }))
+    }
+
     fn compile_batched_matmul(&self) -> Option<RawKernel> {
         Some(RawKernel::new(NativeBatchedMatmul::default()))
     }

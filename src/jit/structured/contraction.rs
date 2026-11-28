@@ -421,10 +421,10 @@ const fn epilogued(mut strategy: Strategy) -> Strategy {
 }
 
 /// Whether the strategy `id` applies `ContractionView::epilogue` itself: the native tensor-core products (TF32), through the hook of
-/// their store stage (`gemm_hook`). The exact (`f32`) kernel is not hooked: ptxas gives it 125 registers instead of 153 for any change
+/// their store stage (`gemm_hook`), and the CPU's native product, which runs the epilogue over each tile after its sum. The exact (`f32`) kernel is not hooked: ptxas gives it 125 registers instead of 153 for any change
 /// to its store stage, and it loses 1-6 % (spike D).
 const fn takes_epilogue(id: StrategyId) -> bool {
-    matches!(id, StrategyId::GEMM_TF32 | StrategyId::GEMM_TF32_RAGGED | StrategyId::GEMM_TF32_PADDED)
+    matches!(id, StrategyId::GEMM_TF32 | StrategyId::GEMM_TF32_RAGGED | StrategyId::GEMM_TF32_PADDED | StrategyId::CONTRACTION_NATIVE_CPU)
 }
 
 /// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
@@ -1095,9 +1095,11 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     // A small operand is a window of a pack: bound as the range of the pack's buffer that it is (or copied out, see `InPin::of`).
     let pins = operands.iter().map(|storage| jit::launch::InPin::of(storage.as_seg())).collect::<Result<Vec<_>, _>>()?;
     let mut words: Vec<u32> = vec![m, n, k, plan.kc, lhs.ld, rhs.ld, lhs.off, rhs.off];
-    // The hook's scalars follow the product's own words (`gemm_copy::UNIFORM_BYTES` of the backend).
-    words.resize(gemm_hook::PRODUCT_WORDS, 0);
-    words[8] = tri;
+    // The hook's scalars follow the product's own words (`gemm_copy::UNIFORM_BYTES` of the backend; the eight of the CPU's).
+    if !matches!(plan.tile, MatmulTile::Native { .. }) {
+        words.resize(gemm_hook::PRODUCT_WORDS, 0);
+        words[8] = tri;
+    }
     words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
     let mut args: Vec<RawArg<'_>> = Vec::with_capacity(5 + pins.len());
     args.push(RawArg::write(out_pin.buffer(), out_bytes));

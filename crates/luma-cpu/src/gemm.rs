@@ -19,7 +19,25 @@ pub struct NativeMatmul {
     pub(crate) func: WorkgroupFn,
     /// What a workgroup costs, learned by the pool (see [`crate::exec::CostHint`]).
     pub(crate) cost: crate::exec::CostHint,
+    /// The epilogue applied to each tile after its sum (W3-U4 B3).
+    pub(crate) epilogue: Option<TileEpilogue>,
 }
+
+/// The epilogue of a product, compiled over one tile (see `Backend::compile_matmul_epilogue`).
+#[derive(Debug)]
+pub(crate) struct TileEpilogue {
+    kernel: crate::codegen::CompiledCpuKernel,
+    /// The read-only operands (bindings `3..3 + inputs` of the launch).
+    inputs: usize,
+    /// The scalars (words `8..8 + scalars` of the launch's uniform).
+    scalars: usize,
+}
+
+/// Most operands and scalars of a tile epilogue (its bindings and uniform words are on the stack).
+const MAX_EPILOGUE_INPUTS: usize = 12;
+const MAX_EPILOGUE_SCALARS: usize = 11;
+/// Words of the uniform of the tile kernel: `rows, cols, row, col, n`, three zero words, the scalars.
+const TILE_WORDS: usize = 8 + MAX_EPILOGUE_SCALARS;
 
 impl NativeKernel for NativeMatmul {}
 
@@ -31,7 +49,19 @@ pub(crate) const UNIFORM_WORDS: usize = 8;
 impl NativeMatmul {
     /// The product of `spec`, `None` if its tile is empty.
     pub fn new(spec: &MatmulSpec) -> Option<Self> {
-        (spec.edge > 0).then(|| NativeMatmul { spec: *spec, func: if spec.half { group_half } else { group }, cost: crate::exec::CostHint::default() })
+        (spec.edge > 0).then(|| NativeMatmul { spec: *spec, func: if spec.half { group_half } else { group }, cost: crate::exec::CostHint::default(), epilogue: None })
+    }
+
+    /// The product of `spec` applying `tile` (compiled, bindings `e0..e(E-1)`, `c`, `p`) to each output tile; `None` if the product is
+    /// not one that has an epilogue (an empty tile, a half-work product) or the epilogue has more operands than a tile takes.
+    pub(crate) fn with_epilogue(spec: &MatmulSpec, tile: crate::codegen::CompiledCpuKernel, bindings: usize, scalars: usize) -> Option<Self> {
+        let inputs = bindings.checked_sub(2)?;
+        if spec.half || inputs > MAX_EPILOGUE_INPUTS || scalars > MAX_EPILOGUE_SCALARS || tile.plan.shared_bytes != 0 || tile.plan.scratch_bytes != 0 {
+            return None;
+        }
+        let mut product = Self::new(spec)?;
+        product.epilogue = Some(TileEpilogue { kernel: tile, inputs, scalars });
+        Some(product)
     }
 
     /// Checks that the buffers of a launch hold every element the product touches (it trusts
@@ -39,8 +69,14 @@ impl NativeMatmul {
     /// a_off, b_off}` and `workgroups` the grid.
     pub(crate) fn validate(&self, bytes: &[u64], words: [u32; UNIFORM_WORDS], workgroups: [u32; 3]) -> Result<(), BackendError> {
         let bad = |what: String| Err(BackendError::Unsupported(format!("native matrix product: {what}")));
-        if bytes.len() != BINDINGS {
-            return bad(format!("{} bindings, expected {BINDINGS}", bytes.len()));
+        let bindings = BINDINGS + self.epilogue.as_ref().map_or(0, |epilogue| epilogue.inputs);
+        if bytes.len() != bindings {
+            return bad(format!("{} bindings, expected {bindings}", bytes.len()));
+        }
+        if let Some(epilogue) = &self.epilogue
+            && bytes[bindings - 1] < 4 * (UNIFORM_WORDS + epilogue.scalars) as u64
+        {
+            return bad(format!("a uniform of {} bytes for {} scalars", bytes[bindings - 1], epilogue.scalars));
         }
         let [m, n, k, kc, lda, ldb, a_off, b_off] = words.map(u64::from);
         if m == 0 || n == 0 || workgroups.contains(&0) {
@@ -81,6 +117,52 @@ impl NativeMatmul {
     }
 }
 
+impl TileEpilogue {
+    /// Applies the epilogue to the tile (`row`, `col`, `rows`, `cols` of an output `n` wide) that `ctx`'s workgroup just summed, by
+    /// running its compiled kernel as a workgroup of its own over the launch's buffers.
+    ///
+    /// # Safety
+    /// `ctx` is the context of a launch of the product that owns `self` (validated: [`NativeMatmul::validate`]) and `uniform` its
+    /// uniform.
+    #[inline(never)]
+    unsafe fn apply(&self, ctx: &WorkgroupCtx, (row, col, rows, cols, n): (usize, usize, usize, usize, usize), uniform: *const u8) {
+        // SAFETY: the launch holds `3 + inputs` bindings and the uniform after them, `binding_bytes` their sizes, and the uniform holds
+        // `8 + scalars` words.
+        unsafe {
+            let mut words = [0u32; TILE_WORDS];
+            words[..5].copy_from_slice(&[rows as u32, cols as u32, row as u32, col as u32, n as u32]);
+            std::ptr::copy_nonoverlapping(uniform.cast::<u32>().add(UNIFORM_WORDS), words.as_mut_ptr().add(8), self.scalars);
+            let mut bindings = [std::ptr::null_mut::<u8>(); MAX_EPILOGUE_INPUTS + 2];
+            let mut bytes = [0u64; MAX_EPILOGUE_INPUTS + 2];
+            for k in 0..self.inputs {
+                bindings[k] = *ctx.bindings.add(BINDINGS - 1 + k);
+                bytes[k] = *ctx.binding_bytes.add(BINDINGS - 1 + k);
+            }
+            bindings[self.inputs] = *ctx.bindings;
+            bytes[self.inputs] = *ctx.binding_bytes;
+            bindings[self.inputs + 1] = words.as_mut_ptr().cast();
+            bytes[self.inputs + 1] = 4 * words.len() as u64;
+            let mut lengths = [0u32; MAX_EPILOGUE_INPUTS + 2];
+            for (slot, &(binding, stride)) in lengths.iter_mut().zip(&self.kernel.plan.array_lengths) {
+                *slot = u32::try_from(bytes[binding as usize] / u64::from(stride.max(1))).unwrap_or(u32::MAX);
+            }
+            let tile = WorkgroupCtx {
+                grid_size: [cols as u32, rows as u32, 1, 0],
+                num_workgroups: [1, 1, 1, 0],
+                workgroup_id: [0, 0, 0, 1],
+                bindings: bindings.as_ptr(),
+                binding_bytes: bytes.as_ptr(),
+                lengths: lengths.as_ptr(),
+                shared: std::ptr::null_mut(),
+                scratch: std::ptr::null_mut(),
+                math: ctx.math,
+                native: std::ptr::null(),
+            };
+            (self.kernel.exec.as_fn())(&tile);
+        }
+    }
+}
+
 /// One workgroup: the output tile `x + y * num_workgroups.x` over the slice of K of layer `z`.
 unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
     // SAFETY: as `workgroup`.
@@ -101,7 +183,9 @@ unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
     unsafe {
         let ctx = &*ctx;
         let kernel = &*ctx.native.cast::<NativeMatmul>();
-        let [c, a, b, uniform] = [0, 1, 2, 3].map(|at| *ctx.bindings.add(at));
+        // The epilogue's operands sit between `b` and the uniform.
+        let uniform_at = BINDINGS - 1 + kernel.epilogue.as_ref().map_or(0, |epilogue| epilogue.inputs);
+        let [c, a, b, uniform] = [0, 1, 2, uniform_at].map(|at| *ctx.bindings.add(at));
         let [m, n, k, kc, lda, ldb, a_off, b_off] = uniform.cast::<[u32; UNIFORM_WORDS]>().read().map(|word| word as usize);
         let edge = kernel.spec.edge as usize;
         let [x, y, z, _] = ctx.workgroup_id;
@@ -124,6 +208,9 @@ unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
             for r in 0..rows {
                 std::ptr::write_bytes(c.add(r * n), 0, cols);
             }
+            if let Some(epilogue) = &kernel.epilogue {
+                epilogue.apply(ctx, (row, col, rows, cols, n), uniform);
+            }
             return;
         }
         // Element `(r, q)` of a row-major matrix of `ld` columns is at `r * ld + q`, of its
@@ -136,6 +223,9 @@ unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
         let a = a.cast::<f32>().add(a_off).offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
         let b = b.cast::<f32>().add(b_off).offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
         matrixmultiply::sgemm(rows, depth, cols, 1.0, a, lhs_strides.0, lhs_strides.1, b, rhs_strides.0, rhs_strides.1, 0.0, c, n as isize, 1);
+        if let Some(epilogue) = &kernel.epilogue {
+            epilogue.apply(ctx, (row, col, rows, cols, n), uniform);
+        }
         if HALF {
             // The tile is the full kernel's, so the lower triangle of the output is the full product's. Its transpose goes to
             // the tile above the diagonal (written by no other workgroup); on a diagonal tile the upper half is overwritten by
