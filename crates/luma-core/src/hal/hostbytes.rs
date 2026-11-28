@@ -158,6 +158,12 @@ impl HostBytes {
         Ok(bytes)
     }
 
+    /// `len` bytes of uninitialised memory that something else (an asynchronous read) fills;
+    /// [`HostBlock::finish`] makes them a `HostBytes`.
+    pub fn block(len: usize) -> HostBlock {
+        HostBlock { bytes: Self::uninit(len) }
+    }
+
     fn uninit(len: usize) -> HostBytes {
         HostBytes { repr: Repr::Heap(Aligned::new(len)) }
     }
@@ -254,5 +260,40 @@ mod tests {
         })
         .unwrap();
         assert!(bytes.as_slice().iter().all(|&b| b == 7));
+    }
+}
+
+/// Uninitialised host memory being filled from outside (see [`HostBytes::block`]).
+#[derive(Debug)]
+pub struct HostBlock {
+    bytes: HostBytes,
+}
+
+impl HostBlock {
+    /// The start of the block; valid for [`HostBlock::len`] bytes while the block lives.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.heap_ptr()
+    }
+
+    /// The size in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the block is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The block as bytes: the first `filled` bytes were written by the caller, the rest are set to zero here.
+    ///
+    /// # Safety
+    /// Every one of the first `filled` bytes was written, and nothing writes the block any more.
+    pub unsafe fn finish(mut self, filled: usize) -> HostBytes {
+        let len = self.len();
+        debug_assert!(filled <= len);
+        // SAFETY: the block holds `len` bytes.
+        unsafe { std::ptr::write_bytes(self.as_mut_ptr().add(filled), 0, len - filled) };
+        self.bytes
     }
 }

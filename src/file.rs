@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use luma_io::{
-    Advice, Dtype, Extent, IoFile, NpyHeader, Sidecar, SidecarState, TileIo, parse_npy, parse_sidecar, read_blocking,
+    Advice, Dtype, Extent, IoFile, IoTicket, NpyHeader, StagePtr, Sidecar, SidecarState, TileIo, parse_npy, parse_sidecar, read_blocking,
     write_blocking, write_npy_header, write_sidecar,
 };
 
@@ -27,6 +27,7 @@ use crate::gpu_type::GpuType;
 use crate::jit::{self, ElemTy, Op, OpKind, Src};
 use crate::shape::Shape;
 use crate::builtin::UnOp;
+use luma_core::hal::{HostBlock, HostBytes};
 
 /// The largest `.npy` header read (NumPy's own limit is 1 MiB).
 const HEAD_BYTES: u64 = (1 << 20) + 64;
@@ -231,6 +232,17 @@ impl FileStore {
         }
         let extent = Extent { offset, len: dst.len() as u64 };
         read_blocking(&*self.engine, &self.file, extent, dst).map(|_| ()).map_err(|e| LumaError::io("read", &self.path, Some(offset), e))
+    }
+
+    /// Starts reading `file_bytes` bytes from `offset` into a new block of `total` bytes (the rest
+    /// of the block is zero once [`PendingRead::finish`] is called). Nothing waits.
+    pub(crate) fn start_read(self: &Arc<Self>, offset: u64, file_bytes: u64, total: usize) -> PendingRead {
+        let mut block = HostBytes::block(total);
+        let filled = (file_bytes as usize).min(total);
+        // SAFETY: the block lives (on the heap, at a fixed address) until `PendingRead` is dropped, which waits for the ticket first; nothing else touches the first `filled` bytes meanwhile.
+        let stage = unsafe { StagePtr::new(block.as_mut_ptr(), filled) };
+        let ticket = self.engine.read(&self.file, Extent { offset, len: filled as u64 }, stage);
+        PendingRead { store: Arc::clone(self), offset, ticket: Some(ticket), block: Some(block), filled }
     }
 
     /// Writes `src` at `offset`.
@@ -829,4 +841,135 @@ fn write_array<T: GpuType>(array: &Array<T>, path: &Path, opts: FileOptions) -> 
         let _ = std::fs::remove_file(sidecar_path(&temp));
     }
     result
+}
+
+/// A read of a file extent into host memory that is under way (see [`FileStore::start_read`]).
+#[derive(Debug)]
+pub(crate) struct PendingRead {
+    store: Arc<FileStore>,
+    offset: u64,
+    ticket: Option<IoTicket>,
+    block: Option<HostBlock>,
+    filled: usize,
+}
+
+impl PendingRead {
+    /// Waits for the read; the bytes past the file's are zero.
+    pub(crate) fn finish(mut self) -> Result<HostBytes> {
+        let ticket = self.ticket.take().expect("a read is finished once");
+        let result = if self.filled == 0 { Ok(0) } else { self.store.engine.wait(&ticket) };
+        result.map_err(|e| LumaError::io("read", &self.store.path, Some(self.offset), e))?;
+        let block = self.block.take().expect("a read is finished once");
+        // SAFETY: the read of the first `filled` bytes completed successfully, and nothing writes the block any more.
+        Ok(unsafe { block.finish(self.filled) })
+    }
+}
+
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        // The engine writes into the block until the ticket completes.
+        if let Some(ticket) = self.ticket.take() {
+            let _ = self.store.engine.wait(&ticket);
+        }
+    }
+}
+
+#[cfg(test)]
+mod readahead_tests {
+    use super::*;
+    use crate::context::ContextOptions;
+    use luma_io::{FailPlan, FailingIo, Fault, PoolIo};
+
+    struct Temp(PathBuf);
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp(name: &str, bytes: &[u8]) -> Temp {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("luma-readahead-{}-{n}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        Temp(path)
+    }
+
+    /// 4 KiB segments, a 16 KiB device budget and 256 KiB of host budget: the staging budget is 32 KiB (8 segments' worth, capped at the depth).
+    fn ctx(depth: usize) -> Context {
+        let ctx = Context::with_options(ContextOptions::from_env().calibrate(false).chunk_bytes(1 << 12).memory_budget(1 << 14).host_budget(Some(1 << 18))).unwrap();
+        ctx.pager().set_readahead_depth(depth);
+        ctx
+    }
+
+    fn values(len: usize) -> Vec<f32> {
+        (0..len).map(|i| ((i * 7 + 3) % 1021) as f32).collect()
+    }
+
+    fn bytes(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn results_are_bit_identical_with_and_without_read_ahead() {
+        let len = 1 << 16;
+        let data = values(len);
+        let file = temp("identical", &bytes(&data));
+        let mut sums = Vec::new();
+        for depth in [0, 4] {
+            let ctx = ctx(depth);
+            let x = Array::<f32>::open_on(&ctx, &file.0, FileOptions::raw().shape(len)).unwrap();
+            let sum = x.sum().item().unwrap();
+            let chain = ((&x * 2.0f32 + 1.0f32).abs() - 0.5f32).sum().item().unwrap();
+            let out = temp("identical-out", &[]);
+            std::fs::remove_file(&out.0).unwrap();
+            let mut y = Array::<f32>::create_on(&ctx, &out.0, len, FileOptions::raw().sidecar(false)).unwrap();
+            (&x * 2.0f32 + 1.0f32).store(&mut y).unwrap();
+            y.flush().unwrap();
+            drop(y);
+            let stored = std::fs::read(&out.0).unwrap();
+            sums.push((sum.to_bits(), chain.to_bits(), stored));
+            if depth > 0 && !ctx.is_cpu() {
+                assert!(ctx.paging_stats().readahead_peak_bytes > 0, "the walk read ahead");
+            }
+        }
+        assert_eq!(sums[0], sums[1]);
+    }
+
+    #[test]
+    fn read_ahead_stays_within_the_staging_budget() {
+        let len = 1 << 16;
+        let file = temp("budget", &bytes(&values(len)));
+        let ctx = ctx(8);
+        let x = Array::<f32>::open_on(&ctx, &file.0, FileOptions::raw().shape(len)).unwrap();
+        x.sum().item().unwrap();
+        assert!(ctx.paging_stats().readahead_peak_bytes <= (1 << 18) / 8, "{:?}", ctx.paging_stats());
+    }
+
+    #[test]
+    fn a_short_last_segment_reads_with_a_zero_tail() {
+        // 4099 bytes: the second segment of a u8 array holds 3 bytes of the file in a word.
+        let len = 4099;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+        let file = temp("tail", &data);
+        let ctx = ctx(4);
+        let x = Array::<u8>::open_on(&ctx, &file.0, FileOptions::raw().shape(len)).unwrap();
+        assert_eq!(x.to_vec().unwrap(), data);
+        let x = Array::<u8>::open_on(&ctx, &file.0, FileOptions::raw().shape(len)).unwrap();
+        assert_eq!((&x + 1u8).to_vec().unwrap(), data.iter().map(|v| v + 1).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_failed_read_ahead_surfaces_at_the_pin_that_needs_it() {
+        let len = 1 << 14;
+        let data = values(len);
+        let file = temp("failing", &bytes(&data));
+        let ctx = ctx(4);
+        // The 4th read (segment 3 when reads go in order) fails.
+        let engine: Arc<dyn TileIo> = Arc::new(FailingIo::new(PoolIo::new(2), FailPlan { read: Some((3, Fault::Fail(std::io::ErrorKind::Other))), ..FailPlan::default() }));
+        let x = Array::<f32>::open_on(&ctx, &file.0, FileOptions::raw().shape(len).engine(engine)).unwrap();
+        let error = (&x * 2.0f32).sum().item().unwrap_err();
+        assert!(matches!(error.root(), LumaError::Io { op: "read", .. }), "{error}");
+    }
 }

@@ -114,6 +114,13 @@ impl Drop for Storage {
     }
 }
 
+/// Tells each segment of a file which one follows it (for read-ahead).
+fn link_segments(segments: &[Arc<Segment>]) {
+    for pair in segments.windows(2) {
+        pair[0].link_next(&pair[1]);
+    }
+}
+
 impl Storage {
     #[cold]
     #[inline(never)]
@@ -274,6 +281,8 @@ impl Storage {
                 Segment::homed(ctx, bytes, Home { store: Arc::clone(store), offset, file_bytes })
             })
             .collect();
+        let segments: Box<[Arc<Segment>]> = segments;
+        link_segments(&segments);
         let mut storage = Self::with_segments(ctx, len, layout, c, segments, None);
         storage.file = Some(Arc::clone(store));
         storage

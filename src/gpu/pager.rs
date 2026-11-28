@@ -16,7 +16,7 @@ use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
 use luma_core::Buffer;
 
 use crate::array::Storage;
-use crate::file::FileStore;
+use crate::file::{FileStore, PendingRead};
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::{FxMap, FxSet};
@@ -120,6 +120,8 @@ pub(crate) struct Segment {
     side: OnceLock<Box<Side>>,
     /// Whether `planned` is `Some` or `failed` is set: the one relaxed load the pin paths pay ([`Segment::settle`]).
     planned_flag: AtomicBool,
+    /// What a file-backed segment needs to be read ahead of its pin; `None` for an anonymous one.
+    ahead: Option<Box<Ahead>>,
 }
 
 /// What a segment that a schedule plans (or planned) carries: made on the first plan, so a segment no schedule touches does not pay
@@ -133,6 +135,30 @@ struct Side {
     /// Number of live [`HostRead`]s: the host executor is reading the bytes of a `State::Host` segment, which neither moves
     /// to the device nor changes meanwhile.
     host_readers: AtomicU32,
+}
+
+/// The read-ahead state of a file-backed segment.
+#[derive(Debug, Default)]
+struct Ahead {
+    /// The read of the home that is under way while the segment is `Away`; lock order: after `state`.
+    read: Mutex<Option<Prefetched>>,
+    /// The segment of the same file that follows this one, for a walk in order to read ahead.
+    next: OnceLock<Weak<Segment>>,
+}
+
+/// A read of a segment's home started before its pin needs it; its bytes count against the
+/// staging budget until it is taken or dropped.
+#[derive(Debug)]
+struct Prefetched {
+    read: Option<PendingRead>,
+    ctx: Context,
+    bytes: u64,
+}
+
+impl Drop for Prefetched {
+    fn drop(&mut self) {
+        self.ctx.pager().readahead_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 /// The segments that read one segment through their lineage; entries of dropped segments are
@@ -337,6 +363,12 @@ pub(crate) struct Pager {
     home_budget: u64,
     /// Sum of the sizes of the buffers of file-backed segments on the device.
     resident_homed_bytes: AtomicU64,
+    /// How many segments ahead of a pin the reads of a file walk start (0: none); `LUMA_READAHEAD`.
+    readahead_depth: std::sync::atomic::AtomicUsize,
+    /// Bytes of reads started ahead of their pins that nothing consumed yet.
+    readahead_bytes: AtomicU64,
+    /// The most `readahead_bytes` was.
+    readahead_peak: AtomicU64,
     /// Bytes read from files into segments.
     io_read_bytes: AtomicU64,
     /// Bytes written back to files.
@@ -465,6 +497,9 @@ impl Pager {
             force_lineage: AtomicBool::new(false),
             home_budget: host_budget,
             resident_homed_bytes: AtomicU64::new(0),
+            readahead_depth: std::sync::atomic::AtomicUsize::new(default_readahead_depth()),
+            readahead_bytes: AtomicU64::new(0),
+            readahead_peak: AtomicU64::new(0),
             io_read_bytes: AtomicU64::new(0),
             io_written_bytes: AtomicU64::new(0),
             home_drops: AtomicU64::new(0),
@@ -474,6 +509,18 @@ impl Pager {
             warned: AtomicBool::new(false),
             evicting: Mutex::new(()),
         }
+    }
+
+    /// Bytes of reads that may be in flight ahead of their pins: `depth` segments of `segment`
+    /// bytes, and at most an eighth of the host budget.
+    fn readahead_budget(&self, segment: u64) -> u64 {
+        (self.readahead_depth.load(Ordering::Relaxed) as u64).saturating_mul(segment).min(self.host_budget / 8)
+    }
+
+    /// Sets how many segments are read ahead (tests compare runs with and without).
+    #[cfg(test)]
+    pub(crate) fn set_readahead_depth(&self, depth: usize) {
+        self.readahead_depth.store(depth, Ordering::Relaxed);
     }
 
     /// Whether host copies are kept at all: only where segments move off the device.
@@ -640,6 +687,7 @@ impl Segment {
             texture: Mutex::new(None),
             side: OnceLock::new(),
             planned_flag: AtomicBool::new(false),
+            ahead: None,
         })
     }
 
@@ -666,6 +714,7 @@ impl Segment {
             texture: Mutex::new(None),
             side: OnceLock::new(),
             planned_flag: AtomicBool::new(false),
+            ahead: Some(Box::default()),
         };
         segment.home = Some(home);
         Arc::new(segment)
@@ -1050,6 +1099,9 @@ impl Segment {
             } else {
                 None
             };
+            if away && !overwrite {
+                self.read_ahead();
+            }
             if away && self.ctx.is_cpu() && pager.budget.is_none() {
                 self.ctx.make_room_homed(self.bytes)?;
             }
@@ -1125,11 +1177,75 @@ impl Segment {
                 pager.register(self, buffer.size());
                 *state = State::Device(buffer);
                 drop(state);
+                if away {
+                    // A read started since (or left over from an overwriting pin) would be stale once the buffer is written.
+                    if let Some(ahead) = &self.ahead {
+                        drop(lock(&ahead.read).take());
+                    }
+                }
                 if was_evicted_by_lineage {
                     self.release_lineage_inputs();
                 }
             }
         }
+    }
+
+    /// Records the segment after this one in its file.
+    pub(crate) fn link_next(&self, next: &Arc<Segment>) {
+        if let Some(ahead) = &self.ahead {
+            let _ = ahead.next.set(Arc::downgrade(next));
+        }
+    }
+
+    /// The segment of the same file that follows this one.
+    fn next_segment(&self) -> Option<Arc<Segment>> {
+        self.ahead.as_ref()?.next.get().and_then(Weak::upgrade)
+    }
+
+    /// Starts reading this segment's home, and those of the segments that follow it in its file,
+    /// as far as the staging budget allows: their pins find the bytes (nearly) there.
+    fn read_ahead(&self) {
+        let pager = self.ctx.pager();
+        if self.ctx.is_cpu() || pager.readahead_depth.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let depth = pager.readahead_depth.load(Ordering::Relaxed);
+        if !self.start_read_ahead() {
+            return;
+        }
+        let mut at = self.next_segment();
+        for _ in 1..depth {
+            let Some(segment) = at else { break };
+            if !segment.start_read_ahead() {
+                break;
+            }
+            at = segment.next_segment();
+        }
+    }
+
+    /// Starts the read of this segment's home unless one is under way, the segment is not `Away`
+    /// or the staging budget is used up; false when the walk should stop.
+    fn start_read_ahead(&self) -> bool {
+        let (Some(home), Some(ahead)) = (self.home(), &self.ahead) else { return false };
+        let pager = self.ctx.pager();
+        let state = lock(&self.state);
+        if !matches!(&*state, State::Away) {
+            return true;
+        }
+        let mut slot = lock(&ahead.read);
+        if slot.is_some() {
+            return true;
+        }
+        let in_flight = pager.readahead_bytes.fetch_add(self.bytes, Ordering::Relaxed) + self.bytes;
+        if in_flight > pager.readahead_budget(self.bytes) {
+            pager.readahead_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+            return false;
+        }
+        pager.readahead_peak.fetch_max(in_flight, Ordering::Relaxed);
+        *slot = Some(Prefetched { read: Some(home.store.start_read(home.offset, home.file_bytes, self.bytes as usize)), ctx: self.ctx.clone(), bytes: self.bytes });
+        drop(slot);
+        drop(state);
+        true
     }
 
     /// Fills `buffer` (idle, at least `self.bytes` bytes) with the data at `home`: read straight
@@ -1148,10 +1264,11 @@ impl Segment {
             home.store.read(home.offset, data)?;
             tail.fill(MaybeUninit::new(0));
         } else {
-            let mut data = HostBytes::zeroed(total);
-            // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the read only writes initialized bytes.
-            let dst = unsafe { std::slice::from_raw_parts_mut(data.as_mut_slice().as_mut_ptr().cast::<MaybeUninit<u8>>(), file_bytes) };
-            home.store.read(home.offset, dst)?;
+            let ahead = self.ahead.as_ref().and_then(|ahead| lock(&ahead.read).take());
+            let data = match ahead {
+                Some(mut ahead) => ahead.read.take().expect("a read is taken once").finish()?,
+                None => home.store.start_read(home.offset, home.file_bytes, total).finish()?,
+            };
             self.ctx.upload(buffer, data.as_slice())?;
         }
         self.ctx.pager().io_read_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);
@@ -1671,6 +1788,7 @@ impl Context {
             home_drops: pager.home_drops.load(Ordering::Relaxed),
             home_writebacks: pager.home_writebacks.load(Ordering::Relaxed),
             file_resident_bytes: pager.resident_homed_bytes.load(Ordering::Relaxed),
+            readahead_peak_bytes: pager.readahead_peak.load(Ordering::Relaxed),
         }
     }
 }
@@ -1739,6 +1857,22 @@ pub struct PagingStats {
     pub home_writebacks: u64,
     /// Bytes of device buffers that file-backed segments hold now.
     pub file_resident_bytes: u64,
+    /// The most bytes of file reads that were under way ahead of the pins that need them (read-ahead is bounded by an eighth of the host budget).
+    pub readahead_peak_bytes: u64,
+}
+
+/// Segments read ahead by default (`LUMA_READAHEAD` overrides; 0 turns read-ahead off).
+fn default_readahead_depth() -> usize {
+    match std::env::var("LUMA_READAHEAD") {
+        Ok(text) => match text.trim().parse::<usize>() {
+            Ok(depth) => depth,
+            Err(_) => {
+                log::warn!("LUMA_READAHEAD={text:?} is not a number; using 4");
+                4
+            }
+        },
+        Err(_) => 4,
+    }
 }
 
 /// The default host budget: half of the available host memory, capped by the cgroup limit; 0

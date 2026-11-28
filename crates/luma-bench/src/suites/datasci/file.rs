@@ -95,7 +95,7 @@ pub(super) fn run(h: &mut Harness) {
     if std::env::var_os("LUMA_BENCH_DECISIONS").is_some() {
         return;
     }
-    if !["file/sum_cold", "file/sum_warm", "file/axpy_to_file", "file/chain3_reads_3x"].iter().any(|case| h.want(case)) {
+    if !["file/sum_cold", "file/sum_warm", "file/axpy_to_file", "file/chain3_reads_3x", "file/h2d_pinned"].iter().any(|case| h.want(case)) {
         return;
     }
     let n = elems(h);
@@ -149,6 +149,18 @@ pub(super) fn run(h: &mut Harness) {
         let tail = y.slice(0, n - 4..n).to_vec().unwrap();
         assert_eq!(tail, (n - 4..n).map(|i| 2.0 * ((i % (1 << 20)) % 1021) as f32 * 0.125 + 1.0).collect::<Vec<_>>());
         drop(y);
+    }
+
+    // The ceiling of the cold and warm rows: uploading host memory (no file, no kernel) to the device, the same number of bytes in 256 MiB pieces.
+    if h.want("file/h2d_pinned") {
+        let piece = n.min(1 << 26);
+        let host: Vec<f32> = (0..piece).map(|i| (i % 1021) as f32 * 0.125).collect();
+        let pieces = n / piece;
+        h.transfer_case("file/h2d_pinned", &size, Work::Bytes((pieces * piece * 4) as f64), &mut || {
+            for _ in 0..pieces {
+                Array::from_slice_on(&ctx, &host, piece).unwrap().eval().unwrap();
+            }
+        });
     }
 
     // Three passes that each need the result of the one before: the file is read three times.
