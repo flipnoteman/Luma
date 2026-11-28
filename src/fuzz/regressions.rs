@@ -973,10 +973,11 @@ fn an_iterate_until_over_a_file_array_whose_first_read_fails_does_not_run_on_an_
     }
 }
 
-/// OPEN (found by `split_io_failures`, seed 13, in a run without an injected failure; no file arrays, no split): with `chunk_bytes` and `slab_bytes` set, variable 4 (the
-/// `Concat` of a `Df32` array with itself six times, after `Assign`s of a `Df32` array to another and a `Compound` on it) has element 140 -4 on luma, -3.375 on the oracle.
+/// Found by `split_io_failures` (seed 13, in a run without an injected failure; no file arrays, no split): with `chunk_bytes` set, a `Concat` of a `Df32` array with itself six times
+/// had element 140 wrong. The node limit cuts the program in the middle (`max_live`) and one kernel stores `f32`-sized masks and `Df32` values at once: the segment length was
+/// that of the first output (256 elements for 4 bytes), so 210 elements "fit one segment", the launch skipped the segmented variant and ran in pieces of 128 (the `Df32`
+/// outputs' segment) without `base`, and the views read at the index within the piece. `plan_shifts` takes the widest output now.
 #[test]
-#[ignore = "open: slab and chunk configuration, Df32 concat"]
 fn a_concat_assign_and_compound_of_df32_arrays_with_slabs_and_chunks_is_wrong() {
     let program = Program {
         config: Config { max_nodes: 64, max_inlined: Some(16), max_live: Some(8), max_inputs: None, chunk_bytes: Some(1024), slab_bytes: Some(4096), ..Config::default_engine() },
@@ -1063,4 +1064,27 @@ fn many_threads_making_and_dropping_contexts_over_file_leaves_keep_getting_devic
         workers.into_iter().map(|worker| worker.join().unwrap()).sum()
     });
     assert_eq!(leaked, 0, "contexts stayed alive after their program ended");
+}
+
+/// Found by a wgpu `fuzz::programs` run (3000 cases): `chunk_bytes` 1024, a `Df32` `Select` read through a circular shift of an `I32` array that is 648 bytes (one segment) next to
+/// the 1296 bytes of the `Df32` one (two). Same cause as `a_concat_assign_and_compound_of_df32_arrays_with_slabs_and_chunks_is_wrong`: the segmentation of a launch followed the first output only.
+#[test]
+fn a_df32_select_read_through_a_shift_beside_a_one_segment_array_is_exact_with_chunks() {
+    check(Program {
+        config: Config { max_nodes: 1024, max_inlined: None, max_live: None, max_inputs: None, staging: false, chunk_bytes: Some(1024), ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: Bool, seed: 0 },
+            Linspace { start: 1.961, end: 1.62, n: 27 },
+            Input { dims: [9, 6, 1, 1], ty: U32, seed: 246302325265394467 },
+            Reshape { src: 0, dims: [12, 1, 1, 1] },
+            View { src: 2, view: Concat { axis: 1, others: vec![2, 2] } },
+            Unary { src: 4, op: ToI32 },
+            View { src: 3, view: Take { idx: 4 } },
+            Binary { lhs: Var(5), rhs: Const(-7.0), op: Sub },
+            Select { mask: 6, a: Const(2.0), b: Const(3.0), ty: Df32 },
+            View { src: 7, view: ShiftCirc { offs: vec![2, 4] } },
+            Loop { kind: IterateUntilAll, steps: 7, states: vec![1], body: vec![Linspace { start: 0.99399996, end: 1.978, n: 37 }, View { src: 10, view: ShiftCirc { offs: vec![-4] } }], next: vec![12] },
+        ],
+    });
 }

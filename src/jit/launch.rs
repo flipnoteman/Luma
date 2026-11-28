@@ -578,6 +578,8 @@ pub(super) fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
 pub(crate) struct Shifted {
     /// Elements of the arrays: the shifts wrap around this length.
     len: usize,
+    /// Elements of the segments `ids` is indexed by (the segment of the widest output).
+    seg: usize,
     /// Per output segment and input, the ids of the segments bound as slots.
     ids: Vec<Vec<Vec<u32>>>,
     /// What the shifted reads of the ghost inputs reach (see [`Span::Ghost`]), by input.
@@ -624,7 +626,10 @@ fn plan_shifts(
     let layout = layout_elem(key, inputs, len);
     // The segment length of the arrays the launch follows (see `Storage::segment_len`). Arrays of other element sizes have their
     // own: a launch binds them by slab, which lies in one segment of each (see `launch_store`).
-    let c = crate::array::segment_len_of_stride(ctx, layout as usize);
+    // Outputs of several element sizes have segments of several lengths: the launch runs in pieces of the shortest (see `piece_len`),
+    // so a program that reads through shifts or views needs `base` as soon as the widest output spans two segments.
+    let widest = if matches!(key.tail, Tail::Reduce(_) | Tail::AxisReduce(_)) { layout } else { out_elems(key).into_iter().fold(layout, u64::max) };
+    let c = crate::array::segment_len_of_stride(ctx, widest as usize);
     // A reduction folds segment by segment, which needs one segmentation (a store binds by slab instead).
     if matches!(key.tail, Tail::Reduce(_) | Tail::AxisReduce(_)) {
         let mixed = inputs.iter().any(|input| input.layout().stride() as u64 != layout);
@@ -663,7 +668,7 @@ fn plan_shifts(
         return Ok(None);
     };
     key.spans = counts;
-    Ok(Some(Shifted { len, ids, reaches }))
+    Ok(Some(Shifted { len, seg: c, ids, reaches }))
 }
 
 /// `ElemLayout::stride` of every output of `key`: one per stored value, or the one value a
@@ -1401,7 +1406,7 @@ pub(super) fn store_args_slab<'a, O: AsSeg, I: AsSeg>(
     // The slot ids of the segment of `outputs[0]` the slab lies in: a slab inside a segment reads a subset of what the segment reads.
     let mut slot_ids = match shifted {
         None => None,
-        Some(_) => segment_ids(shifted, slab.a / first.meta().seg_len)?,
+        Some(shifted) => segment_ids(Some(shifted), slab.a / shifted.seg)?,
     };
     // Ghost inputs: what the slab reads beside its window goes to the ghost buffer, and its description to the uniform.
     let mut plans: Vec<Option<GhostSlab>> = Vec::new();
