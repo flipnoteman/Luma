@@ -6,6 +6,7 @@
 mod common;
 mod compile;
 mod ext;
+mod fuse;
 mod fusion;
 mod hostexec;
 mod hoststep;
@@ -41,6 +42,7 @@ pub fn run(h: &mut Harness) {
         ("reduce_force", reduce_force::run),
         ("loop", loops::run),
         ("fusion", fusion::run),
+        ("fuse", fuse::run),
         ("trace", trace::run),
         ("memory", memory::run),
         ("readback", readback::run),
