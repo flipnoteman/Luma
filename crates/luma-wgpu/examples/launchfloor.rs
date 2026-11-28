@@ -7,14 +7,10 @@ const SRC: &str = "@group(0) @binding(0) var<storage, read> x: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x < 1u) { y[0] = x[0] * 1.0001 + 1e-6; } }";
 
-fn med(v: &mut Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
 fn us(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
-fn line(name: &str, v: &mut Vec<f64>) {
+fn line(name: &str, v: &[f64]) {
     let n = v.len();
     let (p10, m, p90, mx) = (v[n / 10], v[n / 2], v[n * 9 / 10], v[n - 1]);
     println!("  {name:<28} med {m:8.2}  p10 {p10:8.2}  p90 {p90:8.2}  max {mx:9.2}");
@@ -144,8 +140,8 @@ fn main() {
         println!("[2] one launch, spin poll(Poll) (us):");
         wt.sort_by(|a, b| a.partial_cmp(b).unwrap());
         tot.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        line("spin", &mut wt);
-        line("total", &mut tot);
+        line("spin", &wt);
+        line("total", &tot);
     }
     // 3. N dependent launches, one submit each, one wait at the end: host enqueue cost and throughput per launch.
     for &n in &[64usize, 256] {
@@ -173,8 +169,8 @@ fn main() {
         println!("[3] {n} dependent launches, submit each, wait at end (us per launch):");
         host.sort_by(|a, b| a.partial_cmp(b).unwrap());
         per.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        line("host (enqueue only)", &mut host);
-        line("wall incl. final wait", &mut per);
+        line("host (enqueue only)", &host);
+        line("wall incl. final wait", &per);
     }
     // 4. N dependent launches in ONE encoder/submit (one pass each).
     for &n in &[64usize, 256] {
@@ -199,8 +195,8 @@ fn main() {
         println!("[4] {n} dependent passes, one submit (us per launch):");
         host.sort_by(|a, b| a.partial_cmp(b).unwrap());
         per.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        line("host (encode+submit)", &mut host);
-        line("wall incl. wait", &mut per);
+        line("host (encode+submit)", &host);
+        line("wall incl. wait", &per);
     }
     // 5. GPU timestamp gap between consecutive dependent passes (one submit per launch, queued ahead, then wait).
     if ts {
@@ -251,9 +247,8 @@ fn main() {
             println!("[5] {n} dependent passes, GPU timestamps, {} (us):", if per_submit { "one submit per pass (cmd bufs queued ahead)" } else { "one submit" });
             gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            line("gap end[i]->begin[i+1]", &mut gaps);
-            line("pass begin->end", &mut durs);
+            line("gap end[i]->begin[i+1]", &gaps);
+            line("pass begin->end", &durs);
         }
     }
-    let _ = med;
 }
