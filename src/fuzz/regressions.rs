@@ -1022,6 +1022,8 @@ fn an_iterate_until_over_two_states_whose_seed_copy_fails_does_not_run_on_unseed
     if let Err(failure) = super::run_with_failure(&program, plan) {
         panic!("{failure}\n{program:?}");
     }
+}
+
 /// Finding of the end-of-wave 3 gate (a wgpu fuzz run hung): the thread's open schedule of a split context over a file leaf was committed when the last
 /// outside handle of the context dropped only if the handles left were its segments' (it did not count the file's store, which holds one too). It never
 /// committed otherwise, and the thread kept the context, its arrays and, on wgpu, its device until it ended: 64 such contexts used up the driver's
