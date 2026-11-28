@@ -7,6 +7,7 @@ mod common;
 mod compile;
 mod ext;
 mod fusion;
+mod hostexec;
 mod hoststep;
 mod launch;
 mod launchcost;
@@ -32,6 +33,7 @@ pub fn run(h: &mut Harness) {
         ("launch", launch::run),
         ("launchcost", launchcost::run),
         ("hoststep", hoststep::run),
+        ("hostexec", hostexec::run),
         ("matmul_build", matmul_build::run),
         ("reduce_build", reduce_build::run),
         ("reduce_force", reduce_force::run),
