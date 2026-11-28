@@ -750,6 +750,25 @@ mod tests {
         assert!(memory.l2_gbs.is_finite() && memory.l2_gbs > 0.0 && memory.latency_ns.is_finite() && memory.latency_ns > 0.0, "{memory}");
     }
 
+    /// Decision 18 of W3-U6: only CUDA has transfer lanes, so no other backend (wgpu, the CPU) pays the transfer probes at its first
+    /// calibration, and none stores a `TransferModel`.
+    #[test]
+    fn only_cuda_measures_the_transfer_lanes() {
+        let options = crate::ContextOptions::from_env().calibrate(false);
+        let ctx = Context::with_options(options).unwrap();
+        let measured = measure_transfers(&ctx).unwrap();
+        let (_, memory) = calibrate(&ctx).unwrap();
+        let stored = memory.and_then(|memory| memory.transfer);
+        if ctx.backend() == luma_core::BackendKind::Cuda && !ctx.is_cpu() {
+            assert!(measured.is_some() && stored.is_some(), "CUDA measures its lanes");
+        } else {
+            assert!(measured.is_none(), "{:?} has no transfer lanes to measure", ctx.backend());
+            assert!(stored.is_none(), "{:?} stores no transfer model", ctx.backend());
+        }
+        let cpu = Context::with_options(crate::ContextOptions::default().backend(luma_core::BackendKind::Cpu).calibrate(false)).unwrap();
+        assert!(measure_transfers(&cpu).unwrap().is_none());
+    }
+
     #[test]
     fn calibrating_a_context_with_small_chunks_leaves_it_usable() {
         let options = crate::ContextOptions::default().calibrate(false).chunk_bytes(1024);
