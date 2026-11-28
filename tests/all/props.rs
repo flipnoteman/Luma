@@ -694,7 +694,7 @@ fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
     x.matmul_tn(&other).to_vec().unwrap();
     let plain = ctx.take_decisions();
     let syrk = |decisions: &[luma::Decision]| decisions.iter().any(|d| d.chosen.contains("syrk"));
-    if ctx.is_cpu() {
+    if matches!(ctx.backend(), luma::BackendKind::Cpu | luma::BackendKind::Cuda) {
         assert!(syrk(&gram), "{gram:?}");
     }
     assert!(!syrk(&plain), "{plain:?}");
