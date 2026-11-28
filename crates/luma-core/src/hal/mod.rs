@@ -1529,6 +1529,22 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn stage_alloc(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
         Ok(Stage::heap(bytes, dir))
     }
+    /// Whether [`Backend::stage_alloc_uninit`] memory lets [`Backend::record_upload_staged`] skip a
+    /// host copy (pinned memory): a caller that fills the stage itself saves the copy through the
+    /// backend's own staging.
+    fn pinned_staging(&self) -> bool {
+        false
+    }
+    /// [`Backend::stage_alloc`] without zeroing the bytes: the caller writes every byte it uploads.
+    fn stage_alloc_uninit(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        self.stage_alloc(bytes, dir)
+    }
+    /// Records an upload of the first `bytes` bytes of `stage` into the start of `dst`, like
+    /// [`Backend::record_upload`]; the backend may keep the stage's memory until the copy ran
+    /// (the stage is empty afterwards).
+    fn record_upload_staged(&self, dst: &Buffer, stage: &mut Stage, bytes: u64, max_buffer_bytes: u64) -> Result<(), BackendError> {
+        self.record_upload(dst, &stage.as_slice()[..bytes as usize], max_buffer_bytes)
+    }
     /// The bytes of `stage`, valid while the host owns it.
     fn stage_ptr<'a>(&self, stage: &'a mut Stage) -> &'a mut [u8] {
         stage.as_mut_slice()

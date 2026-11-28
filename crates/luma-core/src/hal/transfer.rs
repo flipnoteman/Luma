@@ -90,6 +90,12 @@ impl Stage {
         let native: &dyn Any = &*self.native;
         native.downcast_ref()
     }
+
+    /// [`Stage::downcast_ref`] with write access.
+    pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        let native: &mut dyn Any = &mut *self.native;
+        native.downcast_mut()
+    }
 }
 
 /// What a ticket of the default implementations stands for.

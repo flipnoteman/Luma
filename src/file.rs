@@ -27,7 +27,7 @@ use crate::gpu_type::GpuType;
 use crate::jit::{self, ElemTy, Op, OpKind, Src};
 use crate::shape::Shape;
 use crate::builtin::UnOp;
-use luma_core::hal::{HostBlock, HostBytes};
+use luma_core::hal::{HostBlock, HostBytes, Stage};
 
 /// The largest `.npy` header read (NumPy's own limit is 1 MiB).
 const HEAD_BYTES: u64 = (1 << 20) + 64;
@@ -234,15 +234,23 @@ impl FileStore {
         read_blocking(&*self.engine, &self.file, extent, dst).map(|_| ()).map_err(|e| LumaError::io("read", &self.path, Some(offset), e))
     }
 
-    /// Starts reading `file_bytes` bytes from `offset` into a new block of `total` bytes (the rest
-    /// of the block is zero once [`PendingRead::finish`] is called). Nothing waits.
-    pub(crate) fn start_read(self: &Arc<Self>, offset: u64, file_bytes: u64, total: usize) -> PendingRead {
-        let mut block = HostBytes::block(total);
+    /// Starts reading `file_bytes` bytes from `offset` into `stage` (the backend's pinned
+    /// memory) or, without one, into a new heap block of `total` bytes (the rest of it is zero
+    /// once [`PendingRead::finish`] is called). Nothing waits.
+    pub(crate) fn start_read(self: &Arc<Self>, offset: u64, file_bytes: u64, total: usize, stage: Option<Stage>) -> PendingRead {
         let filled = (file_bytes as usize).min(total);
-        // SAFETY: the block lives (on the heap, at a fixed address) until `PendingRead` is dropped, which waits for the ticket first; nothing else touches the first `filled` bytes meanwhile.
-        let stage = unsafe { StagePtr::new(block.as_mut_ptr(), filled) };
-        let ticket = self.engine.read(&self.file, Extent { offset, len: filled as u64 }, stage);
-        PendingRead { store: Arc::clone(self), offset, ticket: Some(ticket), block: Some(block), filled }
+        let mut target = match stage {
+            Some(stage) => Target::Stage(stage),
+            None => Target::Heap(HostBytes::block(total)),
+        };
+        let ptr = match &mut target {
+            Target::Heap(block) => block.as_mut_ptr(),
+            Target::Stage(stage) => stage.as_mut_slice().as_mut_ptr(),
+        };
+        // SAFETY: the memory lives (on the heap or pinned, at a fixed address, also when `target` moves) until `PendingRead` is dropped, which waits for the ticket first; nothing else touches the first `filled` bytes meanwhile.
+        let stage_ptr = unsafe { StagePtr::new(ptr, filled) };
+        let ticket = self.engine.read(&self.file, Extent { offset, len: filled as u64 }, stage_ptr);
+        PendingRead { store: Arc::clone(self), offset, ticket: Some(ticket), target: Some(target), filled, total }
     }
 
     /// Writes `src` at `offset`.
@@ -843,31 +851,50 @@ fn write_array<T: GpuType>(array: &Array<T>, path: &Path, opts: FileOptions) -> 
     result
 }
 
+/// Where a read lands.
+#[derive(Debug)]
+enum Target {
+    Heap(HostBlock),
+    Stage(Stage),
+}
+
+/// What a finished read holds: `total` bytes, the part past the file's zero.
+pub(crate) enum Filled {
+    Heap(HostBytes),
+    Stage(Stage),
+}
+
 /// A read of a file extent into host memory that is under way (see [`FileStore::start_read`]).
 #[derive(Debug)]
 pub(crate) struct PendingRead {
     store: Arc<FileStore>,
     offset: u64,
     ticket: Option<IoTicket>,
-    block: Option<HostBlock>,
+    target: Option<Target>,
     filled: usize,
+    total: usize,
 }
 
 impl PendingRead {
     /// Waits for the read; the bytes past the file's are zero.
-    pub(crate) fn finish(mut self) -> Result<HostBytes> {
+    pub(crate) fn finish(mut self) -> Result<Filled> {
         let ticket = self.ticket.take().expect("a read is finished once");
         let result = if self.filled == 0 { Ok(0) } else { self.store.engine.wait(&ticket) };
         result.map_err(|e| LumaError::io("read", &self.store.path, Some(self.offset), e))?;
-        let block = self.block.take().expect("a read is finished once");
-        // SAFETY: the read of the first `filled` bytes completed successfully, and nothing writes the block any more.
-        Ok(unsafe { block.finish(self.filled) })
+        Ok(match self.target.take().expect("a read is finished once") {
+            // SAFETY: the read of the first `filled` bytes completed successfully, and nothing writes the block any more.
+            Target::Heap(block) => Filled::Heap(unsafe { block.finish(self.filled) }),
+            Target::Stage(mut stage) => {
+                stage.as_mut_slice()[self.filled..self.total].fill(0);
+                Filled::Stage(stage)
+            }
+        })
     }
 }
 
 impl Drop for PendingRead {
     fn drop(&mut self) {
-        // The engine writes into the block until the ticket completes.
+        // The engine writes into the memory until the ticket completes.
         if let Some(ticket) = self.ticket.take() {
             let _ = self.store.engine.wait(&ticket);
         }

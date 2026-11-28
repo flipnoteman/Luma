@@ -16,7 +16,7 @@ use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
 use luma_core::Buffer;
 
 use crate::array::Storage;
-use crate::file::{FileStore, PendingRead};
+use crate::file::{FileStore, Filled, PendingRead};
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::{FxMap, FxSet};
@@ -1242,7 +1242,7 @@ impl Segment {
             return false;
         }
         pager.readahead_peak.fetch_max(in_flight, Ordering::Relaxed);
-        *slot = Some(Prefetched { read: Some(home.store.start_read(home.offset, home.file_bytes, self.bytes as usize)), ctx: self.ctx.clone(), bytes: self.bytes });
+        *slot = Some(Prefetched { read: Some(home.store.start_read(home.offset, home.file_bytes, self.bytes as usize, self.ctx.upload_stage(self.bytes))), ctx: self.ctx.clone(), bytes: self.bytes });
         drop(slot);
         drop(state);
         true
@@ -1265,11 +1265,14 @@ impl Segment {
             tail.fill(MaybeUninit::new(0));
         } else {
             let ahead = self.ahead.as_ref().and_then(|ahead| lock(&ahead.read).take());
-            let data = match ahead {
+            let filled = match ahead {
                 Some(mut ahead) => ahead.read.take().expect("a read is taken once").finish()?,
-                None => home.store.start_read(home.offset, home.file_bytes, total).finish()?,
+                None => home.store.start_read(home.offset, home.file_bytes, total, self.ctx.upload_stage(self.bytes)).finish()?,
             };
-            self.ctx.upload(buffer, data.as_slice())?;
+            match filled {
+                Filled::Heap(data) => self.ctx.upload(buffer, data.as_slice())?,
+                Filled::Stage(mut stage) => self.ctx.upload_staged(buffer, &mut stage, self.bytes)?,
+            }
         }
         self.ctx.pager().io_read_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);
         Ok(())

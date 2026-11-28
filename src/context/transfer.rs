@@ -109,6 +109,27 @@ impl Context {
         })
     }
 
+    /// Host memory the backend uploads from without another copy (pinned memory), `bytes` bytes
+    /// the caller writes completely; `None` where the backend has none.
+    pub(crate) fn upload_stage(&self, bytes: u64) -> Option<luma_core::hal::Stage> {
+        if !self.hal().pinned_staging() {
+            return None;
+        }
+        self.hal().stage_alloc_uninit(bytes, luma_core::hal::StageDir::ToDevice).ok()
+    }
+
+    /// [`Context::upload`] of the first `bytes` bytes of a stage from [`Context::upload_stage`].
+    pub(crate) fn upload_staged(&self, dst: &Buffer, stage: &mut luma_core::hal::Stage, bytes: u64) -> Result<()> {
+        self.abort_recording_for("upload")?;
+        let max = self.max_buffer_bytes();
+        size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        self.relieving(bytes, || match self.hal().record_upload_staged(dst, stage, bytes, max) {
+            Ok(()) => Ok(Some(())),
+            Err(BackendError::OutOfMemory { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        })
+    }
+
     /// Whether `from_slice` writes straight into mappable storage buffers (unified memory)
     /// instead of copying out of a staging buffer.
     pub(crate) fn zero_copy(&self) -> bool {

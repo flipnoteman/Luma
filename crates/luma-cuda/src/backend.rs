@@ -1869,6 +1869,44 @@ impl Backend for CudaBackend {
         Ok(Stage::new(dir, CudaStage { pinned: Some(pinned), len, last: Mutex::new(None), state: Arc::downgrade(&self.state) }))
     }
 
+    fn pinned_staging(&self) -> bool {
+        true
+    }
+
+    fn stage_alloc_uninit(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        let len = usize::try_from(bytes).map_err(|_| BackendError::OutOfMemory { requested: bytes })?;
+        let pinned = self.take_pinned(&mut lock(&self.state), len)?;
+        Ok(Stage::new(dir, CudaStage { pinned: Some(pinned), len, last: Mutex::new(None), state: Arc::downgrade(&self.state) }))
+    }
+
+    fn record_upload_staged(&self, dst: &Buffer, stage: &mut Stage, bytes: u64, max_buffer_bytes: u64) -> Result<(), BackendError> {
+        let dptr = device_ptr(dst)?;
+        if bytes > dst.size().min(max_buffer_bytes) {
+            return Err(BackendError::OutOfMemory { requested: bytes });
+        }
+        let Some(native) = stage.downcast_mut::<CudaStage>() else {
+            return self.record_upload(dst, &stage.as_slice()[..bytes as usize], max_buffer_bytes);
+        };
+        let Some(pinned) = native.pinned.take() else { return Err(BackendError::Gpu("a stage without memory".into())) };
+        let mut st = lock(&self.state);
+        self.bind()?;
+        if st.held.buffers.last() != Some(dst) {
+            st.held.buffers.push(dst.clone());
+        }
+        // SAFETY: the block holds at least `bytes` bytes (the stage's length); it stays alive until the copy has completed (the staging queue or the batch holds it).
+        let staged = unsafe { std::slice::from_raw_parts(pinned.ptr, bytes as usize) };
+        // SAFETY: the destination range lies inside `dst`.
+        let enqueued = unsafe { result::memcpy_htod_async(dptr, staged, self.stream.cu_stream()) };
+        let own_event = if enqueued.is_ok() && pinned.cap >= MARK_MIN { self.event(&mut st).ok().filter(|event| event.record(&self.stream).is_ok()) } else { None };
+        st.pinned_busy += pinned.cap;
+        st.dirty = true;
+        match own_event {
+            Some(event) => st.staging.push_back((event, pinned)),
+            None => st.held.pinned.push(pinned),
+        }
+        enqueued.map_err(gpu)
+    }
+
     fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
         check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
         let native = stage.downcast_ref::<CudaStage>().ok_or_else(|| BackendError::Unsupported("a stage of another backend".into()))?;
