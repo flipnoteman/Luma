@@ -130,8 +130,12 @@ macro_rules! half_array {
             /// The matrix product `self * rhs` (see [`Array::matmul`] of an `f32` array): the
             /// elements are widened to `f32` where the kernel loads them, the product is computed
             /// with the `f32` kernels (so it is accumulated in `f32`, with the precision of the
-            /// context's numerics), and the result is rounded to the element type. There is no
-            /// half-precision matrix unit yet.
+            /// context's numerics), and the result is rounded to the element type. Where the numerics
+            /// allow [`Reduced::MATRIX_ACCUMULATE`](crate::Reduced::MATRIX_ACCUMULATE) (all but
+            /// `strict`) and the device has half-precision tensor cores (CUDA, compute capability 8.0
+            /// or higher), a product whose leading dimensions are multiples of 8 runs on them instead:
+            /// the operands are multiplied exactly and accumulated in `f32` in hardware order, the
+            /// result rounded once.
             #[track_caller]
             pub fn matmul(&self, rhs: &Array<$t>) -> Array<$t> {
                 if let Some(product) = crate::matmul_half::product(self, rhs, false, false, Location::caller()) {

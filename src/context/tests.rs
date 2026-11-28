@@ -642,7 +642,8 @@ fn the_deprecated_numerics_options_apply_over_numerics() {
     // The one switch of the algebraic rewrites before the class flags existed: it still enables them.
     assert_eq!(fast.effective_numerics(), Numerics::fast());
     let exact = ContextOptions::default().tf32_matmul(false);
-    assert_eq!(exact.effective_numerics(), Numerics::strict());
+    // Only TF32 goes: the half-precision units (`MATRIX_ACCUMULATE`, which never round an operand) stay.
+    assert_eq!(exact.effective_numerics(), Numerics::strict().with_reduced(luma::Reduced::MATRIX_ACCUMULATE, true));
     assert_eq!(ContextOptions::default().numerics(Numerics::fast()).effective_numerics(), Numerics::fast());
     let ctx = Context::with_options(exact.backend(BackendKind::Cpu).calibrate(false)).unwrap();
     assert!(!ctx.tf32_matmul() && !ctx.numerics().tf32_matmul());

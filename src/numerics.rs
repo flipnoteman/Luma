@@ -251,8 +251,9 @@ mod tests {
     fn modifiers_apply_in_order() {
         let n = Numerics::parse("strict+tf32-linalg").unwrap();
         assert!(n.tf32_linalg() && !n.tf32_matmul() && !n.fast_math());
-        let n = Numerics::parse("default-tf32-matmul").unwrap();
+        let n = Numerics::parse("default-tf32-matmul-matrix-accumulate").unwrap();
         assert_eq!(n, Numerics::strict());
+        assert_eq!(Numerics::parse("strict+matrix-accumulate+f16-matmul").unwrap().reduced, Reduced::MATRIX_ACCUMULATE | Reduced::F16_OPERANDS);
         let n = Numerics::parse("algebraic-tf32-matmul+tf32-linalg-reassociate").unwrap();
         assert!(!n.tf32_matmul() && n.tf32_linalg() && !n.reassociate && n.reformulate && n.exact_finite);
         assert_eq!(Numerics::parse(&n.to_string()), Ok(n));
