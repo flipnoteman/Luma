@@ -1,19 +1,21 @@
 //! Failures of a commit: the outputs are poisoned and the error reaches everything that uses them.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use super::SplitMode;
 use crate::{Array, Context, ContextOptions};
 
-/// Slab at which the next stage fails (`usize::MAX`: never). One test at a time sets it (they are serialised by `LOCK`).
-static FAIL_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+thread_local! {
+    /// Slab at which the next stage this thread runs fails (`usize::MAX`: never). Per thread: the other tests run beside it.
+    static FAIL_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) fn fail_here(slab: usize) -> bool {
-    if slab >= PANIC_AT.load(Ordering::Relaxed) {
+    if PANIC_HERE.with(std::cell::Cell::get) {
         panic!("injected panic");
     }
-    slab >= FAIL_AT.load(Ordering::Relaxed)
+    slab >= FAIL_AT.with(std::cell::Cell::get)
 }
 
 #[test]
@@ -23,10 +25,10 @@ fn a_failing_commit_poisons_the_outputs() {
     let n = 5 * 256 + 3;
     let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
     let y = &x * 2.0;
-    FAIL_AT.store(3, Ordering::Relaxed);
+    FAIL_AT.with(|at| at.set(3));
     // The commit runs when the GPU is idle (`eval`) or when the data is wanted; the error comes back from the call that triggered it.
     let evaluated = y.eval();
-    FAIL_AT.store(usize::MAX, Ordering::Relaxed);
+    FAIL_AT.with(|at| at.set(usize::MAX));
     let wanted = y.to_vec();
     let error = evaluated.err().or(wanted.err()).expect("the commit failed");
     assert!(format!("{error}").contains("injected failure"), "{error}");
@@ -287,8 +289,10 @@ fn a_single_segment_reduction_keeps_its_bits() {
 
 // -- review fixes --
 
-/// Set while a test wants the next commit to panic (read by `fail_here`, which the executor calls per slab).
-static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+thread_local! {
+    /// Set while this thread's test wants its next commit to panic (read by `fail_here`, which the executor calls per slab).
+    static PANIC_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[test]
 fn a_panic_inside_a_commit_poisons_the_outputs_and_wakes_waiters() {
@@ -297,11 +301,11 @@ fn a_panic_inside_a_commit_poisons_the_outputs_and_wakes_waiters() {
     let n = 5 * 256 + 3;
     let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
     let y = &x * 2.0;
-    PANIC_AT.store(0, Ordering::Relaxed);
+    PANIC_HERE.with(|flag| flag.set(true));
     // The commit runs in `eval` (an idle device) or when the data is wanted: that call panics.
     let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| y.eval()));
     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| y.to_vec().map(|_| ())));
-    PANIC_AT.store(usize::MAX, Ordering::Relaxed);
+    PANIC_HERE.with(|flag| flag.set(false));
     assert!(first.is_err() || second.is_err(), "the commit panicked");
     // Whoever asks next gets an error, not a wait that never ends, and the context keeps working.
     assert!(y.to_vec().is_err());
