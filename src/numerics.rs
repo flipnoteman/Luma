@@ -97,7 +97,12 @@ impl Numerics {
     }
 
     /// [`Numerics::default`] and the algebraic rewrites that change rounding or are exact only
-    /// for finite inputs.
+    /// for finite inputs. Among them, on matrix products: `a * identity` is `a`, `a * diag_matrix(v)`
+    /// is `a * v`, `sum(a * b)` and `sum_axis(a * b, j)` are sums of the operands and a vector
+    /// product, and a chain `(a * b) * v` is multiplied in the cheapest order. To let those rules see
+    /// a product before it is computed, a product (and the sum of one) is not launched at the call
+    /// but when its value is used, so a GPU starts a little later in a loop than with the default
+    /// numerics.
     pub const fn algebraic() -> Self {
         Numerics { reassociate: true, reformulate: true, exact_finite: true, reduced: Reduced::TF32_MATMUL }
     }

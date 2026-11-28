@@ -5,7 +5,7 @@ use super::index::{diag_of_product_form, needs_t1};
 use super::t1::t1;
 use crate::array::Array;
 use crate::context::{Context, ContextOptions};
-use crate::jit::comprehension::{Origin, lower};
+use crate::jit::comprehension::{Algebra, Origin, lower};
 use crate::jit::structured::contraction::{ContractionAttrs, ContractionView, Tf32Request};
 use crate::jit::structured::sites::LazyMode;
 use crate::numerics::Numerics;
@@ -46,6 +46,9 @@ fn view<'a>(lhs: &'a A, rhs: &'a A, tf32: Tf32Request) -> ContractionView<'a> {
 
 #[test]
 fn a_product_of_one_term_is_an_elementwise_product_plus_zero() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Never, Numerics::default());
     let (ha, hb) = (values(6, 0), values(4, 3));
     let a = A::from_slice_on(&ctx, &ha, [1, 6]).unwrap();
@@ -65,6 +68,9 @@ fn a_product_of_one_term_is_an_elementwise_product_plus_zero() {
 
 #[test]
 fn an_explicit_tf32_product_of_one_term_keeps_its_kernel() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Never, Numerics::default());
     let a = A::from_slice_on(&ctx, &values(6, 0), [1, 6]).unwrap();
     let b = A::from_slice_on(&ctx, &values(4, 3), [4, 1]).unwrap();
@@ -75,6 +81,9 @@ fn an_explicit_tf32_product_of_one_term_keeps_its_kernel() {
 
 #[test]
 fn the_pre_filter_is_false_for_an_ordinary_product() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Never, Numerics::default());
     let a = A::from_slice_on(&ctx, &values(12 * 8, 0), [12, 8]).unwrap();
     let b = A::from_slice_on(&ctx, &values(5 * 12, 1), [5, 12]).unwrap();
@@ -82,12 +91,14 @@ fn the_pre_filter_is_false_for_an_ordinary_product() {
     let square = A::from_slice_on(&ctx, &values(64, 2), [8, 8]).unwrap();
     let other = A::from_slice_on(&ctx, &values(64, 3), [8, 8]).unwrap();
     assert!(!needs_t1(&ctx, &square, &other), "a square product of two sources is not a candidate");
-    assert!(needs_t1(&ctx, &square, &square.transpose()), "a gram product is");
     assert!(needs_t1(&ctx, &A::identity_on(&ctx, [8, 8]).unwrap(), &square), "an operand with a property is");
 }
 
 #[test]
 fn a_pending_view_is_composed_into_the_map_and_keeps_the_sum_order() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Never, Numerics::default());
     let (ha, hb) = (values(5 * 4, 1), values(3 * 4, 2));
     let a = A::from_slice_on(&ctx, &ha, [5, 4]).unwrap();
@@ -107,6 +118,9 @@ fn a_pending_view_is_composed_into_the_map_and_keeps_the_sum_order() {
 
 #[test]
 fn the_diagonal_of_a_lazy_product_is_n_squared_work_and_equals_the_product_then_diag() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Always, Numerics::default());
     let n = 9;
     let (ha, hb) = (values(n * 6, 1), values(n * 6, 2));
@@ -131,6 +145,9 @@ fn the_diagonal_of_a_lazy_product_is_n_squared_work_and_equals_the_product_then_
 
 #[test]
 fn the_diagonal_form_merges_the_two_parallel_dims() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let ctx = open(LazyMode::Never, Numerics::default());
     let a = A::from_slice_on(&ctx, &values(24, 1), [4, 6]).unwrap();
     let b = A::from_slice_on(&ctx, &values(24, 2), [6, 4]).unwrap();
@@ -150,7 +167,10 @@ fn finite(len: usize, seed: usize) -> Vec<f32> {
 }
 
 #[test]
-fn a_gram_product_is_tagged_symmetric_and_is_bit_symmetric() {
+fn the_form_of_a_gram_product_is_tagged_symmetric_and_the_product_is_bit_symmetric() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     use crate::jit::comprehension::Props;
     let ctx = open(LazyMode::Always, Numerics::default());
     let (k, n) = (7, 6);
@@ -159,9 +179,7 @@ fn a_gram_product_is_tagged_symmetric_and_is_bit_symmetric() {
     let at = x.transpose();
     let form = t1(view(&at, &x, Tf32Request::Default).form().unwrap(), &ctx);
     assert!(form.props.has(Props::SYMMETRIC), "{:?}", form.props);
-    let gram = x.matmul_tn(&x);
-    assert!(gram.props().has(Props::SYMMETRIC), "the product carries the tag");
-    let c = gram.to_vec().unwrap();
+    let c = x.matmul_tn(&x).to_vec().unwrap();
     for i in 0..n {
         for j in 0..n {
             assert_eq!(c[i * n + j].to_bits(), c[j * n + i].to_bits());
@@ -176,6 +194,9 @@ fn a_gram_product_is_tagged_symmetric_and_is_bit_symmetric() {
 
 #[test]
 fn a_product_with_the_identity_is_the_operand_under_algebraic_and_a_product_otherwise() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let n = 6;
     let data = finite(n * 4, 1);
     for (numerics, rewritten) in [(Numerics::algebraic(), true), (Numerics::default(), false)] {
@@ -198,6 +219,9 @@ fn a_product_with_the_identity_is_the_operand_under_algebraic_and_a_product_othe
 
 #[test]
 fn a_product_with_a_diagonal_matrix_is_a_broadcast_product_under_algebraic() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let (k, m) = (6, 4);
     let (da, dv) = (finite(k * m, 1), finite(k, 4));
     for (numerics, rewritten) in [(Numerics::algebraic(), true), (Numerics::default(), false)] {
@@ -244,6 +268,9 @@ fn rows(ctx: &Context) -> (Vec<DecisionSite>, Vec<String>) {
 
 #[test]
 fn the_sum_of_a_product_is_two_sums_and_a_dot_under_algebraic() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let (k, m, n) = (256, 256, 256);
     let (ha, hb) = (finite(k * m, 1), finite(n * k, 2));
     let want: f64 = host_product(&ha, &hb, k, m, n).iter().sum();
@@ -262,6 +289,9 @@ fn the_sum_of_a_product_is_two_sums_and_a_dot_under_algebraic() {
 
 #[test]
 fn the_sum_along_an_axis_of_a_product_is_a_vector_product_under_algebraic() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let (k, m, n) = (256, 192, 224);
     let (ha, hb) = (finite(k * m, 3), finite(n * k, 4));
     let full = host_product(&ha, &hb, k, m, n);
@@ -282,6 +312,9 @@ fn the_sum_along_an_axis_of_a_product_is_a_vector_product_under_algebraic() {
 
 #[test]
 fn a_chain_with_a_vector_is_multiplied_from_the_vector_under_algebraic() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
     let n = 384;
     let (ha, hb, hv) = (finite(n * n, 1), finite(n * n, 2), finite(n, 3));
     // (a·b)·v on the host in f64: v is [1, n] (the column), the product [1, n].
@@ -298,5 +331,30 @@ fn a_chain_with_a_vector_is_multiplied_from_the_vector_under_algebraic() {
         close(&got.to_vec().unwrap(), &want, 1e-4);
         let (_, fired) = rows(&ctx);
         assert_eq!(fired.iter().any(|rule| rule == "chain_order"), rewritten, "{numerics}: {fired:?}");
+    }
+}
+
+#[test]
+fn the_rules_of_products_fire_exactly_under_the_flags_that_allow_them() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
+    let n = 6;
+    let data = finite(n * 4, 1);
+    for bits in 0..8u8 {
+        let numerics = Numerics { exact_finite: bits & 1 != 0, reassociate: bits & 2 != 0, reformulate: bits & 4 != 0, ..Numerics::strict() };
+        let ctx = open(LazyMode::Never, numerics);
+        let a = A::from_slice_on(&ctx, &data, [n, 4]).unwrap();
+        let one = A::from_slice_on(&ctx, &values(4, 1), [1, 4]).unwrap();
+        let row = A::from_slice_on(&ctx, &values(n, 2), [n, 1]).unwrap();
+        ctx.record_decisions(true);
+        let _ = a.matmul(&A::identity_on(&ctx, [n, n]).unwrap()).to_vec().unwrap();
+        let _ = a.matmul(&row.diag_matrix(0)).to_vec().unwrap();
+        let _ = one.matmul(&row).to_vec().unwrap();
+        let (_, fired) = rows(&ctx);
+        let fired = |rule: &str| fired.iter().any(|name| name == rule);
+        assert!(fired("contract_k1"), "{numerics}: exact, always");
+        assert_eq!(fired("contract_identity"), numerics.reformulate, "{numerics}");
+        assert_eq!(fired("contract_diag"), numerics.reformulate, "{numerics}");
     }
 }

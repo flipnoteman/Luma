@@ -28,7 +28,6 @@ use crate::jit::comprehension::build::Bodies;
 use crate::jit::comprehension::lower;
 use crate::jit::comprehension::{Access, AffineMap, Body, CombineOp, CombinePart, Comprehension, Compensation, DimKind, Epilogue, MapRef, OpTag, Origin, OutMap, Props, MAX_DIMS};
 use crate::jit::program::{Instr, Ref};
-use crate::jit::structured::contraction::Tf32Request;
 use crate::jit::structured::RunState;
 use crate::jit::{BinOp, Edge, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::numerics::Numerics;
@@ -341,31 +340,13 @@ fn contract_diag(form: &Comprehension, _: &Numerics) -> Option<Comprehension> {
 
 // -- the eager path --
 
-/// Whether a `matmul` of `lhs` and `rhs` may be rewritten by a rule of tier 1: a handful of integer and flag tests, so that the
-/// common product pays nothing else. The product is a candidate when `K` is 1, an operand knows what it is (a property), or the
-/// result is square and both operands read one source (`aᵀa`).
+/// Whether a `matmul` of `lhs` and `rhs` may be rewritten by a rule of tier 1: a few integer and flag tests, so that the common
+/// product pays nothing else. The product is a candidate when `K` is 1 or an operand knows what it is (a property). A gram product
+/// (`aᵀa`) is not a candidate here: its tag is set by the product itself (W3-R6) and by rule 11 on the form of a lazy product; a
+/// test of the operands' sources on every eager product cost 1.6% of the host time of `launchcost/matmul32`.
 #[inline(always)]
 pub(crate) fn needs_t1(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> bool {
-    ctx.jit().rules.t1_active && (lhs.shape().dims()[0] == 1 || lhs.has_props() || rhs.has_props() || (lhs.shape().dims()[1] == rhs.shape().dims()[0] && lhs.len() == rhs.len() && same_source(lhs, rhs)))
-}
-
-/// Whether the two arrays are one buffer or node, or a pending view of it.
-fn same_source(lhs: &Array<f32>, rhs: &Array<f32>) -> bool {
-    fn base(array: &Array<f32>) -> Option<usize> {
-        if let Some(node) = array.pending() {
-            if node.is_pending_view() {
-                if let Some([Src::Node(source), ..]) = node.operands() {
-                    return Some(Arc::as_ptr(&source) as usize);
-                }
-                if let Some([Src::Buffer(source), ..]) = node.operands() {
-                    return Some(Arc::as_ptr(&source) as usize);
-                }
-            }
-            return Some(Arc::as_ptr(node) as usize);
-        }
-        array.recorded_storage().map(|storage| Arc::as_ptr(storage) as usize)
-    }
-    matches!((base(lhs), base(rhs)), (Some(a), Some(b)) if a == b)
+    ctx.jit().rules.t1_active && (lhs.shape().dims()[0] == 1 || lhs.has_props() || rhs.has_props())
 }
 
 /// What the rules of tier 1 make of a product that [`needs_t1`].
@@ -401,9 +382,4 @@ fn note(ctx: &Context, location: &'static Location<'static>, rule: Rid) {
     if ctx.jit().recording_decisions() {
         ctx.jit().note_decision(Decision::new("matmul", location, DecisionSite::Rewrite, info(rule).name));
     }
-}
-
-/// Whether the request is for the context's default rounding or exact `f32` (an explicit `tf32` request is never rewritten).
-pub(crate) fn rewritable(tf32: Tf32Request) -> bool {
-    tf32 != Tf32Request::Tf32
 }
