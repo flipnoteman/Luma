@@ -29,7 +29,8 @@ use crate::harness::Harness;
 type Group = fn(&mut Harness);
 
 pub fn run(h: &mut Harness) {
-    let groups: [(&str, Group); 16] = [
+    // A slice, not a fixed-length array: branches that each add a group no longer collide on the length.
+    let groups: &[(&str, Group)] = &[
         ("compile", compile::run),
         ("launch", launch::run),
         ("launchcost", launchcost::run),
@@ -49,7 +50,7 @@ pub fn run(h: &mut Harness) {
         ("ext", ext::run),
     ];
     let start = Instant::now();
-    for (name, group) in groups {
+    for &(name, group) in groups {
         let t = Instant::now();
         group(h);
         println!("-- jit/{name}: {:.1} s", t.elapsed().as_secs_f64());
