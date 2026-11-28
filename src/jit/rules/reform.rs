@@ -433,6 +433,10 @@ fn epilogue_map(form: &Comprehension, access: &Access) -> Option<EpiMap> {
 fn factor_invariant(scope: &Scope, site: Site, _: &Numerics) -> Option<Rewrite> {
     let Site::Comp(root_id) = site else { return None };
     let root = scope.comp(root_id).filter(|comp| comp.role == ScopeRole::Root)?;
+    // A reduction that could be recorded with others is left to be (the merged kernel reads what it reads once).
+    if scope.comps.len() != 1 {
+        return None;
+    }
     let original = &root.form;
     let reduce_ok = matches!(&original.origin, Origin::Api(OpTag::Reduce(ops) | OpTag::ReduceAxis(ops)) if ops.as_slice() == [ReduceOp::Sum]);
     if !reduce_ok || original.ty != ElemTy::F32 || !matches!(original.epilogue, Epilogue::None) || original.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) {
@@ -474,6 +478,11 @@ fn factor_invariant(scope: &Scope, site: Site, _: &Numerics) -> Option<Rewrite> 
     };
     // What the factor reads goes to the epilogue as inputs (each a function of the output element); what the sum reads stays.
     let (u_instrs, v_instrs) = (u_needed(&form, u), u_needed(&form, v));
+    // A factor that is only an array or a constant is not worth a pass of its own (and the reduction would leave the kernel it is
+    // merged into); one that computes something is.
+    if u_instrs.is_empty() {
+        return None;
+    }
     let mut inputs: smallvec::SmallVec<[EpiInput; 3]> = smallvec![];
     let mut epi_of: Vec<Option<u32>> = vec![None; form.inputs.len()];
     let mut scalars: smallvec::SmallVec<[crate::jit::Scalar; 2]> = smallvec![];
