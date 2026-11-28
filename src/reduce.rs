@@ -620,6 +620,13 @@ impl<T: ScalarType> Array<T> {
         Array::resolve(self.context(), shape, result, name, location)
     }
 
+    /// Whether this array is a product that was not forced, under numerics that let a rule of tier 2 rewrite it.
+    #[cold]
+    #[inline(never)]
+    fn is_unforced_product(&self, ctx: &Context) -> bool {
+        crate::jit::structured::wants_unforced(ctx.numerics_ref()) && self.structured().is_some_and(|value| value.is_unforced())
+    }
+
     fn run_reduce(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(tag.op_count());
@@ -638,7 +645,7 @@ impl<T: ScalarType> Array<T> {
             (Some(node), _) => Some((Src::Node(Arc::clone(node)), false)),
             (None, src @ Src::Buffer(_)) if wgsl == "f32" => Some((src, true)),
             // A product that is not forced stays that way under numerics that let a rule of tier 2 rewrite it (`sum(a·b)`).
-            (None, src @ Src::Node(_)) if wgsl == "f32" && crate::jit::structured::wants_unforced(ctx.numerics_ref()) && self.structured().is_some_and(|value| value.is_unforced()) => Some((src, false)),
+            (None, src @ Src::Node(_)) if wgsl == "f32" && self.is_unforced_product(ctx) => Some((src, false)),
             _ => None,
         };
         if let Some((operand, buffer)) = operand {

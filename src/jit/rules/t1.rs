@@ -40,7 +40,8 @@ const ROUNDS: usize = 4;
 #[inline]
 #[track_caller]
 pub(crate) fn t1(form: Comprehension, ctx: &Context) -> Comprehension {
-    if !ctx.jit().rules.t1_active {
+    // The rules of the library match a form of two operands (a product) or a reduce dim of one element: nothing else pays for the loop.
+    if !ctx.jit().rules.t1_active || (form.inputs.len() != 2 && !form.space.iter().any(|dim| dim.extent == 1 && dim.is_reduce())) {
         return form;
     }
     run(form, ctx, T1_RULES, ctx.numerics_ref(), Location::caller())

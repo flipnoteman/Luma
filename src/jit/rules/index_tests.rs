@@ -292,7 +292,7 @@ fn the_sum_along_an_axis_of_a_product_is_a_vector_product_under_algebraic() {
     if Algebra::current() < Algebra::On {
         return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
     }
-    let (k, m, n) = (256, 192, 224);
+    let (k, m, n) = (512, 448, 480);
     let (ha, hb) = (finite(k * m, 3), finite(n * k, 4));
     let full = host_product(&ha, &hb, k, m, n);
     let ctx = open(LazyMode::Never, Numerics::algebraic());
