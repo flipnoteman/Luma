@@ -96,6 +96,7 @@ pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttr
     }
 }
 
+#[inline(always)]
 fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, shape: Shape, location: &'static Location<'static>) -> Array<f32> {
     let ctx = lhs.context();
     let tuning = ctx.tuning();
@@ -291,7 +292,7 @@ impl ContractionRun {
     /// `matmul_batched`.
     pub(crate) fn form(&self, lhs: &Array<f32>, rhs: &Array<f32>, location: &'static Location<'static>) -> Option<Comprehension> {
         match &self.kind {
-            ContractionKind::Matmul { attrs, .. } => ContractionView { lhs, rhs, attrs: *attrs, location }.form(),
+            ContractionKind::Matmul { attrs, .. } => rules::with_operand_props(ContractionView { lhs, rhs, attrs: *attrs, location }.form(), lhs, rhs),
             ContractionKind::Batched { geom, .. } => {
                 if !Algebra::builds_forms() {
                     return None;
@@ -321,12 +322,7 @@ impl ContractionView<'_> {
             return None;
         }
         let geom = self.check().ok()?;
-        let mut form = Comprehension::contract(self.lhs.src().ok()?, self.rhs.src().ok()?, geom, self.attrs);
-        if self.lhs.has_props() || self.rhs.has_props() {
-            form.inputs[0].props = self.lhs.props();
-            form.inputs[1].props = self.rhs.props();
-        }
-        Some(form)
+        Some(Comprehension::contract(self.lhs.src().ok()?, self.rhs.src().ok()?, geom, self.attrs))
     }
 
     /// The errors a launch would give that depend on buffer sizes: an operand that is evaluated in several buffers, a result that needs

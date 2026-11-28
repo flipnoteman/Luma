@@ -627,6 +627,17 @@ impl<T: ScalarType> Array<T> {
         crate::jit::structured::wants_unforced(ctx.numerics_ref()) && self.structured().is_some_and(|value| value.is_unforced())
     }
 
+    /// The operand of a reduction of a product that was not forced, under numerics that let a rule of tier 2 rewrite it (`sum(a·b)`):
+    /// it stays that way. Out of line, so that the arms before it cost nothing.
+    #[cold]
+    #[inline(never)]
+    fn unforced_product_operand(&self, ctx: &Context, wgsl: &str) -> Option<(Src, bool)> {
+        if wgsl != "f32" || !crate::jit::structured::wants_unforced(ctx.numerics_ref()) || !self.structured().is_some_and(|value| value.is_unforced()) {
+            return None;
+        }
+        Some((self.src().ok()?, false))
+    }
+
     fn run_reduce(&self, tag: OpTag, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(tag.op_count());
@@ -644,9 +655,7 @@ impl<T: ScalarType> Array<T> {
         let operand = match (self.pending(), src) {
             (Some(node), _) => Some((Src::Node(Arc::clone(node)), false)),
             (None, src @ Src::Buffer(_)) if wgsl == "f32" => Some((src, true)),
-            // A product that is not forced stays that way under numerics that let a rule of tier 2 rewrite it (`sum(a·b)`).
-            (None, src @ Src::Node(_)) if wgsl == "f32" && self.is_unforced_product(ctx) => Some((src, false)),
-            _ => None,
+            _ => self.unforced_product_operand(ctx, wgsl),
         };
         if let Some((operand, buffer)) = operand {
             // The reduction reads the operand later, so it is registered with it like any other
@@ -695,7 +704,7 @@ impl<T: ScalarType> Array<T> {
             || self.error().is_some()
             || (ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS)
             || self.len() < ctx.tuning().axis_defer_cells
-            || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)))
+            || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)) && !self.is_unforced_product(ctx))
         {
             return None;
         }

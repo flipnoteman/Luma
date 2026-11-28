@@ -362,7 +362,7 @@ pub(crate) enum Product {
 /// The rules of tier 1 over the form of the product `lhs · rhs` (see the module documentation).
 pub(crate) fn product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, attrs: crate::jit::structured::contraction::ContractionAttrs, location: &'static Location<'static>) -> Product {
     let view = crate::jit::structured::contraction::ContractionView { lhs, rhs, attrs, location };
-    let Some(form) = view.form() else { return Product::Unchanged };
+    let Some(form) = with_operand_props(view.form(), lhs, rhs) else { return Product::Unchanged };
     let before = form.origin.clone();
     let form = t1(form, ctx);
     if form.origin == before {
@@ -382,4 +382,14 @@ fn note(ctx: &Context, location: &'static Location<'static>, rule: Rid) {
     if ctx.jit().recording_decisions() {
         ctx.jit().note_decision(Decision::new("matmul", location, DecisionSite::Rewrite, info(rule).name));
     }
+}
+
+/// The form of a product with the properties of the operands on its inputs.
+pub(crate) fn with_operand_props(form: Option<Comprehension>, lhs: &Array<f32>, rhs: &Array<f32>) -> Option<Comprehension> {
+    let mut form = form?;
+    if lhs.has_props() || rhs.has_props() {
+        form.inputs[0].props = lhs.props();
+        form.inputs[1].props = rhs.props();
+    }
+    Some(form)
 }

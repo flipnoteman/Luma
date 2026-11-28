@@ -31,7 +31,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use index::{Product, diag_of_product, needs_t1, product as product_hook};
+pub(crate) use index::{Product, with_operand_props, diag_of_product, needs_t1, product as product_hook};
 pub(crate) use registry::{Rid, RuleId, hit, rules_hash};
 pub(crate) use scope::MAX_SCOPE_COMPS;
 pub(crate) use t1::{T1_RULES, t1};
