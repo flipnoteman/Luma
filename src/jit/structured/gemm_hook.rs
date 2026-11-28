@@ -18,9 +18,9 @@ use crate::jit::epi_hook;
 use crate::kernel::KernelCore;
 use crate::matmul::MatmulTile;
 
-/// Words of the uniform before the hook's scalars: the product's own (`gemm_copy::UNIFORM_BYTES / 4` in luma-cuda; 12 once W3-R6's
-/// triangular word and the three reserved ones are in).
-pub(crate) const PRODUCT_WORDS: usize = 8;
+/// Words of the uniform before the hook's scalars: the product's own (`gemm_copy::UNIFORM_BYTES / 4` in luma-cuda): the eight
+/// of the layout, the triangular word and the three reserved ones (W3-R6).
+pub(crate) const PRODUCT_WORDS: usize = 12;
 
 /// Hooked kernels per context.
 pub(crate) const MAX_HOOKED: usize = 64;
@@ -168,7 +168,7 @@ mod tests {
 
     #[track_caller]
     fn product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, epilogue: Option<&EpiProgram>) -> Output {
-        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32 }, location: Location::caller(), epilogue };
+        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller(), epilogue, partners: &[] };
         select::execute(ctx, &Subject::Contraction(&view)).ok().expect("the product runs")
     }
 
@@ -185,7 +185,7 @@ mod tests {
         loop {
             match product(ctx, lhs, rhs, Some(program)) {
                 Output::Epilogued(storages) => return Some(read(ctx, Output::Storage(Arc::clone(&storages[0])), m, n)),
-                Output::Storage(_) => {
+                Output::Storage(_) | Output::Group(_) => {
                     if start.elapsed() > wait {
                         return None;
                     }
@@ -263,7 +263,7 @@ mod tests {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
             match product(&ctx, &lhs, &rhs, Some(&epi)) {
-                Output::Storage(_) => std::thread::sleep(Duration::from_millis(50)),
+                Output::Storage(_) | Output::Group(_) => std::thread::sleep(Duration::from_millis(50)),
                 Output::Epilogued(storages) => {
                     let got = read(&ctx, Output::Storage(Arc::clone(&storages[0])), m, n);
                     assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());

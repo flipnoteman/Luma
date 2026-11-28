@@ -146,7 +146,7 @@ fn bufs(backend: &CudaBackend, (m, n, k): (usize, usize, usize)) -> Bufs {
 
 fn launch_gemm(backend: &CudaBackend, kernel: &CompiledKernel, spec: &GemmSpec, (m, n, k): (usize, usize, usize), b: &Bufs, with_bias: bool, tag: Option<u64>) {
     let mut uniform = Vec::new();
-    for word in [m, n, k, k, k, n, 0, 0] {
+    for word in [m, n, k, k, k, n, 0, 0, 0, 0, 0, 0] {
         uniform.extend_from_slice(&(word as u32).to_le_bytes());
     }
     let grid = [n.div_ceil(spec.cols as usize) as u32, m.div_ceil(spec.rows as usize) as u32, 1];

@@ -1398,6 +1398,7 @@ impl GemmSpec {
     /// The same product as a half-work one (see [`GemmSpec::half`]).
     pub const fn with_half(self) -> Self {
         GemmSpec { half: true, ..self }
+    }
 
     /// The same product applying the epilogue hook `hook` to every output (the module is passed to [`Backend::compile_gemm`]).
     pub const fn with_hook(self, hook: HookId) -> Self {

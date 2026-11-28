@@ -495,7 +495,7 @@ pub(crate) fn ptx_hooked(config: &Config, hook: Option<&Hook>) -> Result<String,
         }
         p!(w, "ret;");
         w.text.push_str("}\n");
-        return w.text;
+        return Ok(w.text);
     }
     if mode.guarded() {
         // Pairs are stored as `v2` only where `n` is even (the row starts 8-byte aligned).

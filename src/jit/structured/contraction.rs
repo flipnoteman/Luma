@@ -713,7 +713,7 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
     let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, layouts) } else { 0 };
     if let Some(program) = view.epilogue.filter(|_| takes_epilogue(params.by))
-        && let Some(storage) = launch_hooked(ctx, &sides, &plan, params.geom, layouts, program)?
+        && let Some(storage) = launch_hooked(ctx, &sides, &plan, params.geom, (layouts, tri), program)?
     {
         return Ok(Lowered::Done(Output::Epilogued(smallvec::smallvec![storage])));
     }
@@ -1019,7 +1019,7 @@ fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
 /// The product of `sides` with the epilogue `program` applied by the hooked native kernel, `None` where that is not possible and the
 /// plain product runs (the caller applies the program as a separate pass, bit for bit the same): a split product (the epilogue
 /// cannot run per slice), operands that are not evaluated, a kernel that is still compiling or that the backend cannot build, a program that is not one the hook computes.
-fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geometry, layouts: [Layout; 2], program: &EpiProgram) -> Result<Option<Arc<Storage>>, Failure> {
+fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geometry, (layouts, tri): ([Layout; 2], u32), program: &EpiProgram) -> Result<Option<Arc<Storage>>, Failure> {
     let (MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)) = (&sides[0], &sides[1]) else { return Ok(None) };
     if plan.slices != 1 {
         return Ok(None);
@@ -1071,6 +1071,7 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     let mut words: Vec<u32> = vec![m, n, k, plan.kc, lhs.ld, rhs.ld, lhs.off, rhs.off];
     // The hook's scalars follow the product's own words (`gemm_copy::UNIFORM_BYTES` of the backend).
     words.resize(gemm_hook::PRODUCT_WORDS, 0);
+    words[8] = tri;
     words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
     let mut args: Vec<RawArg<'_>> = Vec::with_capacity(5 + pins.len());
     args.push(RawArg::write(out_pin.buffer(), out_bytes));
