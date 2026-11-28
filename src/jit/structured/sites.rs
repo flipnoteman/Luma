@@ -159,11 +159,12 @@ impl Sites {
         if recording {
             return (Laziness::Eager, SiteSlot::NONE);
         }
-        if tuning.lazy == LazyMode::Never {
-            return (if wants_unforced(numerics) { Laziness::Lazy } else { Laziness::Eager }, SiteSlot::NONE);
+        // The numerics of tier 2 want every product unforced, whatever the mode and the site say.
+        if wants_unforced(numerics) || tuning.lazy == LazyMode::Always {
+            return (Laziness::Lazy, SiteSlot::NONE);
         }
         match tuning.lazy {
-            LazyMode::Always => (Laziness::Lazy, SiteSlot::NONE),
+            LazyMode::Never => (Laziness::Eager, SiteSlot::NONE),
             _ => self.decide_site(SiteKey::of(location), tuning.lazy_probe_every),
         }
     }
