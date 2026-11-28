@@ -1153,7 +1153,7 @@ struct Merged {
 
 /// Reductions computed together, in order (a kernel cache key, so a fixed-size value), and what
 /// is applied to their results.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ReduceList {
     ops: [ReduceOp; MAX_ACCS],
     len: u8,
@@ -1170,6 +1170,24 @@ pub(crate) struct ReduceList {
     block: u32,
     /// Whether the pass is the balanced merge of block states (see [`ReduceList::balanced`]).
     balanced: bool,
+}
+
+/// The text of kernel labels and Decision logs: the fields of a list that is neither blocked nor balanced print as they always did.
+impl std::fmt::Debug for ReduceList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = f.debug_struct("ReduceList");
+        shown
+            .field("ops", &self.ops)
+            .field("len", &self.len)
+            .field("epilogue", &self.epilogue)
+            .field("single_pass", &self.single_pass)
+            .field("gate", &self.gate)
+            .field("merged", &self.merged);
+        if self.block != 0 || self.balanced {
+            shown.field("block", &self.block).field("balanced", &self.balanced);
+        }
+        shown.finish()
+    }
 }
 
 impl ReduceList {
