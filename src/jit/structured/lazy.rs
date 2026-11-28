@@ -180,7 +180,7 @@ impl Structured {
             ContractionKind::Matmul { attrs, .. } => ("matmul", OpTag::Matmul { tf32: attrs.tf32.request() }),
             ContractionKind::Batched { .. } => ("matmul_batched", OpTag::MatmulBatched),
         };
-        let run = ContractionRun { operands: Mutex::new(Some([lhs.clone(), rhs.clone()])), kind, slot, inherited: OnceLock::new(), leaf_id: AtomicU64::new(0), depth };
+        let run = ContractionRun { operands: Mutex::new(Some([lhs.held_clone(), rhs.held_clone()])), kind, slot, inherited: OnceLock::new(), leaf_id: AtomicU64::new(0), depth };
         debug_assert!(run.form(lhs, rhs, location).is_none_or(|form| form.validate().is_ok()), "the form of an API product is well formed");
         let comp = Comp { form: Mutex::new(None), meta: Meta { ty: ElemTy::F32, len, tag, geom: None, launch: Launch::AtForce }, run: RunState::Contraction(Box::new(run)) };
         let value = Arc::new(Structured::new(Family::Comprehension(comp), false, name, location));

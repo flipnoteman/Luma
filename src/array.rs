@@ -525,6 +525,16 @@ impl<T: GpuType> Array<T> {
         self.props.get().props()
     }
 
+    /// A clone that a pending product holds as its operand: the handle keeps its properties (a clone shares the data, so `clone`
+    /// makes the original forget them; the product only reads its copy, so a write through the original still clears its own).
+    #[inline(always)]
+    pub(crate) fn held_clone(&self) -> Self {
+        let kept = self.props.get();
+        let held = self.clone();
+        self.props.set(kept);
+        held
+    }
+
     /// Whether any property is recorded; a bool test, so that operations that keep none pay nothing else.
     #[inline(always)]
     pub(crate) fn has_props(&self) -> bool {
