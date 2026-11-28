@@ -183,6 +183,24 @@ impl Drop for Context {
     }
 }
 
+/// A handle on a context that does not keep it open: what a plan the context itself holds (the factorisation plans of its `JitState`)
+/// names it by, so that the two do not hold one another alive.
+#[derive(Clone, Debug)]
+pub(crate) struct WeakContext(std::sync::Weak<Inner>);
+
+impl WeakContext {
+    /// The context, if some handle on it is still alive.
+    pub(crate) fn upgrade(&self) -> Option<Context> {
+        self.0.upgrade().map(|inner| Context { inner })
+    }
+}
+
+impl Context {
+    pub(crate) fn downgrade(&self) -> WeakContext {
+        WeakContext(Arc::downgrade(&self.inner))
+    }
+}
+
 static DEFAULT_CONTEXT: OnceLock<Result<Context>> = OnceLock::new();
 
 /// The process-wide default [`Context`], opened on first use.

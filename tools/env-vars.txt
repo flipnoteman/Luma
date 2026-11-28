@@ -57,6 +57,7 @@ LUMA_NATIVE_	internal	W0	never	prefix wildcard in docs (LUMA_NATIVE_*)
 LUMA_NATIVE_GEMM	dev	W0	before-release	auto
 LUMA_NATIVE_SOLVE	dev	W0	before-release	auto
 LUMA_OWN_GEMM	dev	W0	before-release	on
+LUMA_FACTOR_GRAPHS	dev	W3-U5	before-release	on (off: factorisation calls (`lu`, `qr`, `cholesky`, `solve`, `inverse`, `solve_spd`) always run their body; otherwise the second call of a key records its launches and later calls replay them)
 LUMA_PLAN_CACHE	dev	W0	before-release	on
 LUMA_QR_TSQR	dev	W0	before-release	on
 LUMA_RECORD_DECISIONS	user	W1-U0a	never	off

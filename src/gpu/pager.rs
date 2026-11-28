@@ -187,7 +187,8 @@ impl Drop for Pin {
 /// in the pager's `resident_bytes` (so the memory budget sees them) until this is dropped.
 #[derive(Debug)]
 pub(crate) struct Accounted {
-    ctx: Context,
+    /// Weak: a plan kept by the context itself counts its bytes here.
+    ctx: crate::context::WeakContext,
     bytes: u64,
 }
 
@@ -195,25 +196,31 @@ impl Accounted {
     /// Counts `bytes` as resident.
     pub(crate) fn new(ctx: &Context, bytes: u64) -> Accounted {
         ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
-        Accounted { ctx: ctx.clone(), bytes }
+        Accounted { ctx: ctx.downgrade(), bytes }
     }
 
     /// Counts `bytes` more.
     pub(crate) fn add(&mut self, bytes: u64) {
-        self.ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(ctx) = self.ctx.upgrade() {
+            ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
         self.bytes += bytes;
     }
 
     /// Stops counting `bytes` of what was counted so far.
     pub(crate) fn sub(&mut self, bytes: u64) {
         debug_assert!(bytes <= self.bytes, "uncounting more than was counted");
-        self.ctx.pager().resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(ctx) = self.ctx.upgrade() {
+            ctx.pager().resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
         self.bytes -= bytes;
     }
 
     /// Stops counting everything counted so far.
     pub(crate) fn clear(&mut self) {
-        self.ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Some(ctx) = self.ctx.upgrade() {
+            ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
         self.bytes = 0;
     }
 
@@ -226,7 +233,9 @@ impl Accounted {
 
 impl Drop for Accounted {
     fn drop(&mut self) {
-        self.ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Some(ctx) = self.ctx.upgrade() {
+            ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
     }
 }
 

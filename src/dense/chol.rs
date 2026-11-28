@@ -608,7 +608,12 @@ impl Array<f32> {
     #[track_caller]
     pub fn cholesky(&self) -> Array<f32> {
         let n = self.shape().dims()[0];
-        lower(self, Location::caller()).with_props(Props::triangle(true, false, n, n))
+        let loc = Location::caller();
+        let l = match super::graph::cholesky_cached(self, loc) {
+            Some(done) => done,
+            None => lower(self, loc),
+        };
+        l.with_props(Props::triangle(true, false, n, n))
     }
 
     /// The upper Cholesky factor `U`, `A = Uᵀ U`, reading the upper triangle of `A`: the
@@ -634,6 +639,9 @@ impl Array<f32> {
     #[track_caller]
     pub fn solve_spd(&self, b: &Array<f32>) -> Array<f32> {
         let loc = Location::caller();
+        if let Some(done) = super::graph::solve_spd_cached(self, b, loc) {
+            return done;
+        }
         let l = lower(self, loc);
         cholesky_solve(&l, b, loc)
     }

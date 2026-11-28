@@ -183,7 +183,7 @@ mod program;
 mod readers;
 mod rerun;
 pub(crate) mod split;
-mod replay;
+pub(crate) mod replay;
 mod simplify;
 pub(crate) mod rules;
 pub(crate) mod speculate;
@@ -3244,6 +3244,8 @@ pub(crate) struct JitState {
     /// [`JitState::plans`].
     plan_epoch: AtomicU64,
     plan_stats: plancache::Stats,
+    /// The recorded launches of factorisation calls by key (see `dense::graph`).
+    pub(crate) factor_plans: crate::dense::graph::FactorPlans,
     /// What this context knows of trace following (see [`follow`]).
     follow: follow::Shared,
     /// Evaluations the plan cache still sits out (see [`plancache`]).
@@ -3373,6 +3375,7 @@ impl JitState {
             plan_cache: AtomicBool::new(plancache::enabled_by(std::env::var(plancache::ENV).ok().as_deref())),
             plan_epoch: AtomicU64::new(0),
             plan_stats: plancache::Stats::default(),
+            factor_plans: crate::dense::graph::FactorPlans::default(),
             follow: follow::Shared::new(),
             plan_skip: AtomicU32::new(0),
             decisions_on: AtomicBool::new(env_records_decisions()),
@@ -3805,6 +3808,12 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_speculate(&self, on: bool) {
         lock(&self.speculation).enabled = on;
+    }
+
+    /// What the planning settings are now (see [`JitState::plan_epoch`]): the factorisation plans are made under one.
+    #[inline]
+    pub(crate) fn plan_epoch(&self) -> u64 {
+        self.plan_epoch.load(Ordering::Relaxed)
     }
 
     /// Switches the plan cache on or off (see [`plancache`]); dropping every plan.

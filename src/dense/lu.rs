@@ -1061,7 +1061,11 @@ impl Array<f32> {
     /// The factors are poisoned if the array has a fourth axis.
     #[track_caller]
     pub fn lu(&self) -> Lu {
-        factor(self, "lu", Location::caller())
+        let loc = Location::caller();
+        match super::graph::lu_cached(self, loc) {
+            Some(done) => done,
+            None => factor(self, "lu", loc),
+        }
     }
 
     /// Solves `A X = B` (`self` is `A`) by LU with partial pivoting for a square `A`; `b` is
@@ -1080,7 +1084,10 @@ impl Array<f32> {
             return routed;
         }
         match Dims::of(self) {
-            Ok(d) if d.rows == d.cols => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+            Ok(d) if d.rows == d.cols => match super::graph::solve_cached(self, b, d, loc) {
+                Some(done) => done,
+                None => solve_with(&factor(self, "solve", loc), b, "solve", loc),
+            },
             Ok(d) if d.rows > d.cols => super::qr::Qr::lstsq(&self.qr(), b),
             Ok(_) => super::qr::min_norm(self, b, "solve", loc),
             Err(e) => fail(self.context(), b.shape(), e, "solve", loc),
@@ -1097,7 +1104,10 @@ impl Array<f32> {
     pub fn inverse(&self) -> Array<f32> {
         let loc = Location::caller();
         match Dims::square(self) {
-            Ok(_) => inverse_with(&factor(self, "inverse", loc), "inverse", loc),
+            Ok(_) => match super::graph::inverse_cached(self, loc) {
+                Some(done) => done,
+                None => inverse_with(&factor(self, "inverse", loc), "inverse", loc),
+            },
             Err(e) => fail(self.context(), self.shape(), e, "inverse", loc),
         }
     }
@@ -1194,7 +1204,7 @@ impl Lu {
 }
 
 /// `U⁻¹ L⁻¹ P b`.
-fn solve_with(f: &Lu, b: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+pub(super) fn solve_with(f: &Lu, b: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let (rhs, vector) = rhs_matrix(&f.lu, b);
     let x = solve_matrix(f, &rhs, op, loc);
     if vector { x.reshape(b.shape()) } else { x }
@@ -1211,7 +1221,7 @@ pub(crate) fn solve_matrix(f: &Lu, rhs: &Array<f32>, op: &'static str, loc: &'st
     lower_left_factor(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1)
 }
 
-fn inverse_with(f: &Lu, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+pub(super) fn inverse_with(f: &Lu, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let [n, _, batch, _] = f.lu.shape().dims();
     let shape = Shape::from([n, n, batch]);
     let (cols, rows) = match (Array::<u32>::range_on(f.lu.context(), shape, 0), Array::<u32>::range_on(f.lu.context(), shape, 1)) {

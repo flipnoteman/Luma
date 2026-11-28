@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use luma_core::{Buffer, Dispatch, ExecGraph, GraphLaunch};
 
 use crate::array::{Array, Failure, Storage};
-use crate::context::{Cmd, CmdArg, Context, RawArg, Recording};
+use crate::context::{Cmd, CmdArg, Context, RawArg, Recording, WeakContext};
 use crate::error::Result;
 use crate::erased::Erased;
 use crate::gpu::hash::FxMap;
@@ -21,7 +21,8 @@ use super::Node;
 
 /// The launches of one traced step, ready to be encoded again.
 pub(crate) struct Plan {
-    ctx: Context,
+    /// Weak: a plan the context itself keeps (see `dense::graph`) must not keep it open.
+    ctx: WeakContext,
     seed: Vec<(Arc<Storage>, Arc<Storage>)>,
     cmds: Vec<Cmd>,
     /// Keep the segments the commands use resident and alive (not those of dead transient
@@ -41,7 +42,7 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn new(ctx: &Context, recording: Recording) -> Plan {
         Plan {
-            ctx: ctx.clone(),
+            ctx: ctx.downgrade(),
             seed: recording.seed,
             cmds: recording.cmds,
             pins: recording.pins,
@@ -79,6 +80,11 @@ impl Plan {
         self.cmds.len()
     }
 
+    /// The context the plan was recorded on. The plan is used while it is open.
+    pub(crate) fn context(&self) -> Context {
+        self.ctx.upgrade().expect("a plan is used while its context is open")
+    }
+
     /// The recorded commands, in order.
     pub(crate) fn commands(&self) -> &[Cmd] {
         &self.cmds
@@ -100,7 +106,7 @@ impl Plan {
     /// launch each, and the bytes of the buffers they bind moved at the device's bandwidth (what the
     /// planner measures a kernel by, see `cost::kernel_ns`).
     pub(crate) fn modeled_ns(&self) -> (f64, f64) {
-        let cost = self.ctx.cost_model();
+        let cost = self.context().cost_model();
         let bytes: u64 = self
             .cmds
             .iter()
@@ -130,7 +136,7 @@ impl Plan {
     /// from the recorded workgroups.
     pub(crate) fn replay(&self, subst: &[(Buffer, Buffer)], indirect: Option<&Buffer>) -> Result<()> {
         for (l, cmd) in self.cmds.iter().enumerate() {
-            cmd.encode(&self.ctx, subst, indirect.map(|buffer| (buffer, 12 * l as u64)))?;
+            cmd.encode(&self.context(), subst, indirect.map(|buffer| (buffer, 12 * l as u64)))?;
         }
         Ok(())
     }
@@ -138,7 +144,7 @@ impl Plan {
     /// Makes the traced results real: copies the seeds, then runs the commands once as recorded.
     pub(crate) fn run_once(&self) -> Result<()> {
         for (from, to) in &self.seed {
-            self.ctx.copy_storage(from, to)?;
+            self.context().copy_storage(from, to)?;
         }
         self.replay(&[], None)
     }
@@ -164,8 +170,10 @@ impl Plan {
 
 impl Drop for Plan {
     fn drop(&mut self) {
-        for buffer in self.retired.drain(..) {
-            self.ctx.recycle(buffer);
+        if let Some(ctx) = self.ctx.upgrade() {
+            for buffer in self.retired.drain(..) {
+                ctx.recycle(buffer);
+            }
         }
     }
 }
@@ -519,7 +527,7 @@ impl Stepper {
             }
             Ok(())
         };
-        let ctx = &self.plan.ctx;
+        let ctx = &self.plan.context();
         if ctx.recording_here() || ctx.is_profiling() {
             return plain(2);
         }
@@ -551,7 +559,7 @@ impl Stepper {
         for subst in &substs {
             builder.plan(&self.plan, subst, None);
         }
-        builder.capture(&self.plan.ctx)
+        builder.capture(&self.plan.context())
     }
 
     /// The buffer swaps that make the plan compute step `t` (1-based).
@@ -585,7 +593,7 @@ impl Stepper {
     pub(crate) fn seed_fixed(&self) -> Result<()> {
         for (j, &fixed) in self.fixed.iter().enumerate() {
             if fixed {
-                self.plan.ctx.copy_storage(&self.inits[j], &self.ping[j])?;
+                self.plan.context().copy_storage(&self.inits[j], &self.ping[j])?;
             }
         }
         Ok(())
@@ -596,7 +604,7 @@ impl Stepper {
         if steps.is_multiple_of(2) {
             for (j, &fixed) in self.fixed.iter().enumerate() {
                 if fixed {
-                    self.plan.ctx.copy_storage(&self.inits[j], &self.pong[j])?;
+                    self.plan.context().copy_storage(&self.inits[j], &self.pong[j])?;
                 }
             }
         }

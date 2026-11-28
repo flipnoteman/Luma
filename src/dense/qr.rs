@@ -412,7 +412,7 @@ fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) ->
     joined.unwrap_or_else(|e| Node::failed(a.context(), a, e, op, loc))
 }
 
-fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
+pub(super) fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
     let ctx = a.context();
     let d = match Dims::of(a) {
         Ok(d) if d.rows >= d.cols => d,
@@ -461,7 +461,11 @@ impl Array<f32> {
     /// The factors are poisoned if there are more columns than rows.
     #[track_caller]
     pub fn qr(&self) -> Qr {
-        factor(self, "qr", Location::caller())
+        let loc = Location::caller();
+        match super::graph::qr_cached(self, loc) {
+            Some(done) => done,
+            None => factor(self, "qr", loc),
+        }
     }
 
     /// The least-squares solution of `A X = B` for `A` with `m >= n` rows by QR:
