@@ -361,7 +361,7 @@ pub(crate) enum Product {
 
 /// The rules of tier 1 over the form of the product `lhs · rhs` (see the module documentation).
 pub(crate) fn product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, attrs: crate::jit::structured::contraction::ContractionAttrs, location: &'static Location<'static>) -> Product {
-    let view = crate::jit::structured::contraction::ContractionView { lhs, rhs, attrs, location };
+    let view = crate::jit::structured::contraction::ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
     let Some(form) = with_operand_props(view.form(), lhs, rhs) else { return Product::Unchanged };
     let before = form.origin.clone();
     let form = t1(form, ctx);

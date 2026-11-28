@@ -171,7 +171,7 @@ mod partners {
     use crate::jit::structured::contraction::{ContractionAttrs, Tf32Request};
     use crate::jit::structured::lazy::MAX_PARTNERS;
 
-    const ATTRS: ContractionAttrs = ContractionAttrs { tf32: Tf32Request::Default };
+    const ATTRS: ContractionAttrs = ContractionAttrs { tf32: Tf32Request::Default, half: false };
 
     fn product(ctx: &Context, a: &A, b: &A) -> A {
         let c = a.matmul(b);
