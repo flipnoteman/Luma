@@ -71,7 +71,7 @@ fn every_baseline_variant_passes_and_a_broken_one_fails() {
 fn every_half_unit_variant_passes_its_verification() {
     use luma_core::GemmOut;
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("luma-unit-verify-half-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("luma-unit-verify-cuda-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: set before the backend opens and before any other thread of this binary reads it.
     unsafe { std::env::set_var("LUMA_CACHE_DIR", &dir) };
@@ -114,7 +114,8 @@ fn every_half_unit_variant_passes_its_verification() {
     let _ = std::fs::remove_dir_all(&dir);
     let broken = UnitVerifier::new();
     broken.set_tamper(Some(std::sync::Arc::new(|_, out: &mut [f32]| out.swap(400, 401))));
-    assert!(!broken.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::F16).with_out(GemmOut::F16)).0.ok);
+    let v = broken.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::F16).with_out(GemmOut::F16));
+    assert!(!v.0.ok);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{} of {count} failed:\n{}", failures.len(), failures.join("\n"));
 }
