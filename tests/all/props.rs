@@ -736,3 +736,64 @@ fn a_tf32_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_produ
     }
     assert!(ran_once || matches!(ctx.backend(), luma::BackendKind::Metal), "no Gram product ran the half-work strategy");
 }
+
+fn finite_numerics(base: Numerics) -> Numerics {
+    let mut numerics = base;
+    numerics.exact_finite = true;
+    numerics
+}
+
+/// `TriangularK`: a triangular operand cuts the range of K of each tile row (column) under `exact_finite`; the terms left out are
+/// products with zeros, so the bits of finite inputs are those of the full range.
+#[test]
+fn a_triangular_operand_cuts_the_range_of_k_and_keeps_the_bits() {
+    for base in [Numerics::strict(), Numerics::default()] {
+        let (plain, cut) = (ctx_with(base), ctx_with(finite_numerics(base)));
+        for (n, other) in [(96usize, 40usize), (300, 77), (1024, 130)] {
+            let square = gram_data(n * n, n);
+            let wide = gram_data(n * other, other);
+            for ctx in [&plain, &cut] {
+                let (a, b) = (on(ctx, &square, [n, n]), on(ctx, &wide, [other, n]));
+                let (x, y) = (on(ctx, &wide, [n, other]), on(ctx, &square, [n, n]));
+                let products = |ctx: &Context| {
+                    let _ = ctx;
+                    [
+                        a.upper(false).matmul(&b),
+                        a.lower(false).matmul(&b),
+                        x.matmul(&y.upper(false)),
+                        x.matmul(&y.lower(false)),
+                    ]
+                };
+                let results = products(ctx).map(|product| bits(&product));
+                let reference: Vec<Vec<u32>> = {
+                    let (a, b, x, y) = (a.cache(), b.cache(), x.cache(), y.cache());
+                    let (au, al, yu, yl) = (a.clone().upper(false).cache(), a.clone().lower(false).cache(), y.clone().upper(false).cache(), y.clone().lower(false).cache());
+                    [au.matmul(&b), al.matmul(&b), x.matmul(&yu), x.matmul(&yl)].map(|product| bits(&product)).to_vec()
+                };
+                for (at, (got, want)) in results.iter().zip(&reference).enumerate() {
+                    assert_eq!(got, want, "product {at} of size {n}, exact_finite {}", ctx.numerics().exact_finite);
+                }
+            }
+        }
+    }
+}
+
+/// The terms left out are the products with the zeros of the triangle: an infinity where the zeros are would be NaN in the full range.
+#[test]
+fn the_cut_range_does_not_read_the_zero_region_of_a_triangle() {
+    let n = 1024;
+    let mut rhs = gram_data(n * 64, 5);
+    rhs[(n - 1) * 64..].fill(f32::INFINITY);
+    let data = gram_data(n * n, 9);
+    let run = |numerics: Numerics| {
+        let ctx = ctx_with(numerics);
+        let (a, b) = (on(&ctx, &data, [n, n]), on(&ctx, &rhs, [64, n]));
+        (ctx.backend(), a.upper(false).matmul(&b).to_vec().unwrap())
+    };
+    let (_, full) = run(Numerics::strict());
+    assert!(full[..64].iter().all(|x| x.is_nan()), "the full range multiplies zeros by the infinities");
+    let (backend, cut) = run(finite_numerics(Numerics::strict()));
+    if backend == luma::BackendKind::Cuda {
+        assert!(cut[..64].iter().all(|x| x.is_finite()), "the first tile row stops before the infinities");
+    }
+}

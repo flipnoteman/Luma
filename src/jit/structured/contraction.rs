@@ -15,6 +15,7 @@ use crate::caps::Caps;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
+use crate::jit::comprehension::Props;
 use crate::jit::structured::select;
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::matmul::{MatmulTile, Plan, SLICE};
@@ -593,12 +594,35 @@ fn lower_padded(ctx: &Context, view: &ContractionView<'_>, params: &ContractionP
     gemm(ctx, view, params, lhs, rhs)
 }
 
+/// `TriangularK`: the word of the uniform that cuts the range of K of each tile row (column) to what a triangular operand leaves
+/// non-zero: 1 a lower left operand, 2 an upper one, 3 a lower right operand, 4 an upper one, 0 the whole range. The terms left out
+/// are products with exact zeros, so it is `exact_finite` (an infinity or a NaN in the zero region would have made the full range a
+/// NaN); not for an operand with an offset (a window of a triangle is not one in its own coordinates), nor a half-work product.
+fn triangle_word(ctx: &Context, view: &ContractionView<'_>, plan: Plan, layouts: [Layout; 2]) -> u32 {
+    if !ctx.numerics().exact_finite || layouts.iter().any(|layout| layout.off != 0) || matches!(plan.tile, MatmulTile::GemmHalf { .. }) {
+        return 0;
+    }
+    let (lhs, rhs) = (view.lhs.props(), view.rhs.props());
+    if lhs.has(Props::LOWER) {
+        1
+    } else if lhs.has(Props::UPPER) {
+        2
+    } else if rhs.has(Props::LOWER) {
+        3
+    } else if rhs.has(Props::UPPER) {
+        4
+    } else {
+        0
+    }
+}
+
 /// The product of `lhs` and `rhs` (the view's operands, or their padded copies) as a native launch: their sides and layouts, the plan
 /// of the strategy, one launch.
 fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, lhs: &Array<f32>, rhs: &Array<f32>) -> Result<Lowered, Failure> {
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
-    done(launch(ctx, sides, plan, params.geom, Some(layouts))?)
+    let tri = triangle_word(ctx, view, plan, layouts);
+    done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)))?)
 }
 
 /// `array` in a buffer of its own whose leading dimension is a multiple of 4: zero columns appended to its first axis (an expression,
@@ -817,11 +841,11 @@ fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
 /// `layouts` are the operands' leading dimensions and offsets for the backend's own kernels (which read eight words of uniform),
 /// `None` for the shader kernels.
-fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<[Layout; 2]>) -> Result<Arc<Storage>, Failure> {
+fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<([Layout; 2], u32)>) -> Result<Arc<Storage>, Failure> {
     let Geometry { m: m32, n: n32, k: k32 } = geom;
     let len = Shape::from([n32 as usize, m32 as usize, 1, 1]).validate()?;
     let words = match layouts {
-        Some([lhs, rhs]) => {
+        Some(([lhs, rhs], tri)) => {
             // The kernels index their operands with 32 bits.
             let (a_extent, b_extent) = (
                 if lhs.transposed { extent(lhs.off, k32, m32, lhs.ld) } else { extent(lhs.off, m32, k32, lhs.ld) },
@@ -830,7 +854,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
             if a_extent > u64::from(u32::MAX) || b_extent > u64::from(u32::MAX) {
                 return Err(LumaError::DimensionTooLarge { shape: [n32 as usize, m32 as usize, 1, 1] }.into());
             }
-            Some([lhs.ld, rhs.ld, lhs.off, rhs.off])
+            Some([lhs.ld, rhs.ld, lhs.off, rhs.off, tri, 0, 0, 0])
         }
         None => None,
     };
@@ -844,7 +868,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         None => (out_pin.buffer(), out_bytes),
     };
     let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: 0 };
-    let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0];
+    let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0, 0, 0, 0];
     let words = match words {
         Some(extra) => {
             uniform[4..].copy_from_slice(&extra);

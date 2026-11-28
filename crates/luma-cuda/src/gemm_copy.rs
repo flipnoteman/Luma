@@ -9,8 +9,9 @@ use luma_core::GemmLanes;
 
 use crate::ptx::Ptx;
 
-/// The words of the uniform: `{m, n, k, kc, lda, ldb, a_off, b_off}`.
-pub(crate) const UNIFORM_BYTES: usize = 32;
+/// The words of the uniform: `{m, n, k, kc, lda, ldb, a_off, b_off, tri, 0, 0, 0}` (`tri` is `TriangularK`'s word, see [`k_range`]; the last three
+/// are reserved). A launch that passes fewer words has the rest zero.
+pub(crate) const UNIFORM_BYTES: usize = 48;
 
 /// How the copies of a kernel guard the edges of the matrices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -94,7 +95,7 @@ pub(crate) fn declare_chunks(text: &mut String, x: &str, n: u32) {
     text.push_str(&format!("    .reg .b64 %g{x}<{n}>;\n    .reg .b32 %d{x}<{n}>;\n    .reg .b32 %k{x}<{n}>;\n    .reg .b32 %z{x}<{n}>;\n    .reg .pred %v{x}<{n}>;\n"));
 }
 
-/// Loads the uniform: `%r0..%r3` `m, n, k, kc`, `%r50..%r53` `lda, ldb, a_off, b_off`; the offsets are added to the pointers `%rd1` and
+/// Loads the uniform: `%r0..%r3` `m, n, k, kc`, `%r50..%r53` `lda, ldb, a_off, b_off`, `%r54` `tri`; the offsets are added to the pointers `%rd1` and
 /// `%rd2` (clobbers `%rd3`).
 pub(crate) fn load_uniform(w: &mut Ptx) {
     p!(w, "ld.param.u32 %r0, [pu];");
@@ -105,6 +106,7 @@ pub(crate) fn load_uniform(w: &mut Ptx) {
     p!(w, "ld.param.u32 %r51, [pu+20];");
     p!(w, "ld.param.u32 %r52, [pu+24];");
     p!(w, "ld.param.u32 %r53, [pu+28];");
+    p!(w, "ld.param.u32 %r54, [pu+32];");
     p!(w, "ld.param.u64 %rd0, [pc];");
     p!(w, "ld.param.u64 %rd1, [pa];");
     p!(w, "ld.param.u64 %rd2, [pb];");
@@ -112,6 +114,27 @@ pub(crate) fn load_uniform(w: &mut Ptx) {
     p!(w, "add.u64 %rd1, %rd1, %rd3;");
     p!(w, "mul.wide.u32 %rd3, %r53, 4;");
     p!(w, "add.u64 %rd2, %rd2, %rd3;");
+}
+
+/// The range of K a workgroup covers: with `%r13` the first `k` of its slice and `%r26` one past its last on entry, `%r13` and
+/// `%r14` (the length) on exit, cut to what the operand that is a triangle leaves non-zero for the tile `(%r11, %r12)` of edges `bm`
+/// x `bn`: `tri` 1 (left operand lower: `k < bm0 + bm`), 2 (left upper: `k >= bm0`), 3 (right lower: `k >= bn0`), 4 (right
+/// upper: `k < bn0 + bn`), 0 the whole range. The terms left out are products with zeros. Clobbers `%r27`, `%r28`, `%p15`.
+pub(crate) fn k_range(w: &mut Ptx, bm: u32, bn: u32) {
+    p!(w, "mov.u32 %r27, 0;");
+    p!(w, "mov.u32 %r28, 4294967295;");
+    p!(w, "setp.eq.u32 %p15, %r54, 1;");
+    p!(w, "@%p15 add.u32 %r28, %r11, {bm};");
+    p!(w, "setp.eq.u32 %p15, %r54, 2;");
+    p!(w, "@%p15 mov.u32 %r27, %r11;");
+    p!(w, "setp.eq.u32 %p15, %r54, 3;");
+    p!(w, "@%p15 mov.u32 %r27, %r12;");
+    p!(w, "setp.eq.u32 %p15, %r54, 4;");
+    p!(w, "@%p15 add.u32 %r28, %r12, {bn};");
+    p!(w, "max.u32 %r13, %r13, %r27;");
+    p!(w, "min.u32 %r26, %r26, %r28;");
+    p!(w, "max.u32 %r26, %r26, %r13;");
+    p!(w, "sub.u32 %r14, %r26, %r13;");
 }
 
 /// The stores of the pair of accumulators `c0, c1` of one row (`%rd5` its address of column `col`, `%r32` the column, `%p4` whether the row

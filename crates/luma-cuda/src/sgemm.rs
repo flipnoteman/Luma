@@ -277,7 +277,7 @@ pub(crate) fn ptx(config: &Config) -> String {
     p!(w, "mul.lo.u32 %r13, %r25, %r3;");
     p!(w, "add.u32 %r26, %r13, %r3;");
     p!(w, "min.u32 %r26, %r26, %r2;");
-    p!(w, "sub.u32 %r14, %r26, %r13;");
+    gemm_copy::k_range(&mut w, bm, bn);
     p!(w, "add.u32 %r15, %r14, {};", bk - 1);
     p!(w, "shr.u32 %r15, %r15, {};", bk.trailing_zeros());
     p!(w, "mov.u32 %r20, smem;");

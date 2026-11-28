@@ -1,8 +1,10 @@
 //! Matrix properties (W3-R6): banded solves and banded products against what they replace. `props/band_solve_*` run
 //! `Array::solve_banded` on a matrix made by `from_diagonals` and the line solver called directly on the same diagonals (the pair
 //! shows the overhead of the property route, which should be none); `props/band_matmul_*` run the sum of shifts that `matmul` takes
-//! under `exact_finite` against the dense product of the same matrix, evaluated. The half-work products (`props/syrk`,
-//! `props/trimm`) are not here: they need W3-R6 part 3.
+//! under `exact_finite` against the dense product of the same matrix, evaluated. The half-work products: `props/syrk*` run `xᵀ x`
+//! (the half-work strategy) against the product of an equal copy (`*_full`), on the `f32` kernels (strict numerics) and with the
+//! default numerics (TF32 on tensor cores); `props/trimm*` run `lower(a) · b` under `exact_finite` (`TriangularK`) against the
+//! product of the evaluated matrix.
 
 use luma::*;
 
@@ -88,26 +90,48 @@ pub fn run(h: &mut Harness) {
         h.ctx = saved;
 
         // Gram products: `xᵀ x` through the half-work strategy against the full product of an equal copy (so not recognised as a
-        // Gram product). `f32` kernels (strict numerics: the CUDA tensor-core product has no half-work kernel yet).
-        let saved = std::mem::replace(&mut h.ctx, Context::with_options(ContextOptions::from_env().numerics(Numerics::strict())).unwrap());
-        let shapes: &[(usize, usize)] = if cpu { &[(512, 1024), (1024, 512)] } else { &[(1024, 4096), (4096, 1024)] };
-        for &(cols, rows) in shapes {
-            let data = values(rows * cols, 790, -1.0, 1.0);
-            let x = upload(h, &data, [cols, rows]);
-            let copy = upload(h, &data, [cols, rows]);
-            let (gram, full) = (host(&x.matmul_tn(&x)), host(&x.matmul_tn(&copy)));
-            for r in 0..cols {
-                for c in 0..cols {
-                    assert_eq!(gram[r * cols + c].to_bits(), gram[c * cols + r].to_bits(), "props/syrk: bit-symmetric");
-                    if c <= r {
-                        assert_eq!(gram[r * cols + c].to_bits(), full[r * cols + c].to_bits(), "props/syrk: the full product's lower triangle");
+        // Gram product), on the `f32` kernels (strict numerics) and with the default numerics (TF32 where the device has tensor cores).
+        for (tag, numerics) in [("", Numerics::strict()), ("_tf32", Numerics::default())] {
+            let saved = std::mem::replace(&mut h.ctx, Context::with_options(ContextOptions::from_env().numerics(numerics)).unwrap());
+            let shapes: &[(usize, usize)] = if cpu { &[(512, 1024), (1024, 512)] } else { &[(1024, 4096), (4096, 1024)] };
+            for &(cols, rows) in shapes {
+                let data = values(rows * cols, 790, -1.0, 1.0);
+                let x = upload(h, &data, [cols, rows]);
+                let copy = upload(h, &data, [cols, rows]);
+                let (gram, full) = (host(&x.matmul_tn(&x)), host(&x.matmul_tn(&copy)));
+                for r in 0..cols {
+                    for c in 0..cols {
+                        assert_eq!(gram[r * cols + c].to_bits(), gram[c * cols + r].to_bits(), "props/syrk{tag}: bit-symmetric");
+                        if c <= r {
+                            // The full product of a device may split K (the half-work kernel does not): the same sums in another order.
+                            let (g, f) = (gram[r * cols + c], full[r * cols + c]);
+                            assert!(if cpu { g.to_bits() == f.to_bits() } else { (g - f).abs() <= 2e-3 * (1.0 + f.abs()) }, "props/syrk{tag}: the full product's lower triangle: {g} vs {f}");
+                        }
                     }
                 }
+                let work = Work::Flops(2.0 * (cols * cols * rows) as f64);
+                h.case(&format!("props/syrk{tag}"), &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&x).eval().unwrap());
+                h.case(&format!("props/syrk{tag}_full"), &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&copy).eval().unwrap());
             }
-            let work = Work::Flops(2.0 * (cols * cols * rows) as f64);
-            h.case("props/syrk", &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&x).eval().unwrap());
-            h.case("props/syrk_full", &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&copy).eval().unwrap());
+            h.ctx = saved;
         }
-        h.ctx = saved;
+
+        // `lower(a) · b` under `exact_finite` (`TriangularK`: each tile row stops where the zeros of the triangle begin) against the
+        // product of the evaluated matrix (a copy carries no property, so it runs the whole range).
+        for (tag, base) in [("", Numerics::strict()), ("_tf32", Numerics::default())] {
+            let mut numerics = base;
+            numerics.exact_finite = true;
+            let saved = std::mem::replace(&mut h.ctx, Context::with_options(ContextOptions::from_env().numerics(numerics)).unwrap());
+            let n: usize = if cpu { 1024 } else { pick(h, 2048, 4096) };
+            let a = upload(h, &values(n * n, 800, -1.0, 1.0), [n, n]);
+            let b = upload(h, &values(n * n, 810, -1.0, 1.0), [n, n]);
+            let dense = a.upper(false).cache();
+            let (cut, full) = (host(&a.upper(false).matmul(&b)), host(&dense.matmul(&b)));
+            assert!(cut.iter().zip(&full).all(|(c, f)| c.to_bits() == f.to_bits()), "props/trimm{tag}: the cut range keeps the bits");
+            let work = Work::Flops(2.0 * (n * n * n) as f64);
+            h.case(&format!("props/trimm{tag}"), &format!("lower(a) [{n},{n}] x b"), work, &mut || a.upper(false).matmul(&b).eval().unwrap());
+            h.case(&format!("props/trimm{tag}_full"), &format!("lower(a) [{n},{n}] x b"), work, &mut || dense.matmul(&b).eval().unwrap());
+            h.ctx = saved;
+        }
     });
 }
