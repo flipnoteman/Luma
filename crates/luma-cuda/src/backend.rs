@@ -971,6 +971,8 @@ pub struct CudaBackend {
     /// The transfer lane: [`Backend::transfer_in`] / [`Backend::transfer_out`] copy on it while
     /// kernels run on `stream`. Ordered against `stream` only through events.
     transfer: Arc<CudaStream>,
+    /// The readback lane: [`Backend::record_readback_staged`] copies on it, so a write-back (which waits for the kernels that wrote its buffer) never holds up the uploads queued on `transfer` behind it, and the two directions overlap.
+    readback: Arc<CudaStream>,
     /// The stream graphs are captured on, created on first use.
     capture: Mutex<Option<Arc<CudaStream>>>,
     pending: AtomicU32,
@@ -987,6 +989,7 @@ impl fmt::Debug for CudaBackend {
 impl Drop for CudaBackend {
     fn drop(&mut self) {
         // Everything the state holds is released only after both lanes have run dry.
+        let _ = self.readback.synchronize();
         let _ = self.transfer.synchronize();
         let _ = self.stream.synchronize();
     }
@@ -998,6 +1001,7 @@ impl CudaBackend {
         let shared = CudaShared::acquire()?;
         let stream = shared.ctx.new_stream().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         let transfer = shared.ctx.new_stream().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
+        let readback = shared.ctx.new_stream().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         let state = State {
             dispatches: 0,
             dirty: false,
@@ -1018,7 +1022,7 @@ impl CudaBackend {
             params: Params::default(),
             profiler: None,
         };
-        Ok(CudaBackend { shared, stream, transfer, capture: Mutex::new(None), pending: AtomicU32::new(0), state: Arc::new(Mutex::new(state)) })
+        Ok(CudaBackend { shared, stream, transfer, readback, capture: Mutex::new(None), pending: AtomicU32::new(0), state: Arc::new(Mutex::new(state)) })
     }
 
     fn bind(&self) -> Result<(), BackendError> {
@@ -1078,8 +1082,13 @@ impl CudaBackend {
 
     /// The ticket of the copy just queued on the transfer lane; the stage remembers it.
     fn transfer_ticket(&self, stage: &CudaStage) -> Result<Ticket, BackendError> {
+        self.lane_ticket(stage, &self.transfer)
+    }
+
+    /// The ticket of the copy just queued on `lane`; the stage remembers it.
+    fn lane_ticket(&self, stage: &CudaStage, lane: &CudaStream) -> Result<Ticket, BackendError> {
         let event = Arc::new(self.shared.ctx.new_event(None).map_err(gpu)?);
-        event.record(&self.transfer).map_err(gpu)?;
+        event.record(lane).map_err(gpu)?;
         *lock(&stage.last) = Some(Arc::clone(&event));
         Ok(Ticket::new(CudaTicket(event)))
     }
@@ -1938,18 +1947,18 @@ impl Backend for CudaBackend {
         let pinned = native.pinned.as_ref().ok_or_else(|| BackendError::Gpu("a stage without memory".into()))?.ptr;
         let mut st = lock(&self.state);
         self.bind()?;
-        // The transfer lane copies after what the compute lane queued so far (the kernels that wrote the buffer); the compute lane does not wait for it: the caller holds the buffer until the ticket completes.
+        // The readback lane copies after what the compute lane queued so far (the kernels that wrote the buffer); the compute lane does not wait for it: the caller holds the buffer until the ticket completes.
         let before = self.event(&mut st)?;
         before.record(&self.stream).map_err(gpu)?;
-        self.transfer.wait(&before).map_err(gpu)?;
+        self.readback.wait(&before).map_err(gpu)?;
         st.free_events.push(before);
         // SAFETY: the source range lies inside `src`, which the caller keeps alive and unwritten until the ticket completes; the stage holds `bytes` bytes of pinned memory that the host leaves alone until then.
         unsafe {
             let host = std::slice::from_raw_parts_mut(pinned.cast::<MaybeUninit<u8>>(), bytes as usize);
-            result::memcpy_dtoh_async(host, sptr, self.transfer.cu_stream())
+            result::memcpy_dtoh_async(host, sptr, self.readback.cu_stream())
         }
         .map_err(gpu)?;
-        self.transfer_ticket(native)
+        self.lane_ticket(native, &self.readback)
     }
 
     fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
