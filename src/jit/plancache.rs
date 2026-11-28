@@ -1334,6 +1334,9 @@ fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Ve
     let most: i64 = pending.iter().map(|root| 1 + root.below_len() as i64).sum();
     if jit.pending_nodes.load(Ordering::Relaxed) > most && !jit.deferred_seen.load(Ordering::Relaxed) {
         note_miss(jit);
+        if trace() {
+            eprintln!("luma plan cache: other arrays are pending");
+        }
         taint_tape("other arrays are pending");
         return run(pending);
     }
@@ -1343,6 +1346,9 @@ fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Ve
         // Not a graph the cache can handle: nothing is remembered.
         None => {
             note_miss(jit);
+            if trace() {
+                eprintln!("luma plan cache: not walkable");
+            }
             taint_tape("the graph is not one the plan cache can walk");
             walk.clear();
             run(pending);
@@ -1372,6 +1378,9 @@ fn evaluate_planned(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Ve
             }
             if replayed.is_ok() {
                 jit.plan_stats.hits.fetch_add(1, Ordering::Relaxed);
+                if trace() {
+                    eprintln!("luma plan cache: hit");
+                }
             } else {
                 taint_tape("the plan cache's replay failed");
                 // Whatever the plan finished is finished; the rest is evaluated as ever.
