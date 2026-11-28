@@ -13,8 +13,11 @@ fn chain(ctx: &Context, xs: &[f32], rounds: usize) -> (f64, Vec<f32>) {
     for k in 0..rounds {
         y = (&y * 1.0009 + (k % 5) as f32 * 0.25).sin().abs() + &x * 0.5;
     }
-    let out = y.to_vec().unwrap();
-    (start.elapsed().as_secs_f64(), out)
+    // Timed up to the computed array: reading it back to a host vector (page faults of a fresh allocation) is not what is measured.
+    y.eval().unwrap();
+    ctx.sync().unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    (elapsed, y.to_vec().unwrap())
 }
 
 fn main() {
