@@ -140,6 +140,9 @@ pub struct Config {
     pub df_split: bool,
     pub chunk_bytes: Option<u64>,
     pub memory_budget: Option<u64>,
+    /// Bytes of a slab of the schedules of arrays split over several buffers (`ContextOptions::slab_bytes`; `Some` also turns
+    /// `SplitMode::Auto` on, so that slabs below segments, ghosts and expansions run).
+    pub slab_bytes: Option<u64>,
     /// The `f32`, `u32` and `i32` inputs are written to a temporary file and opened read-only as file arrays (with small segments and budget, see `engine`).
     pub file_leaves: bool,
     pub cost: CostChoice,
@@ -169,6 +172,7 @@ impl Config {
             df_split: false,
             chunk_bytes: None,
             memory_budget: None,
+            slab_bytes: None,
             file_leaves: false,
             cost: CostChoice::Test,
         }
@@ -2142,6 +2146,7 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         prop::sample::select(vec![None, None, Some(1024u64)]),
         prop::sample::select(vec![None, None, Some(1u64 << 20)]),
         prop::bool::weighted(0.15),
+        prop::sample::select(vec![None, None, Some(256u64), Some(1 << 12), Some(1 << 16)]),
         prop::sample::select(vec![CostChoice::Test, CostChoice::SlowLaunch, CostChoice::SlowArithmetic]),
     );
     (limits, flags, memory).prop_map(|(limits, flags, memory)| Config {
@@ -2158,7 +2163,8 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         chunk_bytes: memory.0,
         memory_budget: memory.1,
         file_leaves: memory.2,
-        cost: memory.3,
+        cost: memory.4,
+        slab_bytes: memory.3,
     })
 }
 

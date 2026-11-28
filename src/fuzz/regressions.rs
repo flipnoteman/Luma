@@ -458,6 +458,7 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
             df_split: false,
             chunk_bytes: None,
             memory_budget: None,
+            slab_bytes: None,
             file_leaves: false,
             cost: Test,
         },
@@ -765,7 +766,7 @@ fn i32_and_with_a_saturating_constant_is_not_the_identity() {
 #[test]
 fn bool_xor_reduce_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, file_leaves: false, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
@@ -781,7 +782,7 @@ fn bool_xor_reduce_promote_df32() {
 #[test]
 fn bool_loop_state_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, file_leaves: false, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [300, 1, 1, 1], ty: Bool, seed: 0 },
@@ -881,6 +882,38 @@ fn assigning_into_a_file_leaf() {
         stmts: vec![
             Input { dims: [12, 1, 1, 1], ty: U32, seed: 0 },
             Assign { target: 0, path: vec![], rhs: Const(0.0) },
+        ],
+    });
+}
+
+/// `slab_bytes` (W3-P4 fuzz dimension): a kernel that reads a view of a short array, on an output that fits one segment, restarted its
+/// grid at every slab of 64 elements (the plain variant has no `base`), so the second slab repeated the first.
+#[test]
+fn a_broadcast_view_over_slabs_of_one_segment_keeps_its_index() {
+    check(Program {
+        config: Config { chunk_bytes: Some(1024), slab_bytes: Some(256), file_leaves: true, ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            View { src: 1, view: Permute { perm: [2, 1, 3, 0] } },
+            Binary { lhs: Var(0), rhs: Const(0.0), op: Minimum },
+            Binary { lhs: Var(2), rhs: Var(3), op: Maximum },
+        ],
+    });
+}
+
+#[test]
+fn an_iterate_all_stencil_with_pinned_slabs() {
+    check(Program {
+        config: Config { slab_bytes: Some(256), ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 0 },
+            Input { dims: [7, 5, 1, 1], ty: I32, seed: 0 },
+            View { src: 0, view: Pad { widths: vec![(0, 0), (0, 0)], mode: Edge } },
+            Loop { kind: IterateAll, steps: 4, states: vec![1], body: vec![Compare { lhs: 1, rhs: Const(2.0), op: Equal }, View { src: 3, view: ShiftClamp { offs: vec![0, -4] } }, Scan { src: 2, axis: 0, op: CumSum }], next: vec![5] },
+            Put { target: 3, idx: vec![9, 6, 1, 26, 12, 27, 2, 11, 7, 17, 37, 23, 20, 29, 16, 18, 8, 33, 3, 31, 4, 24, 36, 0, 30, 5, 32, 13, 15, 28, 34, 22, 35, 10, 21], vals: Var(3) },
         ],
     });
 }

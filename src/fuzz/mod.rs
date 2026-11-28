@@ -1277,6 +1277,9 @@ fn engine(config: &Config) -> Option<Context> {
     if let Some(bytes) = memory_budget {
         options = options.memory_budget(bytes);
     }
+    if let Some(bytes) = config.slab_bytes {
+        options = options.split(crate::SplitMode::Auto).slab_bytes(Some(bytes));
+    }
     let ctx = Context::with_options(options).ok()?;
     if config.memory_budget.is_some() {
         // The arrays are too small for recomputing to beat a transfer: evict by lineage whenever it is allowed.
@@ -1451,7 +1454,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             return best;
         }
         let default = Config::default_engine();
-        let resets: [fn(&mut Config, &Config); 13] = [
+        let resets: [fn(&mut Config, &Config); 14] = [
             |c, d| c.max_nodes = d.max_nodes,
             |c, d| c.max_inlined = d.max_inlined,
             |c, d| c.max_live = d.max_live,
@@ -1463,6 +1466,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             |c, d| c.df_split = d.df_split,
             |c, d| c.chunk_bytes = d.chunk_bytes,
             |c, d| c.memory_budget = d.memory_budget,
+            |c, d| c.slab_bytes = d.slab_bytes,
             |c, d| c.file_leaves = d.file_leaves,
             |c, d| c.cost = d.cost,
         ];
