@@ -842,6 +842,8 @@ pub struct HostRegion {
 // SAFETY: the pointer is plain data; `keepalive` owns the memory and the importer guarantees exclusive access while a writable buffer exists.
 unsafe impl Send for HostRegion {}
 
+const BORROWED_ID: u64 = 1 << 63;
+
 /// A device buffer of any backend. Cloning shares the buffer; equality is identity (a view made
 /// by [`Buffer::at`] is equal to the buffer it views).
 #[derive(Clone, Debug)]
@@ -851,22 +853,24 @@ pub struct Buffer {
     usage: BufferUsage,
     native: Arc<dyn NativeBuffer>,
     offset: u64,
-    borrowed: bool,
 }
 
 impl Buffer {
     /// Wraps a backend's buffer of `size` bytes.
     pub fn new(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
-        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0, borrowed: false }
+        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0 }
     }
     /// Wraps a backend's buffer over host memory it does not own (see [`Backend::import_host`]):
     /// a pool must not take it back for reuse ([`Buffer::is_borrowed`]).
     pub fn new_borrowed(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
-        Buffer { borrowed: true, ..Self::new(size, usage, native) }
+        // Marked by the top bit of the id (ids count up from 0), so that the struct does not grow for it.
+        let mut buffer = Self::new(size, usage, native);
+        buffer.id |= BORROWED_ID;
+        buffer
     }
     /// Whether the buffer shows memory the backend does not own (made by [`Buffer::new_borrowed`]).
     pub fn is_borrowed(&self) -> bool {
-        self.borrowed
+        self.id & BORROWED_ID != 0
     }
     /// A view of this buffer that a launch binds from `offset` bytes on (a storage argument of a
     /// backend whose [`Backend::storage_offset_align`] is not 0, with `offset` a multiple of it;
