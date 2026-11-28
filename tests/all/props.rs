@@ -793,7 +793,7 @@ fn the_cut_range_does_not_read_the_zero_region_of_a_triangle() {
     let (_, full) = run(Numerics::strict());
     assert!(full[..64].iter().all(|x| x.is_nan()), "the full range multiplies zeros by the infinities");
     let (backend, cut) = run(finite_numerics(Numerics::strict()));
-    if backend == luma::BackendKind::Cuda {
+    if backend != luma::BackendKind::Cpu {
         assert!(cut[..64].iter().all(|x| x.is_finite()), "the first tile row stops before the infinities");
     }
 }

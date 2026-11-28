@@ -724,7 +724,7 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
     {
         return Ok(Lowered::Done(Output::Epilogued(smallvec::smallvec![storage])));
     }
-    done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)), None)?)
+    done(launch(ctx, sides, plan, params.geom, Some(layouts), tri, None)?)
 }
 
 /// [`gemm`] of a product with an epilogue over a split `K` (W3-U4 B3), off the path of the plain product: the plain partial products
@@ -888,7 +888,7 @@ fn lower_syrk(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Re
     if base == StrategyId::CONTRACTION_TILED {
         let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
         let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
-        return done(launch(ctx, sides, plan, params.geom, None, None)?);
+        return done(launch(ctx, sides, plan, params.geom, None, 0, None)?);
     }
     if is_padded(base) {
         let copied = copies(view, base);
@@ -938,7 +938,7 @@ fn lower_skinny(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> 
         }
     }
     let applied = epilogue_of(view, geom)?;
-    finish(launch(ctx, sides, plan, geom, None, applied.as_ref())?, applied.is_some())
+    finish(launch(ctx, sides, plan, geom, None, 0, applied.as_ref())?, applied.is_some())
 }
 
 /// The staged tiles: always (the plan fails only when the grid is too large, which `lower` reports).
@@ -953,7 +953,12 @@ fn lower_tiled(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> R
     let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
     let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
     let applied = epilogue_of(view, params.geom)?;
-    finish(launch(ctx, sides, plan, params.geom, None, applied.as_ref())?, applied.is_some())
+    let tri = if matches!(plan.tile, MatmulTile::T128 | MatmulTile::T128x32 | MatmulTile::T32x128 | MatmulTile::T32) && (view.lhs.has_props() || view.rhs.has_props()) {
+        triangle_word(ctx, view, [layout(view.lhs), layout(view.rhs)])
+    } else {
+        0
+    };
+    finish(launch(ctx, sides, plan, params.geom, None, tri, applied.as_ref())?, applied.is_some())
 }
 
 // -- epilogues --
@@ -1140,11 +1145,11 @@ fn launch_applied(ctx: &Context, sides: [MatmulSide; 2], kernel: jit::MatmulKern
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
 /// `layouts` are the operands' leading dimensions and offsets for the backend's own kernels (which read eight words of uniform),
 /// `None` for the shader kernels.
-fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<([Layout; 2], u32)>, epilogue: Option<&Applied>) -> Result<Arc<Storage>, Failure> {
+fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<[Layout; 2]>, tri: u32, epilogue: Option<&Applied>) -> Result<Arc<Storage>, Failure> {
     let Geometry { m: m32, n: n32, k: k32 } = geom;
     let len = Shape::from([n32 as usize, m32 as usize, 1, 1]).validate()?;
     let words = match layouts {
-        Some(([lhs, rhs], tri)) => {
+        Some([lhs, rhs]) => {
             // The kernels index their operands with 32 bits.
             let (a_extent, b_extent) = (
                 if lhs.transposed { extent(lhs.off, k32, m32, lhs.ld) } else { extent(lhs.off, m32, k32, lhs.ld) },
@@ -1153,7 +1158,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
             if a_extent > u64::from(u32::MAX) || b_extent > u64::from(u32::MAX) {
                 return Err(LumaError::DimensionTooLarge { shape: [n32 as usize, m32 as usize, 1, 1] }.into());
             }
-            Some(([lhs.ld, rhs.ld, lhs.off, rhs.off], tri))
+            Some([lhs.ld, rhs.ld, lhs.off, rhs.off])
         }
         None => None,
     };
@@ -1169,13 +1174,17 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
     let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: epilogue.filter(|_| plan.slices == 1).map_or(0, |applied| applied.form) };
     let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0];
     let words = match words {
-        Some((extra, tri)) => {
+        Some(extra) => {
             uniform[4..8].copy_from_slice(&extra);
             // The kernels read the ninth word (`TriangularK`) as zero when it is not passed.
             uniform[8] = tri;
             &uniform[..8 + usize::from(tri != 0)]
         }
-        None => &uniform[..4],
+        // The shader kernels: `m, n, k, kc, tri`.
+        None => {
+            uniform[4] = tri;
+            &uniform[..5]
+        }
     };
     let out = RawArg::write(target, target_bytes);
     // Split over K, the slices are plain partial products and the epilogue runs in the kernel that sums them.

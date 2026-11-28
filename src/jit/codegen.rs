@@ -755,7 +755,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             src.push_str("n: u32, ");
         }
         if let Tail::Matmul { form, .. } = key.tail {
-            src.push_str("m: u32, n: u32, k: u32, kc: u32, ");
+            src.push_str("m: u32, n: u32, k: u32, kc: u32, tri: u32, ");
             if crate::jit::comprehension::lower::contract::form(form).batch {
                 src.push_str("nb: u32, sa: u32, sb: u32, sc: u32, ");
             }

@@ -2548,7 +2548,7 @@ pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
 }
 
 /// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM
-/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc` (see `matmul::body`), and for the backend's native tiles
+/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc, tri` (the shader kernels; `tri` is `TriangularK`'s word) (see `matmul::body`), and for the backend's native tiles
 /// (`Native`, `Gemm`, `GemmRagged`) also `lda, ldb, a_off, b_off`, the leading dimensions and element offsets of the operand
 /// matrices in their buffers (see `GemmSpec`).
 /// Operands that are lazy expressions are fused into the kernel when they can be (see

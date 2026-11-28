@@ -339,7 +339,7 @@ pub(crate) struct Plan {
 /// The kernel of [`Builtin::Matmul`]: the operands are the buffers `a` and `b`.
 pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool) -> String {
     format!(
-        "struct Params {{ m: u32, n: u32, k: u32, kc: u32 }}
+        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, tri: u32 }}
 @group(1) @binding(0) var<storage, read_write> c: array<f32>;
 @group(1) @binding(1) var<storage, read> a: array<f32>;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
@@ -356,7 +356,7 @@ pub(crate) fn builtin_epilogue_source(tile: MatmulTile, aligned: bool, split: bo
     let mut binding = 3;
     let inputs = crate::jit::epilogue_bindings(&form, &mut binding);
     let mut src = format!(
-        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, {} }}
+        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, tri: u32, {} }}
 @group(1) @binding(0) var<storage, read_write> c: array<f32>;
 @group(1) @binding(1) var<storage, read> a: array<f32>;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
@@ -545,7 +545,7 @@ impl Loads {
 /// The statements that start a workgroup of a kernel: the range of K it covers (`k_begin`,
 /// `k_end`, as WGSL expressions) and the offset of its output.
 struct Range {
-    declare: &'static str,
+    declare: String,
     k_begin: &'static str,
     k_end: &'static str,
     out: &'static str,
@@ -570,16 +570,42 @@ fn half_tile(edge: u32) -> String {
     )
 }
 
-fn range(aligned: bool, split: bool) -> Range {
-    match (split, aligned) {
-        (true, _) => Range {
-            declare: "    let kb = wid.z * p.kc;\n    let ke = min(p.k, kb + p.kc);\n    let zo = wid.z * p.m * p.n;\n",
+/// The statements that start a workgroup of a kernel of tiles of `bm` rows by `bn` columns (`cut`, the tile origin `row0`/`col0` in scope):
+/// with `TriangularK` (the word `p.tri`, as in `luma-cuda`'s `gemm_copy::k_range`) the range of K is cut to what the operand that is a
+/// triangle leaves non-zero for the tile: `tri` 1 (left operand lower: `k < row0 + bm`), 2 (left upper: `k >= row0`), 3 (right lower:
+/// `k >= col0`), 4 (right upper: `k < col0 + bn`), 0 the whole range. The terms left out are products with zeros. A half-work kernel
+/// (`cut` is `None`) runs the whole range.
+fn range(aligned: bool, split: bool, cut: Option<(u32, u32)>) -> Range {
+    let Some((bm, bn)) = cut else {
+        return match (split, aligned) {
+            (true, _) => Range {
+                declare: "    let kb = wid.z * p.kc;\n    let ke = min(p.k, kb + p.kc);\n    let zo = wid.z * p.m * p.n;\n".to_owned(),
+                k_begin: "kb",
+                k_end: "ke",
+                out: "zo + ",
+            },
+            (false, false) => Range { declare: "    let ke = p.k;\n".to_owned(), k_begin: "0u", k_end: "ke", out: "" },
+            (false, true) => Range { declare: String::new(), k_begin: "0u", k_end: "p.k", out: "" },
+        };
+    };
+    let cut = format!(
+        "    var klo = 0u;
+    var khi = 0xffffffffu;
+    if (p.tri == 1u) {{ khi = row0 + {bm}u; }}
+    if (p.tri == 2u) {{ klo = row0; }}
+    if (p.tri == 3u) {{ klo = col0; }}
+    if (p.tri == 4u) {{ khi = col0 + {bn}u; }}
+"
+    );
+    if split {
+        Range {
+            declare: format!("{cut}    let kb = max(wid.z * p.kc, klo);\n    let ke = max(min(min(p.k, wid.z * p.kc + p.kc), khi), kb);\n    let zo = wid.z * p.m * p.n;\n"),
             k_begin: "kb",
             k_end: "ke",
             out: "zo + ",
-        },
-        (false, false) => Range { declare: "    let ke = p.k;\n", k_begin: "0u", k_end: "ke", out: "" },
-        (false, true) => Range { declare: "", k_begin: "0u", k_end: "p.k", out: "" },
+        }
+    } else {
+        Range { declare: format!("{cut}    let kb = klo;\n    let ke = max(min(p.k, khi), kb);\n"), k_begin: "kb", k_end: "ke", out: "" }
     }
 }
 
@@ -628,7 +654,7 @@ fn t128(aligned: bool, split: bool, loads: &Loads, half: bool, epi: bool) -> Str
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, (!half).then_some((128, 128)));
     let end = if aligned { "" } else { ", ke" };
     // Accumulator `c{2 i + h}` holds row `i` (of 8), columns half `h`. The loops are unrolled
     // here so the accumulators stay in registers.
@@ -748,7 +774,7 @@ fn t32_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Stri
 fn t32(aligned: bool, split: bool, loads: &Loads, form: &ContractForm) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((32, 32)));
     let end = if aligned { "" } else { ", ke" };
     // A batch writes its layer at `zi * p.sc`.
     let out = if loads.batch { "zi * p.sc + " } else { out };
@@ -845,7 +871,7 @@ fn t128x32(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((128, 32)));
     let end = if aligned { "" } else { ", ke" };
     let mut decl = String::new();
     let mut update = String::new();
@@ -918,7 +944,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 fn t32x128(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((32, 128)));
     let end = if aligned { "" } else { ", ke" };
     let mut decl = String::new();
     let mut update = String::new();
