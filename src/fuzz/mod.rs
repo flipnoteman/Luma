@@ -1536,7 +1536,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             return best;
         }
         let default = Config::default_engine();
-        let resets: [fn(&mut Config, &Config); 14] = [
+        let resets: [fn(&mut Config, &Config); 15] = [
             |c, d| c.max_nodes = d.max_nodes,
             |c, d| c.max_inlined = d.max_inlined,
             |c, d| c.max_live = d.max_live,
