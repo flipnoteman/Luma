@@ -191,8 +191,9 @@ impl HostExec {
     }
 }
 
-/// Whether the program's result is bit-identical wherever it is computed: only ops of the measured exact set (IEEE `+ - * /`, `sqrt`,
-/// `min`/`max`, `abs`, `neg`, rounding to integer, comparisons, `select`, casts, integer and bit operations), and no float
+/// Whether the program's result is bit-identical wherever it is computed: only ops of the measured exact set (IEEE `+ - *`,
+/// `min`/`max`, `abs`, `neg`, rounding to integer, comparisons, `select`, casts, integer and bit operations; `sqrt` is not: the
+/// corpus found the CPU's differing by one ulp from CUDA's and wgpu's, and a device's `/` is not required to round correctly either), and no float
 /// multiplication feeding a float addition or subtraction (a device may contract the pair into an `fma`, the CPU does not).
 pub(crate) fn host_exact(key: &FusedKey) -> bool {
     let (mut mul, mut add) = (false, false);
@@ -200,14 +201,14 @@ pub(crate) fn host_exact(key: &FusedKey) -> bool {
         let float = matches!(instr.op.ty, super::ElemTy::F32);
         match instr.op.kind {
             OpKind::Unary(op) => {
-                if !matches!(op, UnOp::Neg | UnOp::Sqrt | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::Id) {
+                if !matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::Id) {
                     return false;
                 }
             }
             OpKind::Binary(op) => match op {
                 BinOp::Mul => mul |= float,
                 BinOp::Add | BinOp::Sub => add |= float,
-                BinOp::Div | BinOp::Min | BinOp::Max => {}
+                BinOp::Min | BinOp::Max => {}
                 op if op.is_bitwise() => {}
                 _ => return false,
             },
@@ -352,7 +353,8 @@ mod tests {
             Box::new(|x, y| (x - y).abs()),
             Box::new(|x, y| x.maximum(y)),
             Box::new(|x, y| x.minimum(y.abs())),
-            Box::new(|x, y| (x + y).abs().sqrt()),
+            Box::new(|x, y| x.floor() - y.ceil()),
+            Box::new(|x, y| (x - y).round().abs()),
             Box::new(|x, y| crate::ops::select(&x.gt(y), x, y)),
         ];
         let want: Vec<Vec<f32>> = programs.iter().enumerate().map(|(i, f)| f(&a[2 * i], &a[2 * i + 1]).to_vec().unwrap()).collect();
@@ -361,7 +363,8 @@ mod tests {
         let ran = exec.stats().runs;
         for (i, f) in programs.iter().enumerate() {
             let got = f(&a[2 * i], &a[2 * i + 1]).to_vec().unwrap();
-            assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want[i].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "program {i}");
+            let bad = got.iter().zip(&want[i]).position(|(g, w)| g.to_bits() != w.to_bits());
+            assert!(bad.is_none(), "program {i}: first difference at {:?}: host {:?} device {:?}", bad, bad.map(|k| got[k]), bad.map(|k| want[i][k]));
         }
         assert!(exec.stats().runs > ran, "some ran on the host");
     }
