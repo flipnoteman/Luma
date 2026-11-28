@@ -649,3 +649,41 @@ fn a_chain_that_fits_at_window_one_stays_one_stage() {
         assert!(down <= 4 * n as u64 + seg, "the retained output crosses once: {down} {both:?}");
     }
 }
+
+/// A reduction that runs before its call returns is not a schedule (`stream_stats` counts what the deferral path opened).
+#[test]
+fn a_lone_multi_segment_sum_is_not_counted_as_a_schedule() {
+    let ctx = deferring();
+    let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
+    let sum = x.sum().item().unwrap();
+    let want: f32 = data().iter().sum();
+    assert!((sum - want).abs() <= 1e-3 * want.abs().max(1.0), "{sum} {want}");
+    let stats = ctx.stream_stats();
+    assert_eq!(stats.schedules, 0, "{stats:?}");
+    assert_eq!((stats.steps, stats.stages, stats.slabs), (0, 0, 0), "{stats:?}");
+    assert!(stats.immediate_reductions >= 1, "{stats:?}");
+}
+
+fn int_data() -> Vec<u32> {
+    (0..N as u32).map(|i| i.wrapping_mul(2654435761) ^ (i >> 3)).collect()
+}
+
+/// Integer reductions over several segments run as per-slab partials (exact, so the bits are the single pass's): `off` and `auto` agree
+/// for every operation, a product that never forms joins the producer's stage, and an integer sum is a deferred step like a float one.
+#[test]
+fn integer_reductions_over_segments_are_exact_per_slab_partials() {
+    let (on, off) = (deferring(), kernel_major());
+    let run = |ctx: &Context| {
+        let xs = Array::<u32>::from_slice_on(ctx, &int_data(), N).unwrap();
+        let ys = Array::<u32>::from_slice_on(ctx, &int_data().iter().map(|v| v.rotate_left(7) | 1).collect::<Vec<_>>(), N).unwrap();
+        let is = Array::<i32>::from_slice_on(ctx, &int_data().iter().map(|&v| v as i32).collect::<Vec<_>>(), N).unwrap();
+        let product = (&xs * &ys).sum().item().unwrap();
+        (xs.sum().item().unwrap(), xs.min().item().unwrap(), xs.max().item().unwrap(), is.sum().item().unwrap(), is.min().item().unwrap(), is.max().item().unwrap(), product)
+    };
+    assert_eq!(run(&on), run(&off));
+    let stats = on.stream_stats();
+    assert!(stats.immediate_reductions + stats.schedules >= 7, "{stats:?}");
+    let want: u32 = int_data().iter().fold(0u32, |a, &v| a.wrapping_add(v));
+    let xs = Array::<u32>::from_slice_on(&on, &int_data(), N).unwrap();
+    assert_eq!(xs.sum().item().unwrap(), want);
+}

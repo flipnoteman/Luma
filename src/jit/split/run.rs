@@ -60,8 +60,10 @@ impl Future {
 
 pub(super) fn run(ctx: &Context, open: &mut Open) -> Result<(), LumaError> {
     let stats = ctx.stream_counters();
-    stats.schedules.fetch_add(1, Ordering::Relaxed);
-    stats.steps.fetch_add(open.steps.len() as u64, Ordering::Relaxed);
+    if open.counted {
+        stats.schedules.fetch_add(1, Ordering::Relaxed);
+        stats.steps.fetch_add(open.steps.len() as u64, Ordering::Relaxed);
+    }
     let stages = compile(ctx, open);
     let stages = fit(ctx, open, stages)?;
     let open: &Open = open;
@@ -222,7 +224,9 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
     if let [step] = steps
         && matches!(step.kernel, StepKernel::Relowered)
     {
-        stats.stages.fetch_add(1, Ordering::Relaxed);
+        if open.counted {
+            stats.stages.fetch_add(1, Ordering::Relaxed);
+        }
         super::reduce::run_relowered(ctx, open, step)?;
         return Ok(StageInfo { window: 0, streamed_in: 0, streamed_out: 0 });
     }
@@ -257,11 +261,13 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
 
     let carries = Carries::new(ctx, steps)?;
     let slabs = stage.slabs(open);
-    stats.stages.fetch_add(1, Ordering::Relaxed);
-    for transient in &stage.transients {
-        let meta = open.arrays[transient.array as usize].meta;
-        stats.transient_bytes_elided.fetch_add(meta.layout.bytes(meta.len), Ordering::Relaxed);
-        stats.transients.fetch_add(1, Ordering::Relaxed);
+    if open.counted {
+        stats.stages.fetch_add(1, Ordering::Relaxed);
+        for transient in &stage.transients {
+            let meta = open.arrays[transient.array as usize].meta;
+            stats.transient_bytes_elided.fetch_add(meta.layout.bytes(meta.len), Ordering::Relaxed);
+            stats.transients.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let order = slab_order(open, stage, slabs);
     let mut info = StageInfo { window: 0, streamed_in: 0, streamed_out: 0 };
@@ -279,7 +285,9 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
         if super::tests::fail_here(order[0]) {
             return Err(LumaError::Gpu("injected failure".into()));
         }
-        stats.slabs.fetch_add(slabs as u64, Ordering::Relaxed);
+        if open.counted {
+            stats.slabs.fetch_add(slabs as u64, Ordering::Relaxed);
+        }
         run_slabs(ctx, open, stage, choice, &order, &fixed, &carries)?;
     } else {
         let bound = bind_all(ctx, open, steps, &fixed);
@@ -288,7 +296,9 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
             if super::tests::fail_here(slab) {
                 return Err(LumaError::Gpu("injected failure".into()));
             }
-            stats.slabs.fetch_add(1, Ordering::Relaxed);
+            if open.counted {
+                stats.slabs.fetch_add(1, Ordering::Relaxed);
+            }
             launch_steps(ctx, open, stage, &bound, slab, &carries)?;
         }
     }

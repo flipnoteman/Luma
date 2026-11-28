@@ -360,7 +360,7 @@ impl Structured {
         comp.meta.tag.is_whole_reduce()
             && !layout.is_packed()
             && !self.ops().as_slice().iter().any(|op| op.is_arg())
-            && jit::split::reduces_in_blocks(ctx, matches!(comp.meta.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16), operand.len(), comp.meta.ty.layout())
+            && jit::split::reduces_in_blocks(ctx, operand.len(), comp.meta.ty.layout())
     }
 
     /// Records this reduction as canonical blocks: into this thread's schedule where that is allowed, else run at once.
@@ -1094,7 +1094,7 @@ fn reduce_into<T: GpuType>(
     if emit.ctx().split_mode() != jit::split::SplitMode::Off
         && !bits
         && !ops.as_slice().iter().any(|op| op.is_arg())
-        && jit::split::reduces_in_blocks(emit.ctx(), is_float_wgsl(wgsl), array.len(), T::LAYOUT)
+        && jit::split::reduces_in_blocks(emit.ctx(), array.len(), T::LAYOUT)
     {
         return reduce_in_blocks(emit, array, elem, wgsl, ops, scratch, target, finish);
     }
@@ -1150,10 +1150,6 @@ fn reduce_into<T: GpuType>(
     run_passes(emit, scratch, collect, len_u32(results.len())?, true, target, finish)
 }
 
-/// Whether the reduction of elements of the WGSL type `wgsl` is of floats (their sums depend on the order).
-fn is_float_wgsl(wgsl: &str) -> bool {
-    wgsl.contains("f32") || wgsl.contains("f64") || wgsl.contains("f16")
-}
 
 /// [`reduce_into`] of a float array of several segments in a context that splits: canonical blocks (see `jit::split`), run now. The
 /// values are in `target`, or in a scratch buffer.

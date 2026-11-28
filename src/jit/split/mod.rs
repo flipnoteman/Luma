@@ -107,6 +107,8 @@ pub struct StreamStats {
     pub ghost_bytes: u64,
     /// Launches of producer kernels over the regions of expanded halo edges (see `plan`).
     pub producer_regions: u64,
+    /// Reductions over arrays of several segments that ran before their call returned (they are no schedules: none of the counters above counts them, but the bytes they moved).
+    pub immediate_reductions: u64,
 }
 
 /// The counters behind [`StreamStats`].
@@ -127,6 +129,7 @@ pub(crate) struct StreamCounters {
     pub(super) cuts: AtomicU64,
     ghost_bytes: AtomicU64,
     producer_regions: AtomicU64,
+    pub(super) immediate_reductions: AtomicU64,
 }
 
 impl StreamCounters {
@@ -148,6 +151,7 @@ impl StreamCounters {
             cuts: get(&self.cuts),
             ghost_bytes: get(&self.ghost_bytes),
             producer_regions: get(&self.producer_regions),
+            immediate_reductions: get(&self.immediate_reductions),
         }
     }
 
@@ -281,6 +285,9 @@ pub(crate) struct Open {
     by_segments: FxMap<usize, u32>,
     pub(crate) steps: Vec<Step>,
     out_bytes: u64,
+    /// Whether the counters of the schedules (`schedules`, `steps`, `stages`, `slabs`, transients) count the run: not for an immediate
+    /// reduction, which only borrows the executor (see [`StreamStats::immediate_reductions`]).
+    counted: bool,
 }
 
 impl Open {
@@ -783,7 +790,12 @@ impl Open {
 
     /// An open schedule that is not one of a thread's (see `reduce::run_now`).
     fn private() -> Open {
-        Open { arrays: Vec::new(), by_segments: FxMap::default(), steps: Vec::new(), out_bytes: 0 }
+        Open { arrays: Vec::new(), by_segments: FxMap::default(), steps: Vec::new(), out_bytes: 0, counted: true }
+    }
+
+    /// An open schedule of one reduction that runs at once: not a schedule in the statistics.
+    fn immediate() -> Open {
+        Open { counted: false, ..Open::private() }
     }
 }
 

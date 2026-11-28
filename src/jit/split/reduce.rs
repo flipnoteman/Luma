@@ -58,10 +58,11 @@ pub(crate) struct Spec {
 }
 
 /// Whether a reduction over `len` elements of `layout` in `ctx` is done in canonical blocks: the context splits (`LUMA_SPLIT` is not
-/// `off`), the elements are floats, and they span several segments. Integer, bit-packed and single-segment reductions keep their
-/// kernels and their bits.
-pub(crate) fn applies(ctx: &Context, float: bool, len: usize, layout: crate::gpu_type::ElemLayout) -> bool {
-    ctx.split_mode() != super::SplitMode::Off && float && Storage::segment_count_of(ctx, len, layout) > 1
+/// `off`) and the elements span several segments. The partial of a slab of an integer reduction is exact (the operations are associative
+/// and commutative on integers, wrapping included), so the same blocks and the same tree give the bits the single pass gives; a float
+/// reduction's bits are the tree's (see the module documentation). Bit-packed and single-segment reductions keep their kernels.
+pub(crate) fn applies(ctx: &Context, len: usize, layout: crate::gpu_type::ElemLayout) -> bool {
+    ctx.split_mode() != super::SplitMode::Off && Storage::segment_count_of(ctx, len, layout) > 1
 }
 
 /// Records the canonical-block reduction `spec` of the elements of `fused` (or, when the expression is not fused, of the storage
@@ -121,8 +122,9 @@ pub(crate) fn record(
     if deferred {
         defer(ctx, step, &outputs, &inputs, &reaches, &|_| false, segments, writer)?;
     } else {
-        let mut open = Open::private();
+        let mut open = Open::immediate();
         open.push(step, &outputs, &inputs, &reaches, &|_| false, segments, writer, 0);
+        ctx.stream_counters().immediate_reductions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         super::run::run(ctx, &mut open)?;
     }
     Ok(())
