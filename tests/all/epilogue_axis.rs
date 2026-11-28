@@ -188,3 +188,34 @@ fn a_write_to_a_scale_after_creation_does_not_change_the_value() {
     sum.eval().unwrap();
     assert_eq!(bits(&scaled.to_vec().unwrap()), bits(&(&sum * &reference).to_vec().unwrap()));
 }
+
+#[test]
+fn an_input_is_not_absorbed_where_it_would_keep_reductions_from_sharing_a_kernel() {
+    let ctx = Context::new().unwrap();
+    let dims = [64, if ctx.is_cpu() { 1usize << 16 } else { 1 << 18 }];
+    let x = Array::from_slice_on(&ctx, &values(dims[0] * dims[1], 51, -1.0, 1.0), dims).unwrap();
+    let scale = Array::from_slice_on(&ctx, &values(64, 52, 0.5, 1.5), [64, 1]).unwrap();
+    for array in [&x, &scale] {
+        array.eval().unwrap();
+    }
+    ctx.flush().unwrap();
+    let run = |first: bool| {
+        let (a, b) = (plain_sum(&x, 1), squares_sum(&x, 1));
+        if first {
+            a.eval().unwrap();
+            b.eval().unwrap();
+            ctx.flush().unwrap();
+        }
+        ctx.record_decisions(true);
+        // A scalar is applied by the last pass wherever the reduction is; an array input only where no other reduction waits.
+        let (scaled, halved) = (&a * &scale, &b * 0.5);
+        let out = (bits(&scaled.to_vec().unwrap()), bits(&halved.to_vec().unwrap()));
+        let log = epilogue_decisions(&ctx.take_decisions());
+        ctx.record_decisions(false);
+        (out, log)
+    };
+    let (fused, log) = run(false);
+    assert!(log.iter().any(|chosen| chosen == "separate: merge"), "{log:?}");
+    assert_eq!(absorbed_ops(&log), Some(1), "{log:?}");
+    assert_eq!(fused, run(true).0);
+}

@@ -112,6 +112,12 @@ impl JitState {
         lock(&self.structured).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
     }
 
+    /// Whether a registered reduction that reduces another expression than `seed` does could be recorded together with it (what
+    /// `partner_of` says): the base and derived values of one reduction are no others, they share their operand.
+    pub(crate) fn has_other_partners(&self, seed: &Structured) -> bool {
+        lock(&self.structured).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && !Arc::ptr_eq(candidate.operand(), seed.operand()) && candidate.partner_of(seed))
+    }
+
     /// The registered values that could be recorded together with `seed` (what `partner_of` says, no walk of their expressions), oldest
     /// first, for the planning scope of the rewrite engine.
     pub(crate) fn scope_partners(&self, seed: &Structured) -> Vec<Arc<Structured>> {
@@ -125,6 +131,9 @@ impl JitState {
         let axis = seed.is_axis();
         let cap = if axis { ctx.tuning().reduce_multi.min(crate::scan::AXIS_MULTI) } else { ctx.tuning().reduce_multi };
         let mut accs = seed.ops().as_slice().len();
+        // The inputs of the epilogues the group applies are bindings too (`reduce::MAX_AXIS_EPI_INPUTS`): a member that would
+        // take the group over them is left to the next kernel instead of keeping the whole group from sharing one.
+        let mut epi_inputs = seed.epi().map_or(0, |epi| epi.inputs.len());
         if accs >= cap || !(if axis { seed.axis_mergeable(ctx) } else { seed.mergeable(ctx) }) {
             return Vec::new();
         }
@@ -151,6 +160,10 @@ impl JitState {
             if std::ptr::eq(Arc::as_ptr(candidate), seed) || taken.contains(&Arc::as_ptr(candidate)) || accs + ops > cap || !candidate.partner_of(seed) {
                 continue;
             }
+            let candidate_inputs = candidate.epi().map_or(0, |epi| epi.inputs.len());
+            if epi_inputs + candidate_inputs > crate::reduce::MAX_AXIS_EPI_INPUTS {
+                continue;
+            }
             let operand = candidate.operand();
             if flying.contains(&Arc::as_ptr(operand)) || computing.iter().any(|&id| operand.below_contains(id) || operand.id == id) {
                 continue;
@@ -171,6 +184,7 @@ impl JitState {
             union_into(&mut inputs, &mut tmp, &operand_inputs);
             below.add(operand, true);
             accs += ops;
+            epi_inputs += candidate_inputs;
             partners.push(Arc::clone(candidate));
         }
         partners

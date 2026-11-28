@@ -40,7 +40,7 @@ use crate::shape::Shape;
 // The methods below are the reduce family's: the predicates and recording of a [`Structured`] whose payload is a [`Comp`].
 
 /// Most inputs of the epilogues of the axis reductions recorded in one kernel.
-const MAX_AXIS_EPI_INPUTS: usize = 4;
+pub(crate) const MAX_AXIS_EPI_INPUTS: usize = 4;
 
 /// The epilogues of the axis reductions `members` (in the order of the ops of their kernel) as the last pass launches them: `None`
 /// if none has one.
@@ -922,6 +922,13 @@ impl<T: ScalarType> Array<T> {
             AxisRhs::Array(other) => {
                 if inputs.len() >= MAX_EPI_INPUTS {
                     refuse("limit");
+                    return None;
+                }
+                // An input is a binding of the kernel that records this reduction, which has room for a few (`MAX_AXIS_EPI_INPUTS`): with
+                // axis reductions of other expressions waiting it could keep the group from sharing one kernel, and a merge is worth more
+                // than the consumer's own pass. The consumer is then an elementwise node, for the coarsening to take as before.
+                if ctx.jit().has_other_partners(reduced) {
+                    refuse("merge");
                     return None;
                 }
                 // One value per line, in a buffer: anything else (a pending expression, a broadcast) is an elementwise node of its own.
