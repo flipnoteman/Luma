@@ -1590,6 +1590,11 @@ impl Backend for CudaBackend {
         compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
     }
 
+    fn kernel_revision(&self) -> u64 {
+        static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *REVISION.get_or_init(|| cache::source_revision(&[include_str!("tensor.rs"), include_str!("sgemm.rs"), include_str!("gemm_copy.rs")]))
+    }
+
     fn gemm_tiles(&self, unit: GemmUnit) -> &[(u32, u32)] {
         match (self.shared.cc.0 >= 8, unit) {
             (false, _) => &[],

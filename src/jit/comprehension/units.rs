@@ -6,7 +6,10 @@
 use crate::caps::Caps;
 use crate::jit::ElemTy;
 use crate::numerics::Reduced;
-use luma_core::GemmUnit;
+use std::panic::Location;
+
+use crate::context::Context;
+use luma_core::{Decision, DecisionSite, GemmSpec, GemmUnit, Verdict};
 
 /// The identity of a row of [`UNITS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,6 +94,32 @@ impl UnitDesc {
     }
 }
 
+/// The label of a unit variant in the decision log: `<unit> <rows>x<cols> <edge>`.
+pub(crate) fn variant_label(spec: &GemmSpec) -> String {
+    format!("{:?} {}x{} {:?}", spec.unit, spec.rows, spec.cols, spec.lanes)
+}
+
+impl Context {
+    /// Whether the unit variant of `spec` may be selected: its reference verification (W3-R7 §5, `luma_core::hal::verify`) passed. The
+    /// first call of a variant on a device with no stored verdict runs the verification and waits for it (about a kernel launch, and
+    /// stored on disk afterwards); the same call never returns another answer later. A failure disables the variant and is recorded as
+    /// `Rejected("verification failed")`; the first use of a verified variant records the wait. The baseline units (`Fma`, `Tf32`) are
+    /// not subject to verification: callers do not ask for them.
+    pub(crate) fn unit_verified(&self, spec: &GemmSpec, op: &'static str, location: &'static Location<'static>) -> bool {
+        let (verdict, waited) = self.unit_verifier().verdict(self.hal(), spec);
+        if waited.is_some() {
+            let label = variant_label(spec);
+            let decision = if verdict.ok {
+                Decision::new(op, location, DecisionSite::Unit, format!("{label} verified"))
+            } else {
+                Decision::new(op, location, DecisionSite::Unit, label.clone()).candidate(label, Verdict::Rejected("verification failed"))
+            };
+            self.jit().note_decision(decision);
+        }
+        verdict.ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +130,47 @@ mod tests {
             assert_eq!(UnitDesc::of(unit).gemm, unit);
         }
         assert_eq!(UNITS.iter().map(|u| u.id).collect::<Vec<_>>(), [UnitId::CudaTf32, UnitId::Fma]);
+    }
+
+    /// The reference verification through a context: a verified variant is accepted on its first call (with a decision recording the
+    /// wait) and silently afterwards; a variant whose kernel is broken (a test hook alters its output) is disabled, with a
+    /// `Rejected("verification failed")` decision, and stays so.
+    #[test]
+    fn unit_variants_are_verified_once_and_a_broken_one_is_disabled() {
+        let Ok(ctx) = Context::new() else { return };
+        if !ctx.caps().contains(Caps::TF32) {
+            eprintln!("SKIPPED: no tensor-core units on this device");
+            return;
+        }
+        let tiles = ctx.hal().gemm_tiles(GemmUnit::Tf32).to_vec();
+        let (rows, cols) = tiles[tiles.len() - 1];
+        let good = GemmSpec::new(rows, cols, false, true, GemmUnit::Tf32);
+        let broken = GemmSpec::new(rows, cols, true, false, GemmUnit::Tf32);
+        ctx.record_decisions(true);
+        let here = Location::caller();
+        assert!(ctx.unit_verified(&good, "matmul", here));
+        let first = ctx.take_decisions();
+        let unit: Vec<_> = first.iter().filter(|d| d.site == DecisionSite::Unit).collect();
+        assert_eq!(unit.len(), 1, "the wait is recorded: {first:?}");
+        assert!(unit[0].chosen.ends_with("verified"), "{:?}", unit[0]);
+        assert!(ctx.unit_verified(&good, "matmul", here));
+        assert!(ctx.take_decisions().iter().all(|d| d.site != DecisionSite::Unit), "a known verdict records nothing");
+
+        // The flipped fragment index of a broken kernel: two columns of every row swapped.
+        ctx.unit_verifier().set_tamper(Some(std::sync::Arc::new(|spec: &GemmSpec, out: &mut [f32]| {
+            if spec.lhs_transposed {
+                let n = out.len();
+                out.swap(n / 3, n / 3 + 1);
+                out[n / 2] += 1.0e9;
+            }
+        })));
+        assert!(!ctx.unit_verified(&broken, "matmul", here));
+        let log = ctx.take_decisions();
+        let rejected = log.iter().find(|d| d.site == DecisionSite::Unit).expect("the failure is recorded");
+        assert_eq!(rejected.candidates.len(), 1);
+        assert_eq!(rejected.candidates[0].1, Verdict::Rejected("verification failed"));
+        ctx.unit_verifier().set_tamper(None);
+        assert!(!ctx.unit_verified(&broken, "matmul", here), "a Bad verdict stays for the life of the context");
+        assert!(ctx.unit_verified(&good, "matmul", here));
     }
 }

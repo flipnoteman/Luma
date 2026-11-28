@@ -59,6 +59,8 @@ struct Inner {
     keyed_kernels: Mutex<std::collections::HashMap<String, Arc<KernelCore>>>,
     /// The tensor-core products with an epilogue hook, least recently used first (see `jit::structured::gemm_hook`).
     hooked_gemms: Mutex<crate::jit::structured::gemm_hook::Table>,
+    /// The verdicts of the reference verification of matrix-unit variants (W3-R7 §5).
+    unit_verifier: luma_core::hal::verify::UnitVerifier,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
@@ -880,6 +882,7 @@ impl Context {
                 chirps: Mutex::new(std::collections::HashMap::new()),
                 jit: JitState::new(&limits, &options.effective_numerics()),
                 hooked_gemms: Mutex::new(Default::default()),
+                unit_verifier: Default::default(),
                 kernels: BuildCache::default(),
                 module_kernels: Mutex::default(),
                 keyed_kernels: Mutex::default(),
@@ -1258,6 +1261,10 @@ impl Context {
     }
 
     /// The table of the products with an epilogue hook.
+    pub(crate) fn unit_verifier(&self) -> &luma_core::hal::verify::UnitVerifier {
+        &self.inner.unit_verifier
+    }
+
     pub(crate) fn hooked_gemms(&self) -> &Mutex<crate::jit::structured::gemm_hook::Table> {
         &self.inner.hooked_gemms
     }

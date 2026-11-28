@@ -17,6 +17,7 @@ pub mod hostbytes;
 pub mod texture;
 mod transfer;
 pub mod topology;
+pub mod verify;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
@@ -484,6 +485,9 @@ pub enum DecisionSite {
     /// The slab length of a stage of a schedule: `chosen` is `L=2^k` with the elements and the ghost share, `candidates` the neighbouring
     /// powers with their estimated cost and the bound that excluded the next one (`L_mem`, `L_pin`, `seg_len`, `cap`).
     Slab,
+    /// A matrix-unit variant was selected or disqualified (W3-R7): `chosen` is `<unit> <tile> <edge>`; a variant whose reference
+    /// verification failed is recorded as `Rejected("verification failed")`, and one that waited for its verification notes the wait.
+    Unit,
 }
 
 /// What became of a candidate that was not chosen.
@@ -1434,6 +1438,11 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// Free and total device memory right now, where the API reports it (`None` otherwise).
     fn memory_now(&self) -> Option<MemoryNow> {
         None
+    }
+    /// A revision of the code that generates the matrix kernels (see [`cache::source_revision`]): part of the key of a stored
+    /// verification verdict ([`verify`]), so that a build whose kernels differ never reads another's verdict.
+    fn kernel_revision(&self) -> u64 {
+        0
     }
     /// The device's on-disk cache.
     fn disk_cache(&self) -> &Arc<DiskCache>;
