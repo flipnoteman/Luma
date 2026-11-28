@@ -15,23 +15,29 @@
 //! operand and not in the output is summed out of the operand, a label repeated inside an operand takes the diagonal.
 
 use std::panic::Location;
+use std::sync::Arc;
 
 use crate::array::{Array, Failure};
 use crate::context::Context;
 use crate::error::LumaError;
+use crate::gpu::lock;
 use crate::jit::comprehension::build::Bodies;
 use crate::jit::comprehension::{lower, Access, AffineMap, Body, CombineOp, CombinePart, Combiner, Comprehension, Dim, Epilogue, MapRef, OpTag, Origin, OutMap, Props, MAX_DIMS};
 use crate::jit::{Edge, ElemTy};
 use crate::shape::Shape;
 use smallvec::{smallvec, SmallVec};
 
+mod path;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use path::Memo as PathMemo;
 
 // Which tier each pair of this thread's `einsum` calls took, and whether tier 2 is switched off (`lowerable == false`).
 #[cfg(test)]
 thread_local! {
     static TIERS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NO_GENERIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -365,7 +371,7 @@ fn run(ctx: &Context, spec: &str, operands: &[&Array<f32>], location: &'static L
         let term = prepare(terms.pop().expect("one operand"), wanted_mask, location);
         return Ok(term.arranged(&wanted, location).array);
     }
-    for (i, j) in left_to_right(terms.len()) {
+    for &(i, j) in contraction_order(ctx, spec, operands, &inputs, wanted_mask, &labels).iter() {
         let (a, b) = if i > j {
             let a = terms.remove(i);
             (a, terms.remove(j))
@@ -380,9 +386,24 @@ fn run(ctx: &Context, spec: &str, operands: &[&Array<f32>], location: &'static L
     Ok(terms.pop().expect("one result").array)
 }
 
-/// The pairs of the default order over `n` operands: positions in the running list, the result of a step appended to it.
-fn left_to_right(n: usize) -> Vec<(usize, usize)> {
-    (0..n.saturating_sub(1)).map(|step| if step == 0 { (0, 1) } else { (n - step - 1, 0) }).collect()
+/// The order the pairs run in: left to right, or under `numerics.reassociate` the cheapest the search finds (remembered per spec,
+/// shapes and numerics, so a loop pays for the search once).
+fn contraction_order(ctx: &Context, spec: &str, operands: &[&Array<f32>], inputs: &[Vec<u8>], output: u64, labels: &Labels) -> Arc<path::Path> {
+    if operands.len() < 3 || !ctx.numerics_ref().reassociate {
+        return Arc::new(path::left_to_right(operands.len()));
+    }
+    let key = path::Key { spec: spec.to_string(), shapes: operands.iter().map(|operand| operand.shape().dims()).collect(), numerics: ctx.numerics() };
+    if let Some(found) = lock(&ctx.jit().einsum_paths).get(&key) {
+        return Arc::clone(found);
+    }
+    #[cfg(test)]
+    SEARCHES.with(|searches| searches.set(searches.get() + 1));
+    let masks: Vec<u64> = inputs.iter().map(|subscripts| subscripts.iter().fold(0, |mask, &label| mask | bit(label))).collect();
+    let model = ctx.cost_model();
+    let costs = path::Costs { flops_per_ns: model.f32_ops_per_ns.max(1e-3), bytes_per_ns: model.bandwidth_gbs.max(1e-3), launch_ns: model.launch_us * 1000.0 };
+    let found = Arc::new(path::search(&path::Problem { inputs: &masks, output, extent: &labels.extent }, &costs));
+    lock(&ctx.jit().einsum_paths).insert(key, Arc::clone(&found));
+    found
 }
 
 /// Contracts `operands` as `spec` says (`"ij,jk->ik"` is a matrix product; see the [module](self) for the syntax).

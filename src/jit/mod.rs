@@ -3160,6 +3160,8 @@ pub(crate) struct JitState {
     pub(crate) rules: rules::RulesState,
     /// Strategy rankings by subject (see [`structured::select`]).
     pub(crate) selections: structured::select::SelectionCache,
+    /// The contraction orders `einsum` searched under `numerics.reassociate`, by spec, shapes and numerics.
+    pub(crate) einsum_paths: crate::einsum::PathMemo,
     /// What the selection cache of the strategy registry needs of the context (see [`structured::select`]).
     pub(crate) selcache: structured::select::SelState,
     /// Sampled launch timings of strategies (see [`structured::telemetry`]).
@@ -3314,6 +3316,7 @@ impl JitState {
             structured: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             selections: Mutex::new(FxMap::default()),
+            einsum_paths: Mutex::new(FxMap::default()),
             rules: rules::RulesState::new(numerics),
             selcache: structured::select::SelState::new(),
             telemetry: structured::telemetry::Telemetry::default(),

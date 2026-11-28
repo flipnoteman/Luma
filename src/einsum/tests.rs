@@ -196,3 +196,46 @@ fn malformed_specs_poison() {
         assert!(einsum(spec, &operands).to_vec().is_err(), "{spec} should poison");
     }
 }
+
+fn reassociating() -> Context {
+    Context::with_options(ContextOptions::from_env().calibrate(false).numerics(crate::Numerics::algebraic())).unwrap()
+}
+
+/// The result of `spec` on a context that may reassociate against the host reference (small integers: exact in any order).
+fn check_on(ctx: &Context, spec: &str, sizes: &[(char, usize)]) {
+    let inputs: Vec<&str> = spec.split("->").next().unwrap().split(',').collect();
+    let made: Vec<(Array<f32>, Vec<f32>)> = inputs.iter().enumerate().map(|(i, s)| operand(ctx, s, sizes, i + 1)).collect();
+    let arrays: Vec<&Array<f32>> = made.iter().map(|m| &m.0).collect();
+    let data: Vec<Vec<f32>> = made.iter().map(|m| m.1.clone()).collect();
+    let got: Vec<f64> = einsum(spec, &arrays).to_vec().unwrap_or_else(|e| panic!("{spec}: {e}")).into_iter().map(f64::from).collect();
+    assert_eq!(got, reference(spec, sizes, &data), "{spec}");
+}
+
+#[test]
+fn the_searched_order_gives_the_same_values_and_is_remembered() {
+    let ctx = reassociating();
+    let skew = [('i', 40), ('j', 3), ('k', 40), ('l', 3)];
+    super::SEARCHES.with(|searches| searches.set(0));
+    check_on(&ctx, "ij,jk,kl->il", &skew);
+    check_on(&ctx, "ij,jk,kl->il", &skew);
+    assert_eq!(super::SEARCHES.with(std::cell::Cell::get), 1, "the second call reads the memo");
+    check_on(&ctx, "ij,jk,kl->il", &[('i', 3), ('j', 40), ('k', 3), ('l', 40)]);
+    assert_eq!(super::SEARCHES.with(std::cell::Cell::get), 2, "other shapes are another key");
+    let s = [('a', 3), ('b', 4), ('c', 2), ('d', 5), ('e', 3), ('f', 2)];
+    // Four operands (exhaustive), five and eight (subset search), nine (greedy), a branching network, and a trace inside a chain.
+    check_on(&ctx, "ab,bc,cd,de->ae", &s);
+    check_on(&ctx, "ab,bc,cd,de,ef->af", &s);
+    check_on(&ctx, "ab,bc,cd,de,ef,fa,ab,bc->ac", &s);
+    check_on(&ctx, "ab,bc,cd,de,ef,fa,ab,bc,cd->ad", &s);
+    check_on(&ctx, "ab,bc,ca->", &s);
+    check_on(&ctx, "ab,ab,bc->c", &s);
+    check_on(&ctx, "aa,ab,bc->c", &[('a', 3), ('b', 2), ('c', 4)]);
+}
+
+#[test]
+fn an_intermediate_with_more_than_four_axes_is_an_error_not_a_panic() {
+    let ctx = cpu();
+    let s = [('a', 2), ('b', 2), ('c', 2), ('d', 2), ('e', 2), ('f', 2)];
+    let made: Vec<Array<f32>> = ["ab", "cd", "ef", "abcdef"].iter().enumerate().map(|(n, sub)| if sub.len() > 4 { operand(&ctx, "ab", &s, n).0 } else { operand(&ctx, sub, &s, n).0 }).collect();
+    assert!(einsum("ab,cd,ef,abcdef->", &[&made[0], &made[1], &made[2], &made[3]]).to_vec().is_err());
+}
