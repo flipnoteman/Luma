@@ -22,6 +22,11 @@ pub trait NativeStage: Any + fmt::Debug + Send + Sync + 'static {
     fn bytes(&self) -> &[u8];
     /// The staged bytes, for writing.
     fn bytes_mut(&mut self) -> &mut [u8];
+    /// The size the stage was allocated for: the length of [`NativeStage::bytes`] unless the host
+    /// cannot see the bytes yet (a readback buffer that is not mapped).
+    fn capacity(&self) -> usize {
+        self.bytes().len()
+    }
 }
 
 /// The default representation: plain heap memory.
@@ -67,7 +72,7 @@ impl Stage {
 
     /// The size in bytes.
     pub fn len(&self) -> u64 {
-        self.native.bytes().len() as u64
+        self.native.capacity() as u64
     }
 
     /// Whether the stage holds no bytes.

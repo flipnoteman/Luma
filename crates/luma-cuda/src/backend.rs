@@ -1923,6 +1923,35 @@ impl Backend for CudaBackend {
         Ok(ticket)
     }
 
+    fn record_readback_staged(&self, src: &Buffer, stage: &mut Stage, bytes: u64) -> Result<Ticket, BackendError> {
+        let sptr = device_ptr(src)?;
+        if bytes > src.size() || bytes > stage.len() {
+            return Err(BackendError::OutOfMemory { requested: bytes });
+        }
+        let Some(native) = stage.downcast_ref::<CudaStage>() else {
+            let host = &mut stage.as_mut_slice()[..bytes as usize];
+            // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `read_into` only writes.
+            let host = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<MaybeUninit<u8>>(), host.len()) };
+            self.read_into(src, host, false, Duration::ZERO)?;
+            return Ok(Ticket::done());
+        };
+        let pinned = native.pinned.as_ref().ok_or_else(|| BackendError::Gpu("a stage without memory".into()))?.ptr;
+        let mut st = lock(&self.state);
+        self.bind()?;
+        // The transfer lane copies after what the compute lane queued so far (the kernels that wrote the buffer); the compute lane does not wait for it: the caller holds the buffer until the ticket completes.
+        let before = self.event(&mut st)?;
+        before.record(&self.stream).map_err(gpu)?;
+        self.transfer.wait(&before).map_err(gpu)?;
+        st.free_events.push(before);
+        // SAFETY: the source range lies inside `src`, which the caller keeps alive and unwritten until the ticket completes; the stage holds `bytes` bytes of pinned memory that the host leaves alone until then.
+        unsafe {
+            let host = std::slice::from_raw_parts_mut(pinned.cast::<MaybeUninit<u8>>(), bytes as usize);
+            result::memcpy_dtoh_async(host, sptr, self.transfer.cu_stream())
+        }
+        .map_err(gpu)?;
+        self.transfer_ticket(native)
+    }
+
     fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, after: &[Ticket]) -> Result<Ticket, BackendError> {
         check_transfer(stage, StageDir::ToDevice, dst, dst_offset, bytes)?;
         let native = stage.downcast_ref::<CudaStage>().ok_or_else(|| BackendError::Unsupported("a stage of another backend".into()))?;

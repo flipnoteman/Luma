@@ -140,6 +140,25 @@ impl Context {
         })
     }
 
+    /// Host memory for [`Context::readback_staged`], `bytes` bytes (pinned where the backend has
+    /// any); `None` where the backend has no staging memory of its own.
+    pub(crate) fn readback_stage(&self, bytes: u64) -> Option<luma_core::hal::Stage> {
+        if !self.hal().pinned_staging() {
+            return None;
+        }
+        self.hal().stage_alloc_uninit(bytes, luma_core::hal::StageDir::FromDevice).ok()
+    }
+
+    /// Records a copy of the first `bytes` bytes of `src` into a stage from [`Context::readback_stage`],
+    /// ordered after everything recorded so far and asynchronous on the backend's transfer lane:
+    /// the ticket completes when the bytes are in the stage. The caller keeps `src` unwritten
+    /// until then.
+    pub(crate) fn readback_staged(&self, src: &Buffer, stage: &mut luma_core::hal::Stage, bytes: u64) -> Result<luma_core::Ticket> {
+        self.abort_recording_for("readback")?;
+        self.notify_released();
+        Ok(self.hal().record_readback_staged(src, stage, bytes)?)
+    }
+
     /// Whether the copy `ticket` stands for has completed (a failed query counts as done: the
     /// waiting paths report the error).
     pub(crate) fn ticket_done(&self, ticket: &luma_core::Ticket) -> bool {

@@ -83,6 +83,24 @@ fn baseline(path: &Path, cold: bool) -> f64 {
     total as f64 / started.elapsed().as_secs_f64() / 1e9
 }
 
+/// GB/s of writing `bytes` bytes sequentially to a new file in 4 MiB pieces, synced at the end: the write ceiling of `file/axpy_to_file`.
+fn write_baseline(path: &Path, bytes: u64) -> f64 {
+    let piece = vec![0x5au8; 4 << 20];
+    let started = Instant::now();
+    let mut file = std::fs::File::create(path).expect("create the write baseline file");
+    let mut left = bytes;
+    while left > 0 {
+        let n = left.min(piece.len() as u64) as usize;
+        file.write_all(&piece[..n]).unwrap();
+        left -= n as u64;
+    }
+    file.sync_data().unwrap();
+    let rate = bytes as f64 / started.elapsed().as_secs_f64() / 1e9;
+    drop(file);
+    let _ = std::fs::remove_file(path);
+    rate
+}
+
 /// GB/s of `passes` passes over `bytes` bytes that `f` makes.
 fn rate(bytes: u64, passes: u64, f: &mut dyn FnMut()) -> f64 {
     let started = Instant::now();
@@ -145,6 +163,8 @@ pub(super) fn run(h: &mut Harness) {
         });
         let before = ctx.paging_stats();
         println!("  file/axpy_to_file: {axpy:.2} GB/s read + write ({} MiB written so far)", before.io_written_bytes >> 20);
+        let (read, write) = (baseline(&input.0, false), write_baseline(&scratch("seqw").0, bytes));
+        println!("  file/axpy_to_file ceiling: sequential read (cached) {read:.2} GB/s, sequential write {write:.2} GB/s; both in turn: {:.2} GB/s", 2.0 / (1.0 / read + 1.0 / write));
         // The last element of the last segment made it to the file.
         let tail = y.slice(0, n - 4..n).to_vec().unwrap();
         assert_eq!(tail, (n - 4..n).map(|i| 2.0 * ((i % (1 << 20)) % 1021) as f32 * 0.125 + 1.0).collect::<Vec<_>>());

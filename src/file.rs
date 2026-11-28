@@ -23,6 +23,7 @@ use crate::context::{Context, default_context};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
+use crate::gpu::pager::{Goal, WriteJob};
 use crate::gpu_type::GpuType;
 use crate::jit::{self, ElemTy, Op, OpKind, Src};
 use crate::shape::Shape;
@@ -203,6 +204,8 @@ pub(crate) struct FileStore {
     storage: Mutex<Weak<Storage>>,
     /// The first error of a write-back since the last successful flush.
     failed: Mutex<Option<Arc<LumaError>>>,
+    /// The write-backs under way in the background (see `gpu::pager::writeback`); finished ones are dropped as new ones come.
+    pending: Mutex<Vec<Arc<WriteJob>>>,
 }
 
 impl FileStore {
@@ -225,11 +228,77 @@ impl FileStore {
         lock(&self.failed).get_or_insert_with(|| Arc::new(error.clone()));
     }
 
+    /// Starts writing `len` bytes at `src` to `offset`; the write is under way until the ticket completes.
+    ///
+    /// # Safety
+    /// `src` must be valid for reads of `len` bytes, and stay valid and unchanged until the ticket has completed.
+    pub(crate) unsafe fn start_write(&self, offset: u64, src: *const u8, len: usize) -> IoTicket {
+        // SAFETY: the caller's contract; the engine only reads through the pointer of a write.
+        let stage = unsafe { StagePtr::new(src.cast_mut(), len) };
+        self.engine.write(&self.file, Extent { offset, len: len as u64 }, stage)
+    }
+
+    /// Whether the write `ticket` has completed, and how.
+    pub(crate) fn poll_io(&self, ticket: &IoTicket) -> Option<std::io::Result<u64>> {
+        self.engine.poll(ticket)
+    }
+
+    /// Waits for `ticket`.
+    pub(crate) fn wait_io(&self, ticket: &IoTicket) -> std::io::Result<u64> {
+        self.engine.wait(ticket)
+    }
+
+    /// The error of a failed write of the range at `offset`.
+    pub(crate) fn write_error(&self, offset: u64, error: std::io::Error) -> LumaError {
+        LumaError::io("write", &self.path, Some(offset), error)
+    }
+
+    /// Adds a write-back under way.
+    pub(crate) fn push_pending(&self, job: Arc<WriteJob>) {
+        let mut pending = lock(&self.pending);
+        pending.retain(|job| !job.is_done());
+        pending.push(job);
+    }
+
+    /// Whether a write-back of bytes of `[offset, offset + len)` is under way.
+    pub(crate) fn has_pending_overlap(&self, offset: u64, len: u64) -> bool {
+        lock(&self.pending).iter().any(|job| !job.is_done() && job.overlaps(offset, len))
+    }
+
+    /// Waits for the write-backs that overlap `[offset, offset + len)`: what reads the range sees
+    /// their bytes. Returns the first error of a write that failed (its segment is dirty again).
+    pub(crate) fn drain_overlap(&self, offset: u64, len: u64) -> Result<()> {
+        let jobs: Vec<Arc<WriteJob>> = lock(&self.pending).iter().filter(|job| !job.is_done() && job.overlaps(offset, len)).cloned().collect();
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // The readbacks first: every write is under way before the first is waited for.
+        let mut first = None;
+        for job in &jobs {
+            if let Err(error) = job.advance(true, Goal::Read) {
+                first.get_or_insert(error);
+            }
+        }
+        for job in &jobs {
+            if let Err(error) = job.advance(true, Goal::Done) {
+                first.get_or_insert(error);
+            }
+        }
+        lock(&self.pending).retain(|job| !job.is_done());
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Waits for every write-back of the file.
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.drain_overlap(0, u64::MAX)
+    }
+
     /// Reads `dst.len()` bytes from `offset`; every byte of `dst` is written on success.
     pub(crate) fn read(&self, offset: u64, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
         }
+        self.drain_overlap(offset, dst.len() as u64)?;
         let extent = Extent { offset, len: dst.len() as u64 };
         read_blocking(&*self.engine, &self.file, extent, dst).map(|_| ()).map_err(|e| LumaError::io("read", &self.path, Some(offset), e))
     }
@@ -525,14 +594,25 @@ impl<T: GpuType> Array<T> {
             return Ok(());
         }
         self.context().sync()?;
-        let mut first = None;
+        // Write-backs under way from evictions: their errors, and those of ones that failed in the background, come out first, with the data still dirty.
+        let mut first = file.drain().err();
+        if let Some(error) = lock(&file.failed).take() {
+            first.get_or_insert_with(|| LumaError::clone(&error));
+        }
+        if let Some(error) = first {
+            return Err(error);
+        }
         for j in 0..storage.segments() {
             if let Err(error) = storage.segment(j).write_back() {
                 first.get_or_insert(error);
             }
         }
+        if let Err(error) = file.drain() {
+            first.get_or_insert(error);
+        }
         if let Some(error) = first {
-            file.failed_with(&error);
+            // Reported here, once: the next flush tries again.
+            lock(&file.failed).take();
             return Err(error);
         }
         file.finish_flush()?;
@@ -686,6 +766,7 @@ fn attach<T: GpuType>(
         completion: Mutex::new(located.completion),
         storage: Mutex::new(Weak::new()),
         failed: Mutex::new(None),
+        pending: Mutex::new(Vec::new()),
     });
     let layout = T::LAYOUT;
     let storage = Arc::new(Storage::homed(ctx, shape_len, layout, &store, store.data.start, elem_bytes::<T>()));
@@ -998,5 +1079,86 @@ mod readahead_tests {
         let x = Array::<f32>::open_on(&ctx, &file.0, FileOptions::raw().shape(len).engine(engine)).unwrap();
         let error = (&x * 2.0f32).sum().item().unwrap_err();
         assert!(matches!(error.root(), LumaError::Io { op: "read", .. }), "{error}");
+    }
+
+    /// `x * 2 + 1` stored into a new file on `ctx`: the file, the array and the values it holds.
+    fn stored(ctx: &Context, input: &Temp, len: usize, engine: Option<Arc<dyn TileIo>>) -> (Temp, Array<f32>, Vec<f32>) {
+        let data = values(len);
+        let out = temp("wb-out", &[]);
+        std::fs::remove_file(&out.0).unwrap();
+        let x = Array::<f32>::open_on(ctx, &input.0, FileOptions::raw().shape(len)).unwrap();
+        let mut opts = FileOptions::raw().sidecar(false);
+        if let Some(engine) = engine {
+            opts = opts.engine(engine);
+        }
+        let mut y = Array::<f32>::create_on(ctx, &out.0, len, opts).unwrap();
+        (&x * 2.0f32 + 1.0f32).store(&mut y).unwrap();
+        let want = data.iter().map(|v| v * 2.0 + 1.0).collect();
+        (out, y, want)
+    }
+
+    #[test]
+    fn a_write_back_that_fails_in_the_background_surfaces_at_flush_and_keeps_the_data() {
+        let len = 1 << 14;
+        let file = temp("wb-fail", &bytes(&values(len)));
+        let ctx = ctx(4);
+        if ctx.is_cpu() {
+            // The synchronous path fails the operation that evicts.
+            return;
+        }
+        // The third write fails, while the segments after it compute.
+        let engine: Arc<dyn TileIo> = Arc::new(FailingIo::new(PoolIo::new(2), FailPlan { write: Some((2, Fault::Fail(std::io::ErrorKind::Other))), ..FailPlan::default() }));
+        let (out, y, want) = stored(&ctx, &file, len, Some(engine));
+        let error = y.flush().unwrap_err();
+        assert!(matches!(error.root(), LumaError::Io { op: "write", .. }), "{error}");
+        // Nothing was lost: the segment is back in memory, dirty.
+        assert_eq!(y.to_vec().unwrap(), want);
+        y.flush().unwrap();
+        drop(y);
+        assert_eq!(std::fs::read(&out.0).unwrap(), bytes(&want));
+    }
+
+    #[test]
+    fn a_read_sees_the_bytes_of_the_writes_still_pending() {
+        let len = 1 << 15;
+        let file = temp("wb-read", &bytes(&values(len)));
+        let ctx = ctx(4);
+        let (out, y, want) = stored(&ctx, &file, len, None);
+        // No flush: the read waits for the write-backs of the extents it reads.
+        assert_eq!(y.to_vec().unwrap(), want);
+        assert_eq!((&y + 1.0f32).sum().item().unwrap(), want.iter().map(|v| f64::from(*v) + 1.0).sum::<f64>() as f32);
+        y.flush().unwrap();
+        drop(y);
+        assert_eq!(std::fs::read(&out.0).unwrap(), bytes(&want));
+    }
+
+    #[test]
+    fn write_backs_stay_within_the_staging_budget_and_dropping_the_array_lands_them() {
+        let len = 1 << 16;
+        let file = temp("wb-budget", &bytes(&values(len)));
+        let ctx = ctx(4);
+        let (out, y, want) = stored(&ctx, &file, len, None);
+        // No flush: the drop of the array writes what is left.
+        drop(y);
+        assert_eq!(std::fs::read(&out.0).unwrap(), bytes(&want));
+        if !ctx.is_cpu() {
+            let peak = ctx.paging_stats().writeback_peak_bytes;
+            // 4 segments in flight and two more (4 KiB each).
+            assert!(peak > 0 && peak <= 6 * 4096, "{peak}");
+        }
+    }
+
+    #[test]
+    fn results_are_bit_identical_when_writes_stay_synchronous() {
+        let len = 1 << 15;
+        let file = temp("wb-sync", &bytes(&values(len)));
+        let mut stored_bytes = Vec::new();
+        for depth in [0, 4] {
+            let ctx = ctx(depth);
+            let (out, y, _) = stored(&ctx, &file, len, None);
+            drop(y);
+            stored_bytes.push(std::fs::read(&out.0).unwrap());
+        }
+        assert_eq!(stored_bytes[0], stored_bytes[1]);
     }
 }

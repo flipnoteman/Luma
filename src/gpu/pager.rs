@@ -26,6 +26,11 @@ use crate::jit::split::Schedule;
 use luma_core::hal::size_class;
 use crate::gpu::lock;
 
+mod writeback;
+
+pub(crate) use writeback::{Goal, WriteJob};
+use writeback::{Kind, OutRing};
+
 /// Smallest list length worth pruning.
 const PRUNE_MIN: usize = 32;
 
@@ -59,6 +64,17 @@ pub(crate) struct Home {
     /// Bytes of the file the segment covers: at most the segment's bytes; the rest (the tail of
     /// a packed segment that does not fill its last word) is zero and never written.
     pub(crate) file_bytes: u64,
+    /// Set while a write-back started by [`Segment::write_back`] may still be reading the buffer:
+    /// a write pin waits for it first.
+    flushing: AtomicBool,
+    /// That write-back; lock order: after the segment's `state`.
+    flush_job: Mutex<Weak<WriteJob>>,
+}
+
+impl Home {
+    pub(crate) fn new(store: Arc<FileStore>, offset: u64, file_bytes: u64) -> Home {
+        Home { store, offset, file_bytes, flushing: AtomicBool::new(false), flush_job: Mutex::new(Weak::new()) }
+    }
 }
 
 /// Where a windowed segment's data is: `bytes` bytes of the one buffer of `pack`, from `offset`.
@@ -383,6 +399,16 @@ pub(crate) struct Pager {
     readahead_peak: AtomicU64,
     /// The host stages of file reads and uploads.
     ring: Mutex<StageRing>,
+    /// The host stages of background write-backs not in use (see `writeback`).
+    wring: Mutex<OutRing>,
+    /// Bytes of write stages, idle or in use.
+    wstage_bytes: AtomicU64,
+    /// The most `wstage_bytes` was.
+    wstage_peak: AtomicU64,
+    /// The background write-backs, oldest first; finished ones are pruned as they are reaped.
+    writes: Mutex<VecDeque<Weak<WriteJob>>>,
+    /// How many of them have not finished.
+    writes_pending: std::sync::atomic::AtomicUsize,
     /// Bytes read from files into segments.
     io_read_bytes: AtomicU64,
     /// Bytes written back to files.
@@ -515,6 +541,11 @@ impl Pager {
             readahead_bytes: AtomicU64::new(0),
             readahead_peak: AtomicU64::new(0),
             ring: Mutex::new(StageRing::default()),
+            wring: Mutex::new(OutRing::default()),
+            wstage_bytes: AtomicU64::new(0),
+            wstage_peak: AtomicU64::new(0),
+            writes: Mutex::new(VecDeque::new()),
+            writes_pending: std::sync::atomic::AtomicUsize::new(0),
             io_read_bytes: AtomicU64::new(0),
             io_written_bytes: AtomicU64::new(0),
             home_drops: AtomicU64::new(0),
@@ -1070,9 +1101,16 @@ impl Segment {
     /// brought back from host memory, copied out of its pack or recomputed otherwise.
     fn pin_device(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
         let pager = self.ctx.pager();
+        if self.home.is_some() {
+            self.ctx.reap_writes();
+        }
         loop {
             if let State::Device(buffer) = &*lock(&self.state) {
                 if write {
+                    // A write-back may still be reading the buffer.
+                    if self.flushing() {
+                        self.settle_flush();
+                    }
                     self.invalidate_host_copy();
                 }
                 self.pins.fetch_add(1, Ordering::Acquire);
@@ -1114,6 +1152,13 @@ impl Segment {
             } else {
                 None
             };
+            if away && let Some(home) = self.home() {
+                // The bytes of a write still going on are the file's; the error of a failed one comes out here.
+                home.store.drain_overlap(home.offset, home.file_bytes)?;
+                if !matches!(&*lock(&self.state), State::Away) {
+                    continue;
+                }
+            }
             if away && !overwrite {
                 self.read_ahead();
             }
@@ -1247,6 +1292,10 @@ impl Segment {
         if !matches!(&*state, State::Away) {
             return true;
         }
+        // Its file range is being written: the pin waits for that and reads then.
+        if home.store.has_pending_overlap(home.offset, home.file_bytes) {
+            return true;
+        }
         let mut slot = lock(&ahead.read);
         if slot.is_some() {
             return true;
@@ -1350,8 +1399,9 @@ impl Segment {
 
     /// Writes the data of a segment that is on the device and dirty to its (writable) home and
     /// marks it clean; the buffer stays. Does nothing for a clean segment or one that is not on
-    /// the device.
-    pub(crate) fn write_back(&self) -> Result<()> {
+    /// the device. Where the pager writes in the background (see `writeback`) the write is only
+    /// started: [`FileStore::drain`] waits for it, and a failure puts the segment back to dirty.
+    pub(crate) fn write_back(self: &Arc<Self>) -> Result<()> {
         self.settle()?;
         self.debug_settled();
         let Some(home) = self.home() else { return Ok(()) };
@@ -1361,13 +1411,30 @@ impl Segment {
         // Before the state lock: aborting a recording can pin this segment.
         self.ctx.abort_recording_for("write back of a file segment")?;
         let state = lock(&self.state);
-        let State::Device(buffer) = &*state else { return Ok(()) };
-        if self.home_valid.load(Ordering::Acquire) {
-            return Ok(());
+        match &*state {
+            State::Device(buffer) => {
+                if self.home_valid.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if self.ctx.async_writes()
+                    && let Ok(job) = self.ctx.start_write(Some(Arc::clone(self)), home, self.bytes, buffer, Kind::Flush, false)
+                {
+                    *lock(&home.flush_job) = Arc::downgrade(&job);
+                    home.flushing.store(true, Ordering::Release);
+                    self.home_valid.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                let data = self.ctx.read_spill(buffer, self.bytes)?;
+                self.write_home(home, &data)?;
+                self.home_valid.store(true, Ordering::Release);
+            }
+            // The data of a write that failed in the background: it is written from memory (the next pin uploads it as usual).
+            State::Host(data) => {
+                self.write_home(home, data)?;
+                self.home_valid.store(true, Ordering::Release);
+            }
+            _ => {}
         }
-        let data = self.ctx.read_spill(buffer, self.bytes)?;
-        self.write_home(home, &data)?;
-        self.home_valid.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1446,6 +1513,9 @@ impl Segment {
                 Some(f(&mut data.as_mut_slice()[..self.bytes as usize]))
             }
             State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                if self.flushing() {
+                    self.settle_flush();
+                }
                 self.invalidate_host_copy();
                 self.clear_lineage();
                 self.home_written();
@@ -1607,12 +1677,17 @@ fn copy_zero_tail(src: &[u8], dst: &mut [u8]) {
 impl Segment {
     /// What dropping a file-backed segment that is on the device does besides recycling the buffer:
     /// the last dirty copy of the data goes to the file first (a failure is logged and kept for `flush`).
+    /// Where the pager writes in the background, the write takes the buffer over (`true`: it counts
+    /// and recycles it); the array's drop waits for it.
     #[cold]
     #[inline(never)]
-    fn drop_homed(&self, buffer: &Buffer) {
+    fn drop_homed(&self, buffer: &Buffer) -> bool {
         if let Some(home) = self.home()
             && !self.home_valid.load(Ordering::Acquire)
         {
+            if self.ctx.async_writes() && self.ctx.start_write(None, home, self.bytes, buffer, Kind::Evict, false).is_ok() {
+                return true;
+            }
             let written = self.ctx.read_spill(buffer, self.bytes).and_then(|data| self.write_home(home, &data));
             if let Err(error) = written {
                 home.store.failed_with(&error);
@@ -1620,6 +1695,7 @@ impl Segment {
             }
         }
         self.ctx.pager().resident_homed_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+        false
     }
 }
 
@@ -1656,14 +1732,22 @@ impl Drop for Segment {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         match std::mem::replace(state, State::Empty) {
             State::Device(buffer) => {
-                if self.home.is_some() {
-                    self.drop_homed(&buffer);
+                // A background write took the buffer over, with its count.
+                if self.home.is_some() && self.drop_homed(&buffer) {
+                    return;
                 }
                 self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
                 self.ctx.recycle(buffer);
             }
             State::Host(data) => {
                 self.ctx.pager().host_state_bytes.fetch_sub(data.len() as u64, Ordering::Relaxed);
+                // The data of a write-back that failed: one more try, since nothing else holds it.
+                if let Some(home) = self.home()
+                    && !self.home_valid.load(Ordering::Acquire)
+                    && let Err(error) = self.write_home(home, &data)
+                {
+                    log::error!("luma: could not write back a dropped file segment: {error}");
+                }
             }
             State::Empty | State::Window(_) | State::Lineage | State::Away => {}
         }
@@ -1695,7 +1779,14 @@ impl Context {
         let pager = self.pager();
         let Some(budget) = pager.budget else { return Ok(()) };
         let class = size_class(bytes, self.max_buffer_bytes()).unwrap_or(bytes);
-        while pager.resident_bytes.load(Ordering::Relaxed) + class > budget && self.evict_one()? { std::hint::spin_loop() }
+        self.reap_writes();
+        while pager.resident_bytes.load(Ordering::Relaxed) + class > budget {
+            // Nothing left to evict: the buffer of a write-back under way is free once it was read.
+            if !self.evict_one()? && !self.wait_one_readback() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
         Ok(())
     }
 
@@ -1771,7 +1862,12 @@ impl Context {
         let buffer = buffer.clone();
         if let Some(home) = victim.home() {
             // The file is the copy: a clean segment is dropped, a dirty one is written back first.
+            let mut handed_over = false;
             if victim.home_valid.load(Ordering::Acquire) {
+                // A write-back that was started may still be reading the buffer.
+                if victim.flushing() {
+                    victim.settle_flush();
+                }
                 #[cfg(debug_assertions)]
                 if pager.clean_evictions.load(Ordering::Relaxed).is_multiple_of(16) {
                     let real = self.read_spill(&buffer, victim.bytes)?;
@@ -1782,21 +1878,27 @@ impl Context {
                     assert!(file == &real.as_slice()[..file.len()], "a clean file segment differs from its file: a write did not mark it dirty");
                 }
                 pager.clean_evictions.fetch_add(1, Ordering::Relaxed);
+            } else if self.async_writes() && self.start_write(Some(Arc::clone(&victim)), home, victim.bytes, &buffer, Kind::Evict, home.store.drop_cache()).is_ok() {
+                // The readback and the write go on in the background; the job holds the buffer until it was read and counts it until then.
+                victim.home_valid.store(true, Ordering::Release);
+                handed_over = true;
             } else {
                 // Flushes and waits, so every recorded use of the buffer has run.
                 let data = self.read_spill(&buffer, victim.bytes)?;
                 victim.write_home(home, &data)?;
                 victim.home_valid.store(true, Ordering::Release);
             }
-            if home.store.drop_cache() {
+            if !handed_over && home.store.drop_cache() {
                 home.store.advise_drop(home.offset, home.file_bytes);
             }
             pager.home_drops.fetch_add(1, Ordering::Relaxed);
             *state = State::Away;
             lock(&victim.texture).take();
-            victim.uncount(buffer.size());
             lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
-            self.recycle(buffer);
+            if !handed_over {
+                victim.uncount(buffer.size());
+                self.recycle(buffer);
+            }
             drop(state);
             return Ok(true);
         }
@@ -1920,6 +2022,7 @@ impl Context {
             home_writebacks: pager.home_writebacks.load(Ordering::Relaxed),
             file_resident_bytes: pager.resident_homed_bytes.load(Ordering::Relaxed),
             readahead_peak_bytes: pager.readahead_peak.load(Ordering::Relaxed),
+            writeback_peak_bytes: pager.wstage_peak.load(Ordering::Relaxed),
         }
     }
 }
@@ -1990,6 +2093,8 @@ pub struct PagingStats {
     pub file_resident_bytes: u64,
     /// The most bytes of file reads that were under way ahead of the pins that need them (read-ahead is bounded by an eighth of the host budget).
     pub readahead_peak_bytes: u64,
+    /// The most bytes of host staging memory the background write-backs of file segments held at once (bounded like the read-ahead; 0 where write-backs are synchronous).
+    pub writeback_peak_bytes: u64,
 }
 
 /// Segments read ahead by default (`LUMA_READAHEAD` overrides; 0 turns read-ahead off).

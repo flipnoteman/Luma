@@ -1589,6 +1589,22 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
         self.record_upload(dst, &stage.as_slice()[..bytes as usize], max_buffer_bytes)?;
         Ok(Ticket::done())
     }
+    /// Records a copy of the first `bytes` bytes of `src` into the start of `stage` (allocated
+    /// for [`StageDir::FromDevice`]), ordered after everything recorded so far, and returns the
+    /// ticket of the copy. The caller keeps `src` alive and unwritten, and leaves the stage alone,
+    /// until the ticket completes; then `stage.as_slice()` holds the bytes.
+    ///
+    /// The default reads back at once, so the ticket is done on return.
+    fn record_readback_staged(&self, src: &Buffer, stage: &mut Stage, bytes: u64) -> Result<Ticket, BackendError> {
+        if bytes > stage.len() {
+            return Err(BackendError::OutOfMemory { requested: bytes });
+        }
+        let host = &mut stage.as_mut_slice()[..bytes as usize];
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `read_into` only writes.
+        let host = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<MaybeUninit<u8>>(), host.len()) };
+        self.read_into(src, host, false, Duration::ZERO)?;
+        Ok(Ticket::done())
+    }
     /// The bytes of `stage`, valid while the host owns it.
     fn stage_ptr<'a>(&self, stage: &'a mut Stage) -> &'a mut [u8] {
         stage.as_mut_slice()

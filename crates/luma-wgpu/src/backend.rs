@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -312,6 +312,81 @@ impl Drop for WgpuStage {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             // Never uploaded: still mapped, so the next upload takes it as it is.
+            let _ = lock(&self.pool).put(buffer);
+        }
+    }
+}
+
+/// A readback buffer a copy out of the device lands in (see [`Backend::record_readback_staged`]):
+/// the copy maps it for reading, and the bytes are read in place once the ticket completed.
+#[derive(Debug)]
+struct WgpuReadStage {
+    /// `None` only while dropping.
+    buffer: Option<Buffer>,
+    /// The size the stage was allocated for.
+    cap: usize,
+    /// Bytes the last readback copied.
+    copied: usize,
+    /// Whether the buffer was asked to map (and so has to be unmapped before it is copied into again).
+    armed: bool,
+    /// The mapping of the last readback, until the host looked at it.
+    pending: Mutex<Option<MapReceiver>>,
+    /// Start of the mapped range, null while the host cannot see the bytes.
+    ptr: AtomicPtr<u8>,
+    /// Where the buffer goes back to.
+    pool: Arc<Mutex<FreeUploads>>,
+}
+
+impl WgpuReadStage {
+    /// Waits for the mapping of the last readback (its submission has completed) and finds the bytes.
+    fn mapped(&self) -> Option<*mut u8> {
+        let ptr = self.ptr.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            return Some(ptr);
+        }
+        let receiver = lock(&self.pending).take()?;
+        let buffer = self.buffer.as_ref()?;
+        receiver.recv().ok()?.ok()?;
+        let view = own(buffer).slice(..self.copied as u64).get_mapped_range().ok()?;
+        let ptr = view.as_ptr().cast_mut();
+        self.ptr.store(ptr, Ordering::Release);
+        Some(ptr)
+    }
+
+    /// Unmaps the buffer: the next readback copies into it again.
+    fn rearm(&mut self) {
+        if let Some(buffer) = &self.buffer
+            && std::mem::take(&mut self.armed)
+        {
+            own(buffer).unmap();
+        }
+        *self.pending.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.ptr.store(std::ptr::null_mut(), Ordering::Release);
+    }
+}
+
+impl NativeStage for WgpuReadStage {
+    fn bytes(&self) -> &[u8] {
+        match self.mapped() {
+            // SAFETY: the mapped range holds `copied` bytes while the buffer is held and not unmapped (`rearm` takes `&mut self`).
+            Some(ptr) => unsafe { std::slice::from_raw_parts(ptr, self.copied) },
+            None => &[],
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut []
+    }
+
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+}
+
+impl Drop for WgpuReadStage {
+    fn drop(&mut self) {
+        self.rearm();
+        if let Some(buffer) = self.buffer.take() {
             let _ = lock(&self.pool).put(buffer);
         }
     }
@@ -643,7 +718,7 @@ pub struct WgpuBackend {
     /// Recycled mappable storage buffers (unified memory), mapped again for zero-copy uploads.
     mappable: Arc<Mutex<FreeUploads>>,
     /// Idle readback buffers.
-    readbacks: Mutex<FreeUploads>,
+    readbacks: Arc<Mutex<FreeUploads>>,
     /// Buffers their owners released; the cached bind groups still holding them are dropped at
     /// the next submission, which frees them.
     released: Arc<Mutex<Vec<Buffer>>>,
@@ -764,7 +839,7 @@ impl WgpuBackend {
             cost: Arc::clone(&gpu.0.cost),
             uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
             mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
-            readbacks: Mutex::new(FreeUploads::new(cap)),
+            readbacks: Arc::new(Mutex::new(FreeUploads::new(cap))),
             released: Arc::new(Mutex::new(Vec::new())),
             free_chunks: Arc::new(Mutex::new(Vec::new())),
             unmapped: Mutex::new(Vec::new()),
@@ -1714,7 +1789,10 @@ impl Backend for WgpuBackend {
 
     fn stage_alloc_uninit(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
         if dir != StageDir::ToDevice {
-            return self.stage_alloc(bytes, dir);
+            let len = bytes.next_multiple_of(COPY_BUFFER_ALIGNMENT);
+            let buffer = self.readback_buffer(len)?;
+            let native = WgpuReadStage { buffer: Some(buffer), cap: len as usize, copied: 0, armed: false, pending: Mutex::new(None), ptr: AtomicPtr::new(std::ptr::null_mut()), pool: Arc::clone(&self.readbacks) };
+            return Ok(Stage::new(dir, native));
         }
         let len = bytes.next_multiple_of(COPY_BUFFER_ALIGNMENT);
         let class = size_class(len, self.max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
@@ -1740,6 +1818,32 @@ impl Backend for WgpuBackend {
         lock(&self.uploads).in_flight += staging.size();
         guard.uploads.push(staging);
         Ok(Ticket::done())
+    }
+
+    fn record_readback_staged(&self, src: &Buffer, stage: &mut Stage, bytes: u64) -> Result<Ticket, BackendError> {
+        let Some(native) = stage.downcast_mut::<WgpuReadStage>().filter(|native| bytes as usize <= native.cap && bytes.is_multiple_of(COPY_BUFFER_ALIGNMENT)) else {
+            if bytes as usize > stage.as_slice().len() {
+                return Err(BackendError::OutOfMemory { requested: bytes });
+            }
+            let host = &mut stage.as_mut_slice()[..bytes as usize];
+            // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and `read_into` only writes.
+            let host = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<MaybeUninit<u8>>(), host.len()) };
+            self.read_into(src, host, false, Duration::ZERO)?;
+            return Ok(Ticket::done());
+        };
+        let src = raw(src)?;
+        native.rearm();
+        let Some(staging) = native.buffer.as_ref() else { return Err(BackendError::Gpu("a stage without memory".into())) };
+        let submission = {
+            let mut guard = self.batch()?;
+            self.encoder(&mut guard).copy_buffer_to_buffer(src, 0, own(staging), 0, bytes);
+            self.flush_locked(&mut guard)
+        };
+        let mapped = map_for_read(own(staging).slice(..bytes));
+        native.copied = bytes as usize;
+        native.armed = true;
+        *lock(&native.pending) = Some(mapped);
+        Ok(submission.map_or_else(Ticket::done, |index| Ticket::new(WgpuTicket(index))))
     }
 
     fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, _after: &[Ticket]) -> Result<Ticket, BackendError> {

@@ -80,11 +80,24 @@ pub(crate) struct Storage {
     /// Id of the lazy node this is the result of, `u64::MAX` if none; finds the state of a loop
     /// whose node was dropped (see `jit::looped`).
     producer: AtomicU64,
-    /// The file the segments live in, for a storage opened or created as a file array (see
-    /// [`Array::open`]).
-    file: Option<Arc<FileStore>>,
     /// Elements of a full segment, `C` (computed once).
     seg_len: usize,
+    /// The file the segments live in, for a storage opened or created as a file array (see [`Array::open`]). The last field: see [`FileGuard`].
+    file: Option<FileGuard>,
+}
+
+/// The file of a file-backed storage. It is the last field of [`Storage`]: its drop runs once the
+/// segments are gone (dirty ones started their write-backs as they were dropped), and waits for
+/// every write-back of the file.
+#[derive(Debug)]
+pub(crate) struct FileGuard(Arc<FileStore>);
+
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.drain() {
+            log::error!("luma: could not write back a dropped file array: {error}");
+        }
+    }
 }
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -278,13 +291,13 @@ impl Storage {
                 let bytes = layout.bytes(range.len());
                 let offset = data_offset + range.start as u64 * elem_bytes;
                 let file_bytes = bytes.min(data_end - offset);
-                Segment::homed(ctx, bytes, Home { store: Arc::clone(store), offset, file_bytes })
+                Segment::homed(ctx, bytes, Home::new(Arc::clone(store), offset, file_bytes))
             })
             .collect();
         let segments: Box<[Arc<Segment>]> = segments;
         link_segments(&segments);
         let mut storage = Self::with_segments(ctx, len, layout, c, segments, None);
-        storage.file = Some(Arc::clone(store));
+        storage.file = Some(FileGuard(Arc::clone(store)));
         storage
     }
 
@@ -309,7 +322,7 @@ impl Storage {
 
     /// The file of a file-backed storage.
     pub(crate) fn file(&self) -> Option<&Arc<FileStore>> {
-        self.file.as_ref()
+        self.file.as_ref().map(|guard| &guard.0)
     }
 
     /// The storage this one aliases the segments of (see [`Array::probe`]).
@@ -320,7 +333,7 @@ impl Storage {
     /// Whether nothing may write the storage: it borrows the buffers of another one, or it is a
     /// file opened without `writable()`.
     pub(crate) fn is_read_only(&self) -> bool {
-        self.is_alias() || self.file.as_ref().is_some_and(|file| !file.writable())
+        self.is_alias() || self.file().is_some_and(|file| !file.writable())
     }
 
     /// [`Storage::pin`] for a command that overwrites every byte of segment `j`: a file-backed
