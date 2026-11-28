@@ -150,6 +150,10 @@ impl<T: ScalarType> Array<T> {
                 (base, inner.then(&map))
             }
             (None, Some(node)) if jit::recompute_viewed(node) => (Src::Node(Arc::clone(node)), map),
+            // An axis reduction with an absorbed epilogue (W3-U4 D1) stands where the division of `mean_axis` stood, a lazy node that a
+            // view reads without recording anything: its recording waits for the expression that uses the view, which keeps it in one
+            // kernel with the reductions made after it.
+            (None, None) if self.structured().is_some_and(|value| value.has_epilogue() && value.is_unforced()) => (self.src()?, map),
             _ => (Src::Buffer(Arc::clone(self.storage_alongside()?)), map),
         };
 

@@ -166,6 +166,11 @@ impl Structured {
         epi.as_ref()
     }
 
+    /// Whether this is an axis reduction that applies an absorbed epilogue.
+    pub(crate) fn has_epilogue(&self) -> bool {
+        self.epi().is_some()
+    }
+
     pub(crate) fn finish(&self) -> Finish {
         let RunState::Reduce { finish, .. } = &self.comp().run else { unreachable!("a reduction") };
         *finish
