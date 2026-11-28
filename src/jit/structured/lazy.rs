@@ -112,6 +112,9 @@ pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttr
     // The rules of tier 1 (W3-R4R5): a few tests of the operands say whether any of them may apply.
     let mut tagged = None;
     if rules::needs_t1(ctx, lhs, rhs) {
+        if let Some(scaled) = rules::scaled_product(ctx, lhs, rhs, attrs, shape, location) {
+            return scaled;
+        }
         match rules::product_hook(ctx, lhs, rhs, attrs, location) {
             rules::Product::Replaced(array) => return array,
             rules::Product::Props(props) => tagged = Some(props),

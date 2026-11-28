@@ -164,11 +164,15 @@ registry! {
     T1Comprehension ContractK1, "contract_k1", Exact, Exact, true, "contract_k1";
     T1Comprehension DiagOfProduct, "diag_of_product", Exact, Exact, true, "diag_of_product";
     T1Comprehension GramSymmetric, "gram_symmetric", Exact, Exact, true, "gram_symmetric";
+    T1Comprehension ScaleThrough, "scale_through", Reassociating, Reassociating, true, "scale_through";
     T1Comprehension ContractIdentity, "contract_identity", Reformulating, Reformulating, true, "contract_identity";
     T1Comprehension ContractDiag, "contract_diag", Reformulating, Reformulating, true, "contract_diag";
-    // tier 2: reformulating products (W3-R4R5); cost-accepted
+    // tier 2 (W3-R4R5); cost-accepted. `shared_operand` (4) is not a rule of the normaliser: the partner search of W3-U4 makes it (its
+    // table entry, class and check are here), so it is not in `T2_RULES`.
+    T2 SharedOperand, "shared_operand", Exact, Exact, false, "shared_operand";
     T2 ChainOrder, "chain_order", Reassociating, Reassociating, false, "chain_order";
     T2 SumOfProduct, "sum_of_product", Reformulating, Reformulating, false, "sum_of_product";
+    T2 FactorInvariant, "factor_invariant", Reformulating, Reformulating, false, "factor_invariant";
 }
 
 /// The rule `id` fired. Nothing in release: a rewrite is a branch and a copy of the operands, and every instruction here is

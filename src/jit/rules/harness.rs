@@ -1166,3 +1166,16 @@ fn programs_are_what_integ_made_them() {
     let wrong: Vec<String> = got.iter().zip(&want).filter(|(g, w)| g != w).map(|(g, w)| format!("{g}   (integ: {w})")).collect();
     assert!(wrong.is_empty(), "{} programs differ from integ:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+#[test]
+#[should_panic(expected = "ExactFinite bit check failed")]
+fn seeded_scale_through_tagged_exact_finite_fails() {
+    // The factor applied once after the sum rounds differently from the factor applied to each term.
+    run_seeded(seeded_matrix("scale exact finite", Class::ExactFinite, E::Matmul(bx(mul(k(1.1), x(0))), bx(x(1))), mul(k(1.1), E::Matmul(bx(x(0)), bx(x(1)))), &[&[3, 2], &[2, 4]]));
+}
+
+#[test]
+#[should_panic(expected = "Exact bit check failed")]
+fn seeded_factor_invariant_tagged_exact_fails() {
+    run_seeded(seeded_matrix("factor exact", Class::Exact, E::Sum { axis: 0, of: bx(mul(E::Bcast { axis: 0, of: bx(x(1)) }, x(0))) }, mul(x(1), E::Sum { axis: 0, of: bx(x(0)) }), &[&[3, 4], &[3, 1]]));
+}

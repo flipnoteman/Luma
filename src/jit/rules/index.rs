@@ -346,7 +346,63 @@ fn contract_diag(form: &Comprehension, _: &Numerics) -> Option<Comprehension> {
 /// test of the operands' sources on every eager product cost 1.6% of the host time of `launchcost/matmul32`.
 #[inline(always)]
 pub(crate) fn needs_t1(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> bool {
-    (lhs.has_props() || rhs.has_props() || lhs.shape().dims()[0] == 1) && ctx.jit().rules.t1_active
+    ((lhs.has_props() || rhs.has_props() || lhs.shape().dims()[0] == 1) && ctx.jit().rules.t1_active) || (ctx.jit().rules.scale_active && (scale_of(lhs).is_some() || scale_of(rhs).is_some()))
+}
+
+// -- rule 12 --
+
+/// `x · s` or `s · x`: the pending scalar product `array` is, as its operand `x` and the factor `s` (an `f32` known at creation).
+#[inline(never)]
+fn scale_of(array: &Array<f32>) -> Option<(Src, f32)> {
+    let node = array.pending()?;
+    if node.op().kind != OpKind::Binary(BinOp::Mul) || node.is_looped() || node.deferred_value().is_some() {
+        return None;
+    }
+    let [a, b, _] = node.operands()?;
+    match (a, b) {
+        (x @ (Src::Node(_) | Src::Buffer(_)), Src::Scalar(s)) | (Src::Scalar(s), x @ (Src::Node(_) | Src::Buffer(_))) if s.ty == ElemTy::F32 => Some((x, f32::from_bits(s.bits as u32))),
+        _ => None,
+    }
+}
+
+/// The operand `array` is without its scalar factor, as an array of the same shape.
+fn unscaled(ctx: &Context, array: &Array<f32>, src: Src) -> Array<f32> {
+    match src {
+        Src::Node(node) => Array::from_node(ctx, array.shape(), node),
+        Src::Buffer(storage) => Array::from_storage(ctx, array.shape(), storage),
+        Src::Scalar(_) => unreachable!("an operand of a scalar product is an array"),
+    }
+}
+
+/// 12 `scale_through`, `Reassociating`: `(s·a)·b` and `a·(s·b)` are `s·(a·b)`, the factor applied once to each output as the product's
+/// epilogue (a step of the absorbed program) instead of to each element of an operand. The sum adds products of unscaled operands,
+/// so the rounding differs (the class); a factor of a power of two is no exception (a scaled subnormal or overflow). Called by the
+/// product when [`needs_t1`] says an operand is a scalar product and the numerics reassociate: `None` where it does not apply.
+///
+/// The form-level statement of the rule is the harness's `scale_through`; the form of a product has no epilogue the lowering takes,
+/// so this is a hook like rule 6b, and what it makes is a lazy product with an absorbed step (`Structured::absorb`), or, where the
+/// product runs at once, the product times the factor.
+pub(crate) fn scaled_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, attrs: crate::jit::structured::contraction::ContractionAttrs, shape: crate::shape::Shape, location: &'static Location<'static>) -> Option<Array<f32>> {
+    if !ctx.jit().rules.scale_active || lhs.has_props() || rhs.has_props() {
+        return None;
+    }
+    let (mut factors, mut operands): (smallvec::SmallVec<[f32; 2]>, [Option<Array<f32>>; 2]) = (smallvec![], [None, None]);
+    for (slot, array) in operands.iter_mut().zip([lhs, rhs]) {
+        if let Some((src, factor)) = scale_of(array) {
+            *slot = Some(unscaled(ctx, array, src));
+            factors.push(factor);
+        }
+    }
+    if factors.is_empty() {
+        return None;
+    }
+    let (a, b) = (operands[0].as_ref().unwrap_or(lhs), operands[1].as_ref().unwrap_or(rhs));
+    note(ctx, location, Rid::ScaleThrough);
+    let mut product = crate::jit::structured::lazy::product(a, b, attrs, shape, location);
+    for factor in factors {
+        product = crate::jit::structured::lazy::absorb_binary::<f32, f32>(&product, &crate::ops::Rhs::Scalar(factor), BinOp::Mul, false, location).unwrap_or_else(|| &product * factor);
+    }
+    Some(product)
 }
 
 /// What the rules of tier 1 make of a product that [`needs_t1`].

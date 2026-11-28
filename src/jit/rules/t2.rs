@@ -118,6 +118,9 @@ pub(crate) struct RulesState {
     pub(crate) t1_active: bool,
     /// The same for tier 2 (mode `on`).
     pub(crate) t2_active: bool,
+    /// Whether the scalar factors of a product's operands may move out of it (rule 12, `Reassociating`): the eager path's pre-filter
+    /// reads this one flag, so a context that does not reassociate pays a load and a branch.
+    pub(crate) scale_active: bool,
     pub(crate) memo: Memo,
 }
 
@@ -131,6 +134,7 @@ impl RulesState {
         RulesState {
             t1_active: mode >= Algebra::T1 && t1.iter().any(|rule| rule.info.allowed(numerics)),
             t2_active: mode >= Algebra::On && t2.iter().any(|rule| rule.info.allowed(numerics)),
+            scale_active: mode >= Algebra::T1 && numerics.reassociate,
             memo: Mutex::new(FxMap::default()),
         }
     }

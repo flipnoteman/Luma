@@ -219,7 +219,7 @@ pub(super) fn tr(a: E) -> E {
 /// The rules of W3-R4R5 whose lhs and rhs are programs of matrices (`contract_view` ... `contract_diag`). The rules of tier 2
 /// (sum of a product, invariant factors, chain order) follow in [`reform_rules`].
 pub(super) fn index_rules() -> Vec<Rule> {
-    use Class::{Exact, Reformulating};
+    use Class::{Exact, Reassociating, Reformulating};
     let none = Gate::None;
     let sq: &'static [&'static [usize]] = &[&[3, 3]];
     vec![
@@ -232,6 +232,8 @@ pub(super) fn index_rules() -> Vec<Rule> {
         rule("diag_of_product", Exact, E::Diag(bx(matmul(x(0), x(1)))), E::Sum { axis: 0, of: bx(mul(x(0), tr(x(1)))) }, &[&[3, 4], &[4, 3]], None, None, none),
         // 11: `aᵀa` is its own transpose, bit for bit.
         rule("gram_symmetric", Exact, matmul(tr(x(0)), x(0)), tr(matmul(tr(x(0)), x(0))), &[&[4, 3]], None, None, none),
+        // 12: a scalar factor of an operand scales the product (the rounding differs: the scale is applied once, after the sum).
+        rule("scale_through", Reassociating, matmul(mul(k(1.5), x(0)), x(1)), mul(k(1.5), matmul(x(0), x(1))), &[&[3, 2], &[2, 4]], Some(2e-5), None, none),
         // 5: `a·I`.
         rule("contract_identity", Reformulating, matmul(x(0), E::Eye(0)), x(0), sq, Some(2e-5), Some("a NaN or infinity in a spreads over a row of the product (x * 0); -0 becomes +0"), none),
         // 6a: `a·diag(v)` with `v` a row vector of the diagonal.
@@ -250,7 +252,7 @@ pub(super) fn index_rules() -> Vec<Rule> {
 
 /// The rules of tier 2 of W3-R4R5 as expressions: `sum_of_product` and `chain_order`.
 pub(super) fn reform_rules() -> Vec<Rule> {
-    use Class::{Reassociating, Reformulating};
+    use Class::{Exact, Reassociating, Reformulating};
     let sum = |axis, of| E::Sum { axis, of: bx(of) };
     vec![
         // 7: the sum of all the entries of a product is the product of the column sums of `a` and the row sums of `b`.
@@ -264,6 +266,20 @@ pub(super) fn reform_rules() -> Vec<Rule> {
             Some("an infinity or NaN in a or b reaches the result through fewer terms (x * 0); -0 sums differ"),
             Gate::None,
         ),
+        // 8: a factor that does not depend on the summed index leaves the sum: `Σ_k s(i)·x(i,k)` is `s(i)·Σ_k x(i,k)`.
+        rule(
+            "factor_invariant",
+            Reformulating,
+            sum(0, mul(E::Bcast { axis: 0, of: bx(x(1)) }, x(0))),
+            mul(x(1), sum(0, x(0))),
+            &[&[3, 4], &[3, 1]],
+            Some(2e-5),
+            Some("an infinity or NaN in a sum that s multiplies at 0 (s * inf, 0 * NaN), the order of the roundings; -0 sums differ"),
+            Gate::None,
+        ),
+        // 4: one product over the two right operands side by side gives the two products (every output sums the same terms in the
+        // same order of `k` when the plan keeps `kc` and does not split K).
+        rule("shared_operand", Exact, E::Cat { axis: 0, a: bx(matmul(x(0), x(1))), b: bx(matmul(x(0), x(2))) }, matmul(x(0), E::Cat { axis: 0, a: bx(x(1)), b: bx(x(2)) }), &[&[3, 4], &[4, 2], &[4, 5]], None, None, Gate::None),
         // 9: `(a·b)·v` is `a·(b·v)`; the rounding differs.
         rule("chain_order", Reassociating, matmul(matmul(x(0), x(1)), x(2)), matmul(x(0), matmul(x(1), x(2))), &[&[3, 4], &[4, 5], &[5, 1]], Some(1e-4), None, Gate::None),
     ]

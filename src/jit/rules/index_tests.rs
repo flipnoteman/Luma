@@ -361,3 +361,43 @@ fn the_rules_of_products_fire_exactly_under_the_flags_that_allow_them() {
         assert_eq!(fired("contract_diag"), numerics.reformulate, "{numerics}");
     }
 }
+
+#[test]
+fn a_scalar_factor_of_an_operand_is_the_epilogue_of_the_product_under_reassociate() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
+    let (k, m, n) = (96, 64, 80);
+    let (ha, hb) = (finite(k * m, 5), finite(n * k, 6));
+    let full = host_product(&ha, &hb, k, m, n);
+    let scaled: Vec<f64> = full.iter().map(|v| v * 2.5 * -0.75).collect();
+    for (numerics, rewritten) in [(Numerics::algebraic(), true), (Numerics::default(), false), (Numerics { reassociate: true, ..Numerics::strict() }, true)] {
+        let ctx = open(LazyMode::Never, numerics);
+        let a = A::from_slice_on(&ctx, &ha, [k, m]).unwrap();
+        let b = A::from_slice_on(&ctx, &hb, [n, k]).unwrap();
+        ctx.record_decisions(true);
+        // The factor of each operand: both move out of the product.
+        let c = (&a * 2.5).matmul_f32(&(&b * -0.75));
+        close(&c.to_vec().unwrap(), &scaled, 1e-4);
+        let log = ctx.take_decisions();
+        let fired = log.iter().filter(|d| d.site == DecisionSite::Rewrite && d.chosen == "scale_through").count();
+        let absorbed = log.iter().filter(|d| d.site == DecisionSite::Epilogue && d.chosen.to_string().starts_with("absorbed")).count();
+        assert_eq!(fired > 0, rewritten, "{numerics}: {log:?}");
+        assert_eq!(absorbed > 0, rewritten, "{numerics}: the factors are steps of the product's epilogue");
+    }
+}
+
+#[test]
+fn the_scale_pre_filter_is_only_asked_when_the_numerics_reassociate() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
+    for (numerics, wants) in [(Numerics::default(), false), (Numerics::algebraic(), true)] {
+        let ctx = open(LazyMode::Never, numerics);
+        let a = A::from_slice_on(&ctx, &values(12 * 8, 0), [12, 8]).unwrap();
+        let b = A::from_slice_on(&ctx, &values(5 * 12, 1), [5, 12]).unwrap();
+        assert!(!needs_t1(&ctx, &a, &b), "{numerics}");
+        assert_eq!(needs_t1(&ctx, &(&a * 3.0), &b), wants, "{numerics}: a scaled operand");
+        assert_eq!(needs_t1(&ctx, &a, &(&b * 3.0)), wants, "{numerics}: a scaled operand");
+    }
+}
