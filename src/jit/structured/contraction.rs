@@ -420,7 +420,7 @@ const fn entry(
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, replayable: matches!(id.1, 1 | 4 | 7), reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, replayable: matches!(id.1, 1 | 4 | 7..=9), reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
 }
 
 /// A ragged or a padded kernel: new in this part, so not a baseline (its kernel may be compiling, or over the variant budget: the

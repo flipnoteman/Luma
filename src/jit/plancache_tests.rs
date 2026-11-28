@@ -689,8 +689,11 @@ fn a_changed_shape_class_is_another_plan() {
 #[test]
 fn reductions_recorded_together_are_not_replayed_alone() {
     // Two reductions of one operand are recorded in one kernel (the merged strategy, which a replay does not run): the step is not
-    // cached, and runs as ever.
-    let ctx = ctx();
+    // cached, and runs as ever. The merged kernel is due at once: on CUDA a group is recorded one by one a few times first, and then in
+    // its kernel once a background compile is ready, which another test of the process (or the time a batch takes) decides, so that
+    // the launches of two runs of the same steps would differ by when they happen.
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = 0).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
     let step = |u: &A, t: usize| {
         let (lo, hi) = (u.min(), u.max());
         ((u - &lo) / &(&hi - &lo + 1.0) * (1.0 + 0.01 * t as f32)).clamp(-4.0, 4.0)
