@@ -14,17 +14,24 @@
 //! expression that reads it drops the product unevaluated, and with it the operands it pinned.
 
 use std::panic::Location;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use smallvec::SmallVec;
 
+use super::epilogue::{EpiInput, EpiMap, EpiProgram, StepOperand};
 use super::contraction::{self, ContractionAttrs, ContractionView, Geometry};
 use super::select;
 use super::sites::{LazyMode, Laziness, SiteSlot};
 use super::strategy::{Output, Subject};
 use super::{Comp, Family, Launch, Meta, RunState, Structured};
 use crate::array::{Array, Failure, Storage};
+use crate::builtin::{BinOp, UnOp};
+use crate::gpu_type::{GpuType, ScalarType};
+use crate::jit::program::Ref;
+use crate::jit::{self, OpKind, Scalar};
+use crate::ops::Rhs;
+use crate::profile::{Decision, DecisionSite};
 use crate::bmm;
 use crate::context::Context;
 use crate::error::LumaError;
@@ -49,6 +56,28 @@ pub(crate) struct ContractionRun {
     /// How many unrecorded products this one is at the end of a chain of (itself included): recording it records them first, one
     /// call deeper each, and dropping it drops them the same way.
     depth: u16,
+    /// The epilogue absorbed into this value (W3-U4), if it is a derived one.
+    epilogue: Option<Absorbed>,
+    /// Set when a consumer was absorbed from this value: forcing it is not a lone force for its site (see
+    /// [`super::sites::Sites::note_forced_alone`]).
+    absorbed_from: AtomicBool,
+}
+
+/// What an elementwise consumer of a lazy product added to it: the program the product's strategy applies to each output element
+/// (`Absorbed::program`, relative to the plain product), the arrays its inputs read, and how to take the last step alone when the
+/// value it was derived from is still in use.
+pub(crate) struct Absorbed {
+    pub(crate) program: Arc<EpiProgram>,
+    /// One array per input of `program`, as the consumer read them (before any broadcast).
+    pub(crate) arrays: SmallVec<[Array<f32>; 3]>,
+    /// The shape of the output.
+    shape: Shape,
+    /// The value this one was derived from, if it is still alive: it was used elsewhere (or is yet), so the product is computed once,
+    /// for both, and the last step runs over its buffer.
+    parent: Weak<Structured>,
+    /// The last step over the parent's value (`Ref::Acc`), with its input array if it has one.
+    delta: Arc<EpiProgram>,
+    delta_arrays: SmallVec<[Array<f32>; 1]>,
 }
 
 /// The longest chain of unrecorded products. A longer one records the products it would read when it is made: recording and
@@ -180,7 +209,7 @@ impl Structured {
             ContractionKind::Matmul { attrs, .. } => ("matmul", OpTag::Matmul { tf32: attrs.tf32.request() }),
             ContractionKind::Batched { .. } => ("matmul_batched", OpTag::MatmulBatched),
         };
-        let run = ContractionRun { operands: Mutex::new(Some([lhs.held_clone(), rhs.held_clone()])), kind, slot, inherited: OnceLock::new(), leaf_id: AtomicU64::new(0), depth };
+        let run = ContractionRun { operands: Mutex::new(Some([lhs.held_clone(), rhs.held_clone()])), kind, slot, inherited: OnceLock::new(), leaf_id: AtomicU64::new(0), depth, epilogue: None, absorbed_from: AtomicBool::new(false) };
         debug_assert!(run.form(lhs, rhs, location).is_none_or(|form| form.validate().is_ok()), "the form of an API product is well formed");
         let comp = Comp { form: Mutex::new(None), meta: Meta { ty: ElemTy::F32, len, tag, geom: None, launch: Launch::AtForce }, run: RunState::Contraction(Box::new(run)) };
         let value = Arc::new(Structured::new(Family::Comprehension(comp), false, name, location));
@@ -232,10 +261,13 @@ impl Structured {
         let held = ctx.jit().hold_requested_reading(leaf_id);
         let computing = Computing::enter(leaf_id);
         let outcome = match &run.kind {
-            ContractionKind::Matmul { attrs, .. } => {
-                let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location, epilogue: None };
-                select::execute(ctx, &Subject::Contraction(&view)).map(Output::into_storage)
-            }
+            ContractionKind::Matmul { attrs, .. } => match &run.epilogue {
+                None => {
+                    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location, epilogue: None };
+                    select::execute(ctx, &Subject::Contraction(&view)).map(Output::into_storage)
+                }
+                Some(absorbed) => self.run_absorbed(ctx, [&lhs, &rhs], *attrs, absorbed),
+            },
             ContractionKind::Batched { geom, launch } => bmm::execute(ctx, &lhs, &rhs, geom, *launch),
         };
         drop(computing);
@@ -243,7 +275,9 @@ impl Structured {
         self.forcing.store(false, Ordering::Relaxed);
         // The form holds sources of the operands: a forced product keeps neither.
         drop(lock(&self.comp().form).take());
-        ctx.jit().sites.note_forced_alone(run.slot);
+        if run.epilogue.is_none() && !run.absorbed_from.load(Ordering::Relaxed) {
+            ctx.jit().sites.note_forced_alone(run.slot);
+        }
         outcome.map_err(|failure| match failure {
             Failure::Inherited(error) => error,
             Failure::New(error) => Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) }),
@@ -262,7 +296,13 @@ impl Structured {
             RunState::Contraction(run) => {
                 let operands = lock(&run.operands);
                 let [lhs, rhs] = operands.as_ref()?;
-                Some(SmallVec::from_buf([lhs.src().ok()?, rhs.src().ok()?]))
+                let mut sources = SmallVec::from_buf([lhs.src().ok()?, rhs.src().ok()?]);
+                if let Some(absorbed) = &run.epilogue {
+                    for array in &absorbed.arrays {
+                        sources.push(array.src().ok()?);
+                    }
+                }
+                Some(sources)
             }
         }
     }
@@ -276,7 +316,7 @@ impl ContractionRun {
         }
         let operands = lock(&self.operands);
         let [lhs, rhs] = operands.as_ref()?;
-        let error = lhs.failed().or_else(|| rhs.failed())?;
+        let error = lhs.failed().or_else(|| rhs.failed()).or_else(|| self.epilogue.as_ref().and_then(|absorbed| absorbed.arrays.iter().find_map(|array| array.failed())))?;
         Some(self.inherited.get_or_init(|| Arc::clone(error)))
     }
 
@@ -306,6 +346,10 @@ impl ContractionRun {
 
     /// [`ContractionRun::form`] of the operands the value still holds; `None` once it was forced.
     pub(crate) fn build_form(&self, location: &'static Location<'static>) -> Option<Comprehension> {
+        // A product with an absorbed epilogue has no form of its own yet: the rewrite engine would read it as the plain product.
+        if self.epilogue.is_some() {
+            return None;
+        }
         let operands = lock(&self.operands);
         let [lhs, rhs] = operands.as_ref()?;
         self.form(lhs, rhs, location)
@@ -335,4 +379,185 @@ impl ContractionView<'_> {
         }
         Ok(())
     }
+}
+
+// -- absorption (W3-U4) --
+
+impl Structured {
+    /// Runs a product that has an absorbed epilogue. If the value it was derived from is alive its product is computed once for both
+    /// and the last step runs over its buffer (the cost of the unfused code). Otherwise the strategy gets the whole program; one that
+    /// does not take it returns the plain product, and the program runs as one elementwise pass over it (bit for bit what the
+    /// consumers would have computed).
+    fn run_absorbed(&self, ctx: &Context, [lhs, rhs]: [&Array<f32>; 2], attrs: ContractionAttrs, absorbed: &Absorbed) -> Result<Arc<Storage>, Failure> {
+        if let Some(parent) = absorbed.parent.upgrade() {
+            let acc = match parent.force(ctx) {
+                Ok(storage) => Arc::clone(storage),
+                Err(error) => return Err(Failure::Inherited(Arc::clone(error))),
+            };
+            return apply_separately(ctx, &absorbed.delta, &absorbed.delta_arrays, Src::Buffer(acc), absorbed.shape, self.location);
+        }
+        let view = ContractionView { lhs, rhs, attrs, location: self.location, epilogue: Some(&absorbed.program) };
+        match select::execute(ctx, &Subject::Contraction(&view))? {
+            Output::Epilogued(storages) => Ok(storages.into_iter().next().expect("one output")),
+            Output::Storage(storage) => {
+                if ctx.jit().recording_decisions() {
+                    ctx.jit().note_decision(Decision::new("matmul", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
+                }
+                apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location)
+            }
+        }
+    }
+}
+
+/// `program` evaluated over `acc` as one fused elementwise kernel: the backend-neutral way to run an epilogue, the instructions
+/// built as the nodes the consumers would have been. `arrays` are the program's inputs.
+pub(crate) fn apply_separately(ctx: &Context, program: &EpiProgram, arrays: &[Array<f32>], acc: Src, shape: Shape, location: &'static Location<'static>) -> Result<Arc<Storage>, Failure> {
+    let mut temps: SmallVec<[Arc<Node>; 8]> = SmallVec::new();
+    for instr in program.instrs.iter() {
+        let mut args = [Src::unused(), Src::unused(), Src::unused()];
+        for (slot, &arg) in args.iter_mut().zip(&instr.args) {
+            *slot = match arg {
+                Ref::Acc => acc.clone(),
+                Ref::Input(j) => arrays[j as usize].broadcast_operand(shape, location)?,
+                Ref::Scalar(k) => Src::Scalar(program.scalars[k as usize]),
+                Ref::Tmp(t) => Src::Node(Arc::clone(&temps[t as usize])),
+                Ref::Unused | Ref::Sub(_) => Src::unused(),
+            };
+        }
+        temps.push(jit::create(ctx, shape.len(), instr.op, args, "epilogue", location)?);
+    }
+    let last = temps.pop().expect("an epilogue has an instruction");
+    let out = Array::<f32>::from_node(ctx, shape, last);
+    out.storage().cloned()
+}
+
+/// The array that is `this` with `op` applied, if `this` is a lazy product that can take it into its epilogue.
+#[inline(always)]
+pub(crate) fn absorb_unary<T: ScalarType, O: ScalarType>(this: &Array<T>, op: UnOp, location: &'static Location<'static>) -> Option<Array<O>> {
+    match this.structured() {
+        Some(value) if matches!(value.comp().run, RunState::Contraction(_)) => absorb(this, value, StepOperand::None, OpKind::Unary(op), None, location),
+        _ => None,
+    }
+}
+
+/// [`absorb_unary`] for `this op rhs`.
+#[inline(always)]
+pub(crate) fn absorb_binary<T: ScalarType, O: ScalarType>(this: &Array<T>, rhs: &Rhs<'_, T>, op: BinOp, scalar_left: bool, location: &'static Location<'static>) -> Option<Array<O>> {
+    let value = this.structured()?;
+    if !matches!(value.comp().run, RunState::Contraction(_)) || op.needs_helper() {
+        return None;
+    }
+    match rhs {
+        Rhs::Scalar(x) => {
+            let scalar = Scalar::of(*x).ok()?;
+            absorb(this, value, StepOperand::Scalar { value: scalar, scalar_left }, OpKind::Binary(op), None, location)
+        }
+        Rhs::Array(other) if !scalar_left => absorb(this, value, StepOperand::None, OpKind::Binary(op), Some(*other as &dyn AnyArray), location),
+        Rhs::Array(_) => None,
+    }
+}
+
+/// An array of some type, as the epilogue sees an operand.
+pub(crate) trait AnyArray {
+    fn as_f32_array(&self) -> Option<Array<f32>>;
+}
+
+impl<T: GpuType> AnyArray for Array<T> {
+    fn as_f32_array(&self) -> Option<Array<f32>> {
+        self.as_f32()
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn absorb<T: GpuType, O: ScalarType>(this: &Array<T>, base: &Arc<Structured>, operand: StepOperand, kind: OpKind, other: Option<&dyn AnyArray>, location: &'static Location<'static>) -> Option<Array<O>> {
+    let ctx = this.context();
+    let RunState::Contraction(run) = &base.comp().run else { return None };
+    let ContractionKind::Matmul { attrs } = &run.kind else { return None };
+    if !base.is_unforced() || base.failure().is_some() || base.in_recording || ctx.recording_here() || base.thread != std::thread::current().id() {
+        return None;
+    }
+    if this.has_props() || this.view().is_some() || this.as_f32().is_none() || ElemTy::of::<O>().ok()? != ElemTy::F32 {
+        return None;
+    }
+    if let OpKind::Unary(UnOp::Id) = kind {
+        return None;
+    }
+    if let OpKind::Unary(op) = kind
+        && op.needs_helper()
+    {
+        return None;
+    }
+    let note = |chosen: String| {
+        if ctx.jit().recording_decisions() {
+            ctx.jit().note_decision(Decision::new("epilogue", location, DecisionSite::Epilogue, chosen));
+        }
+    };
+    let shape = this.shape();
+    // The other operand: an `f32` array of the output's shape, or one that varies along one axis only.
+    let mut arrays: SmallVec<[Array<f32>; 1]> = SmallVec::new();
+    let operand = match (operand, other) {
+        (operand, None) => operand,
+        (_, Some(other)) => {
+            let array = other.as_f32_array()?;
+            if !ctx.same_as(array.context()) || array.has_props() || array.is_read_view() {
+                return None;
+            }
+            let (out, mine) = (shape.dims(), array.shape().dims());
+            let map = if mine == out {
+                EpiMap::Point
+            } else if mine == [out[0], 1, 1, 1] {
+                EpiMap::AlongCols
+            } else if mine == [1, out[1], 1, 1] {
+                EpiMap::AlongRows
+            } else if mine == [1, 1, 1, 1] {
+                EpiMap::Scalar
+            } else {
+                note("separate: operand shape".to_owned());
+                return None;
+            };
+            let input = EpiInput { src: array.src().ok()?, map, ty: ElemTy::F32 };
+            arrays.push(array);
+            StepOperand::Input(input)
+        }
+    };
+    let delta = Arc::new(EpiProgram::step(kind, operand));
+    let program = match &run.epilogue {
+        Some(parent) => parent.program.then(&delta),
+        None => Some(EpiProgram::clone(&delta)),
+    };
+    let Some(program) = program else {
+        note("separate: limit".to_owned());
+        return None;
+    };
+    let operands = lock(&run.operands).as_ref().map(|[lhs, rhs]| [lhs.clone(), rhs.clone()])?;
+    let mut all: SmallVec<[Array<f32>; 3]> = run.epilogue.as_ref().map(|parent| parent.arrays.clone()).unwrap_or_default();
+    all.extend(arrays.iter().cloned());
+    let count = program.instrs.len();
+    for array in operands.iter().chain(&all) {
+        array.record_for_reader();
+    }
+    let derived = ContractionRun {
+        operands: Mutex::new(Some(operands.clone())),
+        kind: ContractionKind::Matmul { attrs: *attrs },
+        slot: run.slot,
+        inherited: OnceLock::new(),
+        leaf_id: AtomicU64::new(0),
+        depth: run.depth,
+        epilogue: Some(Absorbed { program: Arc::new(program), arrays: all.clone(), shape, parent: Arc::downgrade(base), delta, delta_arrays: arrays }),
+        absorbed_from: AtomicBool::new(false),
+    };
+    let comp = Comp { form: Mutex::new(None), meta: Meta { ty: ElemTy::F32, len: base.comp().meta.len, tag: base.comp().meta.tag.clone(), geom: None, launch: Launch::AtForce }, run: RunState::Contraction(Box::new(derived)) };
+    let value = Arc::new(Structured::new(Family::Comprehension(comp), false, base.name, base.location));
+    let leaf = value.leaf(ctx, base.comp().meta.len);
+    let RunState::Contraction(made) = &value.comp().run else { unreachable!("a product") };
+    made.leaf_id.store(leaf.id(), Ordering::Relaxed);
+    let reader = Arc::downgrade(&leaf);
+    for array in operands.iter().chain(&all) {
+        array.add_reader(&reader);
+    }
+    run.absorbed_from.store(true, Ordering::Relaxed);
+    ctx.jit().sites.note_absorbed(run.slot);
+    note(format!("absorbed {count} ops"));
+    Some(Array::from_product(ctx, shape, value, leaf))
 }

@@ -242,6 +242,12 @@ impl<T: ScalarType> Array<T> {
         op: UnOp,
         location: &'static Location<'static>,
     ) -> Outcome<Array<T>> {
+        // A lazy product takes the operation into its epilogue.
+        if op != UnOp::Id
+            && let Some(absorbed) = crate::jit::structured::lazy::absorb_unary::<T, T>(self, op, location)
+        {
+            return Ok(absorbed);
+        }
         // A reduction that has not run takes the operation into its last pass.
         if let Some(fused) = self.fuse_step::<T>(EpilogueStep::Unary(op), 0) {
             return Ok(fused);
@@ -413,6 +419,9 @@ impl<T: ScalarType> Array<T> {
         {
             let result = self.run_unary(by, location);
             return Array::resolve(self.context(), self.shape(), result, name, location);
+        }
+        if let Some(absorbed) = crate::jit::structured::lazy::absorb_binary::<T, T>(self, &rhs, op, scalar_left, location) {
+            return absorbed;
         }
         if let Rhs::Scalar(value) = &rhs
             && let Ok(scalar) = Scalar::of(*value)

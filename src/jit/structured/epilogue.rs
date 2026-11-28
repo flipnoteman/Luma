@@ -18,7 +18,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::jit::program::{Instr, Ref};
-use crate::jit::{ElemTy, Scalar, Src};
+use crate::jit::{ElemTy, Op, OpKind, Scalar, Src};
 
 /// The most instructions an epilogue holds.
 pub(crate) const MAX_EPILOGUE_INSTRS: usize = 16;
@@ -139,4 +139,60 @@ impl EpiProgram {
         }
         Ok(())
     }
+}
+
+impl EpiProgram {
+    /// One step over the combined value: `op` applied to `Ref::Acc`, with the scalar `scalar` (`op(acc, s)`, or `op(s, acc)` if
+    /// `scalar_left`) or the epilogue input `input` (always on the right: `op(acc, input)`).
+    pub(crate) fn step(kind: OpKind, operand: StepOperand) -> EpiProgram {
+        let mut scalars = SmallVec::new();
+        let mut inputs = SmallVec::new();
+        let args = match operand {
+            StepOperand::None => [Ref::Acc, Ref::Unused, Ref::Unused],
+            StepOperand::Scalar { value, scalar_left } => {
+                scalars.push(value);
+                if scalar_left { [Ref::Scalar(0), Ref::Acc, Ref::Unused] } else { [Ref::Acc, Ref::Scalar(0), Ref::Unused] }
+            }
+            StepOperand::Input(input) => {
+                inputs.push(input);
+                [Ref::Acc, Ref::Input(0), Ref::Unused]
+            }
+        };
+        EpiProgram { instrs: Arc::new(vec![Instr { op: Op::new(kind, ElemTy::F32), args }]), inputs, scalars, outputs: SmallVec::from_elem(0, 1) }
+    }
+
+    /// This program followed by `delta`, whose `Ref::Acc` is this program's value: `None` if the result has more than
+    /// [`MAX_EPILOGUE_INSTRS`] instructions, [`MAX_EPI_INPUTS`] inputs or [`MAX_EPI_SCALARS`] scalars. Only for programs of one output.
+    pub(crate) fn then(&self, delta: &EpiProgram) -> Option<EpiProgram> {
+        let (n, inputs, scalars) = (self.instrs.len(), self.inputs.len() as u32, self.scalars.len() as u32);
+        if n + delta.instrs.len() > MAX_EPILOGUE_INSTRS || self.inputs.len() + delta.inputs.len() > MAX_EPI_INPUTS || self.scalars.len() + delta.scalars.len() > MAX_EPI_SCALARS || self.outputs.len() != 1 {
+            return None;
+        }
+        let value = Ref::Tmp(self.outputs[0]);
+        let mut instrs: Vec<Instr> = self.instrs.as_ref().clone();
+        for instr in delta.instrs.iter() {
+            let shift = |arg: Ref| match arg {
+                Ref::Acc => value,
+                Ref::Tmp(t) => Ref::Tmp(t + n as u32),
+                Ref::Input(j) => Ref::Input(j + inputs),
+                Ref::Scalar(k) => Ref::Scalar(k + scalars),
+                other => other,
+            };
+            instrs.push(Instr { op: instr.op, args: instr.args.map(shift) });
+        }
+        let last = instrs.len() as u32 - 1;
+        Some(EpiProgram {
+            instrs: Arc::new(instrs),
+            inputs: self.inputs.iter().chain(&delta.inputs).cloned().collect(),
+            scalars: self.scalars.iter().chain(&delta.scalars).copied().collect(),
+            outputs: SmallVec::from_elem(last, 1),
+        })
+    }
+}
+
+/// The second operand of an [`EpiProgram::step`].
+pub(crate) enum StepOperand {
+    None,
+    Scalar { value: Scalar, scalar_left: bool },
+    Input(EpiInput),
 }

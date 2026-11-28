@@ -190,6 +190,24 @@ impl Sites {
         cell.store(next.0, Ordering::Relaxed);
     }
 
+    /// A lazy value of `slot` had an epilogue absorbed into it (W3-U4): the site stays lazy.
+    pub(crate) fn note_absorbed(&self, slot: SiteSlot) {
+        self.bump(slot, State::ABSORBED);
+    }
+
+    /// A lazy value of `slot` took part in a partner group (W3-U4): the site stays lazy.
+    #[allow(dead_code, reason = "the partner selection of W3-U4 part A2 calls it")]
+    pub(crate) fn note_partnered(&self, slot: SiteSlot) {
+        self.bump(slot, State::PARTNERED);
+    }
+
+    fn bump(&self, slot: SiteSlot, at: u32) {
+        let Some(cell) = self.slots.get(usize::from(slot.0)) else { return };
+        let state = State(cell.load(Ordering::Relaxed));
+        // The slot may belong to another site by now: a wrong answer costs speed, never correctness.
+        cell.store(state.with(at, state.byte(at).saturating_add(1)).with(State::ALONE, 0).0, Ordering::Relaxed);
+    }
+
     /// Marks the slot of `key` as one that absorbed `absorbed` epilogues and took `partnered` partners (what W3-U4 and R4 write).
     #[cfg(test)]
     pub(crate) fn set_attached(&self, key: SiteKey, absorbed: u8, partnered: u8) {

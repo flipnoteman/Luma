@@ -591,6 +591,15 @@ impl<T: GpuType> Array<T> {
         Self::new(ctx, shape, Repr::Lazy(Held::new(node)))
     }
 
+    /// A handle on the same data as an `Array<f32>`, if this array holds `f32`.
+    pub(crate) fn as_f32(&self) -> Option<Array<f32>> {
+        if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f32>() {
+            return None;
+        }
+        let same = self.clone();
+        Some(Array { ctx: same.ctx, shape: same.shape, repr: same.repr, view: same.view, read_view: same.read_view, props: same.props, _marker: PhantomData })
+    }
+
     /// The (not yet recorded) structured value `value` as an array of `shape`.
     pub(crate) fn from_structured(ctx: &Context, shape: Shape, value: Arc<Structured>) -> Self {
         Self::new(ctx, shape, Repr::Structured(value, None))
