@@ -115,7 +115,6 @@ pub(crate) static UNITS: [UnitDesc; 5] = [
         needs: Caps::COOP_F16,
         reduced: Reduced::MATRIX_ACCUMULATE,
         rate: 20_000.0,
-        ragged_max_fmas: u64::MAX,
     },
 ];
 
