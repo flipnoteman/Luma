@@ -86,5 +86,28 @@ pub fn run(h: &mut Harness) {
             h.case(&format!("props/band_matmul_w{width}_dense"), &format!("[{m},{m}] x [{k},{m}]"), Work::Flops(flops), &mut || dense_a.matmul(&x).eval().unwrap());
         }
         h.ctx = saved;
+
+        // Gram products: `xᵀ x` through the half-work strategy against the full product of an equal copy (so not recognised as a
+        // Gram product). `f32` kernels (strict numerics: the CUDA tensor-core product has no half-work kernel yet).
+        let saved = std::mem::replace(&mut h.ctx, Context::with_options(ContextOptions::from_env().numerics(Numerics::strict())).unwrap());
+        let shapes: &[(usize, usize)] = if cpu { &[(512, 1024), (1024, 512)] } else { &[(1024, 4096), (4096, 1024)] };
+        for &(cols, rows) in shapes {
+            let data = values(rows * cols, 790, -1.0, 1.0);
+            let x = upload(h, &data, [cols, rows]);
+            let copy = upload(h, &data, [cols, rows]);
+            let (gram, full) = (host(&x.matmul_tn(&x)), host(&x.matmul_tn(&copy)));
+            for r in 0..cols {
+                for c in 0..cols {
+                    assert_eq!(gram[r * cols + c].to_bits(), gram[c * cols + r].to_bits(), "props/syrk: bit-symmetric");
+                    if c <= r {
+                        assert_eq!(gram[r * cols + c].to_bits(), full[r * cols + c].to_bits(), "props/syrk: the full product's lower triangle");
+                    }
+                }
+            }
+            let work = Work::Flops(2.0 * (cols * cols * rows) as f64);
+            h.case("props/syrk", &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&x).eval().unwrap());
+            h.case("props/syrk_full", &format!("x [{cols},{rows}]"), work, &mut || x.matmul_tn(&copy).eval().unwrap());
+        }
+        h.ctx = saved;
     });
 }
