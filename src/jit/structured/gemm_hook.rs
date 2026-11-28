@@ -177,19 +177,27 @@ mod tests {
         Array::<f32>::from_storage(ctx, [n, m, 1, 1].into(), output.into_storage()).to_vec().unwrap()
     }
 
-    /// The hooked product: the plain one runs while the kernel compiles, so the call is repeated until the hook applies.
+    /// The hooked product: the plain one runs while the kernel compiles, so the call is repeated until the hook applies. `None` if it
+    /// did not within `wait`: the strategy the cost model picked for the shape is not a hooked one.
     #[track_caller]
-    fn hooked(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, program: &EpiProgram, m: usize, n: usize) -> Vec<f32> {
+    fn hooked_within(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, program: &EpiProgram, m: usize, n: usize, wait: Duration) -> Option<Vec<f32>> {
         let start = Instant::now();
         loop {
             match product(ctx, lhs, rhs, Some(program)) {
-                Output::Epilogued(storages) => return read(ctx, Output::Storage(Arc::clone(&storages[0])), m, n),
+                Output::Epilogued(storages) => return Some(read(ctx, Output::Storage(Arc::clone(&storages[0])), m, n)),
                 Output::Storage(_) => {
-                    assert!(start.elapsed() < Duration::from_secs(30), "the hooked kernel never became ready ({m}x{n})");
+                    if start.elapsed() > wait {
+                        return None;
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
         }
+    }
+
+    #[track_caller]
+    fn hooked(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, program: &EpiProgram, m: usize, n: usize) -> Vec<f32> {
+        hooked_within(ctx, lhs, rhs, program, m, n, Duration::from_secs(30)).unwrap_or_else(|| panic!("the hooked kernel never became ready ({m}x{n})"))
     }
 
     fn operands(ctx: &Context, (m, n, k): (usize, usize, usize)) -> [Array<f32>; 2] {
@@ -200,7 +208,7 @@ mod tests {
     fn a_hooked_relu_with_a_bias_is_the_plain_product_then_the_elementwise_pass_bit_for_bit() {
         let Some(ctx) = context() else { return };
         // Aligned, a ragged edge, and a shape that pads.
-        for shape in [(96, 160, 64), (128, 256, 96), (100, 130, 70), (33, 65, 17)] {
+        for shape in [(96, 160, 64), (128, 256, 96), (100, 130, 70), (301, 515, 130), (1001, 1030, 515)] {
             let (m, n, _) = shape;
             let [lhs, rhs] = operands(&ctx, shape);
             let bias = Array::from_slice_on(&ctx, &values(n, 3), [n]).unwrap();
@@ -208,7 +216,13 @@ mod tests {
             let plain = read(&ctx, product(&ctx, &lhs, &rhs, None), m, n);
             let bias = bias.to_vec().unwrap();
             let expected: Vec<u32> = plain.iter().enumerate().map(|(at, acc)| (acc + bias[at % n]).max(0.0).to_bits()).collect();
-            let got: Vec<u32> = hooked(&ctx, &lhs, &rhs, &epi, m, n).iter().map(|v| v.to_bits()).collect();
+            // Small ragged shapes may be better off on a kernel that takes no hook: only the aligned ones must be hooked.
+            let wait = if shape.0 % 4 == 0 && shape.1 % 4 == 0 { Duration::from_secs(30) } else { Duration::from_secs(8) };
+            let Some(got) = hooked_within(&ctx, &lhs, &rhs, &epi, m, n, wait) else {
+                assert!(wait < Duration::from_secs(30), "{shape:?} was never hooked");
+                continue;
+            };
+            let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
             assert_eq!(got, expected, "{shape:?}");
         }
     }
