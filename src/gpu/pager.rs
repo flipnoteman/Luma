@@ -115,12 +115,20 @@ pub(crate) struct Segment {
     detached: AtomicBool,
     /// The texture of this segment's data made last (see [`crate::texture`]).
     texture: Mutex<Option<crate::texture::Cached>>,
-    /// The schedule that holds a step writing this segment (see [`crate::jit::split`]): a cell next to `state`, not a variant of
+    /// The schedule that holds a step writing this segment (see [`crate::jit::split`]) and the failure of one: cells next to `state`, not a variant of
     /// it, because an in-place step writes segments that are on the device or in host memory and must keep their state.
-    planned: Mutex<Option<Weak<Schedule>>>,
+    side: OnceLock<Box<Side>>,
     /// Whether `planned` is `Some` or `failed` is set: the one relaxed load the pin paths pay ([`Segment::settle`]).
     planned_flag: AtomicBool,
-    /// Why the step that was to write this segment failed; every later use of the data fails with it.
+}
+
+/// What a segment that a schedule plans (or planned) carries: made on the first plan, so a segment no schedule touches does not pay
+/// for it.
+#[derive(Debug, Default)]
+struct Side {
+    /// The schedule that holds a step writing the segment.
+    planned: Mutex<Option<Weak<Schedule>>>,
+    /// Why the step that was to write the segment failed; every later use of the data fails with it.
     failed: OnceLock<Arc<LumaError>>,
 }
 
@@ -500,22 +508,22 @@ impl Segment {
 
     #[cold]
     fn settle_planned(&self) -> Result<()> {
-        let schedule = lock(&self.planned).as_ref().and_then(Weak::upgrade);
+        let schedule = self.side.get().and_then(|side| lock(&side.planned).as_ref().and_then(Weak::upgrade));
         if let Some(schedule) = schedule {
             schedule.settle()?;
-        } else if self.failed.get().is_none() {
+        } else if self.failure().is_none() {
             // The schedule is gone without committing (it cannot be, but a stale cell must not stay).
             self.clear_planned();
         }
-        match self.failed.get() {
-            Some(error) => Err(LumaError::clone(error)),
+        match self.failure() {
+            Some(error) => Err(LumaError::clone(&error)),
             None => Ok(()),
         }
     }
 
     /// The error of the step that was to write this segment, if it failed.
     pub(crate) fn failure(&self) -> Option<Arc<LumaError>> {
-        self.failed.get().cloned()
+        self.side.get().and_then(|side| side.failed.get().cloned())
     }
 
     /// Whether a step that writes this segment is waiting in a schedule (or failed).
@@ -527,7 +535,7 @@ impl Segment {
     pub(crate) fn plan_for(&self, schedule: &Arc<Schedule>) -> Result<()> {
         loop {
             let other = {
-                let mut cell = lock(&self.planned);
+                let mut cell = lock(&self.side.get_or_init(Box::default).planned);
                 match cell.as_ref().map(|weak| (weak.as_ptr(), weak.upgrade())) {
                     Some((at, _)) if std::ptr::eq(at, Arc::as_ptr(schedule)) => return Ok(()),
                     Some((_, Some(other))) if !other.is_finished() => other,
@@ -547,7 +555,7 @@ impl Segment {
         if !self.planned_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let other = lock(&self.planned).as_ref().and_then(Weak::upgrade);
+        let other = self.side.get().and_then(|side| lock(&side.planned).as_ref().and_then(Weak::upgrade));
         match other {
             Some(other) if !Arc::ptr_eq(&other, schedule) => other.settle(),
             _ => Ok(()),
@@ -556,14 +564,17 @@ impl Segment {
 
     /// Ends the plan of a committed step: the data is what the step wrote.
     pub(crate) fn clear_planned(&self) {
-        *lock(&self.planned) = None;
-        self.planned_flag.store(self.failed.get().is_some(), Ordering::Relaxed);
+        if let Some(side) = self.side.get() {
+            *lock(&side.planned) = None;
+        }
+        self.planned_flag.store(self.failure().is_some(), Ordering::Relaxed);
     }
 
     /// Marks the data as lost: the step that was to write it failed with `error`.
     pub(crate) fn poison(&self, error: &Arc<LumaError>) {
-        let _ = self.failed.set(Arc::clone(error));
-        *lock(&self.planned) = None;
+        let side = self.side.get_or_init(Box::default);
+        let _ = side.failed.set(Arc::clone(error));
+        *lock(&side.planned) = None;
         self.planned_flag.store(true, Ordering::Relaxed);
     }
 
@@ -587,9 +598,8 @@ impl Segment {
             home_valid: AtomicBool::new(false),
             detached: AtomicBool::new(false),
             texture: Mutex::new(None),
-            planned: Mutex::new(None),
+            side: OnceLock::new(),
             planned_flag: AtomicBool::new(false),
-            failed: OnceLock::new(),
         })
     }
 
@@ -614,9 +624,8 @@ impl Segment {
             home_valid: AtomicBool::new(true),
             detached: AtomicBool::new(false),
             texture: Mutex::new(None),
-            planned: Mutex::new(None),
+            side: OnceLock::new(),
             planned_flag: AtomicBool::new(false),
-            failed: OnceLock::new(),
         };
         segment.home = Some(home);
         Arc::new(segment)
@@ -761,7 +770,23 @@ impl Segment {
     }
 
     fn pin_unrecorded(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
-        self.settle()?;
+        if self.planned_flag.load(Ordering::Relaxed) {
+            return self.pin_planned(write, overwrite);
+        }
+        self.pin_settled(write, overwrite)
+    }
+
+    /// [`Segment::pin_unrecorded`] of a segment a schedule plans (or that failed): commits it first. Out of line, so that the
+    /// common pin keeps no state across a call.
+    #[cold]
+    #[inline(never)]
+    fn pin_planned(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
+        self.settle_planned()?;
+        self.pin_settled(write, overwrite)
+    }
+
+    #[inline(always)]
+    fn pin_settled(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
         if !write {
             return self.pin_device(false, false);
         }

@@ -83,9 +83,6 @@ pub(crate) struct Storage {
     /// The file the segments live in, for a storage opened or created as a file array (see
     /// [`Array::open`]).
     file: Option<Arc<FileStore>>,
-    /// Whether kernels over this storage may be deferred into a schedule (see `jit::split`): it has several segments or a home. A
-    /// deferral predicate only; an operation that needs one buffer refuses on `segments() > 1`, never on this.
-    streamed: bool,
     /// Elements of a full segment, `C` (computed once).
     seg_len: usize,
 }
@@ -98,7 +95,7 @@ static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 /// of two of elements) divide it (see `jit::split`). Identical to the plain quotient for strides 1, 2, 4, 8 and 16.
 fn segment_len(ctx: &Context, layout: ElemLayout) -> usize {
     let c = (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / layout.stride()).max(1);
-    if c.is_power_of_two() { c } else { 1 << c.ilog2() }
+    1 << c.ilog2()
 }
 
 impl Storage {
@@ -194,7 +191,6 @@ impl Storage {
         owner: Option<Arc<Storage>>,
     ) -> Self {
         Storage {
-            streamed: segments.len() > 1,
             seg_len,
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
@@ -227,13 +223,13 @@ impl Storage {
             .collect();
         let mut storage = Self::with_segments(ctx, len, layout, c, segments, None);
         storage.file = Some(Arc::clone(store));
-        storage.streamed = true;
         storage
     }
 
-    /// Whether kernels over this storage may be deferred into a schedule (several segments, or a home).
+    /// Whether kernels over this storage may be deferred into a schedule (see `jit::split`): it has several segments or a home. A
+    /// deferral predicate only; an operation that needs one buffer refuses on `segments() > 1`, never on this.
     pub(crate) fn is_streamed(&self) -> bool {
-        self.streamed
+        self.segments.len() > 1 || self.file.is_some()
     }
 
     /// This storage as launches take arrays (see [`SegRef`]); pinning through it marks the storage as materialized, as
