@@ -96,9 +96,6 @@ pub(crate) struct Segment {
     has_dependents: AtomicBool,
     /// Number of live [`Pin`]s; a pinned segment must keep its buffer.
     pins: AtomicU32,
-    /// Number of live [`HostRead`]s: the host executor is reading the bytes of a `State::Host` segment, which neither moves
-    /// to the device nor changes meanwhile.
-    host_readers: AtomicU32,
     /// How many of them were taken by a may-write pin while a lineage read this segment. A pin that is held (a stepper's, a
     /// recording's, a captured graph's) can launch writes long after it was taken, which no
     /// later pin call announces: no lineage is used to evict over an input while one is held.
@@ -133,6 +130,9 @@ struct Side {
     planned: Mutex<Option<Weak<Schedule>>>,
     /// Why the step that was to write the segment failed; every later use of the data fails with it.
     failed: OnceLock<Arc<LumaError>>,
+    /// Number of live [`HostRead`]s: the host executor is reading the bytes of a `State::Host` segment, which neither moves
+    /// to the device nor changes meanwhile.
+    host_readers: AtomicU32,
 }
 
 /// The segments that read one segment through their lineage; entries of dropped segments are
@@ -621,7 +621,6 @@ impl Segment {
             dependents: Mutex::new(Dependents::default()),
             has_dependents: AtomicBool::new(false),
             pins: AtomicU32::new(0),
-            host_readers: AtomicU32::new(0),
             write_pins: AtomicU32::new(0),
             epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
@@ -648,7 +647,6 @@ impl Segment {
             dependents: Mutex::new(Dependents::default()),
             has_dependents: AtomicBool::new(false),
             pins: AtomicU32::new(0),
-            host_readers: AtomicU32::new(0),
             write_pins: AtomicU32::new(0),
             epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
@@ -1086,7 +1084,7 @@ impl Segment {
                 continue;
             }
             if matches!(&*state, State::Host(_)) {
-                if self.host_readers.load(Ordering::Acquire) != 0 {
+                if self.host_readers_live() {
                     // The host executor reads these bytes: wait for it to finish, then start over.
                     drop(state);
                     self.ctx.recycle(buffer);
@@ -1224,6 +1222,12 @@ impl Segment {
         }
     }
 
+    /// Whether a [`HostRead`] of this segment is live (cold: only read where a `State::Host` segment is about to move or change).
+    #[cold]
+    fn host_readers_live(&self) -> bool {
+        self.side.get().is_some_and(|side| side.host_readers.load(Ordering::Acquire) != 0)
+    }
+
     /// The bytes of a segment held in host memory (`State::Host`), readable until the guard drops: the segment does not move
     /// to the device or change meanwhile (a pin that would wait for it). `None` for any other state.
     pub(crate) fn host_read(&self) -> Option<HostRead<'_>> {
@@ -1232,7 +1236,7 @@ impl Segment {
         }
         let state = lock(&self.state);
         let State::Host(data) = &*state else { return None };
-        self.host_readers.fetch_add(1, Ordering::AcqRel);
+        self.side.get_or_init(Box::default).host_readers.fetch_add(1, Ordering::AcqRel);
         Some(HostRead { segment: self, ptr: data.as_slice().as_ptr(), len: self.bytes as usize })
     }
 
@@ -1246,7 +1250,7 @@ impl Segment {
             return None;
         }
         match &mut *lock(&self.state) {
-            State::Host(_) if self.host_readers.load(Ordering::Acquire) != 0 => None,
+            State::Host(_) if self.host_readers_live() => None,
             State::Host(data) => {
                 self.clear_lineage();
                 Some(f(&mut data.as_mut_slice()[..self.bytes as usize]))
@@ -1377,7 +1381,9 @@ impl HostRead<'_> {
 
 impl Drop for HostRead<'_> {
     fn drop(&mut self) {
-        self.segment.host_readers.fetch_sub(1, Ordering::AcqRel);
+        if let Some(side) = self.segment.side.get() {
+            side.host_readers.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 

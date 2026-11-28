@@ -1319,6 +1319,12 @@ impl Context {
         Ok(self.hal().reclaim_idle()?)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn drop_borrowed(buffer: Buffer) {
+        drop(buffer);
+    }
+
     /// Returns a buffer from [`Context::alloc_buffer`] to the pool.
     ///
     /// This is safe while recorded or submitted GPU work still uses the buffer. All of it is
@@ -1329,6 +1335,7 @@ impl Context {
         let Some(buffer) = self.retire(buffer) else { return };
         // Memory the backend does not own (an import of host bytes) never goes back to the pool.
         if buffer.is_borrowed() {
+            Self::drop_borrowed(buffer);
             return;
         }
         if buffer.usage().contains(BufferUsage::MAP_WRITE) {

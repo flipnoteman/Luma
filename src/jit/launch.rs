@@ -195,13 +195,20 @@ fn launch_loop(
     Ok(outputs)
 }
 
+/// The host strategy of [`evaluate`] (W3-HOSTCPU), out of line: only taken with data in host memory.
+#[cold]
+#[inline(never)]
+fn try_host(node: &Arc<Node>, fused: &Fused) -> Option<Result<Storage, Failure>> {
+    super::hostexec::try_store(node.context(), fused, node.len(), node.name, node.location)
+}
+
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.
 pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
     let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
     drop(args);
     // Inputs held in host memory (spilled arrays) may be cheaper to compute on the CPU than to upload (W3-HOSTCPU).
     if node.context().pager().any_host_state()
-        && let Some(done) = super::hostexec::try_store(node.context(), &fused, node.len(), node.name, node.location)
+        && let Some(done) = try_host(node, &fused)
     {
         return done;
     }
