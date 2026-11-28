@@ -30,6 +30,12 @@ All notable changes to Luma are listed here. The format follows
 
 - A product whose operand is the reshape of a transposed (or other windowed) view, such as `a.transpose().reshape([n, 1]).matmul(&r)` of a stored column, failed with "native matrix product: a (binding 1) holds 8 bytes, 12 needed", or on the host path multiplied the wrong elements. A reshape shares the pending view's node, which keeps the shape it was made with; the operand was read as that node's window. A window is now taken only when the array has the node's shape, else the operand is evaluated and read as a dense matrix. A property test over chains of transpose, reshape, slice and broadcast views feeds `matmul`, `matmul_nt`, `matmul_tn` and `matmul_tt` against a host reference.
 
+- A loop of `iterate_until_all` (or any traced step) whose step reads an array that is still in its file (or in host memory) could return the values of an array the step dropped. The recording of the step aborts when it needs the array's upload; a probe of the state that had taken over the buffer of an array the step released was then overwritten by the commands of that array, because the seed copy ran before them. An aborted recording now gives such a buffer's earlier commands a buffer of their own, as the end of a recording does. Found by `fuzz::split_io_failures` (which needs no injected failure to show it) on CUDA and on the CPU backend; the regression test is in `src/fuzz/regressions.rs`.
+
+- The fuzz of injected I/O failures reported a mismatch when the oracle rejected a statement (a shape error) that luma reported as the failed transfer of a deferred step before it; the failed transfer is the expected end of the program.
+
+- Test only: `jit::comprehension::units::tests::unit_variants_are_verified_once_and_a_broken_one_is_disabled` failed in every run after the first of a job, because it found the verdict that an earlier run (or another test) stored in the shared cache directory for the same variant (no wait was recorded). The test now drops the stored verdicts of its two variants first (`UnitVerifier::forget`, hidden). A tampered verification run never stores its verdict, so a broken test run cannot disable a real variant in a later process.
+
 ### Breaking
 
 - HAL (W3-R7 part 3): `luma_core::GemmUnit` gains `CoopF16` (non-exhaustive); the shader GEMM kernels of a product with a triangular operand (and only those: the plain kernels' source and uniform are unchanged) read a fifth uniform word `tri` after `kc`.

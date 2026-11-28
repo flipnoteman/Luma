@@ -190,6 +190,9 @@ mod tests {
         let (rows, cols) = tiles[tiles.len() - 1];
         let good = GemmSpec::new(rows, cols, false, true, GemmUnit::Tf32);
         let broken = GemmSpec::new(rows, cols, true, false, GemmUnit::Tf32);
+        // The cache directory is shared by every run and test of the job: start from no stored verdict on either variant.
+        ctx.unit_verifier().forget(ctx.hal(), &good);
+        ctx.unit_verifier().forget(ctx.hal(), &broken);
         ctx.record_decisions(true);
         let here = Location::caller();
         assert!(ctx.unit_verified(&good, "matmul", here));

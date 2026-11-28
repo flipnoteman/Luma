@@ -394,6 +394,16 @@ impl UnitVerifier {
         *self.tamper.lock().unwrap_or_else(|e| e.into_inner()) = tamper;
     }
 
+    /// Drops the stored verdict on `spec`'s variant (in memory and on disk), so the next call verifies again (tests only: a test of the
+    /// verification itself must not meet a verdict an earlier run or another test stored in the shared cache directory).
+    #[doc(hidden)]
+    pub fn forget(&self, backend: &dyn Backend, spec: &GemmSpec) {
+        let variant = variant_key(spec, backend.kernel_revision());
+        self.cells.lock().unwrap_or_else(|e| e.into_inner()).remove(&variant);
+        let disk = backend.disk_cache();
+        disk.remove_blob(&stem(disk, variant));
+    }
+
     fn cell(&self, variant: u64) -> Arc<OnceLock<UnitVerdict>> {
         Arc::clone(self.cells.lock().unwrap_or_else(|e| e.into_inner()).entry(variant).or_default())
     }
