@@ -286,7 +286,8 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     };
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
-    let product = lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location);
+    let routed = if lhs.has_props() && !matches!(tf32, Tf32Request::Tf32) { crate::dense::route::route_product(lhs, rhs, location) } else { None };
+    let product = routed.unwrap_or_else(|| lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location));
     if lhs.has_props() || rhs.has_props() { product.with_props(lhs.props_used().product(rhs.props_used())) } else { product }
 }
 

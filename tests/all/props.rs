@@ -361,6 +361,11 @@ fn on(ctx: &Context, data: &[f32], dims: impl Into<luma::Shape>) -> Array<f32> {
     Array::from_slice_on(ctx, data, dims).unwrap()
 }
 
+/// The bits with the sign of a zero ignored (the properties are about finite values; a `-0` is outside their claims).
+fn unsigned_bits(a: &Array<f32>) -> Vec<u32> {
+    a.to_vec().unwrap().iter().map(|x| (x + 0.0).to_bits()).collect()
+}
+
 fn bits(a: &Array<f32>) -> Vec<u32> {
     a.to_vec().unwrap().iter().map(|x| x.to_bits()).collect()
 }
@@ -497,4 +502,111 @@ fn the_determinant_of_a_triangle_is_the_product_of_its_diagonal() {
     assert!((det - 1.5f32.powi(n as i32)).abs() < 1e-4, "{det}");
     let reference = a.cache().det().to_vec().unwrap()[0];
     assert!((det - reference).abs() < 1e-3 * reference.abs());
+}
+
+/// A diagonally dominant matrix with the band `(lo, hi)` (`lo` sub-diagonals in the sense of the dense routines), and the same
+/// matrix as a dense array without properties.
+fn dominant_band(ctx: &Context, n: usize, lo: usize, hi: usize) -> (Array<f32>, Array<f32>) {
+    let vector = |len: usize, salt: usize| -> Array<f32> {
+        let data: Vec<f32> = (0..len).map(|i| 0.25 + ((i * 5 + salt * 3) % 7) as f32 * 0.125).collect();
+        on(ctx, &data, [len, 1])
+    };
+    let main = on(ctx, &(0..n).map(|i| 3.0 * (lo + hi) as f32 + 2.0 + (i % 3) as f32).collect::<Vec<_>>(), [n, 1]);
+    let mut diagonals: Vec<(isize, Array<f32>)> = vec![(0, main)];
+    for k in 1..=lo {
+        diagonals.push((k as isize, vector(n - k, k)));
+    }
+    for k in 1..=hi {
+        diagonals.push((-(k as isize), vector(n - k, 10 + k)));
+    }
+    let refs: Vec<(isize, &Array<f32>)> = diagonals.iter().map(|(k, v)| (*k, v)).collect();
+    let band = Array::from_diagonals(&refs);
+    let dense = on(ctx, &band.to_vec().unwrap(), [n, n]);
+    (band, dense)
+}
+
+#[test]
+fn solve_banded_with_a_wider_band_runs_the_block_tridiagonal_solver() {
+    let ctx = ctx_with(Numerics::strict());
+    for (n, lo, hi, k) in [(45usize, 2usize, 2usize, 1usize), (45, 2, 1, 3), (37, 4, 4, 2), (64, 3, 5, 1), (50, 8, 8, 2)] {
+        let (a, dense) = dominant_band(&ctx, n, lo, hi);
+        has(&a, &["BANDED"]);
+        let data: Vec<f32> = (0..n * k).map(|i| ((i * 7 % 11) as f32) - 5.0).collect();
+        let b = on(&ctx, &data, [k, n]);
+        let x = a.solve_banded(&b).to_vec().unwrap();
+        let reference = dense.solve(&b).to_vec().unwrap();
+        assert_eq!(x.len(), reference.len());
+        for (x, d) in x.iter().zip(&reference) {
+            assert!((x - d).abs() <= 2e-3 * (1.0 + d.abs()), "n = {n}, band ({lo}, {hi}): {x} vs {d}");
+        }
+    }
+}
+
+/// The permutation matrix of an LU with real pivoting, and what `P X` should be on the host.
+fn permutation_case(ctx: &Context, n: usize, k: usize) -> (Array<f32>, Vec<usize>, Vec<f32>, Array<f32>) {
+    let data: Vec<f32> = (0..n * n).map(|i| (((i * 31 + 7) % 13) as f32) - 6.0 + if i % (n + 1) == 0 { 0.5 } else { 0.0 }).collect();
+    let lu = on(ctx, &data, [n, n]).lu();
+    let perm: Vec<usize> = lu.perm.to_vec().unwrap().iter().map(|&p| p as usize).collect();
+    let x: Vec<f32> = (0..n * k).map(|i| (i % 9) as f32 - 4.0).collect();
+    (lu.permutation_matrix(), perm, x.clone(), on(ctx, &x, [k, n]))
+}
+
+#[test]
+fn a_permutation_solves_and_multiplies_as_a_row_gather_under_exact_finite() {
+    let (n, k) = (12, 5);
+    for numerics in [Numerics::strict(), Numerics::algebraic()] {
+        let ctx = ctx_with(numerics);
+        let (p, perm, host, x) = permutation_case(&ctx, n, k);
+        has(&p, &["PERMUTATION"]);
+        // `P X`: row `i` is row `perm[i]` of `X`.
+        let product = p.matmul(&x).to_vec().unwrap();
+        // `P y = x`: `y[perm[i]] = x[i]`.
+        let solved = p.solve(&x).to_vec().unwrap();
+        for i in 0..n {
+            for c in 0..k {
+                assert_eq!(product[i * k + c], host[perm[i] * k + c], "P X at ({i}, {c})");
+                assert_eq!(solved[perm[i] * k + c], host[i * k + c], "P y = x at ({i}, {c})");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_banded_product_is_a_sum_of_shifts_under_exact_finite() {
+    let n = 40;
+    // Integers keep every sum exact, so the fused sum and the GEMM agree bit for bit whatever their order.
+    let whole = |ctx: &Context, len: usize, salt: usize| on(ctx, &(0..len).map(|i| ((i * 3 + salt) % 5) as f32 - 2.0).collect::<Vec<_>>(), [len, 1]);
+    for (lo, hi) in [(0usize, 0usize), (1, 1), (1, 2), (2, 2), (8, 7), (8, 8)] {
+        let ctx = ctx_with(Numerics::algebraic());
+        let strict = ctx_with(Numerics::strict());
+        let build = |ctx: &Context| {
+            let mut diagonals = vec![(0isize, whole(ctx, n, 0))];
+            for k in 1..=lo {
+                diagonals.push((k as isize, whole(ctx, n - k, k)));
+            }
+            for k in 1..=hi {
+                diagonals.push((-(k as isize), whole(ctx, n - k, 7 + k)));
+            }
+            let refs: Vec<(isize, &Array<f32>)> = diagonals.iter().map(|(k, v)| (*k, v)).collect();
+            Array::from_diagonals(&refs)
+        };
+        let x: Vec<f32> = (0..n * 6).map(|i| ((i * 5) % 9) as f32 - 4.0).collect();
+        let a = build(&ctx);
+        has(&a, &["BANDED"]);
+        let fused = a.matmul(&on(&ctx, &x, [6, n]));
+        let reference = on(&strict, &build(&strict).to_vec().unwrap(), [n, n]).matmul_f32(&on(&strict, &x, [6, n]));
+        assert_eq!(unsigned_bits(&fused), unsigned_bits(&reference), "band ({lo}, {hi})");
+    }
+    // Wider than 16 diagonals: the GEMM runs and gives the same (integers).
+    let ctx = ctx_with(Numerics::algebraic());
+    let mut diagonals = vec![(0isize, whole(&ctx, n, 0))];
+    for k in 1..=9 {
+        diagonals.push((k, whole(&ctx, n - k as usize, 1)));
+        diagonals.push((-k, whole(&ctx, n - k as usize, 2)));
+    }
+    let refs: Vec<(isize, &Array<f32>)> = diagonals.iter().map(|(k, v)| (*k, v)).collect();
+    let wide = Array::from_diagonals(&refs);
+    let x = on(&ctx, &(0..n * 2).map(|i| (i % 5) as f32).collect::<Vec<_>>(), [2, n]);
+    let dense = on(&ctx, &wide.to_vec().unwrap(), [n, n]).matmul_f32(&x);
+    assert_eq!(bits(&wide.matmul_f32(&x)), bits(&dense));
 }
