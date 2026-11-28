@@ -8,12 +8,13 @@
 //! memory and come back at their next pin.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
-use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
-use luma_core::Buffer;
+use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes, Stage};
+use luma_core::{Buffer, Ticket};
 
 use crate::array::Storage;
 use crate::file::{FileStore, Filled, PendingRead};
@@ -144,6 +145,18 @@ struct Ahead {
     read: Mutex<Option<Prefetched>>,
     /// The segment of the same file that follows this one, for a walk in order to read ahead.
     next: OnceLock<Weak<Segment>>,
+}
+
+/// The host stages file reads land in and uploads copy out of, recycled when the upload's ticket
+/// completes (no stage per segment). Holds the stages that no read uses: `idle` ones, and `flying`
+/// ones whose upload may still be copying; a stage a read holds is counted in `readahead_bytes`.
+#[derive(Debug, Default)]
+struct StageRing {
+    idle: Vec<Stage>,
+    /// In the order of the uploads.
+    flying: VecDeque<(Stage, Ticket)>,
+    /// Bytes of `idle` and `flying`.
+    bytes: u64,
 }
 
 /// A read of a segment's home started before its pin needs it; its bytes count against the
@@ -369,6 +382,8 @@ pub(crate) struct Pager {
     readahead_bytes: AtomicU64,
     /// The most `readahead_bytes` was.
     readahead_peak: AtomicU64,
+    /// The host stages of file reads and uploads.
+    ring: Mutex<StageRing>,
     /// Bytes read from files into segments.
     io_read_bytes: AtomicU64,
     /// Bytes written back to files.
@@ -500,6 +515,7 @@ impl Pager {
             readahead_depth: std::sync::atomic::AtomicUsize::new(default_readahead_depth()),
             readahead_bytes: AtomicU64::new(0),
             readahead_peak: AtomicU64::new(0),
+            ring: Mutex::new(StageRing::default()),
             io_read_bytes: AtomicU64::new(0),
             io_written_bytes: AtomicU64::new(0),
             home_drops: AtomicU64::new(0),
@@ -1242,10 +1258,59 @@ impl Segment {
             return false;
         }
         pager.readahead_peak.fetch_max(in_flight, Ordering::Relaxed);
-        *slot = Some(Prefetched { read: Some(home.store.start_read(home.offset, home.file_bytes, self.bytes as usize, self.ctx.upload_stage(self.bytes))), ctx: self.ctx.clone(), bytes: self.bytes });
+        *slot = Some(Prefetched { read: Some(home.store.start_read(home.offset, home.file_bytes, self.bytes as usize, self.ring_stage())), ctx: self.ctx.clone(), bytes: self.bytes });
         drop(slot);
         drop(state);
         true
+    }
+
+    /// A host stage of at least `self.bytes` bytes for a read of the home: an idle one of the
+    /// ring, a new one while the ring is within the staging budget (the reads under way plus two
+    /// segments of uploads), else the oldest upload's, after it completed. `None` where the
+    /// backend has no stages (the read then lands on the heap).
+    fn ring_stage(&self) -> Option<Stage> {
+        let pager = self.ctx.pager();
+        let mut ring = lock(&pager.ring);
+        loop {
+            while let Some((_, ticket)) = ring.flying.front() {
+                if !self.ctx.ticket_done(ticket) {
+                    break;
+                }
+                if let Some((stage, _)) = ring.flying.pop_front() {
+                    ring.idle.push(stage);
+                }
+            }
+            let fit = ring.idle.iter().enumerate().filter(|(_, stage)| stage.len() >= self.bytes).min_by_key(|(_, stage)| stage.len()).map(|(at, _)| at);
+            if let Some(at) = fit {
+                let stage = ring.idle.swap_remove(at);
+                ring.bytes -= stage.len();
+                return Some(stage);
+            }
+            let held = pager.readahead_bytes.load(Ordering::Relaxed) + ring.bytes;
+            if held <= pager.readahead_budget(self.bytes) + 2 * self.bytes {
+                // Stages too small for this segment (a short tail's) are of no use any more.
+                let too_small = std::mem::take(&mut ring.idle);
+                ring.bytes -= too_small.iter().map(Stage::len).sum::<u64>();
+                drop(too_small);
+                return self.ctx.upload_stage(self.bytes);
+            }
+            let (stage, ticket) = ring.flying.pop_front()?;
+            if self.ctx.ticket_wait(&ticket).is_err() {
+                return None;
+            }
+            ring.idle.push(stage);
+        }
+    }
+
+    /// Gives a stage back to the ring once the upload `ticket` ran; a stage the backend kept
+    /// (empty) is dropped.
+    fn ring_put(&self, stage: Stage, ticket: Ticket) {
+        if stage.is_empty() {
+            return;
+        }
+        let mut ring = lock(&self.ctx.pager().ring);
+        ring.bytes += stage.len();
+        ring.flying.push_back((stage, ticket));
     }
 
     /// Fills `buffer` (idle, at least `self.bytes` bytes) with the data at `home`: read straight
@@ -1267,11 +1332,14 @@ impl Segment {
             let ahead = self.ahead.as_ref().and_then(|ahead| lock(&ahead.read).take());
             let filled = match ahead {
                 Some(mut ahead) => ahead.read.take().expect("a read is taken once").finish()?,
-                None => home.store.start_read(home.offset, home.file_bytes, total, self.ctx.upload_stage(self.bytes)).finish()?,
+                None => home.store.start_read(home.offset, home.file_bytes, total, self.ring_stage()).finish()?,
             };
             match filled {
                 Filled::Heap(data) => self.ctx.upload(buffer, data.as_slice())?,
-                Filled::Stage(mut stage) => self.ctx.upload_staged(buffer, &mut stage, self.bytes)?,
+                Filled::Stage(mut stage) => {
+                    let ticket = self.ctx.upload_staged(buffer, &mut stage, self.bytes)?;
+                    self.ring_put(stage, ticket);
+                }
             }
         }
         self.ctx.pager().io_read_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);

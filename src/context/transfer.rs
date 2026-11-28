@@ -118,16 +118,29 @@ impl Context {
         self.hal().stage_alloc_uninit(bytes, luma_core::hal::StageDir::ToDevice).ok()
     }
 
-    /// [`Context::upload`] of the first `bytes` bytes of a stage from [`Context::upload_stage`].
-    pub(crate) fn upload_staged(&self, dst: &Buffer, stage: &mut luma_core::hal::Stage, bytes: u64) -> Result<()> {
+    /// [`Context::upload`] of the first `bytes` bytes of a stage from [`Context::upload_stage`],
+    /// asynchronous on the backend's transfer lane: the ticket completes when the copy has run
+    /// and the stage may be written again (a stage the backend kept is empty afterwards).
+    pub(crate) fn upload_staged(&self, dst: &Buffer, stage: &mut luma_core::hal::Stage, bytes: u64) -> Result<luma_core::Ticket> {
         self.abort_recording_for("upload")?;
         let max = self.max_buffer_bytes();
         size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
         self.relieving(bytes, || match self.hal().record_upload_staged(dst, stage, bytes, max) {
-            Ok(()) => Ok(Some(())),
+            Ok(ticket) => Ok(Some(ticket)),
             Err(BackendError::OutOfMemory { .. }) => Ok(None),
             Err(error) => Err(error.into()),
         })
+    }
+
+    /// Whether the copy `ticket` stands for has completed (a failed query counts as done: the
+    /// waiting paths report the error).
+    pub(crate) fn ticket_done(&self, ticket: &luma_core::Ticket) -> bool {
+        self.hal().ticket_done(ticket).unwrap_or(true)
+    }
+
+    /// Waits for the copy `ticket` stands for.
+    pub(crate) fn ticket_wait(&self, ticket: &luma_core::Ticket) -> Result<()> {
+        Ok(self.hal().ticket_wait(ticket, Duration::ZERO)?)
     }
 
     /// Whether `from_slice` writes straight into mappable storage buffers (unified memory)

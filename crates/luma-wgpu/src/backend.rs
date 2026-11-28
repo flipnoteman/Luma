@@ -23,7 +23,7 @@ use luma_core::{
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
 use luma_core::hal::{check_transfer, copy_parallel, size_class};
-use luma_core::{Stage, StageDir, Ticket};
+use luma_core::{NativeStage, Stage, StageDir, Ticket};
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
 use crate::codegen;
@@ -275,6 +275,46 @@ fn write_parallel(src: &[u8], mut dst: wgpu::WriteOnly<'_, [u8]>) {
             });
         }
     });
+}
+
+/// An upload staging buffer that is still mapped: the host writes the bytes in place (a file read
+/// lands in it) and [`Backend::record_upload_staged`] unmaps and copies out of it, so the bytes
+/// are never copied on the host.
+#[derive(Debug)]
+struct WgpuStage {
+    /// `None` once the upload took it (or when dropping).
+    buffer: Option<Buffer>,
+    /// Start of the buffer's mapped range, valid while `buffer` is mapped and held here.
+    ptr: *mut u8,
+    len: usize,
+    /// Where an unused buffer goes back to (it is still mapped).
+    pool: Arc<Mutex<FreeUploads>>,
+}
+
+// SAFETY: `ptr` points into the mapped range of the buffer this value owns; only the owner reads or writes it.
+unsafe impl Send for WgpuStage {}
+// SAFETY: as above; shared access only reads through `&self`.
+unsafe impl Sync for WgpuStage {}
+
+impl NativeStage for WgpuStage {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapped range holds `len` bytes while the buffer is held (`len` is 0 after the upload took it).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` makes the host the only user.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for WgpuStage {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            // Never uploaded: still mapped, so the next upload takes it as it is.
+            let _ = lock(&self.pool).put(buffer);
+        }
+    }
 }
 
 /// The outcome of a `map_async` request, see [`map_for_read`].
@@ -1601,6 +1641,40 @@ impl Backend for WgpuBackend {
 
     fn record_upload(&self, dst: &Buffer, data: &[u8], max_buffer_bytes: u64) -> Result<(), BackendError> {
         self.upload_at(dst, 0, data, max_buffer_bytes)
+    }
+
+    fn pinned_staging(&self) -> bool {
+        true
+    }
+
+    fn stage_alloc_uninit(&self, bytes: u64, dir: StageDir) -> Result<Stage, BackendError> {
+        if dir != StageDir::ToDevice {
+            return self.stage_alloc(bytes, dir);
+        }
+        let len = bytes.next_multiple_of(COPY_BUFFER_ALIGNMENT);
+        let class = size_class(len, self.max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+        let buffer = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
+        let ptr = {
+            let mut view = own(&buffer).get_mapped_range_mut(..len).map_err(|e| BackendError::MapRange(e.to_string()))?;
+            view.slice(..).as_raw_ptr().cast::<u8>().as_ptr()
+        };
+        Ok(Stage::new(dir, WgpuStage { buffer: Some(buffer), ptr, len: len as usize, pool: Arc::clone(&self.uploads) }))
+    }
+
+    fn record_upload_staged(&self, dst: &Buffer, stage: &mut Stage, bytes: u64, max_buffer_bytes: u64) -> Result<Ticket, BackendError> {
+        let Some(native) = stage.downcast_mut::<WgpuStage>().filter(|native| native.buffer.is_some() && bytes as usize <= native.len) else {
+            self.upload_at(dst, 0, &stage.as_slice()[..bytes as usize], max_buffer_bytes)?;
+            return Ok(Ticket::done());
+        };
+        let target = raw(dst)?;
+        let Some(staging) = native.buffer.take() else { return Err(BackendError::Gpu("a stage without memory".into())) };
+        native.len = 0;
+        own(&staging).unmap();
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_buffer(own(&staging), 0, target, 0, bytes);
+        lock(&self.uploads).in_flight += staging.size();
+        guard.uploads.push(staging);
+        Ok(Ticket::done())
     }
 
     fn transfer_in(&self, stage: &Stage, dst: &Buffer, dst_offset: u64, bytes: u64, _after: &[Ticket]) -> Result<Ticket, BackendError> {
