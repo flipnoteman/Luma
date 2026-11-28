@@ -144,7 +144,7 @@ fn float_reductions_do_not_depend_on_the_chunk_size() {
         let x = Array::from_slice_on(&ctx, &data, n).unwrap();
         let reduced = x.reduce([crate::Reduction::Sum, crate::Reduction::Min, crate::Reduction::Max, crate::Reduction::SumOfSquares]).to_vec().unwrap();
         seen.push((x.sum().item().unwrap(), x.norm().item().unwrap(), x.mean().item().unwrap(), reduced));
-        assert!(ctx.stream_stats().stages >= 4, "the reductions ran as canonical blocks: {:?}", ctx.stream_stats());
+        assert!(ctx.stream_stats().stages + ctx.stream_stats().immediate_reductions >= 4, "the reductions ran as canonical blocks: {:?}", ctx.stream_stats());
     }
     for other in &seen[1..] {
         assert_eq!(other.0.to_bits(), seen[0].0.to_bits(), "sum");
@@ -255,7 +255,7 @@ fn float_reductions_do_not_depend_on_slab_order() {
         let mut all = bits(x.reduce([crate::Reduction::Sum, crate::Reduction::Max, crate::Reduction::SumOfSquares]).to_vec().unwrap());
         all.extend(bits(y.reduce([crate::Reduction::Sum]).to_vec().unwrap()));
         seen.push(all);
-        assert!(ctx.stream_stats().stages >= 2, "{:?}", ctx.stream_stats());
+        assert!(ctx.stream_stats().stages + ctx.stream_stats().immediate_reductions >= 2, "{:?}", ctx.stream_stats());
     }
     FORCE_ORDER.store(0, Ordering::Relaxed);
     assert!(seen.iter().all(|bits| *bits == seen[0]), "{seen:?}");
