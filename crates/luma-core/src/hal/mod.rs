@@ -1239,6 +1239,25 @@ pub struct MatmulSpec {
     pub lhs_transposed: bool,
     /// Whether `b` holds the transpose of the right matrix.
     pub rhs_transposed: bool,
+    /// A half-work product of a matrix with itself (`xᵀ x`, `x xᵀ`; square `c`): the grid is `[T (T + 1) / 2, 1, 1]` for `T` tile
+    /// rows, workgroup `w` computing the tile `(ty, tx)`, `tx <= ty`, of the closed form [`triangle_tile`], and writing it together
+    /// with its transpose at `(tx, ty)`; the output is bit-symmetric. Not combined with slices of K.
+    pub half: bool,
+}
+
+/// The tile `(row, column)` of workgroup `w` of a half-work product ([`MatmulSpec::half`], [`GemmSpec::half`]): the lower
+/// triangle of tiles row by row, `ty = floor((sqrt(8 w + 1) - 1) / 2)`, `tx = w - ty (ty + 1) / 2`, corrected in integers (the float
+/// root is exact only below 2^24).
+pub fn triangle_tile(w: u32) -> (u32, u32) {
+    let w = w as u64;
+    let mut ty = (((8.0 * w as f64 + 1.0).sqrt() - 1.0) / 2.0) as u64;
+    while ty * (ty + 1) / 2 > w {
+        ty -= 1;
+    }
+    while (ty + 1) * (ty + 2) / 2 <= w {
+        ty += 1;
+    }
+    (ty as u32, (w - ty * (ty + 1) / 2) as u32)
 }
 
 /// A matrix product the backend runs as its own tiled kernel (`Builtin::Matmul` of `luma` with a
@@ -1271,6 +1290,9 @@ pub struct GemmSpec {
     pub exact: bool,
     /// How the kernel copies the operands, and so which shapes it takes.
     pub lanes: GemmLanes,
+    /// A half-work product of a matrix with itself (see [`MatmulSpec::half`]): `rows == cols`, the grid `[T (T + 1) / 2, 1, 1]`,
+    /// every output of the lower triangle of tiles computed as the full kernel does and stored with its transpose.
+    pub half: bool,
 }
 
 /// How a [`GemmSpec`] kernel copies its operands from global memory.
@@ -1290,12 +1312,17 @@ impl GemmSpec {
     /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
     /// transposed, in `f32` (`exact`) or TF32, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
     pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, exact: bool) -> Self {
-        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4 }
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4, half: false }
     }
 
     /// The same product copying its operands with `lanes`.
     pub const fn with_lanes(self, lanes: GemmLanes) -> Self {
         GemmSpec { lanes, ..self }
+    }
+
+    /// The same product as a half-work one (see [`GemmSpec::half`]).
+    pub const fn with_half(self) -> Self {
+        GemmSpec { half: true, ..self }
     }
 }
 
@@ -1533,6 +1560,10 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// none.
     fn gemm_tiles(&self, _exact: bool) -> &[(u32, u32)] {
         &[]
+    }
+    /// Whether [`Backend::compile_gemm`] takes a [`GemmSpec::half`] product.
+    fn gemm_half(&self) -> bool {
+        false
     }
     /// Whether [`Backend::compile_gemm`] takes the [`GemmLanes`] other than `Vec4` (any shape, any leading dimension and offset).
     fn gemm_ragged(&self) -> bool {

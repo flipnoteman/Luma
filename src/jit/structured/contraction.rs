@@ -51,6 +51,8 @@ impl Tf32Request {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ContractionAttrs {
     pub(crate) tf32: Tf32Request,
+    /// The operands are the same value (`xᵀ x`, `x xᵀ`): the product may compute half of its output and mirror it (`SyrkTiled`).
+    pub(crate) half: bool,
 }
 
 /// The extents of a product: `lhs` is `[K, M]`, `rhs` `[N, K]`.
@@ -245,6 +247,7 @@ fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams
         StrategyId::GEMM_F32 => f32_tiles(None),
         StrategyId::GEMM_F32_RAGGED => f32_tiles(Some(GemmLanes::Scalar)),
         StrategyId::GEMM_F32_PADDED => f32_tiles(Some(GemmLanes::Vec4Tails)),
+        StrategyId::SYRK_TILED => syrk_plan(view, ctx, params.geom, transposed),
         StrategyId::CONTRACTION_NATIVE_CPU => Some(native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)),
         StrategyId::CONTRACTION_SKINNY => skinny_plan(m, n, k, along_k(view.lhs, params.geom), groups, bytes).map(Ok),
         StrategyId::CONTRACTION_TILED => Some(tiled_plan(ctx.tuning(), m, n, k, groups, bytes)),
@@ -299,23 +302,27 @@ fn aligned_operands(view: &ContractionView<'_>) -> bool {
 
 impl StrategyId {
     pub(crate) const CONTRACTION_HOST: StrategyId = StrategyId(FamilyTag::Contraction, 0);
-    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 1);
-    pub(crate) const GEMM_TF32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 2);
-    pub(crate) const GEMM_TF32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 3);
-    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 4);
-    pub(crate) const GEMM_F32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 5);
-    pub(crate) const GEMM_F32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
-    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 7);
-    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 8);
-    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 9);
+    pub(crate) const SYRK_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 1);
+    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 2);
+    pub(crate) const GEMM_TF32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 3);
+    pub(crate) const GEMM_TF32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 4);
+    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 5);
+    pub(crate) const GEMM_F32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
+    pub(crate) const GEMM_F32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 7);
+    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 8);
+    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 9);
+    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 10);
 }
 
 /// The products' table, in preference order.
-pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 10] = [
+pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 11] = [
     // The host's sums differ from the device's: its own bit class. The backend's own kernels and the skinny ones read the
     // operands' state (`FitsInputs::OPERANDS`); the others only the shape, the numerics and the device. The aligned, the ragged and
     // the padded kernels of one precision give the same bits for the same plan: one class each (3: TF32, 4: `f32`).
     entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, NumClass::Exact, 1, 0, fits_host, lower_host),
+    // A Gram product (`ContractionAttrs::half`) computes the lower triangle of its tiles and mirrors it: the bits of the full
+    // product's lower triangle, bit-symmetric (the upper triangle of the full product may differ on tensor cores, hence its own class).
+    entry(StrategyId::SYRK_TILED, "syrk-tiled", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 8, 9, fits_syrk, lower_syrk),
     entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, FitsInputs::OPERANDS, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 1, fits_gemm_tf32, lower_gemm),
     cut(StrategyId::GEMM_TF32_RAGGED, "gemm-tf32-ragged", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_ragged),
     cut(StrategyId::GEMM_TF32_PADDED, "gemm-tf32-padded", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_padded),
@@ -595,6 +602,96 @@ fn padded_copy(array: &Array<f32>) -> Array<f32> {
     let first = array.shape().dims()[0];
     let extra = first.next_multiple_of(4) - first;
     if extra > 0 { array.pad([(0, extra), (0, 0)], PadMode::Zero) } else { array.cache() }
+}
+
+// -- half-work products --
+
+/// The strategies whose tiles a half-work product runs, in the order their `fits` are asked: the backend's own `f32` kernels, then
+/// the CPU's native product.
+const SYRK_BASES: [StrategyId; 4] = [StrategyId::GEMM_F32, StrategyId::GEMM_F32_RAGGED, StrategyId::GEMM_F32_PADDED, StrategyId::CONTRACTION_NATIVE_CPU];
+
+/// The strategy whose tiles a half-work product runs: the first of [`SYRK_BASES`] that takes the product, for a Gram product
+/// (`ContractionAttrs::half`) with a square output on a backend that has the half-work kernel.
+fn syrk_base(view: &ContractionView<'_>, ctx: &Context) -> Option<StrategyId> {
+    if !view.attrs.half {
+        return None;
+    }
+    let geom = view.geometry()?;
+    if geom.m != geom.n || geom.k == 0 || geom.m < 2 {
+        return None;
+    }
+    let subject = Subject::Contraction(view);
+    SYRK_BASES.into_iter().find(|&by| {
+        let fits = match by {
+            StrategyId::GEMM_F32 => fits_gemm_f32(&subject, ctx, &Residencies::DEVICE),
+            StrategyId::GEMM_F32_RAGGED => fits_gemm_f32_ragged(&subject, ctx, &Residencies::DEVICE),
+            StrategyId::GEMM_F32_PADDED => fits_gemm_f32_padded(&subject, ctx, &Residencies::DEVICE),
+            _ => fits_native_cpu(&subject, ctx, &Residencies::DEVICE),
+        };
+        fits.is_some() && (by == StrategyId::CONTRACTION_NATIVE_CPU || ctx.hal().gemm_half())
+    })
+}
+
+/// The plan of the half-work product: the plan of its base on square tiles, never split over K (the mirrored triangle would be a
+/// sum of partial products), the lower triangle of its tiles as the grid. `None` where the base's plan splits K.
+fn syrk_plan(view: &ContractionView<'_>, ctx: &Context, geom: Geometry, transposed: [bool; 2]) -> Option<Result<Plan, LumaError>> {
+    let base = syrk_base(view, ctx)?;
+    let Geometry { m, n, k } = geom;
+    let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
+    let plan = if base == StrategyId::CONTRACTION_NATIVE_CPU {
+        native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)
+    } else {
+        let squares: Vec<(u32, u32)> = ctx.hal().gemm_tiles(true).iter().copied().filter(|&(rows, cols)| rows == cols).collect();
+        let lanes = match base {
+            StrategyId::GEMM_F32_RAGGED => GemmLanes::Scalar,
+            StrategyId::GEMM_F32_PADDED => GemmLanes::Vec4Tails,
+            _ => GemmLanes::Vec4,
+        };
+        gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, &squares, transposed, true, groups, bytes).map(|plan| match plan.tile {
+            MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact } => Plan { tile: MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, ..plan },
+            _ => plan,
+        })
+    };
+    let plan = match plan {
+        Ok(plan) if plan.slices == 1 => plan,
+        Ok(_) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let tile = match plan.tile {
+        MatmulTile::Native { edge, lhs_t, rhs_t } => MatmulTile::NativeHalf { edge, lhs_t, rhs_t },
+        half @ MatmulTile::GemmHalf { .. } => half,
+        _ => return None,
+    };
+    let (rows, _) = tile.edges();
+    let side = m.div_ceil(rows);
+    let count = u64::from(side) * (u64::from(side) + 1) / 2;
+    if count > u64::from(groups) {
+        return None;
+    }
+    Some(Ok(Plan { tile, aligned: false, split: false, slices: 1, kc: k, groups: [count as u32, 1, 1] }))
+}
+
+/// A Gram product on the tiles of the strategy it would otherwise run on, the lower triangle of tiles only.
+fn fits_syrk(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
+    let view = view(subject)?;
+    let geom = view.geometry()?;
+    let params = ContractionParams { by: StrategyId::SYRK_TILED, geom };
+    syrk_plan(view, ctx, geom, [false; 2])?.ok()?;
+    Some(Params::Contraction(params))
+}
+
+/// [`lower_gemm`] for a half-work product: the operands are copied first as its base strategy wants.
+fn lower_syrk(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let ctx = emit.ctx();
+    let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
+    let Some(base) = syrk_base(view, ctx) else { return Ok(Lowered::Declined) };
+    if is_padded(base) {
+        let copied = copies(view, base);
+        let (lhs_copy, rhs_copy) = (copied[0].then(|| padded_copy(view.lhs)), copied[1].then(|| padded_copy(view.rhs)));
+        let (lhs, rhs) = (lhs_copy.as_ref().unwrap_or(view.lhs), rhs_copy.as_ref().unwrap_or(view.rhs));
+        return gemm(ctx, view, &params, lhs, rhs);
+    }
+    gemm(ctx, view, &params, view.lhs, view.rhs)
 }
 
 // -- the shader kernels --
@@ -1194,6 +1291,8 @@ fn plan_label(plan: &Plan) -> String {
         MatmulTile::T32x128 => "tiled 32x128".to_string(),
         MatmulTile::T32 => "tiled 32x32".to_string(),
         MatmulTile::Native { edge, .. } => format!("native {edge}"),
+        MatmulTile::NativeHalf { edge, .. } => format!("syrk native {edge}"),
+        MatmulTile::GemmHalf { rows, cols, exact, .. } => format!("syrk {rows}x{cols}{}", if exact { " exact" } else { "" }),
         MatmulTile::Gemm { rows, cols, exact, .. } => format!("gemm {rows}x{cols}{}", if exact { " exact" } else { "" }),
         MatmulTile::GemmRagged { rows, cols, exact, lanes, .. } => {
             format!("gemm {rows}x{cols}{} {}", if exact { " exact" } else { "" }, if lanes == GemmLanes::Scalar { "ragged" } else { "padded" })
@@ -1404,7 +1503,7 @@ mod tests {
 
     #[track_caller]
     fn selected(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request) -> StrategyId {
-        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32 }, location: Location::caller() };
+        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: Location::caller() };
         select::select(ctx, &Subject::Contraction(&view), &Residencies::DEVICE).expect("the staged tiles always fit").id
     }
 
@@ -1445,7 +1544,7 @@ mod tests {
             assert_eq!(group, if cut { 2 } else { 1 }, "{}", strategy.name);
         }
         let names: Vec<&str> = entries.iter().map(|strategy| strategy.name).collect();
-        assert_eq!(names, ["host", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
+        assert_eq!(names, ["host", "syrk-tiled", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
         let class = |name: &str| entries.iter().find(|strategy| strategy.name == name).unwrap().bits;
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-ragged"));
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-padded"));
@@ -1470,7 +1569,7 @@ mod tests {
             }
             // A CPU context has neither the host path nor the backend's own tiles: those strategies do not apply.
             let [lhs, rhs] = operands(&ctx, (64, 12, 64), [false; 2]);
-            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32 }, location: Location::caller() };
+            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller() };
             for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_TF32, StrategyId::GEMM_TF32_RAGGED, StrategyId::GEMM_TF32_PADDED, StrategyId::GEMM_F32, StrategyId::GEMM_F32_RAGGED, StrategyId::GEMM_F32_PADDED] {
                 let strategy = &CONTRACTION_STRATEGIES[usize::from(id.1)];
                 assert!(admit(strategy, &Subject::Contraction(&view), &ctx, &Residencies::DEVICE).is_err(), "{}", strategy.name);
@@ -1520,7 +1619,7 @@ mod tests {
     fn check_reports_errors_in_the_old_order() {
         let first = cpu_with(0, None);
         let second = cpu_with(0, None);
-        let attrs = ContractionAttrs { tf32: Tf32Request::Default };
+        let attrs = ContractionAttrs { tf32: Tf32Request::Default, half: false };
         let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller() }.check();
         let a = Array::<f32>::zeros_on(&first, [4, 3]).unwrap();
         let b = Array::<f32>::zeros_on(&first, [5, 4]).unwrap();

@@ -653,3 +653,49 @@ fn solve_banded_does_not_see_a_write_to_a_diagonal_made_after_the_matrix() {
         assert!((x - d).abs() <= 1e-3 * (1.0 + d.abs()), "{x} vs {d}");
     }
 }
+
+fn gram_data(len: usize, salt: usize) -> Vec<f32> {
+    (0..len).map(|i| (((i * 2654435761usize + salt * 97) >> 7) % 2001) as f32 / 1000.0 - 1.0).collect()
+}
+
+/// `xᵀ x` is bit-symmetric, and its lower triangle is the lower triangle of the full product of two equal copies.
+#[test]
+fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products() {
+    let ctx = ctx_with(Numerics::strict());
+    for (rows, cols) in [(40usize, 33usize), (300, 128), (700, 257), (200, 1000), (64, 96)] {
+        let data = gram_data(rows * cols, cols);
+        let x = on(&ctx, &data, [cols, rows]);
+        let copy = on(&ctx, &data, [cols, rows]);
+        for (name, gram, full) in [("tn", x.matmul_tn(&x), x.matmul_tn(&copy)), ("nt", x.transpose().matmul_nt(&x.transpose()), x.transpose().cache().matmul_nt(&copy.transpose().cache()))] {
+            let (g, f) = (gram.to_vec().unwrap(), full.to_vec().unwrap());
+            let n = if name == "tn" { cols } else { cols };
+            assert_eq!(g.len(), n * n, "{name} {rows}x{cols}");
+            for r in 0..n {
+                for c in 0..n {
+                    assert_eq!(g[r * n + c].to_bits(), g[c * n + r].to_bits(), "{name} {rows}x{cols}: ({r}, {c}) is not symmetric");
+                    if c <= r {
+                        assert_eq!(g[r * n + c].to_bits(), f[r * n + c].to_bits(), "{name} {rows}x{cols}: ({r}, {c}) differs from the full product");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
+    let ctx = ctx_with(Numerics::strict());
+    let data = gram_data(512 * 192, 3);
+    let x = on(&ctx, &data, [192, 512]);
+    let other = on(&ctx, &data, [192, 512]);
+    ctx.record_decisions(true);
+    x.matmul_tn(&x).to_vec().unwrap();
+    let gram = ctx.take_decisions();
+    x.matmul_tn(&other).to_vec().unwrap();
+    let plain = ctx.take_decisions();
+    let syrk = |decisions: &[luma::Decision]| decisions.iter().any(|d| d.chosen.contains("syrk"));
+    if ctx.is_cpu() {
+        assert!(syrk(&gram), "{gram:?}");
+    }
+    assert!(!syrk(&plain), "{plain:?}");
+}

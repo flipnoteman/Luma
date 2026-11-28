@@ -384,7 +384,7 @@ fn a_product_is_two_parallel_dims_and_a_reduce_dim() {
     // lhs [K=5, M=3], rhs [N=4, K=5].
     let geom = Geometry { m: 3, n: 4, k: 5 };
     for (request, tf32) in [(Tf32Request::Default, None), (Tf32Request::Exact, Some(false)), (Tf32Request::Tf32, Some(true))] {
-        let form = Comprehension::contract(src(&lhs), src(&rhs), geom, ContractionAttrs { tf32: request });
+        let form = Comprehension::contract(src(&lhs), src(&rhs), geom, ContractionAttrs { tf32: request, half: false });
         assert_eq!(extents(&form), [(4, "P"), (3, "P"), (5, "R")], "n, m, k");
         assert_eq!(form.inputs[0].shape, [5, 3, 1, 1]);
         assert_eq!(form.inputs[1].shape, [4, 5, 1, 1]);
@@ -404,8 +404,8 @@ fn a_transposed_operand_has_the_same_maps() {
     let ctx = cpu();
     let lhs = array(&ctx, 15);
     let rhs = Array::<f32>::from_slice_on(&ctx, &(0..20).map(|i| i as f32).collect::<Vec<_>>(), [5, 4]).unwrap().transpose();
-    let form = Comprehension::contract(src(&lhs), src(&rhs), Geometry { m: 3, n: 4, k: 5 }, ContractionAttrs { tf32: Tf32Request::Default });
-    let straight = Comprehension::contract(src(&lhs), src(&array(&ctx, 20)), Geometry { m: 3, n: 4, k: 5 }, ContractionAttrs { tf32: Tf32Request::Default });
+    let form = Comprehension::contract(src(&lhs), src(&rhs), Geometry { m: 3, n: 4, k: 5 }, ContractionAttrs { tf32: Tf32Request::Default, half: false });
+    let straight = Comprehension::contract(src(&lhs), src(&array(&ctx, 20)), Geometry { m: 3, n: 4, k: 5 }, ContractionAttrs { tf32: Tf32Request::Default, half: false });
     assert_eq!(form.structure_hash(), straight.structure_hash());
     form.validate().unwrap();
 }
@@ -706,7 +706,7 @@ fn a_contraction_view_has_the_form_of_the_call() {
     let ctx = lazy_cpu();
     let (lhs, rhs) = product_operands(&ctx);
     for (request, tf32) in [(Tf32Request::Default, None), (Tf32Request::Exact, Some(false)), (Tf32Request::Tf32, Some(true))] {
-        let attrs = ContractionAttrs { tf32: request };
+        let attrs = ContractionAttrs { tf32: request, half: false };
         let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs, location: std::panic::Location::caller() };
         let Some(form) = view.form() else {
             assert!(!Algebra::builds_forms(), "LUMA_ALGEBRA=off builds no form");
@@ -739,7 +739,7 @@ fn a_contraction_view_has_the_form_of_the_call() {
 fn a_contraction_view_of_operands_that_make_no_product_has_no_form() {
     let ctx = lazy_cpu();
     let (lhs, rhs) = (array(&ctx, 15).reshape([5, 3]), array(&ctx, 20).reshape([5, 4]));
-    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Default }, location: std::panic::Location::caller() };
+    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Default, half: false }, location: std::panic::Location::caller() };
     assert!(view.form().is_none(), "the shapes do not match");
 }
 

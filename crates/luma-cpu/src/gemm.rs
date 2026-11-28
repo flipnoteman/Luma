@@ -51,7 +51,14 @@ impl NativeMatmul {
             return bad(format!("{slices} slices of {kc} do not cover k = {k}"));
         }
         let edge = u64::from(self.spec.edge);
-        let tiles = n.div_ceil(edge) * m.div_ceil(edge);
+        let mut tiles = n.div_ceil(edge) * m.div_ceil(edge);
+        if self.spec.half {
+            if m != n || slices != 1 {
+                return bad(format!("a half-work product needs a square output and one slice, got {m} x {n} in {slices} slices"));
+            }
+            let side = m.div_ceil(edge);
+            tiles = side * (side + 1) / 2;
+        }
         if u64::from(workgroups[0]) * u64::from(workgroups[1]) < tiles {
             return bad(format!("{} workgroups for {tiles} tiles", u64::from(workgroups[0]) * u64::from(workgroups[1])));
         }
@@ -87,10 +94,16 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
         let [x, y, z, _] = ctx.workgroup_id;
         let tile = y as usize * ctx.num_workgroups[0] as usize + x as usize;
         let columns = n.div_ceil(edge);
-        if m == 0 || n == 0 || tile >= columns * m.div_ceil(edge) {
+        let half = kernel.spec.half;
+        if m == 0 || n == 0 || tile >= if half { columns * (columns + 1) / 2 } else { columns * m.div_ceil(edge) } {
             return;
         }
-        let (row, col) = (tile / columns * edge, tile % columns * edge);
+        let (row, col) = if half {
+            let (ty, tx) = luma_core::triangle_tile(tile as u32);
+            (ty as usize * edge, tx as usize * edge)
+        } else {
+            (tile / columns * edge, tile % columns * edge)
+        };
         let (rows, cols) = (edge.min(m - row), edge.min(n - col));
         let begin = z as usize * kc;
         let depth = if begin < k { kc.min(k - begin) } else { 0 };
@@ -111,6 +124,25 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
         let a = a.cast::<f32>().add(a_off).offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
         let b = b.cast::<f32>().add(b_off).offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
         matrixmultiply::sgemm(rows, depth, cols, 1.0, a, lhs_strides.0, lhs_strides.1, b, rhs_strides.0, rhs_strides.1, 0.0, c, n as isize, 1);
+        if half {
+            // The tile is the full kernel's, so the lower triangle of the output is the full product's. Its transpose goes to
+            // the tile above the diagonal (written by no other workgroup); on a diagonal tile the upper half is overwritten by
+            // the mirror of the lower, so the whole output is bit-symmetric.
+            if row == col {
+                for r in 0..rows {
+                    for q in r + 1..cols {
+                        *c.add(r * n + q) = *c.add(q * n + r);
+                    }
+                }
+            } else {
+                let mirror = c.offset((col * n + row) as isize - (row * n + col) as isize);
+                for r in 0..rows {
+                    for q in 0..cols {
+                        *mirror.add(q * n + r) = *c.add(r * n + q);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -190,7 +222,7 @@ mod tests {
     use super::*;
 
     fn product(lhs_transposed: bool, rhs_transposed: bool) -> NativeMatmul {
-        NativeMatmul::new(&MatmulSpec { edge: 32, lhs_transposed, rhs_transposed }).unwrap()
+        NativeMatmul::new(&MatmulSpec { edge: 32, lhs_transposed, rhs_transposed, half: false }).unwrap()
     }
 
     /// The sizes of the bindings `c, a, b` in floats, then the uniform's.

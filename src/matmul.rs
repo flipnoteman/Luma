@@ -62,6 +62,12 @@ pub(crate) enum MatmulTile {
     /// [`MatmulTile::Gemm`] for a product of any extents, leading dimensions and offsets, copying the operands with `lanes` (never
     /// `Vec4`: those are `Gemm`); see [`GemmLanes`].
     GemmRagged { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool, lanes: GemmLanes },
+    /// [`MatmulTile::Native`] for a half-work product of a matrix with itself (a Gram matrix, see `SyrkTiled`): the workgroups are
+    /// the lower triangle of tiles (grid `[T (T + 1) / 2, 1, 1]`), each stored with its transpose.
+    NativeHalf { edge: u32, lhs_t: bool, rhs_t: bool },
+    /// [`MatmulTile::GemmRagged`] for a half-work product, `rows == cols` (see [`MatmulTile::NativeHalf`]), copying the operands
+    /// with `lanes` (any of them, `Vec4` included).
+    GemmHalf { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool, lanes: GemmLanes },
     /// A small output (see [`skinny_tile`]): each invocation of a workgroup of `width` computes
     /// `rows` x `cols` outputs straight from global memory, and the `groups` invocations that own
     /// the same outputs take the `k` in turn. With `along_k` neighbouring invocations take
@@ -77,8 +83,8 @@ impl MatmulTile {
             MatmulTile::T128x32 => (128, 32),
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
-            MatmulTile::Native { edge, .. } => (edge, edge),
-            MatmulTile::Gemm { rows, cols, .. } | MatmulTile::GemmRagged { rows, cols, .. } => (rows, cols),
+            MatmulTile::Native { edge, .. } | MatmulTile::NativeHalf { edge, .. } => (edge, edge),
+            MatmulTile::Gemm { rows, cols, .. } | MatmulTile::GemmRagged { rows, cols, .. } | MatmulTile::GemmHalf { rows, cols, .. } => (rows, cols),
             MatmulTile::Skinny { .. } => unreachable!("a skinny product has no output tiles of fixed edges"),
         }
     }
@@ -221,17 +227,19 @@ impl Array<f32> {
 /// [`Array::matmul_nt`] as a function.
 #[track_caller]
 pub fn matmul_nt(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    let out = product(lhs, &rhs.transpose(), None);
+    let gram = lhs.is_same_value(rhs);
+    let out = product_of(lhs, &rhs.transpose(), None, gram);
     // `x · xᵀ` is symmetric (the half-work kernel makes it bit-symmetric; see `Props::SYMMETRIC`).
-    if lhs.is_same_value(rhs) { with_symmetric(out) } else { out }
+    if gram { with_symmetric(out) } else { out }
 }
 
 /// [`Array::matmul_tn`] as a function.
 #[track_caller]
 pub fn matmul_tn(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    let out = product(&lhs.transpose(), rhs, None);
+    let gram = lhs.is_same_value(rhs);
+    let out = product_of(&lhs.transpose(), rhs, None, gram);
     // The Gram product `xᵀ · x`.
-    if lhs.is_same_value(rhs) { with_symmetric(out) } else { out }
+    if gram { with_symmetric(out) } else { out }
 }
 
 /// `product` marked symmetric: a square result of a Gram product.
@@ -278,6 +286,12 @@ pub fn matmul_f32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
 
 #[track_caller]
 fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32> {
+    product_of(lhs, rhs, tf32, false)
+}
+
+/// [`product`] of operands that are the same value (`half`: a Gram product, whose half-work strategy may compute one triangle).
+#[track_caller]
+fn product_of(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>, half: bool) -> Array<f32> {
     let location = Location::caller();
     let tf32 = match tf32 {
         None => Tf32Request::Default,
@@ -287,18 +301,18 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     if lhs.has_props() || rhs.has_props() {
-        return product_with_props(lhs, rhs, tf32, shape, location);
+        return product_with_props(lhs, rhs, tf32, half, shape, location);
     }
-    lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location)
+    lazy::product(lhs, rhs, ContractionAttrs { tf32, half }, shape, location)
 }
 
 /// A product of operands that carry matrix properties: routed (a permutation, a band) or the GEMM, with the properties of the
 /// product (see `crate::props`).
 #[cold]
 #[inline(never)]
-fn product_with_props(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request, shape: crate::Shape, location: &'static Location<'static>) -> Array<f32> {
+fn product_with_props(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request, half: bool, shape: crate::Shape, location: &'static Location<'static>) -> Array<f32> {
     let routed = if !matches!(tf32, Tf32Request::Tf32) { crate::dense::route::route_product(lhs, rhs, location) } else { None };
-    let product = routed.unwrap_or_else(|| lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location));
+    let product = routed.unwrap_or_else(|| lazy::product(lhs, rhs, ContractionAttrs { tf32, half }, shape, location));
     product.with_props(lhs.props_used().product(rhs.props_used()))
 }
 
@@ -411,7 +425,7 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         MatmulTile::T128 => t128(aligned, split, &loads),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
-        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } => t32(aligned, split, &loads, form),
+        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::NativeHalf { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } | MatmulTile::GemmHalf { .. } => t32(aligned, split, &loads, form),
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
     }
 }

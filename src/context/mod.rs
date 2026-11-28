@@ -1167,7 +1167,13 @@ impl Context {
                     BuiltinKernel::Wgsl(source) => {
                         let native = match op {
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
-                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
+                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: false }))
+                            }
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::NativeHalf { edge, lhs_t, rhs_t }, .. } => {
+                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: true }))
+                            }
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
+                                Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes).with_half()))
                             }
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
                                 Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact)))

@@ -51,7 +51,7 @@ fn buffer(ctx: &Context, len: usize) -> Src {
 
 /// `matmul` of `[K, M]` by `[N, K]`.
 fn matmul(ctx: &Context, m: u32, n: u32, k: u32) -> Comprehension {
-    Comprehension::contract(buffer(ctx, (k * m) as usize), buffer(ctx, (n * k) as usize), Geometry { m, n, k }, ContractionAttrs { tf32: Tf32Request::Default })
+    Comprehension::contract(buffer(ctx, (k * m) as usize), buffer(ctx, (n * k) as usize), Geometry { m, n, k }, ContractionAttrs { tf32: Tf32Request::Default, half: false })
 }
 
 fn unit(op: OpKind, ty: ElemTy, args: [Ref; 3]) -> Instr {
