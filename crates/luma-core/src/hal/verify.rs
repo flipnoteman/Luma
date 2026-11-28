@@ -77,9 +77,9 @@ fn format(unit: GemmUnit) -> Option<Format> {
         GemmUnit::Fma => Some(Format { round: exact, half: None, tiny: 1.0e-40, bound: ACC_BOUND, big: 1.0e4 }),
         // The reference keeps the operands unrounded: the bound covers the rounding.
         GemmUnit::Tf32 => Some(Format { round: exact, half: None, tiny: 1.0e-40, bound: TF32_BOUND, big: 1.0e4 }),
-        // The products of two halves are exact in `f32`: the same bound as the exact chain. A `big` of 3000 keeps the products and
+        // The products of two halves are exact in `f32`: the same bound as the exact chain. A `big` of 100 (f16) keeps the products and
         // their sums finite in `f32` (and mostly under the `f16` range of the output).
-        GemmUnit::F16 => Some(Format { round: |x| f16_to_f32(f32_to_f16(x)), half: Some((f32_to_f16, f16_to_f32)), tiny: 1.0e-6, bound: ACC_BOUND, big: 3000.0 }),
+        GemmUnit::F16 => Some(Format { round: |x| f16_to_f32(f32_to_f16(x)), half: Some((f32_to_f16, f16_to_f32)), tiny: 1.0e-6, bound: ACC_BOUND, big: 100.0 }),
         GemmUnit::Bf16 => Some(Format { round: |x| bf16_to_f32(f32_to_bf16(x)), half: Some((f32_to_bf16, bf16_to_f32)), tiny: 1.0e-40, bound: ACC_BOUND, big: 3.0e4 }),
         #[allow(unreachable_patterns, reason = "GemmUnit is non_exhaustive: units of other crates' backends")]
         _ => None,
