@@ -106,13 +106,22 @@ pub(crate) fn segment_len_of_stride(ctx: &Context, stride: usize) -> usize {
 impl Drop for Storage {
     /// A file-backed storage that goes with steps still waiting in a schedule commits them first: the file is expected to hold the
     /// data once the array is gone (the segments are written back when the last of them drops, after the commit).
+    #[inline]
     fn drop(&mut self) {
         if self.file.is_some() {
-            for segment in self.segments.iter().filter(|segment| segment.is_planned()) {
-                // A failure is kept by the file store's own error state and reported by `flush`.
-                if let Err(error) = segment.settle() {
-                    log::error!("luma: a deferred store into a dropped file array failed: {error}");
-                }
+            self.settle_planned();
+        }
+    }
+}
+
+impl Storage {
+    #[cold]
+    #[inline(never)]
+    fn settle_planned(&self) {
+        for segment in self.segments.iter().filter(|segment| segment.is_planned()) {
+            // A failure is kept by the file store's own error state and reported by `flush`.
+            if let Err(error) = segment.settle() {
+                log::error!("luma: a deferred store into a dropped file array failed: {error}");
             }
         }
     }
