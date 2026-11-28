@@ -19,10 +19,27 @@ use std::panic::Location;
 use crate::array::{Array, Failure};
 use crate::context::Context;
 use crate::error::LumaError;
+use crate::jit::comprehension::build::Bodies;
+use crate::jit::comprehension::{lower, Access, AffineMap, Body, CombineOp, CombinePart, Combiner, Comprehension, Dim, Epilogue, MapRef, OpTag, Origin, OutMap, Props, MAX_DIMS};
+use crate::jit::{Edge, ElemTy};
 use crate::shape::Shape;
+use smallvec::{smallvec, SmallVec};
 
 #[cfg(test)]
 mod tests;
+
+// Which tier each pair of this thread's `einsum` calls took, and whether tier 2 is switched off (`lowerable == false`).
+#[cfg(test)]
+thread_local! {
+    static TIERS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NO_GENERIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn note_tier(tier: u8) {
+    #[cfg(test)]
+    TIERS.with(|tiers| tiers.borrow_mut().push(tier));
+    let _ = tier;
+}
 
 /// The label of each axis of an operand, fastest axis first; `None` is an axis of extent 1 that no label names.
 type Slots = [Option<u8>; 4];
@@ -208,15 +225,75 @@ fn pair(labels: &Labels, a: Term, b: Term, keep: u64, want: Option<Slots>, locat
     // Fastest first: the first label of the spec string is the slowest axis of the flattened `K`.
     let mut k = of(&a, ma & mb & !keep);
     k.sort_unstable_by_key(|&label| std::cmp::Reverse(labels.first[index(label)]));
-    let result = if k.len() == 1 && m.len() <= 1 && n.len() <= 1 && batch.len() <= 2 {
-        matmul_pair(&a, &b, k[0], m.first().copied(), n.first().copied(), &batch, location)
-    } else {
-        copy_then_matmul(labels, &a, &b, &k, &m, &n, &batch, location)
+    if k.len() == 1 && m.len() <= 1 && n.len() <= 1 && batch.len() <= 2 {
+        note_tier(1);
+        let result = matmul_pair(&a, &b, k[0], m.first().copied(), n.first().copied(), &batch, location);
+        let slots = want.unwrap_or(result.slots);
+        return Ok(result.arranged(&slots, location));
+    }
+    if let Some(result) = generic_pair(labels, &a, &b, &k, keep, want)? {
+        note_tier(2);
+        return Ok(result);
+    }
+    note_tier(3);
+    let result = copy_then_matmul(labels, &a, &b, &k, &m, &n, &batch, location);
+    let slots = want.unwrap_or(result.slots);
+    Ok(result.arranged(&slots, location))
+}
+
+/// Tier 2: the pair as a comprehension form with `Origin::Api(Einsum)`, run by the generic lowering. `None` when the form has no
+/// lowering (more than 6 dims, or what the generic strategies cannot run).
+#[track_caller]
+fn generic_pair(labels: &Labels, a: &Term, b: &Term, k: &[u8], keep: u64, want: Option<Slots>) -> Result<Option<Term>, Failure> {
+    #[cfg(test)]
+    if NO_GENERIC.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    // The result's axes, fastest first: the caller's layout, else A's labels then B's.
+    let result: Vec<u8> = match want {
+        Some(want) => labels_of(&want).collect(),
+        None => {
+            let kept = |label: &u8| keep & bit(*label) != 0;
+            let from_a: Vec<u8> = labels_of(&a.slots).filter(kept).collect();
+            let from_b: Vec<u8> = labels_of(&b.slots).filter(kept).filter(|label| !from_a.contains(label)).collect();
+            [from_a, from_b].concat()
+        }
     };
-    Ok(match want {
-        Some(want) => result.arranged(&want, location),
-        None => result,
-    })
+    if result.len() + k.len() > MAX_DIMS {
+        return Ok(None);
+    }
+    // Dims: the result's axes in order, then the contracted labels, the last label of the spec string the fastest.
+    let dims: Vec<u8> = result.iter().chain(k).copied().collect();
+    let access = |term: &Term| -> Result<Access, Failure> {
+        let mut map = AffineMap::ZERO;
+        for (row, slot) in map.rows.iter_mut().zip(&term.slots) {
+            if let Some(label) = slot {
+                let dim = dims.iter().position(|d| d == label).expect("every label of an operand is a dim");
+                row.coeff[dim] = 1;
+            }
+        }
+        let shape = term.array.shape().dims().map(|d| u32::try_from(d).unwrap_or(u32::MAX));
+        Ok(Access { src: term.array.src()?, shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: Edge::None, fill: None, indirect: None, props: Props::NONE })
+    };
+    let mut axes = [None; 4];
+    for (d, axis) in axes.iter_mut().zip(0..result.len()) {
+        *d = Some(axis as u8);
+    }
+    let form = Comprehension {
+        space: dims.iter().enumerate().map(|(d, &label)| if d < result.len() { Dim::parallel(labels.extent(label) as u64) } else { Dim::reduce(labels.extent(label) as u64) }).collect(),
+        inputs: SmallVec::from_buf([access(a)?, access(b)?]),
+        body: Body { instrs: Bodies::x0_times_x1(ElemTy::F32), scalars: SmallVec::new(), outs: smallvec![0] },
+        combiner: (!k.is_empty()).then(|| Combiner::of(CombineOp::Single(CombinePart::Add), ElemTy::F32)),
+        epilogue: Epilogue::None,
+        output: OutMap::new(axes),
+        props: Props::NONE,
+        origin: Origin::Api(OpTag::Einsum),
+        ty: ElemTy::F32,
+    };
+    if form.validate().is_err() || !lower::lowers(&form) {
+        return Ok(None);
+    }
+    Ok(Some(Term { slots: pack(&result), array: lower::build(a.array.context(), &form) }))
 }
 
 /// Tier 1: the pair is one `matmul` or `matmul_batched` of views.

@@ -64,7 +64,20 @@ fn reference(spec: &str, sizes: &[(char, usize)], data: &[Vec<f32>]) -> Vec<f64>
     out
 }
 
+/// The tiers of the pairs of the last `einsum` call of this thread.
+fn tiers() -> Vec<u8> {
+    super::TIERS.with(|tiers| std::mem::take(&mut *tiers.borrow_mut()))
+}
+
 fn check(spec: &str, sizes: &[(char, usize)]) {
+    check_in(spec, sizes);
+    // Without the generic lowering (`lowerable == false`) the same spec takes the copy-then-matmul tier.
+    super::NO_GENERIC.with(|flag| flag.set(true));
+    check_in(spec, sizes);
+    super::NO_GENERIC.with(|flag| flag.set(false));
+}
+
+fn check_in(spec: &str, sizes: &[(char, usize)]) {
     let ctx = cpu();
     let inputs: Vec<&str> = spec.split("->").next().unwrap().split(',').collect();
     let made: Vec<(Array<f32>, Vec<f32>)> = inputs.iter().enumerate().map(|(i, s)| operand(&ctx, s, sizes, i + 1)).collect();
@@ -72,6 +85,19 @@ fn check(spec: &str, sizes: &[(char, usize)]) {
     let data: Vec<Vec<f32>> = made.iter().map(|m| m.1.clone()).collect();
     let got: Vec<f64> = einsum(spec, &arrays).to_vec().unwrap_or_else(|e| panic!("{spec}: {e}")).into_iter().map(f64::from).collect();
     assert_eq!(got, reference(spec, sizes, &data), "{spec}");
+}
+
+#[test]
+fn pairs_take_the_tier_that_fits() {
+    let s = [('a', 2), ('b', 3), ('c', 2), ('i', 4), ('j', 5), ('k', 3)];
+    for (spec, tier) in [("ij,jk->ik", 1), ("bij,bjk->bik", 1), ("ij,ij->ij", 2), ("i,j->ij", 2), ("ij,ij->", 2), ("abj,abj->ab", 1), ("abcj,abcj->abc", 2)] {
+        tiers();
+        check_in(spec, &s);
+        assert_eq!(tiers(), [tier], "{spec}");
+    }
+    tiers();
+    check("abcj,abcj->abc", &s);
+    assert_eq!(tiers(), [2, 3], "the generic lowering off: tier 3");
 }
 
 #[test]
