@@ -281,6 +281,24 @@ fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams
     }
 }
 
+/// Rule 4 (`shared_operand`, W3-R4R5): whether the product of the view's left operand with the right operands side by side (the view's
+/// own and the `partners'`) sums every output over `K` as each product would alone. It holds when the plan of every member (`plan_of`,
+/// pure: nothing is launched or compiled) and the plan of the merged product (`N` the sum of theirs) cut `K` the same way: the same
+/// `kc` and no slicing of `K`. Then the merged product is `Exact`, the table entry of the rule; otherwise it is `Reassociating` and does
+/// not run at the default numerics. `false` where a strategy has no plan for either.
+#[allow(dead_code, reason = "W3-U4's multi-operand kernels ask it before a group is launched")]
+pub(crate) fn merge_keeps_k_order(view: &ContractionView<'_>, ctx: &Context, by: StrategyId) -> bool {
+    let Some(geom) = view.geometry() else { return false };
+    let transposed = read_layouts(view, by).map(|layout| layout.transposed);
+    let plan = |n: u32| match plan_of(view, ctx, &ContractionParams { by, geom: Geometry { n, ..geom } }, transposed) {
+        Some(Ok(plan)) => Some(plan),
+        _ => None,
+    };
+    let widths: SmallVec<[u32; 4]> = std::iter::once(geom.n).chain(view.partners.iter().map(|partner| u32::try_from(partner.rhs.shape().dims()[0]).unwrap_or(u32::MAX))).collect();
+    let Some(merged) = widths.iter().try_fold(0u32, |all, &n| all.checked_add(n)).and_then(plan) else { return false };
+    merged.slices == 1 && widths.iter().all(|&n| plan(n).is_some_and(|solo| solo.slices == 1 && solo.kc == merged.kc))
+}
+
 /// The stable label of the Decision of a strategy run with `params`.
 pub(crate) fn label(params: &ContractionParams, subject: &Subject<'_>, ctx: &Context) -> String {
     match params.by {

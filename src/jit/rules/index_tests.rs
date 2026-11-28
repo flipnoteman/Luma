@@ -428,3 +428,24 @@ fn a_factor_that_does_not_depend_on_the_summed_index_leaves_the_sum_under_reform
 fn rows_of(ctx: &Context) -> (Vec<DecisionSite>, Vec<String>) {
     rows(ctx)
 }
+
+#[test]
+fn a_merged_product_of_a_shared_operand_keeps_the_order_of_k_unless_the_plan_slices_k() {
+    use crate::jit::structured::contraction::{Partner, merge_keeps_k_order};
+    use crate::jit::structured::strategy::StrategyId;
+    let ctx = open(LazyMode::Never, Numerics::default());
+    let keeps = |m: usize, k: usize, n1: usize, n2: usize, by: StrategyId| {
+        let x = A::from_slice_on(&ctx, &values(k * m, 0), [k, m]).unwrap();
+        let (w1, w2) = (A::from_slice_on(&ctx, &values(n1 * k, 1), [n1, k]).unwrap(), A::from_slice_on(&ctx, &values(n2 * k, 2), [n2, k]).unwrap());
+        let partners = [Partner { rhs: w2.hold(), epilogue: None }];
+        let view = ContractionView { lhs: &x, rhs: &w1, attrs: ContractionAttrs { tf32: Tf32Request::Exact, half: false }, location: std::panic::Location::caller(), epilogue: None, partners: &partners };
+        merge_keeps_k_order(&view, &ctx, by)
+    };
+    for by in [StrategyId::CONTRACTION_TILED, StrategyId::CONTRACTION_NATIVE_CPU] {
+        // A product of ordinary size: whole K in every plan, merged or not.
+        assert!(keeps(256, 256, 256, 256, by) || by == StrategyId::CONTRACTION_NATIVE_CPU && ctx.tuning().native_gemm == 0, "{by:?}");
+    }
+    // A long K over few tiles splits K alone (SPLIT_MIN_K 4096, under SPLIT_TILES output tiles), but not once merged tiles pass the
+    // threshold: the slices differ, the merged product would add the terms in another order.
+    assert!(!keeps(64, 1 << 16, 64, 64, StrategyId::CONTRACTION_TILED) || !keeps(64, 1 << 16, 64, 4096, StrategyId::CONTRACTION_TILED));
+}

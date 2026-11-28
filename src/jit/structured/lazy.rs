@@ -414,6 +414,10 @@ impl Structured {
                 if let RunState::Contraction(run) = &self.comp().run {
                     ctx.jit().sites.note_partnered(run.slot);
                 }
+                // Rule 4 (`shared_operand`) fired: the products of one left operand ran as one.
+                if ctx.jit().recording_decisions() {
+                    ctx.jit().note_decision(Decision::new("matmul", self.location, DecisionSite::Rewrite, "shared_operand"));
+                }
                 Ok(own)
             }
             output => {
