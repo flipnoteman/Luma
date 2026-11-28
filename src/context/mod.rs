@@ -1267,39 +1267,42 @@ impl Context {
     }
 
     /// The cached built-in kernel for `op` on elements of WGSL type `ty`, compiled on first use.
+    #[inline(always)]
     pub(crate) fn builtin(&self, op: Builtin, ty: &'static str) -> Result<Arc<KernelCore>> {
-        self.inner
-            .builtins
-            .get_or_build(&(op, ty), || {
-                let label = format!("{op:?} {ty}");
-                match op.kernel(ty, &self.inner.tuning) {
-                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
-                    BuiltinKernel::Wgsl(source) => {
-                        let native = match op {
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
-                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: false }))
-                            }
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::NativeHalf { edge, lhs_t, rhs_t }, .. } => {
-                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: true }))
-                            }
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
-                                Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes).with_half()))
-                            }
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
-                                Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact)))
-                            }
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
-                                Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes)))
-                            }
-                            Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
-                            _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
-                        };
-                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)
-                    }
+        self.inner.builtins.get_or_build(&(op, ty), || self.build_builtin(op, ty)).map(|(core, _)| core)
+    }
+
+    /// [`Context::builtin`] on a miss.
+    #[cold]
+    #[inline(never)]
+    fn build_builtin(&self, op: Builtin, ty: &'static str) -> Result<Arc<KernelCore>> {
+            let label = format!("{op:?} {ty}");
+            match op.kernel(ty, &self.inner.tuning) {
+                BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
+                BuiltinKernel::Wgsl(source) => {
+                    let native = match op {
+                        Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
+                            Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: false }))
+                        }
+                        Builtin::Matmul { tile: crate::matmul::MatmulTile::NativeHalf { edge, lhs_t, rhs_t }, .. } => {
+                            Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: true }))
+                        }
+                        Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes).with_half()))
+                        }
+                        Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact)))
+                        }
+                        Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes)))
+                        }
+                        Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
+                        _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
+                    };
+                    kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)
                 }
-                .map(Arc::new)
-            })
-            .map(|(core, _)| core)
+            }
+            .map(Arc::new)
     }
 
     /// Takes a buffer of at least `bytes` bytes with exactly `usage` from the pool, creating one

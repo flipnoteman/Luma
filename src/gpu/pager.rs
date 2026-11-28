@@ -232,6 +232,7 @@ impl Accounted {
 }
 
 impl Drop for Accounted {
+    #[inline]
     fn drop(&mut self) {
         if let Some(ctx) = self.ctx.upgrade() {
             ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
