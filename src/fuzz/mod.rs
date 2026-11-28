@@ -1175,6 +1175,9 @@ impl Machine {
                 Ok(())
             }
             (Err(h), Err(l)) if kind_of(&l) == h => Ok(()),
+            // A deferred step that failed on an injected transfer fails the statement that pulls it, before that statement's own check
+            // (a shape error, say) could: the failure of the transfer is the program's expected end.
+            (Err(_), Err(l)) if self.cx.io.is_some() && matches!(l.root(), LumaError::Io { .. }) => Err(Fail::Limit(format!("{at}: injected failure: {l}"))),
             (Err(h), Err(l)) => Err(Fail::Mismatch(format!("{at}: luma failed with {l}, the oracle with {h:?}"))),
             (Err(h), Ok(())) => Err(Fail::Mismatch(format!("{at}: luma succeeded where the oracle fails with {h:?}"))),
             (Ok(()), Err(l)) if self.cx.io.is_some() => Err(Fail::Limit(format!("{at}: injected failure: {l}"))),
