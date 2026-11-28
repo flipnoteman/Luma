@@ -161,6 +161,10 @@ pub(super) enum Input {
     Leaf(u32),
     /// Output `out` of an earlier launch of the plan.
     Out { step: u32, out: u32 },
+    /// (Inside the separate passes of a product's step only.) The product's own buffer.
+    Acc,
+    /// (Likewise.) Output `out` of the earlier pass `step` of the same product.
+    Tail { step: u32, out: u32 },
 }
 
 /// One step of a plan: a recorded `run_store`, or the run of a structured value (a reduction, a product) that launches by itself.
@@ -208,6 +212,17 @@ pub(super) struct StructuredStep {
     prepared: Vec<StoreStep>,
     /// (0, node): the nodes the value became the result of.
     done: Vec<(u32, u32)>,
+    /// The elementwise passes that follow the product when its strategy did not take the absorbed epilogue (`apply_separately`):
+    /// the result of the value is the output of the last one.
+    tail: Option<TailSteps>,
+}
+
+/// The separate passes of a product's step, in the order they ran.
+#[derive(Debug)]
+struct TailSteps {
+    steps: Vec<StoreStep>,
+    /// (pass, output) that is the result of the value.
+    result: (u32, u32),
 }
 
 /// One recorded `run_store`.
@@ -606,17 +621,19 @@ fn leave_cold(entered: Entered, ctx: &Context, value: &Structured, result: &Resu
     RECORDER.with_borrow_mut(|recorder| {
         let Some(recorder) = recorder.as_mut() else { return };
         let Some(frame) = recorder.frames.pop() else { return };
+        // The separate passes that were recorded under this frame.
+        let tail = if recorder.tail.as_ref().is_some_and(|tail| tail.depth == recorder.frames.len() + 1) { recorder.tail.take() } else { None };
         if recorder.tainted.is_some() {
             return;
         }
-        if let Err(why) = close(recorder, frame, ctx, value, result) {
+        if let Err(why) = close(recorder, frame, ctx, value, result, tail) {
             recorder.tainted = Some(why);
         }
     });
 }
 
 /// The step of a recorded value: the strategy that ran it, when it is one a replay can run again.
-fn close(recorder: &mut Recorder, frame: Frame, ctx: &Context, value: &Structured, result: &Result<Arc<Storage>, Arc<crate::error::LumaError>>) -> Result<(), &'static str> {
+fn close(recorder: &mut Recorder, frame: Frame, ctx: &Context, value: &Structured, result: &Result<Arc<Storage>, Arc<crate::error::LumaError>>, tail: Option<TailRec>) -> Result<(), &'static str> {
     let Ok(storage) = result else { return Err("a launch failed") };
     if frame.ambiguous {
         return Err("a value that selected more than one strategy");
@@ -634,9 +651,16 @@ fn close(recorder: &mut Recorder, frame: Frame, ctx: &Context, value: &Structure
     if family == FamilyTag::Reduce && ctx.jit().may_have_partners(value) {
         return Err("a reduction that has partners");
     }
+    let tail = match tail {
+        Some(tail) => {
+            let result = *tail.produced.get(&storage.id()).ok_or("the result of a product's separate passes is not a launch of their own")?;
+            Some(TailSteps { steps: tail.steps, result })
+        }
+        None => None,
+    };
     let step = recorder.steps.len() as u32;
     recorder.produced.insert(storage.id(), (step, 0));
-    recorder.steps.push(Step::Structured(StructuredStep { strategy: id, params, at: frame.at, prepared: frame.prepared, done: Vec::new() }));
+    recorder.steps.push(Step::Structured(StructuredStep { strategy: id, params, at: frame.at, prepared: frame.prepared, done: Vec::new(), tail }));
     Ok(())
 }
 
@@ -703,7 +727,7 @@ pub(super) fn fused_hook(len: usize, build: impl FnOnce() -> Result<Fused, crate
         if recorder.tainted.is_some() || recorder.frames.is_empty() {
             return;
         }
-        match recorder.step(len, &fused) {
+        match recorder.step(len, &fused, false) {
             Ok(step) => {
                 for &at in &step.fused {
                     recorder.fused_marks[at as usize] = true;
@@ -716,6 +740,104 @@ pub(super) fn fused_hook(len: usize, build: impl FnOnce() -> Result<Fused, crate
         }
     });
     Ok(fused)
+}
+
+/// What a product does with the elementwise passes of an absorbed epilogue its strategy did not take.
+pub(crate) enum Pass {
+    /// Runs them (`apply_separately`).
+    Run,
+    /// The plan cache ran them again from the recorded step: the result of the value.
+    Replayed(Result<Arc<Storage>, crate::array::Failure>),
+}
+
+/// Called by a product that has the buffer `storage` and an epilogue left to apply on its own: while a plan is recorded the passes that
+/// follow are noted as part of the value's step, and while it is replayed they are run from it.
+#[inline(always)]
+pub(crate) fn separate_pass(ctx: &Context, value: &Structured, storage: &Arc<Storage>) -> Pass {
+    if structured_flags() == 0 { Pass::Run } else { separate_cold(ctx, value, storage) }
+}
+
+#[cold]
+#[inline(never)]
+fn separate_cold(ctx: &Context, value: &Structured, storage: &Arc<Storage>) -> Pass {
+    let ptr = value as *const Structured as usize;
+    if structured_flags() & REPLAYING != 0 {
+        let tail = REPLAY.with_borrow_mut(|cmd| {
+            let cmd = cmd.as_mut().filter(|cmd| cmd.owner == ptr && cmd.taken && cmd.nested == 0)?;
+            match cmd.tail.take() {
+                Some(tail) => Some(tail),
+                None => {
+                    // The recorded run had no passes: this one is not the run that was recorded.
+                    cmd.diverged = true;
+                    None
+                }
+            }
+        });
+        return match tail {
+            Some(tail) => Pass::Replayed(run_tail(ctx, tail, storage)),
+            None => Pass::Run,
+        };
+    }
+    RECORDER.with_borrow_mut(|recorder| {
+        let Some(recorder) = recorder.as_mut() else { return };
+        if recorder.tainted.is_some() {
+            return;
+        }
+        let Some(&at) = recorder.deferred_at.get(&ptr) else { return };
+        if recorder.frames.last().is_none_or(|frame| frame.at != at) {
+            return;
+        }
+        if recorder.tail.is_some() {
+            recorder.tainted = Some("a product's separate passes inside another's");
+            return;
+        }
+        recorder.tail = Some(TailRec { depth: recorder.frames.len(), acc: storage.id(), steps: Vec::new(), produced: FxMap::default() });
+    });
+    Pass::Run
+}
+
+/// The passes of a product's step with everything they read bound to the buffers of this replay.
+struct TailRun {
+    steps: Vec<TailPass>,
+    result: (u32, u32),
+}
+
+struct TailPass {
+    key: FusedKey,
+    len: usize,
+    inputs: Vec<TailIn>,
+    scalars: Vec<u32>,
+    /// The nodes of the walk the pass computes inside itself.
+    fused: Vec<Arc<Node>>,
+}
+
+enum TailIn {
+    Ready(Arc<Storage>),
+    Acc,
+    Pass(u32, u32),
+}
+
+/// Runs the passes of `tail` over the product `acc`: the elementwise launches `apply_separately` would make, without building and
+/// planning their nodes.
+fn run_tail(ctx: &Context, tail: TailRun, acc: &Arc<Storage>) -> Result<Arc<Storage>, crate::array::Failure> {
+    let mut outs: Vec<Vec<Arc<Storage>>> = Vec::with_capacity(tail.steps.len());
+    for pass in tail.steps {
+        let mut inputs = Vec::with_capacity(pass.inputs.len());
+        for input in &pass.inputs {
+            inputs.push(match input {
+                TailIn::Ready(storage) => Arc::clone(storage),
+                TailIn::Acc => Arc::clone(acc),
+                TailIn::Pass(step, out) => Arc::clone(&outs[*step as usize][*out as usize]),
+            });
+        }
+        for node in &pass.fused {
+            node.fused.store(true, Ordering::Relaxed);
+        }
+        let fused = Fused { key: pass.key, inputs, scalars: pass.scalars, fused_nodes: Vec::new(), instr_nodes: Vec::new(), sub_roots: Vec::new() };
+        let outputs = launch::run_store(ctx, pass.len, fused)?;
+        outs.push(outputs.into_iter().map(Arc::new).collect());
+    }
+    Ok(Arc::clone(&outs[tail.result.0 as usize][tail.result.1 as usize]))
 }
 
 /// What a replay of a structured step hands to the strategy: the strategy and its parameters, and the programs it flattened.
@@ -731,6 +853,8 @@ struct ReplayCmd {
     /// Other structured values that are being recorded inside this one.
     nested: u32,
     diverged: bool,
+    /// The passes that follow the product, for a value that had an epilogue it applied separately.
+    tail: Option<TailRun>,
 }
 
 /// Ends a replayed step, whatever happens.
@@ -787,8 +911,9 @@ pub(super) fn taint_tape(why: &'static str) {
 /// What `run_store` hands back to [`end_store`]: the step each recorder made of the launch.
 #[derive(Clone, Copy)]
 pub(super) struct StoreToken {
-    walk: Option<usize>,
-    tape: Option<usize>,
+    /// The step, and whether it is a pass of a product's step.
+    walk: Option<(usize, bool)>,
+    tape: Option<(usize, bool)>,
 }
 
 /// Starts the recording of a step for trace following.
@@ -842,6 +967,19 @@ pub(super) struct Recorder {
     deferred_at: FxMap<usize, u32>,
     /// The structured values being recorded (a value forced inside another's recording is above it).
     frames: Vec<Frame>,
+    /// The separate passes of the product on top of `frames` that are being recorded.
+    tail: Option<TailRec>,
+}
+
+/// The passes `apply_separately` launches after a product, as they are recorded.
+struct TailRec {
+    /// `frames.len()` while the product's own frame is the top one: the launches made then are its passes.
+    depth: usize,
+    /// The buffer of the product.
+    acc: u64,
+    steps: Vec<StoreStep>,
+    /// The pass and output each buffer of the passes is.
+    produced: FxMap<u64, (u32, u32)>,
 }
 
 /// What a structured value that is being recorded has made so far.
@@ -873,6 +1011,7 @@ impl Recorder {
             tainted: None,
             deferred_at: FxMap::default(),
             frames: Vec::new(),
+            tail: None,
         }
     }
 
@@ -960,19 +1099,25 @@ impl Recorder {
             tainted: None,
             deferred_at: walk.nodes.iter().enumerate().filter_map(|(at, node)| Some((Arc::as_ptr(node.deferred_value()?) as usize, at as u32))).collect(),
             frames: Vec::new(),
+            tail: None,
         }
     }
 
-    /// The step for a `run_store` of `len` elements of `fused`, or `Err` why it cannot be one.
-    fn step(&mut self, len: usize, fused: &Fused) -> Result<StoreStep, &'static str> {
+    /// The step for a `run_store` of `len` elements of `fused`, or `Err` why it cannot be one. `in_tail`: a pass of the product whose
+    /// separate passes are being recorded (its inputs may be the product's buffer or an earlier pass's, and it computes nodes of its own
+    /// that no walk saw).
+    fn step(&mut self, len: usize, fused: &Fused, in_tail: bool) -> Result<StoreStep, &'static str> {
         let key = &fused.key;
+        let tail = self.tail.as_ref().filter(|_| in_tail);
         let inputs = fused
             .inputs
             .iter()
             .map(|input| match (self.leaf_at.get(&input.id()), self.produced.get(&input.id())) {
                 (Some(&at), _) => Ok(Input::Leaf(at)),
                 (None, Some(&(step, out))) => Ok(Input::Out { step, out }),
-                (None, None) => Err("an input that is neither a buffer of the graph nor a result of the evaluation"),
+                (None, None) => tail
+                    .and_then(|tail| if tail.acc == input.id() { Some(Input::Acc) } else { tail.produced.get(&input.id()).map(|&(step, out)| Input::Tail { step, out }) })
+                    .ok_or("an input that is neither a buffer of the graph nor a result of the evaluation"),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut scalars = fused.scalars.clone();
@@ -988,11 +1133,15 @@ impl Recorder {
                 None => return Err("a uniform word that is not a scalar of the graph"),
             }
         }
-        let fused_nodes = fused
-            .fused_nodes
-            .iter()
-            .map(|node| self.node_at.get(&node.id).copied().ok_or("a fused node outside the graph"))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut fused_nodes = Vec::with_capacity(fused.fused_nodes.len());
+        for node in &fused.fused_nodes {
+            match self.node_at.get(&node.id) {
+                Some(&at) => fused_nodes.push(at),
+                // The nodes the passes of a product were made of are theirs alone.
+                None if in_tail => {}
+                None => return Err("a fused node outside the graph"),
+            }
+        }
         Ok(StoreStep { key: key.clone(), len, inputs, scalars, patches, fused: fused_nodes, done: Vec::new() })
     }
 
@@ -1028,20 +1177,25 @@ impl Recorder {
 
 /// Called by `run_store` before it runs `fused` (while recording): the step it will be.
 pub(super) fn begin_store(len: usize, fused: &Fused) -> StoreToken {
-    fn note(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, len: usize, fused: &Fused) -> Option<usize> {
+    fn note(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, len: usize, fused: &Fused) -> Option<(usize, bool)> {
         slot.with_borrow_mut(|recorder| {
             let recorder = recorder.as_mut()?;
             if recorder.tainted.is_some() {
                 return None;
             }
-            match recorder.step(len, fused) {
+            let in_tail = recorder.tail.as_ref().is_some_and(|tail| tail.depth == recorder.frames.len());
+            match recorder.step(len, fused, in_tail) {
                 Ok(mut step) => {
                     step.fused.append(&mut recorder.pending_fused);
                     for &at in &step.fused {
                         recorder.fused_marks[at as usize] = true;
                     }
+                    if in_tail && let Some(tail) = recorder.tail.as_mut() {
+                        tail.steps.push(step);
+                        return Some((tail.steps.len() - 1, true));
+                    }
                     recorder.steps.push(Step::Store(step));
-                    Some(recorder.steps.len() - 1)
+                    Some((recorder.steps.len() - 1, false))
                 }
                 Err(why) => {
                     recorder.tainted = Some(why);
@@ -1058,17 +1212,28 @@ pub(super) fn begin_store(len: usize, fused: &Fused) -> StoreToken {
 
 /// Called by `run_store` when it returns while recording: what the step wrote.
 pub(super) fn end_store<E>(token: StoreToken, outputs: &Result<Vec<Storage>, E>) {
-    fn note<E>(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, step: Option<usize>, outputs: &Result<Vec<Storage>, E>) {
-        let Some(step) = step else { return };
+    fn note<E>(slot: &'static std::thread::LocalKey<RefCell<Option<Recorder>>>, step: Option<(usize, bool)>, outputs: &Result<Vec<Storage>, E>) {
+        let Some((step, in_tail)) = step else { return };
         slot.with_borrow_mut(|recorder| {
             let Some(recorder) = recorder.as_mut() else { return };
             match outputs {
                 Ok(outputs) => {
-                    for (out, storage) in outputs.iter().enumerate() {
-                        recorder.produced.insert(storage.id(), (step as u32, out as u32));
-                    }
+                    let expected = match (in_tail, recorder.tail.as_mut()) {
+                        (true, Some(tail)) => {
+                            for (out, storage) in outputs.iter().enumerate() {
+                                tail.produced.insert(storage.id(), (step as u32, out as u32));
+                            }
+                            tail.steps[step].key.outputs.len()
+                        }
+                        _ => {
+                            for (out, storage) in outputs.iter().enumerate() {
+                                recorder.produced.insert(storage.id(), (step as u32, out as u32));
+                            }
+                            recorder.steps[step].outputs()
+                        }
+                    };
                     // The number of outputs a plan expects is that of the program.
-                    if outputs.len() != recorder.steps[step].outputs() && recorder.tainted.is_none() {
+                    if outputs.len() != expected && recorder.tainted.is_none() {
                         recorder.tainted = Some("a launch with other outputs than its program");
                     }
                 }
@@ -1099,6 +1264,12 @@ fn finished_recording(node: &Node, storage: &Storage) {
         slot.with_borrow_mut(|recorder| {
             let Some(recorder) = recorder.as_mut() else { return };
             if recorder.tainted.is_some() {
+                return;
+            }
+            // A node a product's separate passes made (the nodes of `apply_separately`) finishes with the buffer of one of them.
+            if !recorder.node_at.contains_key(&node.id)
+                && recorder.tail.as_ref().is_some_and(|tail| tail.depth == recorder.frames.len() && tail.produced.contains_key(&storage.id()))
+            {
                 return;
             }
             let (Some(&(step, out)), Some(&at)) = (recorder.produced.get(&storage.id()), recorder.node_at.get(&node.id)) else {
@@ -1307,10 +1478,11 @@ fn replay(ctx: &Context, plan: &Plan, walk: &Walk) -> Result<(), ()> {
             .inputs
             .iter()
             .map(|input| match *input {
-                Input::Leaf(at) => Arc::clone(&walk.leaves[at as usize]),
-                Input::Out { step, out } => Arc::clone(&outs[step as usize][out as usize]),
+                Input::Leaf(at) => Ok(Arc::clone(&walk.leaves[at as usize])),
+                Input::Out { step, out } => Ok(Arc::clone(&outs[step as usize][out as usize])),
+                Input::Acc | Input::Tail { .. } => Err(()),
             })
-            .collect();
+            .collect::<Result<_, ()>>()?;
         let mut scalars = step.scalars.clone();
         for &(slot, class) in &step.patches {
             scalars[slot as usize] = class_words[class as usize];
@@ -1350,6 +1522,7 @@ fn replay_structured(ctx: &Context, step: &StructuredStep, walk: &Walk, class_wo
             inputs.push(match *input {
                 Input::Leaf(at) => Arc::clone(walk.leaves.get(at as usize).ok_or(())?),
                 Input::Out { step, out } => Arc::clone(outs.get(step as usize).and_then(|outputs| outputs.get(out as usize)).ok_or(())?),
+                Input::Acc | Input::Tail { .. } => return Err(()),
             });
         }
         let mut scalars = program.scalars.clone();
@@ -1359,7 +1532,31 @@ fn replay_structured(ctx: &Context, step: &StructuredStep, walk: &Walk, class_wo
         let fused_nodes = program.fused.iter().map(|&at| Arc::clone(&walk.nodes[at as usize])).collect();
         prepared.push(Some(Fused { key: program.key.clone(), inputs, scalars, fused_nodes, instr_nodes: Vec::new(), sub_roots: Vec::new() }));
     }
-    let replaying = Replaying::begin(ReplayCmd { owner: Arc::as_ptr(value) as usize, strategy: step.strategy, params: step.params, prepared, next: 0, taken: false, nested: 0, diverged: false });
+    let tail = match &step.tail {
+        Some(tail) => {
+            let mut steps = Vec::with_capacity(tail.steps.len());
+            for pass in &tail.steps {
+                let mut inputs = Vec::with_capacity(pass.inputs.len());
+                for input in &pass.inputs {
+                    inputs.push(match *input {
+                        Input::Leaf(at) => TailIn::Ready(Arc::clone(walk.leaves.get(at as usize).ok_or(())?)),
+                        Input::Out { step, out } => TailIn::Ready(Arc::clone(outs.get(step as usize).and_then(|outputs| outputs.get(out as usize)).ok_or(())?)),
+                        Input::Acc => TailIn::Acc,
+                        Input::Tail { step, out } => TailIn::Pass(step, out),
+                    });
+                }
+                let mut scalars = pass.scalars.clone();
+                for &(slot, class) in &pass.patches {
+                    scalars[slot as usize] = class_words[class as usize];
+                }
+                let fused = pass.fused.iter().map(|&at| Arc::clone(&walk.nodes[at as usize])).collect();
+                steps.push(TailPass { key: pass.key.clone(), len: pass.len, inputs, scalars, fused });
+            }
+            Some(TailRun { steps, result: tail.result })
+        }
+        None => None,
+    };
+    let replaying = Replaying::begin(ReplayCmd { owner: Arc::as_ptr(value) as usize, strategy: step.strategy, params: step.params, prepared, next: 0, taken: false, nested: 0, diverged: false, tail });
     let result = {
         let _computing = super::Computing::enter(node.id());
         value.record_once(ctx).clone()
@@ -1419,6 +1616,7 @@ pub(super) fn run_step(ctx: &Context, step: &Step, outs: &mut Vec<Vec<Arc<Storag
         inputs.push(match *input {
             Input::Leaf(at) => with.leaf(at).ok_or(())?,
             Input::Out { step, out } => Arc::clone(outs.get(step as usize).and_then(|outputs| outputs.get(out as usize)).ok_or(())?),
+            Input::Acc | Input::Tail { .. } => return Err(()),
         });
     }
     let mut scalars = step.scalars.clone();

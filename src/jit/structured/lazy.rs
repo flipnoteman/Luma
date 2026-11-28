@@ -312,7 +312,7 @@ impl Structured {
             }
             RunState::Contraction(run) => {
                 let ContractionKind::Matmul { attrs } = &run.kind else { return None };
-                if run.epilogue.is_some() || run.absorbed_from.load(Ordering::Relaxed) || run.inherited.get().is_some() {
+                if run.absorbed_from.load(Ordering::Relaxed) || run.inherited.get().is_some() {
                     return None;
                 }
                 let operands = lock(&run.operands);
@@ -323,7 +323,32 @@ impl Structured {
                 attrs.hash(hasher);
                 lhs.shape().dims().hash(hasher);
                 rhs.shape().dims().hash(hasher);
-                Some(SmallVec::from_buf([lhs.src().ok()?, rhs.src().ok()?]))
+                let mut sources = SmallVec::from_buf([lhs.src().ok()?, rhs.src().ok()?]);
+                // An absorbed epilogue: its structure, and what it reads (the arrays, as they are read, and the scalars, as classes).
+                if let Some(absorbed) = &run.epilogue {
+                    // A value derived from one that is alive is computed with it (one product for both): not a plan of its own.
+                    if absorbed.parent.strong_count() > 0 || absorbed.program.outputs.len() != 1 || absorbed.arrays.len() != absorbed.program.inputs.len() {
+                        return None;
+                    }
+                    absorbed.program.instrs.hash(hasher);
+                    absorbed.program.outputs.hash(hasher);
+                    absorbed.shape.dims().hash(hasher);
+                    for (array, input) in absorbed.arrays.iter().zip(&absorbed.program.inputs) {
+                        if array.has_props() || array.failed().is_some() {
+                            return None;
+                        }
+                        input.map.hash(hasher);
+                        array.shape().dims().hash(hasher);
+                        sources.push(array.src().ok()?);
+                    }
+                    // The passes of the epilogue are made when the value is forced, and the simplifier reads the values of their scalars then
+                    // (`x * 1`, `x + 0`, `powf(x, 2)`, constants that fold): the values it reads are part of the key, and the others are classes.
+                    for scalar in &absorbed.program.scalars {
+                        scalar_class(*scalar).hash(hasher);
+                        sources.push(Src::Scalar(*scalar));
+                    }
+                }
+                Some(sources)
             }
         }
     }
@@ -472,7 +497,11 @@ impl Structured {
                         if ctx.jit().recording_decisions() {
                             ctx.jit().note_decision(Decision::new("epilogue", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
                         }
-                        apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location)
+                        // The plan cache records the passes that follow as part of this value's step, and replays them.
+                        match crate::jit::plancache::separate_pass(ctx, self, &storage) {
+                            crate::jit::plancache::Pass::Run => apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location),
+                            crate::jit::plancache::Pass::Replayed(result) => result,
+                        }
                     }
                 }
             }
@@ -527,6 +556,18 @@ impl Structured {
         drop(lock(&self.comp().form).take());
         self.adopt(storage);
     }
+}
+
+/// What the simplifier (`jit::simplify`) can tell of a scalar: its bits where a rule reads its value (zeros, ones, the exponents of
+/// `powf`, values whose products, sums and reciprocals may leave the range of `f32`), `0` for every other value of `f32`.
+fn scalar_class(scalar: Scalar) -> u64 {
+    if scalar.ty == ElemTy::F32 {
+        let value = f32::from_bits(scalar.bits as u32).abs();
+        if value.is_finite() && (2f32.powi(-60)..=2f32.powi(60)).contains(&value) && ![0.5, 1.0, 2.0].contains(&value) {
+            return 0;
+        }
+    }
+    scalar.bits | 1 << 63
 }
 
 /// The most products one launch takes (the subject and its partners).
