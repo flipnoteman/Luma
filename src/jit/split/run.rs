@@ -62,7 +62,8 @@ pub(super) fn run(ctx: &Context, open: &mut Open) -> Result<(), LumaError> {
     let stats = ctx.stream_counters();
     stats.schedules.fetch_add(1, Ordering::Relaxed);
     stats.steps.fetch_add(open.steps.len() as u64, Ordering::Relaxed);
-    let stages = fit(ctx, open, compile(ctx, open))?;
+    let stages = compile(ctx, open);
+    let stages = fit(ctx, open, stages)?;
     let open: &Open = open;
     let future = ctx.pager().budget().is_some().then(|| Future::new(open, &stages));
     let (up, down) = ctx.pager().traffic();
@@ -204,7 +205,8 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
         && matches!(step.kernel, StepKernel::Relowered)
     {
         stats.stages.fetch_add(1, Ordering::Relaxed);
-        return super::reduce::run_relowered(ctx, open, step);
+        super::reduce::run_relowered(ctx, open, step)?;
+        return Ok(StageInfo { window: 0, streamed_in: 0, streamed_out: 0 });
     }
 
     // What the stage streams through a ring instead of making resident (see `ring`).
