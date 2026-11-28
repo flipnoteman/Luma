@@ -21,7 +21,7 @@ pub mod topology;
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
 pub use texture::{TextureCaps, TextureDesc, TextureFilter, TextureFormat};
-pub use hostbytes::{trim_host_pool, HostBytes};
+pub use hostbytes::{set_host_pool_cap, trim_host_pool, HostBytes};
 pub use transfer::{NativeStage, Stage, StageDir, Ticket};
 
 /// Which backend a context runs on.

@@ -646,6 +646,15 @@ pub(super) fn defer(
     let mut step = Some(step);
     loop {
         let schedule = open_schedule(ctx)?;
+        // The size bound commits before the next step is recorded, not after this one: the arrays of the step that filled the
+        // schedule are held by its caller until it returns, and a commit that counts them live would retain them.
+        let full = lock(&schedule.open)
+            .as_ref()
+            .is_some_and(|open| open.steps.len() >= MAX_STEPS || ctx.pager().budget().is_some_and(|budget| open.out_bytes / MAX_OUT_BUDGETS >= budget));
+        if full {
+            commit_here(ctx)?;
+            continue;
+        }
         // What another schedule plans must have run before this step is recorded after it.
         for input in inputs {
             input.as_seg().segments().iter().try_for_each(|segment| segment.settle_other(&schedule))?;
@@ -653,7 +662,7 @@ pub(super) fn defer(
         for out in outputs {
             out.as_seg().segments().iter().try_for_each(|segment| segment.plan_for(&schedule))?;
         }
-        let full = {
+        {
             let mut guard = lock(&schedule.open);
             let Some(open) = guard.as_mut() else {
                 // A commit on another thread took the steps between `open_schedule` and here: record into a new one.
@@ -662,7 +671,6 @@ pub(super) fn defer(
                 continue;
             };
             open.push(step.take().expect("a step is recorded once"), outputs, inputs, reaches, in_place, segments, writer, out_bytes);
-            open.steps.len() >= MAX_STEPS || ctx.pager().budget().is_some_and(|budget| open.out_bytes / MAX_OUT_BUDGETS >= budget)
         };
         for input in inputs {
             input.readers.add_schedule(&schedule);
@@ -672,7 +680,7 @@ pub(super) fn defer(
                 out.readers.add_schedule(&schedule);
             }
         }
-        return if full { commit_here(ctx) } else { Ok(()) };
+        return Ok(());
     }
 }
 

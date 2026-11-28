@@ -5,6 +5,7 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 /// Alignment of every [`HostBytes`] block.
@@ -38,9 +39,19 @@ unsafe impl Sync for Aligned {}
 
 /// Blocks of at least this many bytes are kept for reuse when dropped (below it the allocator's own caches do the job).
 const POOL_MIN: usize = 4 << 20;
-/// Bytes of dropped blocks the pool keeps. Fresh anonymous pages cost a kernel fault and a zeroing each (about 1 GB/s on a loaded
+/// Most bytes of dropped blocks the pool keeps by default (see [`set_host_pool_cap`]). Fresh anonymous pages cost a kernel fault and a zeroing each (about 1 GB/s on a loaded
 /// host, a tenth of a PCIe transfer): a host copy that replaces a freed one of the same size reuses its pages instead.
 const POOL_CAP: usize = 2 << 30;
+
+/// Bytes of dropped blocks the pool keeps now.
+static CAP: AtomicUsize = AtomicUsize::new(POOL_CAP);
+
+/// Sets how many bytes of dropped blocks the pool keeps (the default is 2 GiB), process-wide: the last setter wins. A context sets
+/// `min(2 GiB, host budget / 4)`, so the pool never counts for more than a quarter of the host budget. Blocks above a lowered
+/// cap are freed when they are next dropped or on [`trim_host_pool`].
+pub fn set_host_pool_cap(bytes: u64) {
+    CAP.store(usize::try_from(bytes).unwrap_or(usize::MAX).min(POOL_CAP), Ordering::Relaxed);
+}
 
 /// Dropped large blocks, ready for the next block of the same length.
 static POOL: Mutex<(usize, Vec<Aligned>)> = Mutex::new((0, Vec::new()));
@@ -99,7 +110,7 @@ impl Drop for Aligned {
     fn drop(&mut self) {
         if self.len >= POOL_MIN {
             let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-            if pool.0 + self.len <= POOL_CAP {
+            if pool.0 + self.len <= CAP.load(Ordering::Relaxed) {
                 pool.0 += self.len;
                 // The block moves into the pool; this value is left empty.
                 pool.1.push(Aligned { ptr: self.ptr, len: self.len });

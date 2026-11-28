@@ -432,6 +432,8 @@ impl Pager {
 
     /// A pager with nothing resident that keeps `budget` bytes of array data on the device.
     pub(crate) fn new(budget: Option<u64>, host_budget: u64) -> Self {
+        // The host block pool keeps at most a quarter of the host budget (and 2 GiB).
+        luma_core::hal::set_host_pool_cap(host_budget / 4);
         Pager {
             resident: Mutex::new(Resident::default()),
             resident_bytes: AtomicU64::new(0),
@@ -1535,6 +1537,8 @@ impl Context {
         if pager.host_bytes() <= pager.host_budget {
             return;
         }
+        // Pooled host blocks are the first thing to give back.
+        luma_core::hal::trim_host_pool();
         let mut holders: Vec<Arc<Segment>> = {
             let resident = lock(&pager.resident);
             resident.list.iter().filter_map(Weak::upgrade).filter(|segment| segment.has_copy.load(Ordering::Acquire)).collect()

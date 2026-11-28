@@ -612,3 +612,40 @@ fn an_in_place_takeover_waits_for_a_deferred_store_that_reads_the_buffer() {
         assert_eq!(target.to_vec().unwrap(), broadcast_sum(&row_data(1)));
     }
 }
+
+/// The planner bench's chain: eight cached stages, each its own kernel, over an array of 16 segments.
+fn chain8(x: &Array<f32>) -> Array<f32> {
+    let mut y = x.clone();
+    for k in 0..8 {
+        y = ((&y * (1.0 + 0.0009 * (k + 1) as f32) + 0.25 * (k % 3) as f32).sin().abs() + x * 0.5).tanh().cache();
+    }
+    y
+}
+
+/// A chain whose streamed working set fits at window 1 stays one stage and moves each byte once: the input up, the retained output
+/// down, the intermediates nowhere (a second call, after the input settled on the host).
+#[test]
+fn a_chain_that_fits_at_window_one_stays_one_stage() {
+    let seg = 1u64 << 16;
+    let n = 16 * (seg as usize / 4); // 16 segments, 1 MiB
+    let xs: Vec<f32> = (0..n).map(|i| (i % 1013) as f32 * 0.01).collect();
+    let run = |mode, budget| {
+        let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(seg).memory_budget(budget).split(mode)).expect("a device is available");
+        let x = Array::from_slice_on(&ctx, &xs, n).unwrap();
+        chain8(&x).to_vec().unwrap();
+        let first = ctx.stream_stats();
+        let got = chain8(&x).to_vec().unwrap();
+        (got, first, ctx.stream_stats())
+    };
+    // Half the array: well below it, with room for a handful of slabs.
+    let (on, first, both) = run(SplitMode::Auto, 8 * seg);
+    let (off, ..) = run(SplitMode::Off, 8 * seg);
+    assert_eq!(on, off);
+    if both.streamed > 0 {
+        let (up, down) = (both.upload_bytes - first.upload_bytes, both.download_bytes - first.download_bytes);
+        assert_eq!(both.stages - first.stages, 1, "{both:?}");
+        assert_eq!(both.cuts, 0, "{both:?}");
+        assert!(up <= 4 * n as u64 + seg, "the input crosses once: {up} {both:?}");
+        assert!(down <= 4 * n as u64 + seg, "the retained output crosses once: {down} {both:?}");
+    }
+}
