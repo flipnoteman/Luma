@@ -30,6 +30,7 @@ pub(crate) mod lu;
 pub(crate) mod svd;
 pub(crate) mod qr;
 pub(crate) mod refine;
+pub(crate) mod route;
 pub(crate) mod tri;
 pub(crate) mod trsv;
 pub(crate) mod tsqr;

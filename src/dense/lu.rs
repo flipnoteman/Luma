@@ -1076,6 +1076,9 @@ impl Array<f32> {
     #[track_caller]
     pub fn solve(&self, b: &Array<f32>) -> Array<f32> {
         let loc = Location::caller();
+        if self.has_props() && let Some(routed) = self.route_solve(b, loc) {
+            return routed;
+        }
         match Dims::of(self) {
             Ok(d) if d.rows == d.cols => solve_with(&factor(self, "solve", loc), b, "solve", loc),
             Ok(d) if d.rows > d.cols => super::qr::Qr::lstsq(&self.qr(), b),
@@ -1110,6 +1113,9 @@ impl Array<f32> {
     #[track_caller]
     pub fn det(&self) -> Array<f32> {
         let loc = Location::caller();
+        if self.has_props() && let Some(routed) = self.route_det(loc) {
+            return routed;
+        }
         match Dims::square(self) {
             Ok(_) => {
                 let (sign, logabs) = slogdet_of(&factor(self, "det", loc), "det", loc);

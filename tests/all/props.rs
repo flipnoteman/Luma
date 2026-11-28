@@ -291,3 +291,153 @@ fn a_clone_written_through_does_not_leave_a_stale_property_on_the_original() {
     none(&valid);
     none(&twin);
 }
+
+// -- Routing --
+
+use luma::{solve_tridiagonal, Context, ContextOptions, Numerics, Triangle};
+
+fn ctx_with(numerics: Numerics) -> Context {
+    Context::with_options(ContextOptions::from_env().numerics(numerics)).unwrap()
+}
+
+fn on(ctx: &Context, data: &[f32], dims: impl Into<luma::Shape>) -> Array<f32> {
+    Array::from_slice_on(ctx, data, dims).unwrap()
+}
+
+fn bits(a: &Array<f32>) -> Vec<u32> {
+    a.to_vec().unwrap().iter().map(|x| x.to_bits()).collect()
+}
+
+fn dominant_tridiagonal(ctx: &Context, n: usize) -> (Array<f32>, [Array<f32>; 3]) {
+    let main: Vec<f32> = (0..n).map(|i| 4.0 + (i % 3) as f32).collect();
+    let sub: Vec<f32> = (0..n - 1).map(|i| 1.0 - (i % 4) as f32 * 0.25).collect();
+    let sup: Vec<f32> = (0..n - 1).map(|i| 0.5 + (i % 5) as f32 * 0.125).collect();
+    let (main, sub, sup) = (on(ctx, &main, [n, 1]), on(ctx, &sub, [n - 1, 1]), on(ctx, &sup, [n - 1, 1]));
+    // `diag(1)` is the entry below the diagonal of a row, `diag(-1)` the one above it (see `crate::props`).
+    let a = Array::from_diagonals(&[(0, &main), (1, &sub), (-1, &sup)]);
+    (a, [main, sub, sup])
+}
+
+#[test]
+fn from_diagonals_builds_the_band_it_says() {
+    let ctx = ctx_with(Numerics::strict());
+    let (a, _) = dominant_tridiagonal(&ctx, 7);
+    has(&a, &["BANDED", "band=(1,1)"]);
+    lacks(&a, &["LOWER", "UPPER", "DIAGONAL"]);
+    let v = a.to_vec().unwrap();
+    for r in 0usize..7 {
+        for c in 0..7 {
+            if r.abs_diff(c) > 1 {
+                assert_eq!(v[r * 7 + c], 0.0);
+            }
+        }
+    }
+    let wrong = Array::from_diagonals(&[(0, &on(&ctx, &[1.0; 4], [4, 1])), (1, &on(&ctx, &[1.0; 4], [4, 1]))]);
+    assert!(wrong.to_vec().is_err(), "sizes 4 and 5 do not fit one matrix");
+}
+
+#[test]
+fn solve_banded_runs_the_tridiagonal_solver_and_agrees_with_the_dense_solve() {
+    for numerics in [Numerics::strict(), Numerics::default(), Numerics::algebraic()] {
+        let ctx = ctx_with(numerics);
+        for (n, k) in [(9usize, 1usize), (64, 1), (64, 5)] {
+            let (a, [main, sub, sup]) = dominant_tridiagonal(&ctx, n);
+            let data: Vec<f32> = (0..n * k).map(|i| ((i * 7 % 11) as f32) - 5.0).collect();
+            let b = on(&ctx, &data, [k, n]);
+            let x = a.solve_banded(&b);
+            // The line solver called directly on the same diagonals.
+            let pad = |v: &Array<f32>, front: bool| {
+                let mut host = v.to_vec().unwrap();
+                if front { host.insert(0, 0.0) } else { host.push(0.0) }
+                on(&ctx, &host, [1, n]).broadcast_to([k, n])
+            };
+            let (lo, up) = (pad(&sub, true), pad(&sup, false));
+            let diag = on(&ctx, &main.to_vec().unwrap(), [1, n]).broadcast_to([k, n]);
+            let direct = solve_tridiagonal(1, &lo, &diag, &up, &b);
+            assert_eq!(bits(&x), bits(&direct), "n = {n}, k = {k}");
+            // The dense solve, on the evaluated matrix (which carries no property): `solve` never routes a band.
+            let dense = a.cache().solve(&b);
+            let (xs, ds) = (x.to_vec().unwrap(), dense.to_vec().unwrap());
+            for (x, d) in xs.iter().zip(&ds) {
+                assert!((x - d).abs() <= 1e-3 * (1.0 + d.abs()), "n = {n}: {x} vs {d}");
+            }
+            assert_eq!(bits(&a.solve(&b)), bits(&a.cache().solve(&b)), "solve on a band is the dense path, whatever the numerics");
+        }
+    }
+}
+
+#[test]
+fn solve_banded_without_a_band_is_an_error_and_a_wide_band_is_the_dense_solve() {
+    let ctx = ctx_with(Numerics::strict());
+    let data: Vec<f32> = (0..16).map(|i| if i % 5 == 0 { 8.0 } else { 1.0 }).collect();
+    let a = on(&ctx, &data, [4, 4]);
+    let b = on(&ctx, &[1.0, 2.0, 3.0, 4.0], 4);
+    assert!(a.solve_banded(&b).to_vec().is_err());
+    let main = on(&ctx, &[9.0; 6], [6, 1]);
+    let one = on(&ctx, &[1.0; 5], [5, 1]);
+    let two = on(&ctx, &[0.5; 4], [4, 1]);
+    let wide = Array::from_diagonals(&[(0, &main), (1, &one), (-1, &one), (2, &two), (-2, &two)]);
+    has(&wide, &["band=(2,2)"]);
+    let rhs = on(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 6);
+    assert_eq!(bits(&wide.solve_banded(&rhs)), bits(&wide.cache().solve(&rhs)));
+}
+
+#[test]
+fn triangular_and_diagonal_solves_route_only_under_reformulate() {
+    let n = 9;
+    let off = ctx_with(Numerics::default());
+    let on_ = ctx_with(Numerics::algebraic());
+    let raw: Vec<f32> = (0..n * n).map(|i| if i % (n + 1) == 0 { 6.0 } else { 0.3 + (i % 5) as f32 * 0.1 }).collect();
+    let rhs: Vec<f32> = (0..n * 3).map(|i| (i % 7) as f32 - 3.0).collect();
+    for (name, triangle) in [("lower", Triangle::Lower), ("upper", Triangle::Upper)] {
+        for ctx in [&off, &on_] {
+            let full = on(ctx, &raw, [n, n]);
+            let b = on(ctx, &rhs, [3, n]);
+            // `Array::lower` keeps the entries of an upper triangle of the dense routines (see `crate::props`).
+            let a = if name == "lower" { full.upper(false) } else { full.lower(false) };
+            let routed = a.solve(&b);
+            let dense = a.cache().solve(&b);
+            if ctx.numerics().reformulate {
+                let reference = a.cache().solve_triangular(&b, triangle, false, false);
+                assert_eq!(bits(&routed), bits(&reference), "{name}: routed to solve_triangular");
+            } else {
+                assert_eq!(bits(&routed), bits(&dense), "{name}: the dense path without reformulate");
+            }
+            let (x, d) = (routed.to_vec().unwrap(), dense.to_vec().unwrap());
+            for (x, d) in x.iter().zip(&d) {
+                assert!((x - d).abs() <= 1e-3 * (1.0 + d.abs()), "{name}: {x} vs {d}");
+            }
+        }
+    }
+    // Diagonal.
+    let v: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+    for ctx in [&off, &on_] {
+        let a = on(ctx, &v, [n, 1]).diag_matrix(0);
+        let b = on(ctx, &rhs, [3, n]);
+        let x = a.solve(&b).to_vec().unwrap();
+        for r in 0..n {
+            for c in 0..3 {
+                let want = rhs[r * 3 + c] / v[r];
+                assert!((x[r * 3 + c] - want).abs() <= 1e-5 * (1.0 + want.abs()), "diagonal solve ({r}, {c})");
+            }
+        }
+    }
+    // A vector right-hand side.
+    let a = on(&on_, &v, [n, 1]).diag_matrix(0);
+    let b = on(&on_, &v, n);
+    let x = a.solve(&b);
+    assert_eq!(x.shape().dims(), [n, 1, 1, 1]);
+    assert!(x.to_vec().unwrap().iter().all(|&x| (x - 1.0).abs() < 1e-6));
+}
+
+#[test]
+fn the_determinant_of_a_triangle_is_the_product_of_its_diagonal() {
+    let n = 6;
+    let ctx = ctx_with(Numerics::algebraic());
+    let raw: Vec<f32> = (0..n * n).map(|i| if i % (n + 1) == 0 { 1.5 } else { 0.25 }).collect();
+    let a = on(&ctx, &raw, [n, n]).lower(false);
+    let det = a.det().to_vec().unwrap()[0];
+    assert!((det - 1.5f32.powi(n as i32)).abs() < 1e-4, "{det}");
+    let reference = a.cache().det().to_vec().unwrap()[0];
+    assert!((det - reference).abs() < 1e-3 * reference.abs());
+}
