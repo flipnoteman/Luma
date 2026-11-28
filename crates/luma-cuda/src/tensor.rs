@@ -35,6 +35,10 @@ pub(crate) struct Config {
     pub group: u32,
     /// How the copies guard the edges of the matrices.
     pub mode: Mode,
+    /// A half-work product of a matrix with itself (square tiles): grid `[T (T + 1) / 2, 1, 1]`, workgroup `w` the tile `(ty, tx)`,
+    /// `tx <= ty`, of `luma_core::triangle_tile`. The epilogue stores the lower triangle of the output as the full kernel computes it
+    /// and its transpose above, so the output is bit-symmetric.
+    pub half: bool,
 }
 
 impl Config {
@@ -47,7 +51,7 @@ impl Config {
         // Two stages of the big tile fit two workgroups in a multiprocessor (38 KB each), which hides
         // more latency than a third stage: 32.2 TFLOP/s against 29.1 at 4096^3 on an RTX 3090.
         let stages = if spec.rows * spec.cols >= 128 * 128 { 2 } else { 4 };
-        Config { bm: spec.rows, bn: spec.cols, wm, wn, stages, bk: 16, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, mode: Mode::of(spec.lanes) }
+        Config { bm: spec.rows, bn: spec.cols, wm, wn, stages, bk: 16, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, mode: Mode::of(spec.lanes), half: spec.half }
     }
 
     pub(crate) fn threads(&self) -> u32 {
@@ -84,7 +88,8 @@ impl Config {
 
 /// The PTX of the kernel `main` for `config`.
 pub(crate) fn ptx(config: &Config) -> String {
-    let Config { bm, bn, wm, wn, stages, bk, lhs_t, rhs_t, group, mode } = *config;
+    let Config { bm, bn, wm, wn, stages, bk, lhs_t, rhs_t, group, mode, half } = *config;
+    assert!(!half || bm == bn, "a half-work product has square tiles");
     let threads = config.threads();
     let (warp_rows, warp_cols) = (bm / wm, bn / wn);
     let (mt, nt) = (warp_rows / 16, warp_cols / 8);
@@ -128,7 +133,32 @@ pub(crate) fn ptx(config: &Config) -> String {
     // Warp position: warp = wm_i * wn + wn_i.
     p!(w, "div.u32 %r9, %r6, {wn};");
     p!(w, "rem.u32 %r10, %r6, {wn};");
-    if group == 0 {
+    if half {
+        // Workgroup `w` is the tile `(ty, tx)` of the lower triangle of tiles: `ty = floor((sqrt(8 w + 1) - 1) / 2)` corrected in
+        // integers, `tx = w - ty (ty + 1) / 2` (the float root is exact only below 2^24).
+        p!(w, "mov.u32 %r27, %ctaid.x;");
+        p!(w, "cvt.rn.f32.u32 %f0, %r27;");
+        p!(w, "fma.rn.f32 %f0, %f0, 0f41000000, 0f3F800000;"); // 8 w + 1
+        p!(w, "sqrt.rn.f32 %f0, %f0;");
+        p!(w, "sub.f32 %f0, %f0, 0f3F800000;");
+        p!(w, "mul.f32 %f0, %f0, 0f3F000000;");
+        p!(w, "cvt.rzi.u32.f32 %r25, %f0;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "mul.lo.u32 %r29, %r25, %r28;");
+        p!(w, "shr.u32 %r29, %r29, 1;"); // ty (ty + 1) / 2
+        p!(w, "setp.gt.u32 %p14, %r29, %r27;");
+        p!(w, "@%p14 sub.u32 %r25, %r25, 1;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "add.u32 %r30, %r25, 2;");
+        p!(w, "mul.lo.u32 %r30, %r28, %r30;");
+        p!(w, "shr.u32 %r30, %r30, 1;"); // (ty + 1) (ty + 2) / 2
+        p!(w, "setp.le.u32 %p14, %r30, %r27;");
+        p!(w, "@%p14 add.u32 %r25, %r25, 1;");
+        p!(w, "add.u32 %r28, %r25, 1;");
+        p!(w, "mul.lo.u32 %r29, %r25, %r28;");
+        p!(w, "shr.u32 %r29, %r29, 1;");
+        p!(w, "sub.u32 %r26, %r27, %r29;");
+    } else if group == 0 {
         p!(w, "mov.u32 %r25, %ctaid.y;");
         p!(w, "mov.u32 %r26, %ctaid.x;");
     } else {
@@ -378,6 +408,43 @@ pub(crate) fn ptx(config: &Config) -> String {
     p!(w, "add.u32 %r28, %r28, %r12;");
     p!(w, "shl.b32 %r29, %r8, 1;");
     p!(w, "add.u32 %r28, %r28, %r29;"); // col of fragment (0,0)
+    if half {
+        // Element by element: the elements of the lower triangle (of the matrix, so of a diagonal tile too) at `C[row * n + col]`,
+        // and those below the diagonal, or any of an off-diagonal tile, also at `C[col * n + row]`. A diagonal tile's upper triangle
+        // is never stored: the product of the tensor cores is not assumed to be symmetric inside a tile.
+        p!(w, "setp.ne.u32 %p7, %r11, %r12;");
+        for i in 0..mt {
+            for h in 0..2u32 {
+                p!(w, "add.u32 %r30, %r27, {};", i * 16 + h * 8);
+                p!(w, "setp.lt.u32 %p4, %r30, %r0;");
+                for j in 0..nt {
+                    for e in 0..2u32 {
+                        let c = (i * nt + j) * 4 + h * 2 + e;
+                        p!(w, "add.u32 %r32, %r28, {};", j * 8 + e);
+                        p!(w, "setp.lt.u32 %p5, %r32, %r1;");
+                        p!(w, "and.pred %p5, %p5, %p4;");
+                        p!(w, "setp.ge.u32 %p8, %r30, %r32;");
+                        p!(w, "setp.gt.u32 %p9, %r30, %r32;");
+                        p!(w, "or.pred %p8, %p8, %p7;");
+                        p!(w, "or.pred %p9, %p9, %p7;");
+                        p!(w, "and.pred %p8, %p8, %p5;");
+                        p!(w, "and.pred %p9, %p9, %p5;");
+                        p!(w, "mad.lo.u32 %r31, %r30, %r1, %r32;");
+                        p!(w, "mad.lo.u32 %r33, %r32, %r1, %r30;");
+                        p!(w, "mul.wide.u32 %rd5, %r31, 4;");
+                        p!(w, "mul.wide.u32 %rd6, %r33, 4;");
+                        p!(w, "add.u64 %rd5, %rd5, %rd0;");
+                        p!(w, "add.u64 %rd6, %rd6, %rd0;");
+                        p!(w, "@%p8 st.global.f32 [%rd5], %c{c};");
+                        p!(w, "@%p9 st.global.f32 [%rd6], %c{c};");
+                    }
+                }
+            }
+        }
+        p!(w, "ret;");
+        w.text.push_str("}\n");
+        return w.text;
+    }
     if mode.guarded() {
         // Pairs are stored as `v2` only where `n` is even (the row starts 8-byte aligned).
         p!(w, "and.b32 %r35, %r1, 1;");
@@ -423,6 +490,11 @@ mod tests {
                     let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false).with_lanes(lanes));
                     let text = ptx(&config);
                     assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
+                    if rows == cols {
+                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false).with_lanes(lanes).with_half()));
+                        assert!(half.contains("sqrt.rn.f32") && half.contains("st.global.f32 [%rd6]") && half.trim_end().ends_with('}'), "{rows}x{cols}");
+                        assert_eq!(half.matches("mma.sync").count(), text.matches("mma.sync").count(), "{rows}x{cols}");
+                    }
                     let (warp_rows, warp_cols) = (rows / config.wm, cols / config.wn);
                     // One mma per fragment pair of each of the two k steps of a stage.
                     let expected = (warp_rows / 16) * (warp_cols / 8) * (config.bk / 8);

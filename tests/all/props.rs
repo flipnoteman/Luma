@@ -705,3 +705,29 @@ fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
     }
     assert!(!syrk(&plain), "{plain:?}");
 }
+
+/// The same under the default numerics (TF32 on the tensor cores): bit-symmetric, and the lower triangle is the full product's where
+/// that product does not split K (a short K); within TF32 rounding otherwise.
+#[test]
+fn a_tf32_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products() {
+    let ctx = ctx_with(Numerics::default());
+    for (rows, cols) in [(200usize, 133usize), (256, 1024), (2048, 640), (96, 64), (256, 4097)] {
+        let data = gram_data(rows * cols, cols + 5);
+        let x = on(&ctx, &data, [cols, rows]);
+        let copy = on(&ctx, &data, [cols, rows]);
+        ctx.record_decisions(true);
+        let (g, f) = (x.matmul_tn(&x).to_vec().unwrap(), x.matmul_tn(&copy).to_vec().unwrap());
+        let ran = ctx.take_decisions().iter().any(|d| d.chosen.contains("syrk"));
+        let n = cols;
+        for r in 0..n {
+            for c in 0..=r {
+                assert_eq!(g[r * n + c].to_bits(), g[c * n + r].to_bits(), "{rows}x{cols}: ({r}, {c}) is not symmetric");
+                if ran && rows <= 256 {
+                    assert_eq!(g[r * n + c].to_bits(), f[r * n + c].to_bits(), "{rows}x{cols}: ({r}, {c}) differs from the full product");
+                } else {
+                    assert!((g[r * n + c] - f[r * n + c]).abs() <= 2e-3 * (1.0 + f[r * n + c].abs()), "{rows}x{cols}: ({r}, {c}) is {} against {}", g[r * n + c], f[r * n + c]);
+                }
+            }
+        }
+    }
+}

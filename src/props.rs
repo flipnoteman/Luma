@@ -313,9 +313,9 @@ impl crate::array::Array<f32> {
                     ones += usize::from(v == 1.0);
                     if props.has(Props::SYMMETRIC) && m == n && c < r {
                         let w = at(c, r);
-                        // Bit-equal when the symmetric half-work product ran; a few ulps otherwise (the full kernel's two
-                        // triangles may differ in the last bits on tensor cores).
-                        assert!((v - w).abs() <= 8.0 * f32::EPSILON * v.abs().max(w.abs()), "matrix property claim {label} is false: entries ({r}, {c}) and ({c}, {r}) are {v} and {w}");
+                        // Bit-equal: the half-work product mirrors its lower triangle, and the full kernels' two triangles are
+                        // bit-equal on the `f32` paths.
+                        assert!(v.to_bits() == w.to_bits() || (v.is_nan() && w.is_nan()), "matrix property claim {label} is false: entries ({r}, {c}) and ({c}, {r}) are {v} and {w}");
                     }
                 }
                 assert!(!props.has(Props::PERMUTATION) || ones == 1 || n == 0, "matrix property claim {label} is false: row {r} has {ones} ones");
