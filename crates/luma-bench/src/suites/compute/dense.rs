@@ -269,7 +269,7 @@ fn rules(h: &mut Harness) {
 
 pub fn run(h: &mut Harness) {
     h.guarded("einsum", einsum_rows);
-    h.guarded("dense", rules);
+    h.guarded("rules", rules);
     h.guarded("dense", general);
     h.guarded("dense", launches);
     h.guarded("dense", refined);

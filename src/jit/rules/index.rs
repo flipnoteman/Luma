@@ -346,7 +346,7 @@ fn contract_diag(form: &Comprehension, _: &Numerics) -> Option<Comprehension> {
 /// test of the operands' sources on every eager product cost 1.6% of the host time of `launchcost/matmul32`.
 #[inline(always)]
 pub(crate) fn needs_t1(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> bool {
-    ctx.jit().rules.t1_active && (lhs.shape().dims()[0] == 1 || lhs.has_props() || rhs.has_props())
+    (lhs.has_props() || rhs.has_props() || lhs.shape().dims()[0] == 1) && ctx.jit().rules.t1_active
 }
 
 /// What the rules of tier 1 make of a product that [`needs_t1`].
