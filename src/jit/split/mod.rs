@@ -87,6 +87,8 @@ pub struct StreamStats {
     pub transient_bytes_elided: u64,
     /// Arrays that were transients.
     pub transients: u64,
+    /// Steps whose strategy the re-selection hook replaced because their stage did not fit.
+    pub reselections: u64,
     /// Bytes brought from host memory to the device while schedules ran (every cause: a stage's inputs, evicted segments used again).
     pub upload_bytes: u64,
     /// Bytes moved from the device to host memory while schedules ran (evictions).
@@ -110,6 +112,7 @@ pub(crate) struct StreamCounters {
     slabs: AtomicU64,
     transient_bytes_elided: AtomicU64,
     transients: AtomicU64,
+    reselections: AtomicU64,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
     pub(super) ring_bytes_peak: AtomicU64,
@@ -128,6 +131,7 @@ impl StreamCounters {
             slabs: get(&self.slabs),
             transient_bytes_elided: get(&self.transient_bytes_elided),
             transients: get(&self.transients),
+            reselections: get(&self.reselections),
             upload_bytes: get(&self.upload_bytes),
             download_bytes: get(&self.download_bytes),
             ring_bytes_peak: get(&self.ring_bytes_peak),
@@ -222,6 +226,8 @@ pub(crate) struct Step {
     pub(crate) n_out: usize,
     pub(crate) scalars: Box<[u32]>,
     pub(crate) shifted: Option<Shifted>,
+    /// Whether the re-selection hook already replaced this step's strategy (at most once per step and commit, see `plan::reselect`).
+    pub(crate) reselected: bool,
 }
 
 /// What a schedule knows of an array: its segments, not the `Storage` (a temporary whose handles are all dropped still has its data,
@@ -357,7 +363,7 @@ impl Schedule {
         }
         let open = lock(&self.open).take();
         let result = match open {
-            Some(open) if !open.steps.is_empty() => self.execute(&open),
+            Some(mut open) if !open.steps.is_empty() => self.execute(&mut open),
             _ => Ok(()),
         };
         let shared = result.map_err(Arc::new);
@@ -372,7 +378,7 @@ impl Schedule {
         self.commit()
     }
 
-    fn execute(&self, open: &Open) -> Result<(), LumaError> {
+    fn execute(&self, open: &mut Open) -> Result<(), LumaError> {
         struct Executing(u64);
         impl Drop for Executing {
             fn drop(&mut self) {
@@ -553,6 +559,7 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
         n_out: outputs.len(),
         scalars: scalars.into_boxed_slice(),
         shifted,
+        reselected: false,
     };
     defer(ctx, step, outputs, inputs, &reaches, &in_place, first.segment_count(), (name, location))
 }

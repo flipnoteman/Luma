@@ -150,3 +150,134 @@ fn float_reductions_do_not_depend_on_the_chunk_size() {
     let exact: f64 = data.iter().map(|&v| f64::from(v)).sum();
     assert!((f64::from(seen[0].0) - exact).abs() <= exact.abs() * 1e-4 + 1.0, "{} against {exact}", seen[0].0);
 }
+
+// -- re-selection (D9) --
+
+use crate::array::Failure;
+use crate::caps::Caps;
+use crate::jit::structured::emit::Emit;
+use crate::jit::structured::strategy::{BitClass, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, ReduceParams, PassMode, ResClass, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+
+fn fits_device(_: &Subject<'_>, _: &Context, res: &Residencies) -> Option<Params> {
+    (res.class == ResClass::Device).then_some(Params::Reduce(ReduceParams { pass: PassMode::Auto, groups: 1 }))
+}
+
+fn fits_streamed(_: &Subject<'_>, _: &Context, res: &Residencies) -> Option<Params> {
+    (res.class == ResClass::Streamed).then_some(Params::Reduce(ReduceParams { pass: PassMode::Auto, groups: 1 }))
+}
+
+fn split_global(_: &Subject<'_>, _: &Params) -> SplitClass {
+    SplitClass::Global
+}
+
+fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
+    Ok(Warm { kernels: Vec::new() })
+}
+
+/// The one value the test family's second strategy makes.
+fn lower_forty_two(_: &Subject<'_>, _: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let made = Array::<f32>::from_slice_on(emit.ctx(), &[42.0], 1)?;
+    Ok(Lowered::Done(Output::Storage(Arc::clone(made.storage()?))))
+}
+
+const fn test_entry(at: u8, name: &'static str, fits: crate::jit::structured::strategy::FitsFn) -> Strategy {
+    Strategy {
+        id: StrategyId(FamilyTag::Reduce, at),
+        name,
+        needs: Caps::empty(),
+        numerics: NumClass::Exact,
+        bits: BitClass(at as u16),
+        baseline: true,
+        group: at,
+        prologue: false,
+        epilogue: false,
+        reads: FitsInputs::NONE,
+        fits,
+        cost: None,
+        split: split_global,
+        warm: no_warm,
+        lower: Some(lower_forty_two),
+    }
+}
+
+/// A family of two strategies: the first admits resident operands only, the second admits streamed ones.
+static TEST_FAMILY: [Strategy; 2] = [test_entry(100, "test-resident", fits_device), test_entry(101, "test-streamed", fits_streamed)];
+
+#[test]
+fn reselection_happens_at_most_once() {
+    let _serial = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ctx = blocks_context(1024);
+    let n = 5 * 256;
+    let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
+    let id = ctx.id();
+    super::plan::INFEASIBLE.store(id, Ordering::Relaxed);
+    *super::plan::TEST_ENTRIES.lock().unwrap() = Some((id, &TEST_FAMILY));
+    // The stage of the reduction never fits: the hook replaces its strategy by the one that admits streamed operands, once, and the
+    // stages formed again still do not fit but the step is not asked again.
+    let sum = x.sum();
+    let evaluated = sum.eval();
+    let values = sum.to_vec();
+    super::plan::INFEASIBLE.store(0, Ordering::Relaxed);
+    *super::plan::TEST_ENTRIES.lock().unwrap() = None;
+    evaluated.unwrap();
+    assert_eq!(values.unwrap(), vec![42.0f32]);
+    assert_eq!(ctx.stream_stats().reselections, 1, "{:?}", ctx.stream_stats());
+    // A context that is not asked to fail is not touched.
+    let other = blocks_context(1024);
+    let y = Array::from_slice_on(&other, &vec![1.0f32; n], n).unwrap();
+    assert_eq!(y.sum().to_vec().unwrap(), vec![n as f32]);
+    assert_eq!(other.stream_stats().reselections, 0);
+}
+
+/// Slab order the stages visit (0: the planner's), set by one test at a time.
+pub(super) static FORCE_ORDER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[test]
+fn float_reductions_do_not_depend_on_slab_order() {
+    let _serial = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Segments of 2^16 elements: 6 slabs, blocks of 2^16, and orders a ring would never choose.
+    let n = 6 * (1 << 16) - 777;
+    let data = float_data(n);
+    let mut seen: Vec<Vec<u32>> = Vec::new();
+    for order in [0u8, 1, 2, 3] {
+        FORCE_ORDER.store(order, Ordering::Relaxed);
+        let ctx = blocks_context(1 << 18);
+        let x = Array::from_slice_on(&ctx, &data, n).unwrap();
+        let y = &x * 2.0;
+        let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let mut all = bits(x.reduce([crate::Reduction::Sum, crate::Reduction::Max, crate::Reduction::SumOfSquares]).to_vec().unwrap());
+        all.extend(bits(y.reduce([crate::Reduction::Sum]).to_vec().unwrap()));
+        seen.push(all);
+        assert!(ctx.stream_stats().stages >= 2, "{:?}", ctx.stream_stats());
+    }
+    FORCE_ORDER.store(0, Ordering::Relaxed);
+    assert!(seen.iter().all(|bits| *bits == seen[0]), "{seen:?}");
+}
+
+#[test]
+fn integer_reductions_are_unchanged_by_deferral() {
+    let n = 5 * 256 + 17;
+    let data: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    let mut results = Vec::new();
+    for mode in [SplitMode::Off, SplitMode::Auto] {
+        let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(mode)).expect("a device is available");
+        let x = Array::from_slice_on(&ctx, &data, n).unwrap();
+        results.push((x.sum().item().unwrap(), x.max().item().unwrap(), x.min().item().unwrap()));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn a_single_segment_reduction_keeps_its_bits() {
+    let n = 3000;
+    let data = float_data(n);
+    let mut results = Vec::new();
+    for mode in [SplitMode::Off, SplitMode::Auto] {
+        let ctx = Context::with_options(ContextOptions::from_env().split(mode)).expect("a device is available");
+        let x = Array::from_slice_on(&ctx, &data, n).unwrap();
+        let reduced = x.reduce([crate::Reduction::Sum, crate::Reduction::SumOfSquares]).to_vec().unwrap();
+        results.push((x.sum().item().unwrap().to_bits(), x.norm().item().unwrap().to_bits(), reduced.iter().map(|v| v.to_bits()).collect::<Vec<_>>()));
+        assert_eq!(ctx.stream_stats().stages, 0);
+    }
+    assert_eq!(results[0], results[1]);
+}

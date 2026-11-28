@@ -58,11 +58,12 @@ impl Future {
     }
 }
 
-pub(super) fn run(ctx: &Context, open: &Open) -> Result<(), LumaError> {
+pub(super) fn run(ctx: &Context, open: &mut Open) -> Result<(), LumaError> {
     let stats = ctx.stream_counters();
     stats.schedules.fetch_add(1, Ordering::Relaxed);
     stats.steps.fetch_add(open.steps.len() as u64, Ordering::Relaxed);
-    let stages = fit(ctx, open, compile(open))?;
+    let stages = fit(ctx, open, compile(ctx, open))?;
+    let open: &Open = open;
     let future = ctx.pager().budget().is_some().then(|| Future::new(open, &stages));
     let (up, down) = ctx.pager().traffic();
     let mut slabs = 0;
@@ -108,8 +109,9 @@ fn fit(ctx: &Context, open: &Open, stages: Vec<Stage>) -> Result<Vec<Stage>, Lum
     let mut work: std::collections::VecDeque<Stage> = stages.into();
     let mut fitted = Vec::with_capacity(work.len());
     while let Some(stage) = work.pop_front() {
+        // A step the registry re-selected runs whole (`run_relowered`), outside the slab loop: no floor applies to it.
         let floor = floor_bytes(open, &stage);
-        if floor <= budget {
+        if floor <= budget || matches!(open.steps[stage.steps.start].kernel, StepKernel::Relowered) {
             fitted.push(stage);
             continue;
         }
@@ -198,6 +200,12 @@ pub(super) fn launch_steps(ctx: &Context, steps: &[Step], bound: &[Bound<'_>], s
 fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Option<&Future>) -> Result<StageInfo, LumaError> {
     let stats = ctx.stream_counters();
     let steps = &open.steps[stage.steps.clone()];
+    if let [step] = steps
+        && matches!(step.kernel, StepKernel::Relowered)
+    {
+        stats.stages.fetch_add(1, Ordering::Relaxed);
+        return super::reduce::run_relowered(ctx, open, step);
+    }
 
     // What the stage streams through a ring instead of making resident (see `ring`).
     let next_stage = |array: u32| future.and_then(|future| future.stages_of[array as usize].iter().copied().find(|&s| s as usize > at)).map_or(u64::MAX, u64::from);
@@ -287,6 +295,13 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
 
 /// The slabs of `stage` in the order it visits them.
 fn slab_order(open: &Open, stage: &Stage, slabs: usize) -> Vec<usize> {
+    #[cfg(test)]
+    match super::tests::FORCE_ORDER.load(Ordering::Relaxed) {
+        1 => return (0..slabs).collect(),
+        2 => return (0..slabs).rev().collect(),
+        3 => return (0..slabs).filter(|slab| slab % 2 == 0).chain((0..slabs).filter(|slab| slab % 2 == 1)).collect(),
+        _ => {}
+    }
     if stage.order == SlabOrder::Ascending || slabs < 2 {
         return (0..slabs).collect();
     }

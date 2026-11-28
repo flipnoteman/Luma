@@ -2,7 +2,13 @@
 
 use std::sync::Arc;
 
-use super::{Access, Open, Reach, Space};
+use std::sync::atomic::Ordering;
+
+use super::{Access, Open, Origin, Reach, Space, Step, StepKernel};
+use crate::context::Context;
+use crate::jit::structured::select::select_in;
+use crate::jit::structured::strategy::{Residencies, SplitClass, Strategy, Subject};
+use crate::profile::{Decision, DecisionSite};
 
 /// How a stage visits its slabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,13 +47,100 @@ impl Stage {
 /// - it reads no array the stage wrote through anything but its own element (a halo, a whole buffer, data-dependent indices: those
 ///   edges are cut, which is the kernel-major behaviour for that edge only);
 /// - it writes no array a step of the stage read through such a reach (the neighbour slab would read the new value).
-pub(super) fn compile(open: &Open) -> Vec<Stage> {
+pub(super) fn compile(ctx: &Context, open: &mut Open) -> Vec<Stage> {
+    let mut stages = form(open);
+    // Re-selection (D9): a stage that cannot fit asks the registry for another strategy for each structured step in it, once per
+    // step; the stages are then formed again, because the class of a step decides which edges cut.
+    let mut changed = false;
+    for stage in &stages {
+        if fits(ctx, open, stage) {
+            continue;
+        }
+        for step in &mut open.steps[stage.steps.clone()] {
+            changed |= reselect(ctx, step);
+        }
+    }
+    if changed {
+        stages = form(open);
+    }
+    stages
+}
+
+/// Whether `stage` can run in one pass over its slabs: the floor of its device memory (one slab of every array it binds, see
+/// [`floor_bytes`]) is within the budget. The same signal as the cut of `run::fit`, which comes after: a stage below it re-selects
+/// first. Without a budget everything fits.
+fn fits(ctx: &Context, open: &Open, stage: &Stage) -> bool {
+    #[cfg(test)]
+    if INFEASIBLE.load(Ordering::Relaxed) == ctx.id() {
+        return false;
+    }
+    ctx.pager().budget().is_none_or(|budget| floor_bytes(open, stage) <= budget)
+}
+
+/// The context whose stages are infeasible (tests; 0: none).
+#[cfg(test)]
+pub(super) static INFEASIBLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The strategies re-selection chooses among on one context, instead of the family's table (tests).
+#[cfg(test)]
+pub(super) static TEST_ENTRIES: std::sync::Mutex<Option<(u64, &'static [Strategy])>> = std::sync::Mutex::new(None);
+
+/// The table re-selection looks in for `family` on `ctx`.
+pub(super) fn entries_for(ctx: &Context, family: crate::jit::structured::strategy::FamilyTag) -> &'static [Strategy] {
+    #[cfg(test)]
+    if let Some((id, entries)) = *TEST_ENTRIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        && id == ctx.id()
+    {
+        return entries;
+    }
+    let _ = ctx;
+    crate::jit::structured::strategy::table(family)
+}
+
+/// D9: asks `select` for a strategy of the step's family that admits streamed operands and differs from the current one, and puts
+/// it in the step's place: its `origin`, its `class`, and a kernel that runs the strategy whole when the stage is reached. At most
+/// once per step and commit. Only for a structured step of a registered value.
+fn reselect(ctx: &Context, step: &mut Step) -> bool {
+    let Origin::Structured { value: Some(value), strategy, params: _ } = &step.origin else { return false };
+    if step.reselected {
+        return false;
+    }
+    let family = strategy.family();
+    let entries = entries_for(ctx, family);
+    let subject = Subject::Comp(value);
+    let Some(selection) = select_in(entries, ctx, &subject, &Residencies::STREAMED, None) else { return false };
+    let current = *strategy;
+    let Some((id, chosen)) = std::iter::once((selection.id, selection.params)).chain(selection.rest.iter()).find(|&(id, _)| id != current) else { return false };
+    let Some(entry) = entries.iter().find(|entry| entry.id == id) else { return false };
+    let class = (entry.split)(&subject, &chosen);
+    let (op, location) = subject.site();
+    if ctx.jit().recording_decisions() {
+        ctx.jit().note_decision(Decision::new(op, location, DecisionSite::Schedule, format!("reselect {} instead of {}", entry.name, current_name(entries, current))));
+    }
+    ctx.stream_counters().reselections.fetch_add(1, Ordering::Relaxed);
+    step.origin = Origin::Structured { value: Some(std::sync::Arc::clone(value)), strategy: id, params: chosen };
+    step.class = class;
+    step.kernel = StepKernel::Relowered;
+    step.reselected = true;
+    true
+}
+
+fn current_name(entries: &[Strategy], id: crate::jit::structured::strategy::StrategyId) -> &'static str {
+    entries.iter().find(|entry| entry.id == id).map_or("canonical-blocks", |entry| entry.name)
+}
+
+/// The stages of the steps as they are (see [`compile`]).
+fn form(open: &Open) -> Vec<Stage> {
     let mut stages: Vec<Stage> = Vec::new();
     let mut written: Vec<bool> = vec![false; open.arrays.len()];
     let mut far_read: Vec<bool> = vec![false; open.arrays.len()];
     let mut start = 0;
     for (at, step) in open.steps.iter().enumerate() {
+        // A step run whole by its strategy (re-selection) is a stage of its own, and so is a step that needs the whole array.
+        let alone = |step: &Step| matches!(step.kernel, StepKernel::Relowered) || step.class == SplitClass::Global;
         let joins = at > start
+            && !alone(step)
+            && !alone(&open.steps[start])
             && step.space == open.steps[start].space
             && step.binds.iter().all(|bind| {
                 let array = bind.array as usize;

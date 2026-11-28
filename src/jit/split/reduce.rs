@@ -66,6 +66,7 @@ pub(crate) fn applies(ctx: &Context, float: bool, len: usize, layout: crate::gpu
 
 /// Records the canonical-block reduction `spec` of the elements of `fused` (or, when the expression is not fused, of the storage
 /// `storage()` returns) into `result` (one cell per op): in this thread's schedule when `deferred`, else it runs before this returns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     ctx: &Context,
     fused: Option<BlockSource>,
@@ -76,6 +77,7 @@ pub(crate) fn record(
     origin: Origin,
     writer: (&'static str, &'static std::panic::Location<'static>),
 ) -> Result<(), Failure> {
+    #[allow(clippy::type_complexity)]
     let (first, inputs, reaches, scalars, shifted, space, ops): (First, Vec<Arc<Storage>>, Vec<Reach>, Vec<u32>, _, Space, ReduceList);
     match fused {
         Some(source) => {
@@ -112,6 +114,7 @@ pub(crate) fn record(
         n_out: 1,
         scalars: scalars.into_boxed_slice(),
         shifted,
+        reselected: false,
     };
     let segments = space.slabs();
     let outputs = [&**result];
@@ -120,8 +123,28 @@ pub(crate) fn record(
     } else {
         let mut open = Open::private();
         open.push(step, &outputs, &inputs, &reaches, &|_| false, segments, writer, 0);
-        super::run::run(ctx, &open)?;
+        super::run::run(ctx, &mut open)?;
     }
+    Ok(())
+}
+
+/// Runs a step whose strategy the re-selection hook chose, whole: the strategy lowers the value as it does anywhere else and its
+/// values are copied into the step's result.
+pub(super) fn run_relowered(ctx: &Context, open: &Open, step: &Step) -> Result<(), LumaError> {
+    use crate::jit::structured::strategy::{Lowered, Output, Subject};
+    let Origin::Structured { value: Some(value), strategy, params } = &step.origin else { return Err(LumaError::Gpu("a re-selected step without its value".into())) };
+    let family = strategy.family();
+    let entries = super::plan::entries_for(ctx, family);
+    let lower = entries.iter().find(|entry| entry.id == *strategy).and_then(|entry| entry.lower).ok_or_else(|| LumaError::Gpu("a re-selected strategy that does not lower".into()))?;
+    let subject = Subject::Comp(value);
+    let mut emit = crate::jit::structured::emit::Emit::now(ctx);
+    let Lowered::Done(Output::Storage(made)) = lower(&subject, params, &mut emit).map_err(Failure::into_error)? else {
+        return Err(LumaError::Unsupported("the re-selected strategy declined".into()));
+    };
+    let out = open.arrays[step.binds[0].array as usize].as_seg(ctx);
+    let src = made.pin(0)?;
+    let dst = out.pin_overwrite(0)?;
+    ctx.copy(src.buffer(), 0, dst.buffer(), 0, out.segment_byte_len(0))?;
     Ok(())
 }
 
