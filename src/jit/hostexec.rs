@@ -68,7 +68,7 @@ impl HostExec {
         if (gpu.is_cpu() && !cfg!(test)) || !enabled() {
             return None;
         }
-        let cpu = Context::cpu().ok()?;
+        let cpu = Context::cpu_beside(gpu).ok()?;
         Some(HostExec { cpu, force: std::sync::atomic::AtomicBool::new(false), imports: AtomicU64::new(0), copied: AtomicU64::new(0), runs: AtomicU64::new(0) })
     }
 

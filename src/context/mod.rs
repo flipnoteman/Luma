@@ -101,6 +101,8 @@ struct Inner {
     stages: Mutex<Vec<luma_core::hal::Stage>>,
     /// The CPU context host strategies run on (see [`crate::jit::hostexec`]), opened by the first use.
     host_exec: OnceLock<Option<crate::jit::hostexec::HostExec>>,
+    /// Whether the cost model was calibrated (`ContextOptions::calibrate`): the host executor's CPU context follows it.
+    calibrated: bool,
     /// Report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     assume_busy: std::sync::atomic::AtomicBool,
     /// Report the GPU as idle regardless of the queue (see `Context::set_assume_idle`).
@@ -667,6 +669,11 @@ impl Context {
         Context::with_options(ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() })
     }
 
+    /// [`Context::cpu`] for the host executor: calibrated as `gpu` was, so a context with a pinned (fixed) cost model prices the host with the CPU preset.
+    pub(crate) fn cpu_beside(gpu: &Context) -> Result<Context> {
+        Context::with_options(ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, calibrate: gpu.inner.calibrated, ..ContextOptions::from_env() })
+    }
+
     /// Opens a device of the CUDA backend (NVIDIA GPUs).
     pub fn cuda() -> Result<Context> {
         Context::with_options(ContextOptions { backend: BackendKind::Cuda, ..ContextOptions::from_env() })
@@ -853,6 +860,7 @@ impl Context {
                 waits: WaitHistory::new(),
                 stages: Mutex::new(Vec::new()),
                 host_exec: OnceLock::new(),
+                calibrated: options.calibrate,
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
                 assume_idle: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
