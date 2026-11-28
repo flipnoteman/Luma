@@ -562,7 +562,7 @@ fn plan_shifts(
     len: usize,
 ) -> Result<Option<Shifted>, LumaError> {
     let layout = layout_elem(key, inputs, len);
-    let c = (ctx.segment_bytes() / layout) as usize;
+    let c = crate::array::segment_len_of_stride(ctx, layout as usize);
     // Arrays of different element sizes do not share a segmentation: they only run unsplit.
     let outs = if matches!(key.tail, Tail::Reduce(_)) { Vec::new() } else { out_elems(key) };
     let widest = inputs.iter().map(|input| input.layout().stride() as u64).chain(outs.iter().copied()).max().map_or(layout, |w| w.max(layout));
@@ -1114,6 +1114,10 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
         return Ok(vec![super::transpose::run(ctx, &plan, &inputs[0], len)?]);
     }
     if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len, origin.0, origin.1)? {
+        // Launched at once, over the buffer of the input it took over: a step deferred earlier that reads it must have run.
+        if let Some(buffer) = &reused {
+            split::commit_readers_of(ctx, buffer, false);
+        }
         return Ok(vec![super::transpose::run_fused(ctx, &plan, &inputs, len, reused)?]);
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
@@ -1138,7 +1142,12 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
         }
     };
     let refs: Vec<&Storage> = outputs.iter().collect();
-    if split::deferred(ctx, &key, &refs, &inputs) {
+    let defers = split::deferred(ctx, &key, &refs, &inputs);
+    if taken_over {
+        // A schedule's steps read buffers, not arrays: the takeover test above does not see them.
+        split::commit_readers_of(ctx, refs[0], defers);
+    }
+    if defers {
         let step = split::Recorded { core, key, outputs: &refs, inputs: &inputs, scalars, shifted, name: origin.0, location: origin.1 };
         split::record_store(ctx, step)?;
         return Ok(outputs);

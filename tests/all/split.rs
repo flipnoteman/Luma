@@ -385,7 +385,6 @@ fn an_infeasible_stage_falls_back_in_order() {
 /// A store into a multi-segment file array that is dropped before the schedule committed still reaches the file: a segment with a home
 /// is never a transient.
 #[test]
-#[ignore = "review bug 2 still open: dropping a homed storage must commit its planned segments first"]
 fn a_store_into_a_dropped_file_array_reaches_the_file() {
     let ctx = deferring();
     let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
@@ -395,8 +394,221 @@ fn a_store_into_a_dropped_file_array_reaches_the_file() {
     drop(target);
     let want: Vec<f32> = data().iter().map(|v| v * 2.0 + 1.0).collect();
     let bytes = std::fs::read(&path).unwrap();
-    let got: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let got: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.luma", path.display()));
     assert_eq!(got, want);
+}
+
+// -- review fixes (switch-on bugs) --
+
+const ROWS: usize = 8;
+const COLS: usize = 700;
+
+fn big_data() -> Vec<f32> {
+    (0..ROWS * COLS).map(|i| ((i * 29) % 97) as f32 * 0.25 - 3.0).collect()
+}
+
+fn row_data(k: usize) -> Vec<f32> {
+    (0..COLS).map(|i| ((i * 7 + k) % 13) as f32 * 0.5).collect()
+}
+
+fn broadcast_sum(row: &[f32]) -> Vec<f32> {
+    big_data().iter().enumerate().map(|(i, v)| v + row[i % COLS]).collect()
+}
+
+/// `big` has several segments, `s` one: a deferred `big + s` reads `s`, and `s * 2` takes `s`'s buffer over at once (it is not
+/// deferred: nothing it touches is streamed). The takeover must not run before the step that reads `s` did.
+fn takeover_while_a_step_reads(ctx: &Context, how: u8) {
+    let big = Array::from_slice_on(ctx, &big_data(), [COLS, ROWS]).unwrap();
+    let s = Array::from_slice_on(ctx, &row_data(1), [COLS, 1]).unwrap();
+    let y = &big + &s;
+    let t = s * 2.0;
+    let mut t_values = None;
+    match how {
+        // `y`'s step waits in the schedule (`eval_all` leaves it open); asking for `t` evaluates it at once, over `s`'s buffer.
+        0 => {
+            luma::eval_all(&[&y]).unwrap();
+            t_values = Some(t.to_vec().unwrap());
+        }
+        1 => luma::eval_all(&[&y, &t]).unwrap(),
+        2 => {
+            y.eval().unwrap();
+            t.eval().unwrap();
+            ctx.flush().unwrap();
+        }
+        _ => {
+            y.eval().unwrap();
+            ctx.flush().unwrap();
+            t.eval().unwrap();
+        }
+    }
+    assert_eq!(y.to_vec().unwrap(), broadcast_sum(&row_data(1)));
+    assert_eq!(t_values.unwrap_or_else(|| t.to_vec().unwrap()), row_data(1).iter().map(|v| v * 2.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_in_place_takeover_waits_for_a_deferred_step_that_reads_the_buffer() {
+    for how in 0..4 {
+        // A busy device postpones `eval`: the step waits in the schedule (on an idle one it would commit at once).
+        let busy = deferring();
+        busy.set_assume_busy(true);
+        takeover_while_a_step_reads(&busy, how);
+        let idle = deferring();
+        idle.set_assume_idle(true);
+        takeover_while_a_step_reads(&idle, how);
+        takeover_while_a_step_reads(&kernel_major(), how);
+    }
+}
+
+#[test]
+fn a_takeover_inside_the_deferring_schedule_keeps_the_step_order() {
+    // `x` is read by the first step and taken over by the second, both deferred into one schedule: no commit is needed in between.
+    let ctx = deferring();
+    let off = kernel_major();
+    let run = |ctx: &Context| {
+        let big = Array::from_slice_on(ctx, &data(), N).unwrap();
+        let x = Array::from_slice_on(ctx, &data(), N).unwrap();
+        let y = &big + &x;
+        let z = x * 3.0;
+        luma::eval_all(&[&y, &z]).unwrap();
+        (y.to_vec().unwrap(), z.to_vec().unwrap())
+    };
+    assert_eq!(run(&ctx), run(&off));
+}
+
+#[test]
+fn a_takeover_on_one_thread_commits_the_schedule_of_another() {
+    let ctx = deferring();
+    ctx.set_assume_busy(true);
+    let big = Array::from_slice_on(&ctx, &big_data(), [COLS, ROWS]).unwrap();
+    let s = Array::from_slice_on(&ctx, &row_data(2), [COLS, 1]).unwrap();
+    let y = &big + &s;
+    y.eval().unwrap();
+    // `y`'s step waits in this thread's schedule; the other thread takes `s` over.
+    let t = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let t = s * 2.0;
+                t.eval().unwrap();
+                t.to_vec().unwrap()
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(t, row_data(2).iter().map(|v| v * 2.0).collect::<Vec<_>>());
+    assert_eq!(y.to_vec().unwrap(), broadcast_sum(&row_data(2)));
+}
+
+/// Two threads defer, take over, and wait for each other's schedules: no deadlock, and every result is right.
+#[test]
+fn two_threads_settling_each_others_schedules_do_not_deadlock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let ctx = deferring();
+    ctx.set_assume_busy(true);
+    let big = Array::from_slice_on(&ctx, &big_data(), [COLS, ROWS]).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let (to_b, from_a) = mpsc::channel::<(Array<f32>, usize)>();
+        let (to_a, from_b) = mpsc::channel::<(Array<f32>, usize)>();
+        let (ctx, big) = (&ctx, &big);
+        let a_done = done_tx.clone();
+        scope.spawn(move || {
+            for k in 0..40 {
+                let s = Array::from_slice_on(ctx, &row_data(k), [COLS, 1]).unwrap();
+                let y = big + &s;
+                y.eval().unwrap();
+                let t = s * 2.0;
+                t.eval().unwrap();
+                assert_eq!(t.to_vec().unwrap(), row_data(k).iter().map(|v| v * 2.0).collect::<Vec<_>>());
+                to_b.send((y, k)).unwrap();
+                if let Ok((w, j)) = from_b.try_recv() {
+                    assert_eq!(w.to_vec().unwrap(), broadcast_sum(&row_data(j)).iter().map(|v| v + 1.0).collect::<Vec<_>>());
+                }
+            }
+            drop(to_b);
+            while let Ok((w, j)) = from_b.recv_timeout(Duration::from_secs(1)) {
+                assert_eq!(w.to_vec().unwrap(), broadcast_sum(&row_data(j)).iter().map(|v| v + 1.0).collect::<Vec<_>>());
+            }
+            a_done.send(()).unwrap();
+        });
+        scope.spawn(move || {
+            while let Ok((y, k)) = from_a.recv_timeout(Duration::from_secs(20)) {
+                let s = Array::from_slice_on(ctx, &row_data(k), [COLS, 1]).unwrap();
+                let w = &y + 1.0;
+                let u = &s + 1.0;
+                w.eval().unwrap();
+                u.eval().unwrap();
+                let _ = to_a.send((w, k));
+                assert_eq!(u.to_vec().unwrap(), row_data(k).iter().map(|v| v + 1.0).collect::<Vec<_>>());
+            }
+            done_tx.send(()).unwrap();
+        });
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(120)).expect("the threads finished (no deadlock)");
+        }
+    });
+}
+
+/// A homed array's transients are never taken from a file segment, and a chain over a tiny file array does not size them at a full
+/// segment (the budget below holds two segments and the chain needs more than one colour).
+#[test]
+fn a_chain_over_a_tiny_file_array_runs_in_a_small_budget() {
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).memory_budget(12 * 1024).split(SplitMode::Auto)).expect("a device is available");
+    let off = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).memory_budget(12 * 1024).split(SplitMode::Off)).expect("a device is available");
+    let path = std::env::temp_dir().join(format!("luma-split-test-{}-tiny", std::process::id()));
+    let xs: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+    let run = |ctx: &Context, suffix: &str| {
+        let path = path.with_extension(suffix);
+        let mut file = Array::<f32>::create_on(ctx, &path, 100, luma::FileOptions::raw()).unwrap();
+        file.write(&xs).unwrap();
+        let mut y = file.clone();
+        for k in 0..300 {
+            y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs() - (&y * 0.001);
+        }
+        let got = y.to_vec().unwrap();
+        drop((y, file));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.luma", path.display()));
+        got
+    };
+    assert_eq!(run(&ctx, "on"), run(&off, "off"));
+}
+
+#[test]
+fn reopening_a_file_array_with_a_store_pending_sees_the_store() {
+    let ctx = deferring();
+    let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
+    let path = std::env::temp_dir().join(format!("luma-split-test-{}-store-reopen", std::process::id()));
+    let mut target = Array::<f32>::create_on(&ctx, &path, N, luma::FileOptions::raw()).unwrap();
+    (&x * 2.0 + 1.0).store(&mut target).unwrap();
+    let want: Vec<f32> = data().iter().map(|v| v * 2.0 + 1.0).collect();
+    // While the array lives, a second open shares it.
+    let again = Array::<f32>::open_on(&ctx, &path, luma::FileOptions::raw().recover().writable()).unwrap();
+    assert_eq!(again.to_vec().unwrap(), want);
+    drop(again);
+    // After it is dropped, a new open reads the file the dropped array wrote.
+    (&x * 4.0).store(&mut target).unwrap();
+    drop(target);
+    let reopened = Array::<f32>::open_on(&ctx, &path, luma::FileOptions::raw().recover()).unwrap();
+    assert_eq!(reopened.to_vec().unwrap(), data().iter().map(|v| v * 4.0).collect::<Vec<_>>());
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.luma", path.display()));
+}
+
+/// The same through a store into a multi-segment array, which defers without committing by itself.
+#[test]
+fn an_in_place_takeover_waits_for_a_deferred_store_that_reads_the_buffer() {
+    for mode in [SplitMode::Auto, SplitMode::Segment] {
+        let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(4096).split(mode)).expect("a device is available");
+        let big = Array::from_slice_on(&ctx, &big_data(), [COLS, ROWS]).unwrap();
+        let s = Array::from_slice_on(&ctx, &row_data(1), [COLS, 1]).unwrap();
+        let mut target = Array::<f32>::zeros_on(&ctx, [COLS, ROWS]).unwrap();
+        (&big + &s).store(&mut target).unwrap();
+        let t = s * 2.0;
+        assert_eq!(t.to_vec().unwrap(), row_data(1).iter().map(|v| v * 2.0).collect::<Vec<_>>());
+        assert_eq!(target.to_vec().unwrap(), broadcast_sum(&row_data(1)));
+    }
 }

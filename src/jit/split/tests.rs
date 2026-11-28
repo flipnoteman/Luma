@@ -10,6 +10,9 @@ static FAIL_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) fn fail_here(slab: usize) -> bool {
+    if slab >= PANIC_AT.load(Ordering::Relaxed) {
+        panic!("injected panic");
+    }
     slab >= FAIL_AT.load(Ordering::Relaxed)
 }
 
@@ -280,4 +283,42 @@ fn a_single_segment_reduction_keeps_its_bits() {
         assert_eq!(ctx.stream_stats().stages, 0);
     }
     assert_eq!(results[0], results[1]);
+}
+
+// -- review fixes --
+
+/// Set while a test wants the next commit to panic (read by `fail_here`, which the executor calls per slab).
+static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+#[test]
+fn a_panic_inside_a_commit_poisons_the_outputs_and_wakes_waiters() {
+    let _serial = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(SplitMode::Auto)).expect("a device is available");
+    let n = 5 * 256 + 3;
+    let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
+    let y = &x * 2.0;
+    PANIC_AT.store(0, Ordering::Relaxed);
+    // The commit runs in `eval` (an idle device) or when the data is wanted: that call panics.
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| y.eval()));
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| y.to_vec().map(|_| ())));
+    PANIC_AT.store(usize::MAX, Ordering::Relaxed);
+    assert!(first.is_err() || second.is_err(), "the commit panicked");
+    // Whoever asks next gets an error, not a wait that never ends, and the context keeps working.
+    assert!(y.to_vec().is_err());
+    let waiter = std::thread::scope(|scope| scope.spawn(|| y.to_vec().is_err()).join().unwrap());
+    assert!(waiter);
+    let fresh = Array::from_slice_on(&ctx, &vec![3.0f32; n], n).unwrap();
+    assert_eq!((&fresh + 1.0).to_vec().unwrap(), vec![4.0f32; n]);
+}
+
+#[test]
+fn a_committed_schedule_leaves_the_threads_open_list() {
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(SplitMode::Auto)).expect("a device is available");
+    let n = 5 * 256 + 3;
+    let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
+    let y = &x * 2.0;
+    y.eval().unwrap();
+    let _ = y.to_vec().unwrap();
+    let held = super::OPEN.with(|all| all.borrow().0.len());
+    assert_eq!(held, 0, "a schedule that committed no longer holds its context");
 }

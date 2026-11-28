@@ -343,39 +343,81 @@ impl Schedule {
 
     /// Runs the schedule's steps if nobody has yet, and waits for the thread that is doing it. The error of a failed commit is
     /// returned to everyone who asks.
+    ///
+    /// Lock order: the context's lease comes before the `Committing` mark. A thread that runs steps holds the lease, so a schedule
+    /// that is `Committing` is always being run by a thread that holds it, and a thread that waits for such a schedule while it
+    /// holds the lease itself (the executor settling a segment of another schedule) finds it `Open` and runs it nested instead.
     pub(crate) fn commit(&self) -> Result<(), LumaError> {
         // The thread running the steps pins what they write: nothing to wait for.
         if EXECUTING.with(Cell::get) == self.id {
             return Ok(());
         }
-        {
-            let mut phase = lock(&self.phase);
-            loop {
-                match &*phase {
-                    Phase::Done(result) => return result.clone().map_err(|error| LumaError::clone(&error)),
-                    Phase::Committing => phase = self.done.wait(phase).unwrap_or_else(PoisonError::into_inner),
-                    Phase::Open => {
-                        *phase = Phase::Committing;
-                        break;
+        // One schedule runs at a time on a context. A thread that is already running one (a nested commit) does not wait for itself.
+        let nested = EXECUTING.with(Cell::get) != 0;
+        let mut lease = None;
+        loop {
+            {
+                let mut phase = lock(&self.phase);
+                loop {
+                    match &*phase {
+                        Phase::Done(result) => return result.clone().map_err(|error| LumaError::clone(&error)),
+                        Phase::Committing => {
+                            // Never wait for another thread while holding the lease: it may be waiting for it.
+                            lease = None;
+                            phase = self.done.wait(phase).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        Phase::Open if nested || lease.is_some() => {
+                            *phase = Phase::Committing;
+                            break;
+                        }
+                        Phase::Open => break,
                     }
                 }
+                if matches!(*phase, Phase::Committing) {
+                    break;
+                }
             }
+            lease = Some(lock(self.ctx.schedule_lease()));
         }
         let open = lock(&self.open).take();
+        let mut panicked = None;
         let result = match open {
-            Some(mut open) if !open.steps.is_empty() => self.execute(&mut open),
+            Some(mut open) if !open.steps.is_empty() => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.execute(&mut open))) {
+                Ok(result) => result,
+                Err(payload) => {
+                    panicked = Some(payload);
+                    let error = LumaError::Gpu("a deferred schedule panicked while it ran".into());
+                    self.poison(&open, &error);
+                    Err(error)
+                }
+            },
             _ => Ok(()),
         };
+        drop(lease);
         let shared = result.map_err(Arc::new);
         *lock(&self.phase) = Phase::Done(shared.clone());
         self.done.notify_all();
         self.ctx.schedule_closed();
+        forget_open(self);
+        if let Some(payload) = panicked {
+            std::panic::resume_unwind(payload);
+        }
         shared.map_err(|error| LumaError::clone(&error))
     }
 
     /// [`Schedule::commit`], as the pin paths of a planned segment call it.
     pub(crate) fn settle(&self) -> Result<(), LumaError> {
         self.commit()
+    }
+
+    /// Marks what the steps were to write as lost.
+    fn poison(&self, open: &Open, error: &LumaError) {
+        let error = Arc::new(error.clone());
+        for (array, _) in open.written() {
+            let (op, location) = array.writer.unwrap_or(("elementwise", Location::caller()));
+            let poison = Arc::new(LumaError::Op { op, location, source: Arc::clone(&error) });
+            array.segments.iter().for_each(|segment| segment.poison(&poison));
+        }
     }
 
     fn execute(&self, open: &mut Open) -> Result<(), LumaError> {
@@ -385,24 +427,24 @@ impl Schedule {
                 EXECUTING.with(|executing| executing.set(self.0));
             }
         }
-        // One schedule runs at a time on a context. A thread that is already running one (a nested commit) does not wait for itself.
-        let nested = EXECUTING.with(Cell::get) != 0;
-        let _lease = (!nested).then(|| lock(self.ctx.schedule_lease()));
         let _executing = Executing(EXECUTING.with(|executing| executing.replace(self.id)));
         let result = self.ctx.abort_recording_for("a schedule committed").and_then(|()| run::run(&self.ctx, open));
         match &result {
             Ok(()) => open.written().for_each(|(array, _)| array.segments.iter().for_each(|segment| segment.clear_planned())),
-            Err(error) => {
-                let error = Arc::new(error.clone());
-                for (array, _) in open.written() {
-                    let (op, location) = array.writer.unwrap_or(("elementwise", Location::caller()));
-                    let poison = Arc::new(LumaError::Op { op, location, source: Arc::clone(&error) });
-                    array.segments.iter().for_each(|segment| segment.poison(&poison));
-                }
-            }
+            Err(error) => self.poison(open, error),
         }
         result
     }
+}
+
+/// Drops this thread's entry for a schedule that committed (a commit from another thread leaves the owner's entry to
+/// [`open_schedule`], which replaces finished ones).
+fn forget_open(schedule: &Schedule) {
+    let _ = OPEN.try_with(|all| {
+        if let Ok(mut all) = all.try_borrow_mut() {
+            all.0.retain(|(_, known)| !std::ptr::eq(Arc::as_ptr(known), schedule));
+        }
+    });
 }
 
 impl Open {
@@ -484,6 +526,27 @@ fn open_schedule(ctx: &Context) -> Result<Arc<Schedule>, LumaError> {
         schedule
     })
     .map_err(|_| LumaError::Gpu("a kernel was deferred while its thread was ending".into()))
+}
+
+/// This thread's open schedule on `ctx`, if it has one that still takes steps.
+pub(crate) fn open_here(ctx: &Context) -> Option<Arc<Schedule>> {
+    OPEN.try_with(|all| {
+        let all = all.try_borrow().ok()?;
+        let (_, schedule) = all.0.iter().find(|(id, _)| *id == ctx.id())?;
+        matches!(*lock(&schedule.phase), Phase::Open).then(|| Arc::clone(schedule))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Before a launch writes into the buffer of an input it took over (see `launch::run_store`): the schedules with a deferred step that
+/// reads the buffer commit first, except this thread's open one when the write is deferred into it too (its steps keep their order).
+pub(super) fn commit_readers_of(ctx: &Context, buffer: &Storage, deferred: bool) {
+    if ctx.split_mode() == SplitMode::Off || !buffer.readers.has_schedules() {
+        return;
+    }
+    let keep = if deferred { open_here(ctx) } else { None };
+    buffer.readers.commit_schedules(keep.as_ref());
 }
 
 /// Whether the calling thread is running a schedule's steps: its planned segments are not settled, it is writing them.

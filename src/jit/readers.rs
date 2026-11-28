@@ -157,6 +157,35 @@ impl Readers {
         }
     }
 
+    /// Commits the schedules with a deferred step that reads the buffer, except `keep` (the open schedule a write to the buffer is
+    /// itself deferred into: its steps run in order). Called before a buffer is taken over by a launch that does not go through
+    /// [`Readers::flush`].
+    pub(crate) fn commit_schedules(&self, keep: Option<&Arc<Schedule>>) {
+        let Some(known) = lock(&self.list).schedules.take() else { return };
+        let mut kept = Vec::new();
+        for weak in known.iter() {
+            let Some(schedule) = weak.upgrade() else { continue };
+            if keep.is_some_and(|keep| Arc::ptr_eq(keep, &schedule)) {
+                kept.push(Arc::downgrade(&schedule));
+            } else {
+                // A failure poisons what the steps wrote and is reported when it is used.
+                let _ = schedule.commit();
+            }
+        }
+        if !kept.is_empty() {
+            let mut list = lock(&self.list);
+            match list.schedules.as_mut() {
+                Some(now) => now.extend(kept),
+                None => list.schedules = Some(Box::new(kept)),
+            }
+        }
+    }
+
+    /// Whether any schedule is registered (the cheap test before [`Readers::commit_schedules`]).
+    pub(crate) fn has_schedules(&self) -> bool {
+        lock(&self.list).schedules.as_ref().is_some_and(|known| !known.is_empty())
+    }
+
     pub(super) fn take(&self) -> Weaks {
         let mut list = lock(&self.list);
         list.prune_at = 0;

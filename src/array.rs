@@ -94,8 +94,28 @@ static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 /// A power of two for every stride (`segment_bytes / stride` rounded down), so that the canonical blocks of a float reduction (a power
 /// of two of elements) divide it (see `jit::split`). Identical to the plain quotient for strides 1, 2, 4, 8 and 16.
 fn segment_len(ctx: &Context, layout: ElemLayout) -> usize {
-    let c = (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / layout.stride()).max(1);
+    segment_len_of_stride(ctx, layout.stride())
+}
+
+/// [`segment_len`] for elements of `stride` bytes: what a [`Storage`] of that stride holds per segment.
+pub(crate) fn segment_len_of_stride(ctx: &Context, stride: usize) -> usize {
+    let c = (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / stride).max(1);
     1 << c.ilog2()
+}
+
+impl Drop for Storage {
+    /// A file-backed storage that goes with steps still waiting in a schedule commits them first: the file is expected to hold the
+    /// data once the array is gone (the segments are written back when the last of them drops, after the commit).
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            for segment in self.segments.iter().filter(|segment| segment.is_planned()) {
+                // A failure is kept by the file store's own error state and reported by `flush`.
+                if let Err(error) = segment.settle() {
+                    log::error!("luma: a deferred store into a dropped file array failed: {error}");
+                }
+            }
+        }
+    }
 }
 
 impl Storage {

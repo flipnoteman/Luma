@@ -94,7 +94,7 @@ pub(super) fn plan(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], len: 
         || input.layout() != ty.layout()
         || input.segments() != 1
         || input.is_window()
-        || len as u64 > ctx.segment_bytes() / ty.stride()
+        || len > crate::array::segment_len_of_stride(ctx, ty.stride() as usize)
         || map.out_len() != len
         || input.len() != map.src.iter().map(|&d| d as usize).product::<usize>()
     {
@@ -297,7 +297,7 @@ fn fused_plan(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], scalars: &
         }
     };
     let Some(program) = program else { return Ok(None) };
-    if program.map.out_len() != len || scalars.len() != key.scalar_tys.len() || len as u64 > ctx.segment_bytes() / program.out_ty.stride() {
+    if program.map.out_len() != len || scalars.len() != key.scalar_tys.len() || len > crate::array::segment_len_of_stride(ctx, program.out_ty.stride() as usize) {
         return Ok(None);
     }
     for &(k, at) in &program.bound {
