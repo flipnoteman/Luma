@@ -391,8 +391,9 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
         // A tuning aid: registers, spills and resident workgroups per multiprocessor.
         let spilled = func.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES).unwrap_or(-1);
         eprintln!(
-            "gemm-info {} {}x{} t{}{}: {} registers, {} bytes of local memory, {} bytes of shared memory, {:?} workgroups per multiprocessor",
+            "gemm-info {}{} {}x{} t{}{}: {} registers, {} bytes of local memory, {} bytes of shared memory, {:?} workgroups per multiprocessor",
             if spec.exact { "f32" } else { "tf32" },
+            if hook.is_some() { " hooked" } else { "" },
             spec.rows,
             spec.cols,
             u8::from(spec.lhs_transposed),
