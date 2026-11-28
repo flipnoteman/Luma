@@ -23,6 +23,8 @@ pub struct AlignedBuf {
     ptr: NonNull<u8>,
     layout: Layout,
     size: usize,
+    /// Set for a buffer over memory it does not own ([`AlignedBuf::borrowed`]): what keeps it alive.
+    keepalive: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 // SAFETY: the buffer is plain owned heap memory; synchronisation of contents is the caller's job.
@@ -57,6 +59,30 @@ impl AlignedBuf {
             ptr,
             layout,
             size: len,
+            keepalive: None,
+        })
+    }
+
+    /// A buffer over `len` bytes at `ptr`, memory it does not own: `keepalive` holds it until the
+    /// buffer is dropped. `None` unless `ptr` is 16-byte aligned (the kernels' packet loads).
+    ///
+    /// # Safety
+    /// `ptr..ptr + len` must stay valid for reads (and writes, if a kernel writes it) while
+    /// `keepalive` lives, and nothing else may write it while a launch reads it.
+    pub unsafe fn borrowed(
+        ptr: *mut u8,
+        len: u64,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Self> {
+        let size = usize::try_from(len).ok()?;
+        if size == 0 || ptr.align_offset(16) != 0 {
+            return None;
+        }
+        Some(Self {
+            ptr: NonNull::new(ptr)?,
+            layout: Layout::from_size_align(size, 1).ok()?,
+            size,
+            keepalive: Some(keepalive),
         })
     }
 
@@ -95,6 +121,9 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
+        if self.keepalive.is_some() {
+            return;
+        }
         // SAFETY: allocated in `new` with this exact layout.
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
@@ -315,6 +344,14 @@ const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 const NO_CPU: usize = usize::MAX;
 
 impl CostHint {
+    /// The learned nanoseconds for `total` workgroups, `None` before the first measurement.
+    pub(crate) fn learned_ns(&self, total: u64) -> Option<f64> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            fixed => Some(fixed as f64 * total as f64 / 1024.0),
+        }
+    }
+
     /// Estimated nanoseconds of work for `total` workgroups of `invocations` invocations.
     fn estimate_ns(&self, total: u64, invocations: u64) -> u64 {
         match self.0.load(Ordering::Relaxed) {

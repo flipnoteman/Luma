@@ -99,6 +99,8 @@ struct Inner {
     waits: WaitHistory,
     /// Host memory of finished transfers, kept for the next stage (pinned memory is slow to allocate and fresh heap pages fault).
     stages: Mutex<Vec<luma_core::hal::Stage>>,
+    /// The CPU context host strategies run on (see [`crate::jit::hostexec`]), opened by the first use.
+    host_exec: OnceLock<Option<crate::jit::hostexec::HostExec>>,
     /// Report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     assume_busy: std::sync::atomic::AtomicBool,
     /// Report the GPU as idle regardless of the queue (see `Context::set_assume_idle`).
@@ -409,7 +411,7 @@ impl ContextOptions {
         let mut numerics = self.numerics;
         if self.fast_math {
             // Before the class flags existed `fast_math` was the one switch of the algebraic rewrites too.
-            numerics = numerics.with_reduced(Reduced::FAST_MATH, true);
+            numerics = numerics.with_reduced(Reduced::FAST_MATH, true).with_reduced(Reduced::HOST_PLACEMENT, true);
             numerics.exact_finite = true;
             numerics.reassociate = true;
             numerics.reformulate = true;
@@ -850,6 +852,7 @@ impl Context {
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
                 stages: Mutex::new(Vec::new()),
+                host_exec: OnceLock::new(),
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
                 assume_idle: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
@@ -1067,6 +1070,12 @@ impl Context {
             && self.segment_bytes() >= 65536
             && !self.is_profiling()
             && std::env::var("LUMA_HOST_FAST").as_deref() != Ok("off")
+    }
+
+    /// The auxiliary CPU context host strategies run on, `None` on a CPU context, with `LUMA_HOST_EXEC=off`, or when the
+    /// CPU backend cannot open. Opened by the first call.
+    pub(crate) fn host_exec(&self) -> Option<&crate::jit::hostexec::HostExec> {
+        self.inner.host_exec.get_or_init(|| crate::jit::hostexec::HostExec::open(self)).as_ref()
     }
 
     /// Largest buffer that can be allocated and bound as a storage buffer.
@@ -1310,6 +1319,10 @@ impl Context {
     /// to pooled buffers outside the stream.
     pub(crate) fn recycle(&self, buffer: Buffer) {
         let Some(buffer) = self.retire(buffer) else { return };
+        // Memory the backend does not own (an import of host bytes) never goes back to the pool.
+        if buffer.is_borrowed() {
+            return;
+        }
         if buffer.usage().contains(BufferUsage::MAP_WRITE) {
             // May still be used by the unsubmitted batch, which mapping would invalidate: the
             // backend makes it writable again after the next submission. This must not take

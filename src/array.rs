@@ -145,6 +145,25 @@ impl Storage {
         Self::with_segments(ctx, len, layout, c, segments, None)
     }
 
+    /// A storage of `len` elements of `layout` whose segments live in the buffers `make(byte_offset, bytes)`
+    /// returns (the host executor's imports of host memory, see [`crate::jit::hostexec`]).
+    pub(crate) fn over_buffers(ctx: &Context, len: usize, layout: ElemLayout, mut make: impl FnMut(u64, u64) -> Result<luma_core::Buffer>) -> Result<Self> {
+        let c = segment_len(ctx, layout);
+        let mut segments = Vec::with_capacity(len.div_ceil(c));
+        for j in 0..len.div_ceil(c) {
+            let bytes = layout.bytes(len.min((j + 1) * c) - j * c);
+            segments.push(Segment::filled(ctx, bytes, make(layout.bytes(j * c), bytes)?));
+        }
+        Ok(Self::with_segments(ctx, len, layout, c, segments.into(), None))
+    }
+
+    /// A storage of one segment holding `data` in host memory (`State::Host`), `None` when `len` elements of `layout` need
+    /// more than one segment on this context.
+    pub(crate) fn from_host(ctx: &Context, len: usize, layout: ElemLayout, data: luma_core::hal::HostBytes) -> Option<Self> {
+        let c = segment_len(ctx, layout);
+        (len <= c && data.len() as u64 == layout.bytes(len)).then(|| Self::with_segments(ctx, len, layout, c, Box::new([Segment::host(ctx, layout.bytes(len), data)]), None))
+    }
+
     /// A storage of `len` elements that shows the elements `offset..offset + len` of `pack` (a
     /// storage of one segment, not bit-packed) without a buffer of its own. Kernels that
     /// build their program through [`crate::jit`] read the range through the pack's one

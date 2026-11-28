@@ -559,6 +559,20 @@ impl Backend for CpuBackend {
         AlignedBuf::new(size).map(|b| Buffer::new(size, usage, b))
     }
 
+    fn import_host(&self, region: luma_core::hal::HostRegion) -> Option<Buffer> {
+        let usage = BufferUsage::STORAGE.union(BufferUsage::COPY_SRC).union(BufferUsage::COPY_DST);
+        // SAFETY: the importer guarantees the region and its exclusivity (see `HostRegion`); the buffer holds `keepalive`.
+        let native = unsafe { AlignedBuf::borrowed(region.ptr, region.len, region.keepalive) }?;
+        Some(Buffer::new_borrowed(region.len, usage, native))
+    }
+
+    fn learned_ns(&self, kernel: &CompiledKernel, workgroups: u64) -> Option<f64> {
+        match native(kernel).ok()? {
+            CpuKernel::Compiled(compiled) => compiled.cost.learned_ns(workgroups),
+            _ => None,
+        }
+    }
+
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
         let bytes = data.len() as u64;
         let class = size_class(bytes, max_buffer_bytes)

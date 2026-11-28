@@ -96,6 +96,9 @@ pub(crate) struct Segment {
     has_dependents: AtomicBool,
     /// Number of live [`Pin`]s; a pinned segment must keep its buffer.
     pins: AtomicU32,
+    /// Number of live [`HostRead`]s: the host executor is reading the bytes of a `State::Host` segment, which neither moves
+    /// to the device nor changes meanwhile.
+    host_readers: AtomicU32,
     /// How many of them were taken by a may-write pin while a lineage read this segment. A pin that is held (a stepper's, a
     /// recording's, a captured graph's) can launch writes long after it was taken, which no
     /// later pin call announces: no lineage is used to evict over an input while one is held.
@@ -468,6 +471,18 @@ impl Pager {
         self.budget.is_some() && self.host_budget > 0
     }
 
+    /// Whether any segment of this context is held in host memory (`State::Host`): the one relaxed load that keeps every
+    /// step with only device-resident inputs from looking at the host executor.
+    #[inline(always)]
+    pub(crate) fn any_host_state(&self) -> bool {
+        self.host_state_bytes.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether `bytes` more of host data fit the host budget (host strategies never evict host data to make room).
+    pub(crate) fn host_room(&self, bytes: u64) -> bool {
+        self.host_bytes() + bytes <= self.host_budget
+    }
+
     /// Bytes of host memory held for device data: the segments in host memory and the copies.
     fn host_bytes(&self) -> u64 {
         self.host_state_bytes.load(Ordering::Relaxed) + self.host_copy_bytes.load(Ordering::Relaxed)
@@ -606,6 +621,7 @@ impl Segment {
             dependents: Mutex::new(Dependents::default()),
             has_dependents: AtomicBool::new(false),
             pins: AtomicU32::new(0),
+            host_readers: AtomicU32::new(0),
             write_pins: AtomicU32::new(0),
             epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
@@ -632,6 +648,7 @@ impl Segment {
             dependents: Mutex::new(Dependents::default()),
             has_dependents: AtomicBool::new(false),
             pins: AtomicU32::new(0),
+            host_readers: AtomicU32::new(0),
             write_pins: AtomicU32::new(0),
             epoch: AtomicU64::new(0),
             stamp: AtomicU64::new(0),
@@ -674,6 +691,12 @@ impl Segment {
     /// A segment of `bytes` bytes without a buffer; it gets one at its first pin.
     pub(crate) fn empty(ctx: &Context, bytes: u64) -> Arc<Segment> {
         Self::with_state(ctx, bytes, State::Empty)
+    }
+
+    /// A segment of `bytes` bytes whose data is `data`, held in host memory (it is uploaded at the first pin that needs it).
+    pub(crate) fn host(ctx: &Context, bytes: u64, data: HostBytes) -> Arc<Segment> {
+        ctx.pager().host_state_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Self::with_state(ctx, bytes, State::Host(data))
     }
 
     /// A segment of `bytes` bytes that already lives in `buffer` (from [`Context::alloc_buffer`]
@@ -1063,6 +1086,13 @@ impl Segment {
                 continue;
             }
             if matches!(&*state, State::Host(_)) {
+                if self.host_readers.load(Ordering::Acquire) != 0 {
+                    // The host executor reads these bytes: wait for it to finish, then start over.
+                    drop(state);
+                    self.ctx.recycle(buffer);
+                    std::thread::yield_now();
+                    continue;
+                }
                 let State::Host(data) = std::mem::replace(&mut *state, State::Empty) else { unreachable!() };
                 if let Err(e) = self.ctx.upload(&buffer, data.as_slice()) {
                     *state = State::Host(data);
@@ -1194,6 +1224,18 @@ impl Segment {
         }
     }
 
+    /// The bytes of a segment held in host memory (`State::Host`), readable until the guard drops: the segment does not move
+    /// to the device or change meanwhile (a pin that would wait for it). `None` for any other state.
+    pub(crate) fn host_read(&self) -> Option<HostRead<'_>> {
+        if self.is_planned() || self.ctx.recording_here() {
+            return None;
+        }
+        let state = lock(&self.state);
+        let State::Host(data) = &*state else { return None };
+        self.host_readers.fetch_add(1, Ordering::AcqRel);
+        Some(HostRead { segment: self, ptr: data.as_slice().as_ptr(), len: self.bytes as usize })
+    }
+
     /// [`Segment::with_host_bytes`] with write access; a device buffer must not be pinned by a recording.
     pub(crate) fn with_host_bytes_mut<R>(self: &Arc<Self>, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
         if self.is_planned() || self.ctx.recording_here() {
@@ -1204,6 +1246,7 @@ impl Segment {
             return None;
         }
         match &mut *lock(&self.state) {
+            State::Host(_) if self.host_readers.load(Ordering::Acquire) != 0 => None,
             State::Host(data) => {
                 self.clear_lineage();
                 Some(f(&mut data.as_mut_slice()[..self.bytes as usize]))
@@ -1315,6 +1358,26 @@ impl Segment {
             }
         }
         self.ctx.pager().resident_homed_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+    }
+}
+
+/// Read access to the host bytes of a segment (see [`Segment::host_read`]).
+pub(crate) struct HostRead<'a> {
+    segment: &'a Segment,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl HostRead<'_> {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        // SAFETY: `host_readers` keeps the `State::Host` block in place and unwritten while this guard lives.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for HostRead<'_> {
+    fn drop(&mut self) {
+        self.segment.host_readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

@@ -165,12 +165,14 @@ mod kirgen;
 mod launch;
 pub(crate) mod lineage;
 mod follow;
+pub(crate) mod hostexec;
 mod looped;
 mod operator;
 mod multireduce;
 pub(crate) mod structured;
 mod pack;
 mod params;
+pub(crate) mod placement;
 mod plancache;
 
 /// Whether an array of `len` elements has indices that need the exact division (see `params::DivRemSpec`).

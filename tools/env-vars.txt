@@ -40,6 +40,7 @@ LUMA_FUZZ_SEED	test	W0	never	random
 LUMA_FUZZ_VERBOSE	test	W0	never	unset
 LUMA_HAND_UNCHECKED	test	W0	never	unset (examples/datasci/hand.rs)
 LUMA_HOST_FAST	dev	W0	before-release	auto (off disables; on read by crate tests)
+LUMA_HOST_EXEC	dev	W3-HOSTCPU	before-release	auto (off closes the auxiliary CPU context: spilled arrays are uploaded and run on the device, the baseline of A/B and bit-equality tests)
 LUMA_HOST_BUDGET	user	W1-P1b	never	half of available host memory (cgroup-capped)
 LUMA_IO_THREADS	user	W2-P5a	never	min(8, available parallelism)
 LUMA_LAZY	dev	W2-LAZY	before-release	never (never|site|always)

@@ -39,6 +39,21 @@ fn sum(x: &A) -> A {
     (&(x * 1.0001) + 0.5).sum()
 }
 
+trait CaseOn {
+    fn case_on(&mut self, on_cpu: bool, case: &str, size: &str, work: Work, f: &mut dyn FnMut());
+}
+
+impl CaseOn for Harness {
+    /// A case run on the CPU context launches nothing on the context under test: `transfer_case` registers it as such.
+    fn case_on(&mut self, on_cpu: bool, case: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
+        if on_cpu {
+            self.transfer_case(case, size, work, f);
+        } else {
+            self.case(case, size, work, f);
+        }
+    }
+}
+
 fn small(h: &mut Harness, cpu: &luma::Context) {
     let ctx = h.ctx.clone();
     for e in [6u32, 8, 10, 12, 14, 16] {
@@ -56,13 +71,13 @@ fn small(h: &mut Harness, cpu: &luma::Context) {
             let x2 = x.reshape([rows, cols]);
             let mut s = 1.0f32;
             let rep = 20usize;
-            h.case(&format!("hostexec/small_map{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
+            h.case_on(on_cpu, &format!("hostexec/small_map{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
                 for _ in 0..rep {
                     s += 1e-4;
                     force(&(&(&x * s) + 0.5));
                 }
             });
-            h.case(&format!("hostexec/small_sum{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
+            h.case_on(on_cpu, &format!("hostexec/small_sum{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
                 let mut t = 0.0;
                 for _ in 0..rep {
                     s += 1e-4;
@@ -70,13 +85,13 @@ fn small(h: &mut Harness, cpu: &luma::Context) {
                 }
                 std::hint::black_box(t);
             });
-            h.case(&format!("hostexec/small_axis_sum{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
+            h.case_on(on_cpu, &format!("hostexec/small_axis_sum{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
                 for _ in 0..rep {
                     s += 1e-4;
                     force(&(&x2 * s).sum_axis(1));
                 }
             });
-            h.case(&format!("hostexec/small_argmax{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
+            h.case_on(on_cpu, &format!("hostexec/small_argmax{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
                 let mut t = 0u32;
                 for _ in 0..rep {
                     s += 1e-4;
@@ -98,7 +113,7 @@ fn small(h: &mut Harness, cpu: &luma::Context) {
             let a = A::from_slice_on(c, &ah, [m, m]).unwrap();
             let rep = 10usize;
             let mut s = 1.0f32;
-            h.case(&format!("hostexec/small_matmul{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
+            h.case_on(on_cpu, &format!("hostexec/small_matmul{suffix}"), &tag, per_sec(rep, "call/s"), &mut || {
                 for _ in 0..rep {
                     s += 1e-4;
                     force(&(&a * s).matmul(&a));
@@ -145,12 +160,12 @@ fn big(h: &mut Harness, cpu: &luma::Context) {
                         rb(&f(&x));
                     });
                 }
-                h.case(&format!("hostexec/{name}_cpucopy"), &tag, touched(k), &mut || {
+                h.transfer_case(&format!("hostexec/{name}_cpucopy"), &tag, touched(k), &mut || {
                     let x = A::from_slice_on(cpu, &xh, n).unwrap();
                     force(&f(&x));
                 });
             }
-            h.case(&format!("hostexec/{name}_cpujit"), &tag, touched(k), &mut || {
+            h.transfer_case(&format!("hostexec/{name}_cpujit"), &tag, touched(k), &mut || {
                 force(&f(&xc));
             });
         }

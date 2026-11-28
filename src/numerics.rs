@@ -23,6 +23,11 @@ impl Reduced {
     /// that change values are not this bit's: they are the flags [`Numerics::exact_finite`], [`Numerics::reassociate`] and
     /// [`Numerics::reformulate`], which [`Numerics::fast`] and [`Numerics::algebraic`] set.
     pub const FAST_MATH: Self = Self(1 << 2);
+    /// A pending program that reads spilled (host-resident) data may run on the host's CPU when that is cheaper than uploading
+    /// it, even if the CPU's result may differ in the last bits from the device's (library math, float sums, products, scans).
+    /// Without it only programs whose result is bit-identical wherever it is computed may run there. In [`Numerics::algebraic`]
+    /// and [`Numerics::fast`], not in `default` or `strict`; `LUMA_NUMERICS=...+host`.
+    pub const HOST_PLACEMENT: Self = Self(1 << 3);
 
     /// No feature.
     pub const fn empty() -> Self {
@@ -104,12 +109,12 @@ impl Numerics {
     /// but when its value is used, so a GPU starts a little later in a loop than with the default
     /// numerics.
     pub const fn algebraic() -> Self {
-        Numerics { reassociate: true, reformulate: true, exact_finite: true, reduced: Reduced::TF32_MATMUL }
+        Numerics { reassociate: true, reformulate: true, exact_finite: true, reduced: Reduced::TF32_MATMUL.union(Reduced::HOST_PLACEMENT) }
     }
 
     /// [`Numerics::algebraic`] and fast math.
     pub const fn fast() -> Self {
-        Numerics { reduced: Reduced::TF32_MATMUL.union(Reduced::FAST_MATH), ..Numerics::algebraic() }
+        Numerics { reduced: Reduced::TF32_MATMUL.union(Reduced::FAST_MATH).union(Reduced::HOST_PLACEMENT), ..Numerics::algebraic() }
     }
 
     /// Whether fast math is on.
@@ -125,6 +130,11 @@ impl Numerics {
     /// Whether the factorisations' products may run in TF32.
     pub const fn tf32_linalg(&self) -> bool {
         self.reduced.contains(Reduced::TF32_LINALG)
+    }
+
+    /// Whether results that may differ from the device's in the last bits may be computed on the host (see [`Reduced::HOST_PLACEMENT`]).
+    pub const fn host_placement(&self) -> bool {
+        self.reduced.contains(Reduced::HOST_PLACEMENT)
     }
 
     /// `self` with the reduced-precision features `on` set or cleared.
@@ -162,6 +172,7 @@ impl Numerics {
                 "tf32-matmul" => numerics = numerics.with_reduced(Reduced::TF32_MATMUL, on),
                 "tf32-linalg" => numerics = numerics.with_reduced(Reduced::TF32_LINALG, on),
                 "fast-math" => numerics = numerics.with_reduced(Reduced::FAST_MATH, on),
+                "host" => numerics = numerics.with_reduced(Reduced::HOST_PLACEMENT, on),
                 "reassociate" => numerics.reassociate = on,
                 "reformulate" => numerics.reformulate = on,
                 _ => numerics.exact_finite = on,
@@ -171,7 +182,7 @@ impl Numerics {
         Ok(numerics)
     }
 
-    const MODIFIERS: [&'static str; 6] = ["tf32-matmul", "tf32-linalg", "fast-math", "reassociate", "reformulate", "exact-finite"];
+    const MODIFIERS: [&'static str; 7] = ["tf32-matmul", "tf32-linalg", "fast-math", "host", "reassociate", "reformulate", "exact-finite"];
 }
 
 impl Default for Numerics {
@@ -203,7 +214,7 @@ impl fmt::Display for Numerics {
         if base.exact_finite != self.exact_finite {
             write!(f, "{}exact-finite", sign(self.exact_finite))?;
         }
-        for (flag, name) in [(Reduced::TF32_MATMUL, "tf32-matmul"), (Reduced::TF32_LINALG, "tf32-linalg"), (Reduced::FAST_MATH, "fast-math")] {
+        for (flag, name) in [(Reduced::TF32_MATMUL, "tf32-matmul"), (Reduced::TF32_LINALG, "tf32-linalg"), (Reduced::FAST_MATH, "fast-math"), (Reduced::HOST_PLACEMENT, "host")] {
             if base.reduced.contains(flag) != self.reduced.contains(flag) {
                 write!(f, "{}{name}", sign(self.reduced.contains(flag)))?;
             }

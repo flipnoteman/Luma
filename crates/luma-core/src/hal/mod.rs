@@ -827,6 +827,21 @@ static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 /// A backend's own buffer object, held type-erased by [`Buffer`].
 pub trait NativeBuffer: Any + fmt::Debug + Send + Sync + 'static {}
 
+/// Host memory a backend may show as a buffer without copying (see [`Backend::import_host`]).
+pub struct HostRegion {
+    /// First byte; 64-byte aligned for [`HostBytes`].
+    pub ptr: *mut u8,
+    /// Bytes.
+    pub len: u64,
+    /// Whether kernels may write the region.
+    pub writable: bool,
+    /// Held by the buffer until it is dropped: what owns the memory.
+    pub keepalive: Arc<dyn Any + Send + Sync>,
+}
+
+// SAFETY: the pointer is plain data; `keepalive` owns the memory and the importer guarantees exclusive access while a writable buffer exists.
+unsafe impl Send for HostRegion {}
+
 /// A device buffer of any backend. Cloning shares the buffer; equality is identity (a view made
 /// by [`Buffer::at`] is equal to the buffer it views).
 #[derive(Clone, Debug)]
@@ -836,12 +851,22 @@ pub struct Buffer {
     usage: BufferUsage,
     native: Arc<dyn NativeBuffer>,
     offset: u64,
+    borrowed: bool,
 }
 
 impl Buffer {
     /// Wraps a backend's buffer of `size` bytes.
     pub fn new(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
-        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0 }
+        Buffer { id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed), size, usage, native: Arc::new(native), offset: 0, borrowed: false }
+    }
+    /// Wraps a backend's buffer over host memory it does not own (see [`Backend::import_host`]):
+    /// a pool must not take it back for reuse ([`Buffer::is_borrowed`]).
+    pub fn new_borrowed(size: u64, usage: BufferUsage, native: impl NativeBuffer) -> Self {
+        Buffer { borrowed: true, ..Self::new(size, usage, native) }
+    }
+    /// Whether the buffer shows memory the backend does not own (made by [`Buffer::new_borrowed`]).
+    pub fn is_borrowed(&self) -> bool {
+        self.borrowed
     }
     /// A view of this buffer that a launch binds from `offset` bytes on (a storage argument of a
     /// backend whose [`Backend::storage_offset_align`] is not 0, with `offset` a multiple of it;
@@ -1385,6 +1410,17 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// Allocates a buffer, `None` when the device is out of memory; `mapped` buffers start
     /// mapped for writing.
     fn create_buffer(&self, size: u64, usage: BufferUsage, mapped: bool) -> Option<Buffer>;
+    /// A buffer that shows `region` (host memory the caller owns) without copying it, `None` when the
+    /// backend cannot (the default), the address is not aligned for it, or the region is empty. The
+    /// buffer keeps `region.keepalive` until it is dropped and is [borrowed](Buffer::is_borrowed).
+    fn import_host(&self, _region: HostRegion) -> Option<Buffer> {
+        None
+    }
+    /// What the backend has learned a launch of `workgroups` workgroups of `kernel` costs, in
+    /// nanoseconds, `None` before it ran or when the backend does not learn (the default).
+    fn learned_ns(&self, _kernel: &CompiledKernel, _workgroups: u64) -> Option<f64> {
+        None
+    }
     /// Allocates a buffer holding `data`.
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError>;
     /// Allocates a buffer that is the destination or source of [`Backend::transfer_in`] /

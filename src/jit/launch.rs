@@ -199,6 +199,12 @@ fn launch_loop(
 pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
     let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
     drop(args);
+    // Inputs held in host memory (spilled arrays) may be cheaper to compute on the CPU than to upload (W3-HOSTCPU).
+    if node.context().pager().any_host_state()
+        && let Some(done) = super::hostexec::try_store(node.context(), &fused, node.len(), node.name, node.location)
+    {
+        return done;
+    }
     let mut outputs = run_store(node.context(), node.len(), fused)?;
     outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())))
 }
