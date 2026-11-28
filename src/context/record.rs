@@ -343,7 +343,7 @@ impl Context {
     /// recording keeps the first.
     pub(crate) fn abort_recording_for(&self, reason: &'static str) -> Result<()> {
         // Taken out (and left aborted) before anything is encoded: the commands must not be captured again.
-        let Some(recording) = self
+        let Some(mut recording) = self
             .with_entry(|state| match state {
                 RecState::Active(_) => match std::mem::replace(state, RecState::Aborted(reason)) {
                     RecState::Active(recording) => Some(recording),
@@ -355,6 +355,19 @@ impl Context {
         else {
             return Ok(());
         };
+        // A buffer handed out again that something outside the recording holds (a probe, a result) keeps the commands of its earlier
+        // life on a buffer of their own, as at the end of a recording (see `end_recording`): the seeds are copied before every command,
+        // so a probe that took over a released buffer would else be overwritten by the commands of that buffer's earlier owner.
+        for (from, size, usage, before) in recording.reused_and_kept() {
+            match self.alloc_buffer(size, usage) {
+                Ok(to) => recording.split(from, before, to),
+                Err(error) => {
+                    // The commands still run, as the others of an aborted recording do; the traced code gets the error.
+                    self.encode_recording(*recording).ok();
+                    return Err(error);
+                }
+            }
+        }
         self.encode_recording(*recording)
     }
 

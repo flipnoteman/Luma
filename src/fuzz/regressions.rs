@@ -933,3 +933,20 @@ fn a_write_after_an_iterate_over_segments_commits_the_schedule_of_its_probe() {
         ],
     });
 }
+
+/// Fuzz finding of the injected I/O failures (W3 end-of-wave gate, `split_io_failures`; it needs no failure, only file arrays whose segments are away):
+/// `iterate_until_all` whose step gathers with an index array that is still in its file, and makes an array it drops. The recording of the step
+/// aborted at the upload of the index (the step cannot be recorded); the probe of the state had taken over the buffer of the dropped array, and
+/// the seed copy into it came before the aborted commands, which wrote the dropped array's value over it.
+#[test]
+fn an_iterate_until_whose_recording_aborts_keeps_the_state_a_released_buffer_was_handed_to() {
+    check(Program {
+        config: Config { max_nodes: 2, max_inputs: Some(8), file_leaves: true, ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Full { dims: [9, 6, 1, 1], ty: F32, value: 3.0 },
+            Input { dims: [9, 6, 1, 1], ty: U32, seed: 0 },
+            Loop { kind: IterateUntilAll, steps: 1, states: vec![0], body: vec![View { src: 2, view: Take { idx: 1 } }, Full { dims: [7, 5, 1, 1], ty: U32, value: 5.0 }], next: vec![3] },
+        ],
+    });
+}
