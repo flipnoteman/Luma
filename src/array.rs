@@ -285,6 +285,10 @@ impl Storage {
         self.len
     }
 
+    pub(crate) fn ctx(&self) -> &Context {
+        &self.ctx
+    }
+
     /// How the elements sit in the buffers.
     pub(crate) fn layout(&self) -> ElemLayout {
         self.layout
