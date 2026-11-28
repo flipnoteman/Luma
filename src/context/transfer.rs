@@ -231,6 +231,9 @@ impl Context {
 
 /// The transfer lanes of the backend (W1-P2b), as a schedule's executor uses them: ring buffers, staging memory, copies that run
 /// beside the compute lane, and the tickets that order them.
+/// Bytes of finished transfer memory a context keeps.
+const STAGE_CACHE_BYTES: u64 = 1 << 30;
+
 impl Context {
     /// A device buffer of at least `bytes` bytes that a transfer may copy into or out of (not pooled: it is freed when dropped, after
     /// every ticket that touches it has completed).
@@ -241,8 +244,25 @@ impl Context {
     }
 
     /// Host memory for transfers in direction `dir`.
+    /// A stage given back by [`Context::stage_release`] is reused when it has the right direction and size.
     pub(crate) fn stage_alloc(&self, bytes: u64, dir: luma_core::hal::StageDir) -> Result<luma_core::hal::Stage> {
+        {
+            let mut cache = self.inner.stages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(at) = cache.iter().position(|stage| stage.dir() == dir && stage.len() == bytes) {
+                return Ok(cache.swap_remove(at));
+            }
+        }
         Ok(self.hal().stage_alloc(bytes, dir)?)
+    }
+
+    /// Keeps the host memory of a transfer whose ticket has completed for the next [`Context::stage_alloc`]: at most
+    /// [`STAGE_CACHE_BYTES`] bytes are kept, the rest is freed.
+    pub(crate) fn stage_release(&self, stage: luma_core::hal::Stage) {
+        let mut cache = self.inner.stages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held: u64 = cache.iter().map(luma_core::hal::Stage::len).sum();
+        if held + stage.len() <= STAGE_CACHE_BYTES {
+            cache.push(stage);
+        }
     }
 
     /// [`luma_core::hal::Backend::transfer_in`].

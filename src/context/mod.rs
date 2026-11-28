@@ -97,6 +97,8 @@ struct Inner {
     id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
+    /// Host memory of finished transfers, kept for the next stage (pinned memory is slow to allocate and fresh heap pages fault).
+    stages: Mutex<Vec<luma_core::hal::Stage>>,
     /// Report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     assume_busy: std::sync::atomic::AtomicBool,
     /// Report the GPU as idle regardless of the queue (see `Context::set_assume_idle`).
@@ -847,6 +849,7 @@ impl Context {
                 pager: Pager::new(budget, options.host_budget.unwrap_or_else(crate::gpu::pager::default_host_budget)),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
+                stages: Mutex::new(Vec::new()),
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
                 assume_idle: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
@@ -1276,6 +1279,8 @@ impl Context {
     ///
     /// [`MemoryStats::pooled_bytes`]: crate::MemoryStats::pooled_bytes
     pub fn trim(&self) -> Result<()> {
+        luma_core::hal::trim_host_pool();
+        self.inner.stages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         self.reclaim_idle_buffers()
     }
 

@@ -544,10 +544,15 @@ fn measure_transfers(ctx: &Context) -> Result<Option<luma_core::TransferModel>> 
         return Ok(None);
     }
     const BYTES: u64 = 32 << 20;
+    let t_a = Instant::now();
     let buffer = ctx.lane_buffer(BYTES)?;
     let mut host_in = ctx.stage_alloc(BYTES, luma_core::hal::StageDir::ToDevice)?;
     let mut host_out = ctx.stage_alloc(BYTES, luma_core::hal::StageDir::FromDevice)?;
     host_in.as_mut_slice().fill(1);
+    if std::env::var_os("LUMA_U6_TRACE").is_some() {
+        eprintln!("calibration: transfers alloc {:.0} ms", t_a.elapsed().as_secs_f64() * 1e3);
+    }
+    let t_b = Instant::now();
     let mut best_in = f64::INFINITY;
     let mut best_out = f64::INFINITY;
     for round in 0..=5 {
@@ -565,6 +570,10 @@ fn measure_transfers(ctx: &Context) -> Result<Option<luma_core::TransferModel>> 
         }
     }
 
+    if std::env::var_os("LUMA_U6_TRACE").is_some() {
+        eprintln!("calibration: transfers rounds {:.0} ms", t_b.elapsed().as_secs_f64() * 1e3);
+    }
+    let t_c = Instant::now();
     // A copy kernel over 64 MiB in and out, `reps` launches long enough to cover one transfer, with and without one running.
     let n: u32 = 1 << 24;
     let rig = Rig::new(ctx, kernel_source("", "f32", "in0[i]", "", "x"), "CostOverlap", n, n)?;
@@ -591,6 +600,9 @@ fn measure_transfers(ctx: &Context) -> Result<Option<luma_core::TransferModel>> 
         Ok(((with - base) / best_in).clamp(0.0, 1.0))
     })();
     rig.release(ctx);
+    if std::env::var_os("LUMA_U6_TRACE").is_some() {
+        eprintln!("calibration: transfers derate {:.0} ms", t_c.elapsed().as_secs_f64() * 1e3);
+    }
     let derate = derate?;
     Ok(Some(luma_core::TransferModel::new(BYTES as f64 / best_in, BYTES as f64 / best_out, derate)))
 }
@@ -638,8 +650,19 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<(CostModel, Option<MemoryModel>
     };
 
     let t_launch = time_kernel(ctx, copy(), "CostLaunch", 1, 0, LAUNCHES)?;
+    let t_mem = Instant::now();
     let memory = match measure_memory(ctx, bandwidth_gbs, t_launch) {
-        Ok(memory) => Some(memory.with_transfer(measure_transfers(ctx).unwrap_or_else(|err| {
+        Ok(memory) => Some(memory.with_transfer({
+            if std::env::var_os("LUMA_U6_TRACE").is_some() {
+                eprintln!("calibration: memory hierarchy {:.0} ms", t_mem.elapsed().as_secs_f64() * 1e3);
+            }
+            let t_tr = Instant::now();
+            let r = measure_transfers(ctx);
+            if std::env::var_os("LUMA_U6_TRACE").is_some() {
+                eprintln!("calibration: transfers {:.0} ms", t_tr.elapsed().as_secs_f64() * 1e3);
+            }
+            r
+        }.unwrap_or_else(|err| {
             log::debug!("luma: the transfer lane calibration failed: {err}");
             None
         }))),

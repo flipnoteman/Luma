@@ -3,7 +3,7 @@
 //! compute lane runs the stage's steps on the ring buffers in between, so upload, compute and download of neighbouring slabs overlap
 //! where the backend has lanes (CUDA). Backends whose lanes are the defaults run the same loop synchronously.
 
-use luma_core::hal::{size_class, HostBytes, Stage as HostStage, StageDir, Ticket};
+use luma_core::hal::{copy_parallel_host, size_class, HostBytes, Stage as HostStage, StageDir, Ticket};
 use luma_core::Buffer;
 
 use super::plan::Stage;
@@ -174,7 +174,13 @@ fn word(bytes: u64) -> u64 {
 }
 
 /// Runs the slabs of `stage` in `order` through the ring.
+pub(super) static T: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+fn tick(i: usize, t: std::time::Instant) {
+    T[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
 pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &Choice, order: &[usize], transient: &dyn Fn(u32) -> Option<&'t Buffer>, carries: &Carries<'_>) -> Result<(), LumaError> {
+    let t_all = std::time::Instant::now();
+    let t0 = std::time::Instant::now();
     let steps = &open.steps[stage.steps.clone()];
     let (window, n) = (choice.window, order.len());
     let mut rings: Vec<Ring> = Vec::with_capacity(choice.streams.len());
@@ -189,6 +195,7 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
         }
         rings.push(ring);
     }
+    tick(0, t0);
     let mut outstanding = Outstanding { ctx, tickets: Vec::new() };
     let mut up: Vec<Vec<Ticket>> = vec![Vec::new(); n];
     let mut down: Vec<Vec<Ticket>> = vec![Vec::new(); n];
@@ -199,14 +206,24 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
     let finalize = |rings: &[Ring], down: &[Vec<Ticket>], q: usize| -> Result<(), LumaError> {
         let (slab, slot) = (order[q], q % window);
         for ring in rings.iter().filter(|ring| ring.dir == Dir::Out) {
+            let t = std::time::Instant::now();
             for ticket in &down[q] {
                 ctx.ticket_wait(ticket)?;
             }
+            tick(1, t);
+            let t = std::time::Instant::now();
             let segment = &open.arrays[ring.array as usize].segments[slab];
             let bytes = segment.data_bytes() as usize;
-            let mut block = HostBytes::zeroed(bytes);
-            block.as_mut_slice().copy_from_slice(&ring.hosts[slot].as_slice()[..bytes]);
+            tick(2, t);
+            let t = std::time::Instant::now();
+            let block = HostBytes::filled_by::<LumaError>(bytes, |dst| {
+                copy_parallel_host(&ring.hosts[slot].as_slice()[..bytes], dst);
+                Ok(())
+            })?;
+            tick(3, t);
+            let t = std::time::Instant::now();
             segment.set_host(block)?;
+            tick(4, t);
         }
         Ok(())
     };
@@ -219,17 +236,23 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
             for ring in rings.iter_mut().filter(|ring| ring.dir == Dir::In && ring.flags[slab_q]) {
                 if q >= window {
                     // The host memory of the slot is free once the upload before it has completed.
+                    let t = std::time::Instant::now();
                     for ticket in &up[q - window] {
                         ctx.ticket_wait(ticket)?;
                     }
+                    tick(5, t);
                 }
                 let segment = &open.arrays[ring.array as usize].segments[slab_q];
                 let bytes = word(segment.data_bytes());
+                let t = std::time::Instant::now();
                 if !segment.stream_read(&mut ring.hosts[slot_q].as_mut_slice()[..bytes as usize])? {
                     return Err(LumaError::Gpu("a streamed input segment moved while its stage ran".into()));
                 }
+                tick(6, t);
+                let t = std::time::Instant::now();
                 let after: Vec<Ticket> = if q >= window { done[q - window].iter().cloned().collect() } else { Vec::new() };
                 let ticket = ctx.transfer_in(&ring.hosts[slot_q], &ring.bufs[slot_q], bytes, &after)?;
+                tick(7, t);
                 segment.note_streamed_in(segment.data_bytes());
                 outstanding.tickets.push(ticket.clone());
                 up[q].push(ticket);
@@ -249,9 +272,13 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
                 transient(array).or_else(|| rings.iter().find(|ring| ring.array == array && ring.flags[slab]).map(|ring| &ring.bufs[slot]))
             };
             let bound = bind_all(ctx, open, steps, &fixed);
+            let t = std::time::Instant::now();
             launch_steps(ctx, steps, &bound, slab, carries)?;
+            tick(8, t);
         }
+        let t = std::time::Instant::now();
         let ticket = ctx.lane_barrier(&[])?;
+        tick(9, t);
         outstanding.tickets.push(ticket.clone());
         done[p] = Some(ticket);
         // Host memory of a slot is reused by the download `window` slabs later: its blocks are installed first.
@@ -263,15 +290,29 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
             let segment = &open.arrays[ring.array as usize].segments[slab];
             let bytes = word(segment.data_bytes());
             let after: Vec<Ticket> = done[p].iter().cloned().collect();
+            let t = std::time::Instant::now();
             let ticket = ctx.transfer_out(&ring.bufs[slot], &mut ring.hosts[slot], bytes, &after)?;
+            tick(10, t);
             outstanding.tickets.push(ticket.clone());
             down[p].push(ticket);
         }
     }
+    let t = std::time::Instant::now();
     outstanding.finish()?;
+    tick(1, t);
     while finalized < n {
         finalize(&rings, &down, finalized)?;
         finalized += 1;
+    }
+    for ring in rings {
+        for host in ring.hosts {
+            ctx.stage_release(host);
+        }
+    }
+    tick(11, t_all);
+    if std::env::var_os("LUMA_U6_TRACE").is_some() {
+        let v: Vec<f64> = T.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6).collect();
+        eprintln!("stage n={n} total {:.0}ms | setup {:.0} dwait {:.0} dalloc {:.0} dcopy {:.0} setHost {:.0} upwait {:.0} streamRead {:.0} xferIn {:.0} launch {:.0} barrier {:.0} xferOut {:.0}", v[11], v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
     }
     Ok(())
 }

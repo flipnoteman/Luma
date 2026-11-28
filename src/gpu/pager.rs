@@ -1248,8 +1248,11 @@ impl Segment {
         match &*lock(&self.state) {
             State::Host(data) => {
                 let n = dst.len().min(data.len());
-                dst[..n].copy_from_slice(&data.as_slice()[..n]);
-                dst[n..].fill(0);
+                let (head, tail) = dst.split_at_mut(n);
+                // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the copy only writes initialized bytes.
+                let head = unsafe { std::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<MaybeUninit<u8>>(), n) };
+                copy_parallel_host(&data.as_slice()[..n], head);
+                tail.fill(0);
                 Ok(true)
             }
             State::Away => {

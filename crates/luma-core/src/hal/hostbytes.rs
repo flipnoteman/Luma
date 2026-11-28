@@ -5,6 +5,7 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::sync::{Mutex, PoisonError};
 
 /// Alignment of every [`HostBytes`] block.
 pub const HOST_ALIGN: usize = 64;
@@ -35,16 +36,54 @@ unsafe impl Send for Aligned {}
 // SAFETY: shared access only reads the bytes.
 unsafe impl Sync for Aligned {}
 
+/// Blocks of at least this many bytes are kept for reuse when dropped (below it the allocator's own caches do the job).
+const POOL_MIN: usize = 4 << 20;
+/// Bytes of dropped blocks the pool keeps. Fresh anonymous pages cost a kernel fault and a zeroing each (about 1 GB/s on a loaded
+/// host, a tenth of a PCIe transfer): a host copy that replaces a freed one of the same size reuses its pages instead.
+const POOL_CAP: usize = 2 << 30;
+
+/// Dropped large blocks, ready for the next block of the same length.
+static POOL: Mutex<(usize, Vec<Aligned>)> = Mutex::new((0, Vec::new()));
+
+/// Frees the blocks kept for reuse.
+pub fn trim_host_pool() {
+    let blocks = {
+        let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.0 = 0;
+        std::mem::take(&mut pool.1)
+    };
+    for mut block in blocks {
+        block.free();
+    }
+}
+
 impl Aligned {
     fn layout(len: usize) -> Layout {
         // Zero-length blocks are never allocated (see `new`), so the size is at least 1.
         Layout::from_size_align(len.max(1), HOST_ALIGN).expect("host buffer size overflows")
     }
 
+    /// Returns the block to the allocator, leaving this value empty.
+    fn free(&mut self) {
+        if self.len != 0 {
+            // SAFETY: allocated in `new` with this layout.
+            unsafe { alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len)) }
+            self.len = 0;
+        }
+    }
+
     /// Uninitialised memory.
     fn new(len: usize) -> Aligned {
         if len == 0 {
             return Aligned { ptr: NonNull::<u8>::dangling().with_addr(std::num::NonZeroUsize::new(HOST_ALIGN).expect("nonzero")), len };
+        }
+        if len >= POOL_MIN {
+            let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(at) = pool.1.iter().position(|block| block.len == len) {
+                let block = pool.1.swap_remove(at);
+                pool.0 -= len;
+                return block;
+            }
         }
         let layout = Self::layout(len);
         // SAFETY: `layout` has a nonzero size.
@@ -58,10 +97,17 @@ impl Aligned {
 
 impl Drop for Aligned {
     fn drop(&mut self) {
-        if self.len != 0 {
-            // SAFETY: allocated in `new` with this layout.
-            unsafe { alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len)) }
+        if self.len >= POOL_MIN {
+            let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+            if pool.0 + self.len <= POOL_CAP {
+                pool.0 += self.len;
+                // The block moves into the pool; this value is left empty.
+                pool.1.push(Aligned { ptr: self.ptr, len: self.len });
+                self.len = 0;
+                return;
+            }
         }
+        self.free();
     }
 }
 
@@ -162,6 +208,21 @@ mod tests {
         assert_eq!(bytes.as_slice().as_ptr() as usize % HOST_ALIGN, 0);
         assert!(bytes.as_slice().iter().all(|&b| b == 0));
         assert!(HostBytes::zeroed(0).is_empty());
+    }
+
+    #[test]
+    fn large_blocks_are_reused_and_trimmed() {
+        let len = POOL_MIN + 4096;
+        let first = HostBytes::zeroed(len);
+        let at = first.as_slice().as_ptr() as usize;
+        drop(first);
+        // Another test may have taken the block meanwhile: the contract is only that a block of the length comes back usable.
+        let again = HostBytes::zeroed(len);
+        assert!(again.as_slice().iter().all(|&b| b == 0));
+        let _ = at;
+        drop(again);
+        trim_host_pool();
+        assert!(HostBytes::zeroed(len).as_slice().iter().all(|&b| b == 0));
     }
 
     #[test]
