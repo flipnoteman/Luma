@@ -254,3 +254,15 @@ fn a_transposed_operand_is_merged_through_a_copy() {
     check_on(&ctx, "dc,ec,ed->", &[('c', 3), ('d', 2), ('e', 2)]);
     super::tests::set_no_generic(false);
 }
+
+/// A chain of four matrices under `reassociate` is multiplied in another order by `chain_order`; the added products read
+/// placeholders fed by the products that make them, which the scope check accepts.
+#[test]
+fn a_reassociated_chain_of_four_adds_products_that_read_fed_placeholders() {
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false).numerics(crate::Numerics::algebraic())).unwrap();
+    let dims = [4usize, 6, 17, 9, 4];
+    let mats: Vec<Array<f32>> = (0..4).map(|t| Array::from_slice_on(&ctx, &(0..dims[t] * dims[t + 1]).map(|i| ((i * 7 + t * 3) % 11) as f32 / 11.0 - 0.5).collect::<Vec<f32>>(), [dims[t + 1], dims[t]]).unwrap()).collect();
+    let refs: Vec<&Array<f32>> = mats.iter().collect();
+    let got = einsum("ab,bc,cd,de->ae", &refs).to_vec().unwrap();
+    assert_eq!(got.len(), dims[0] * dims[4]);
+}

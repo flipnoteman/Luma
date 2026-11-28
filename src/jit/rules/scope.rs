@@ -325,9 +325,12 @@ impl Scope {
                 debug_assert!(known(src) || fed, "a rewrite of {id:?} reads a source the scope does not");
             }
         }
-        for form in &rewrite.add {
+        for (i, form) in rewrite.add.iter().enumerate() {
+            // An added comprehension has the next free id; one that a feed names reads its placeholder from the producer.
+            let id = CompId(self.next + i as u32);
+            let fed = rewrite.feeds.iter().any(|feed| feed.consumer == id);
             for src in sources(form) {
-                debug_assert!(known(src), "an added comprehension reads a source the scope does not");
+                debug_assert!(known(src) || fed, "an added comprehension reads a source the scope does not");
             }
         }
     }

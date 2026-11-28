@@ -21,6 +21,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- Internal (debug builds only): the rewrite check of the plan scope panicked ("an added comprehension reads a source the scope does not") on a reassociated `einsum` chain of four or more matrices, such as `ab,bc,cd,de->ae` under `numerics.reassociate`. `chain_order` adds products that read placeholders fed by the products that make them; the check now accepts a source for an added comprehension that a feed names, as it already did for a replaced one. Release builds never ran the check and the chain's values are unchanged (the f64 bound of `fuzz::einsum` holds); the fuzz of 3000 `einsum` cases passes in debug.
+
 - A product whose operand is the reshape of a transposed (or other windowed) view, such as `a.transpose().reshape([n, 1]).matmul(&r)` of a stored column, failed with "native matrix product: a (binding 1) holds 8 bytes, 12 needed", or on the host path multiplied the wrong elements. A reshape shares the pending view's node, which keeps the shape it was made with; the operand was read as that node's window. A window is now taken only when the array has the node's shape, else the operand is evaluated and read as a dense matrix. A property test over chains of transpose, reshape, slice and broadcast views feeds `matmul`, `matmul_nt`, `matmul_tn` and `matmul_tt` against a host reference.
 
 ### Breaking
