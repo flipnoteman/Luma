@@ -134,6 +134,9 @@ macro_rules! half_array {
             /// half-precision matrix unit yet.
             #[track_caller]
             pub fn matmul(&self, rhs: &Array<$t>) -> Array<$t> {
+                if let Some(product) = crate::matmul_half::product(self, rhs, false, false, Location::caller()) {
+                    return product;
+                }
                 self.to_f32().matmul(&rhs.to_f32()).$to()
             }
 
@@ -141,18 +144,27 @@ macro_rules! half_array {
             /// [`Array::matmul`] of this type).
             #[track_caller]
             pub fn matmul_nt(&self, rhs: &Array<$t>) -> Array<$t> {
+                if let Some(product) = crate::matmul_half::product(self, rhs, false, true, Location::caller()) {
+                    return product;
+                }
                 self.to_f32().matmul_nt(&rhs.to_f32()).$to()
             }
 
             /// `self.transpose() * rhs` (see [`Array::matmul_tn`] of an `f32` array).
             #[track_caller]
             pub fn matmul_tn(&self, rhs: &Array<$t>) -> Array<$t> {
+                if let Some(product) = crate::matmul_half::product(self, rhs, true, false, Location::caller()) {
+                    return product;
+                }
                 self.to_f32().matmul_tn(&rhs.to_f32()).$to()
             }
 
             /// `self.transpose() * rhs.transpose()` (see [`Array::matmul_tt`] of an `f32` array).
             #[track_caller]
             pub fn matmul_tt(&self, rhs: &Array<$t>) -> Array<$t> {
+                if let Some(product) = crate::matmul_half::product(self, rhs, true, true, Location::caller()) {
+                    return product;
+                }
                 self.to_f32().matmul_tt(&rhs.to_f32()).$to()
             }
 

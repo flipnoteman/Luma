@@ -176,6 +176,7 @@ mod kernel;
 mod linalg;
 mod bmm;
 mod matmul;
+mod matmul_half;
 mod nan;
 mod numerics;
 mod ops;

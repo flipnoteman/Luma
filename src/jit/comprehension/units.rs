@@ -18,6 +18,10 @@ pub(crate) enum UnitId {
     CudaTf32,
     /// The exact `f32` kernels on the ordinary cores: the reference unit.
     Fma,
+    /// `f16` tensor cores (CUDA `mma.m16n8k16`), `f32` accumulation.
+    CudaF16,
+    /// `bf16` tensor cores (CUDA `mma.m16n8k16`), `f32` accumulation.
+    CudaBf16,
 }
 
 /// One matrix unit.
@@ -48,7 +52,7 @@ pub(crate) struct UnitDesc {
 }
 
 /// The units, in preference order.
-pub(crate) static UNITS: [UnitDesc; 2] = [
+pub(crate) static UNITS: [UnitDesc; 4] = [
     UnitDesc {
         id: UnitId::CudaTf32,
         gemm: GemmUnit::Tf32,
@@ -75,6 +79,35 @@ pub(crate) static UNITS: [UnitDesc; 2] = [
         rate: 22_900.0,
         ragged_max_fmas: 4_000_000_000,
     },
+    // The half-precision units multiply exactly and accumulate in `f32` (`MATRIX_ACCUMULATE`: no operand is rounded below its stored
+    // precision). Their rates are measured at 4096^3 on an RTX 3090 (see the CHANGELOG of W3-R7); no ragged cap: the kernels' edges are
+    // in-kernel.
+    UnitDesc {
+        id: UnitId::CudaF16,
+        gemm: GemmUnit::F16,
+        shape: [16, 8, 16],
+        subgroup: 32,
+        a: ElemTy::F16,
+        b: ElemTy::F16,
+        acc: ElemTy::F32,
+        needs: Caps::F16_MMA,
+        reduced: Reduced::MATRIX_ACCUMULATE,
+        rate: 55_000.0,
+        ragged_max_fmas: u64::MAX,
+    },
+    UnitDesc {
+        id: UnitId::CudaBf16,
+        gemm: GemmUnit::Bf16,
+        shape: [16, 8, 16],
+        subgroup: 32,
+        a: ElemTy::BF16,
+        b: ElemTy::BF16,
+        acc: ElemTy::F32,
+        needs: Caps::BF16_MMA,
+        reduced: Reduced::MATRIX_ACCUMULATE,
+        rate: 55_000.0,
+        ragged_max_fmas: u64::MAX,
+    },
 ];
 
 /// The unit of a `MatmulTile::Gemm*`'s `exact` flag (the flag stays in the tile: its `Debug` text is a kernel label that decisions
@@ -89,6 +122,8 @@ impl UnitDesc {
     pub(crate) fn of(unit: GemmUnit) -> &'static UnitDesc {
         match unit {
             GemmUnit::Tf32 => &UNITS[0],
+            GemmUnit::F16 => &UNITS[2],
+            GemmUnit::Bf16 => &UNITS[3],
             _ => &UNITS[1],
         }
     }
@@ -126,10 +161,10 @@ mod tests {
 
     #[test]
     fn each_gemm_unit_has_its_row() {
-        for unit in [GemmUnit::Fma, GemmUnit::Tf32] {
+        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16] {
             assert_eq!(UnitDesc::of(unit).gemm, unit);
         }
-        assert_eq!(UNITS.iter().map(|u| u.id).collect::<Vec<_>>(), [UnitId::CudaTf32, UnitId::Fma]);
+        assert_eq!(UNITS.iter().map(|u| u.id).collect::<Vec<_>>(), [UnitId::CudaTf32, UnitId::Fma, UnitId::CudaF16, UnitId::CudaBf16]);
     }
 
     /// The reference verification through a context: a verified variant is accepted on its first call (with a decision recording the

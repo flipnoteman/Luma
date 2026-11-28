@@ -1388,7 +1388,7 @@ fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_gr
 static OWN_F32_KERNELS_OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("LUMA_OWN_GEMM").is_ok_and(|v| v.trim() == "off"));
 
 /// Tiles per multiprocessor a tensor-core product aims for.
-const GEMM_HALF_TILES_PER_SM: u32 = 4;
+pub(crate) const GEMM_HALF_TILES_PER_SM: u32 = 4;
 /// Smallest `M` and `K` of a product of the backend's own kernels (below it the tiles are mostly
 /// padding), and of its `N`, except for a product of at most [`SMALL_N_MAX_M`] rows, whose few
 /// columns (the classes of a classifier head) fill part of a 32-wide tile but still beat the
@@ -1490,7 +1490,7 @@ fn f32_tile_rate(tile: (u32, u32), workgroups: u32, units: u32, useful: f64) -> 
 /// long K split K (see [`native_plan`]). `f32` tiles: the one with the best rate, K split as
 /// [`f32_split`] says (see [`f32_tile_rate`]).
 #[allow(clippy::too_many_arguments)]
-fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], unit: GemmUnit, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+pub(crate) fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], unit: GemmUnit, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
     let exact = unit == GemmUnit::Fma;
     let units = tuning.compute_units;
     let wanted = units.max(1).saturating_mul(half_per_sm).div_ceil(2);

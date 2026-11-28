@@ -28,6 +28,14 @@ impl Reduced {
     /// Without it only programs whose result is bit-identical wherever it is computed may run there. In [`Numerics::algebraic`]
     /// and [`Numerics::fast`], not in `default` or `strict`; `LUMA_NUMERICS=...+host`.
     pub const HOST_PLACEMENT: Self = Self(1 << 3);
+    /// A product may run on a matrix unit whose accumulation differs from the sequential `f32` chain (hardware order and width)
+    /// **without rounding any operand below its stored precision**: `f16` and `bf16` arrays on the half-precision tensor cores. The
+    /// unit multiplies exactly and accumulates in `f32`; the result is rounded once to the array's type. In `default`, `algebraic` and
+    /// `fast`, not in `strict` (which widens and uses the `f32` kernels); `LUMA_NUMERICS=...+matrix-accumulate`.
+    pub const MATRIX_ACCUMULATE: Self = Self(1 << 4);
+    /// `f32` operands of a product may be **rounded to `f16`** (11 significant bits; a magnitude over 65504 becomes infinite) so that
+    /// it runs on the half-precision matrix units. In no preset: `LUMA_NUMERICS=...+f16-matmul`.
+    pub const F16_OPERANDS: Self = Self(1 << 5);
 
     /// No feature.
     pub const fn empty() -> Self {
@@ -91,9 +99,10 @@ pub struct Numerics {
 }
 
 impl Numerics {
-    /// The default: TF32 matrix products where the device has tensor cores, everything else exact.
+    /// The default: TF32 matrix products where the device has tensor cores, `f16` / `bf16` products on the half-precision matrix
+    /// units (operands never rounded below their stored precision), everything else exact.
     pub const fn default() -> Self {
-        Numerics { reassociate: false, reformulate: false, exact_finite: false, reduced: Reduced::TF32_MATMUL }
+        Numerics { reassociate: false, reformulate: false, exact_finite: false, reduced: Reduced::TF32_MATMUL.union(Reduced::MATRIX_ACCUMULATE) }
     }
 
     /// Exact `f32` semantics: no TF32, no fast math, no rewrite that changes a bit.
@@ -109,12 +118,12 @@ impl Numerics {
     /// but when its value is used, so a GPU starts a little later in a loop than with the default
     /// numerics.
     pub const fn algebraic() -> Self {
-        Numerics { reassociate: true, reformulate: true, exact_finite: true, reduced: Reduced::TF32_MATMUL.union(Reduced::HOST_PLACEMENT) }
+        Numerics { reassociate: true, reformulate: true, exact_finite: true, reduced: Reduced::TF32_MATMUL.union(Reduced::MATRIX_ACCUMULATE).union(Reduced::HOST_PLACEMENT) }
     }
 
     /// [`Numerics::algebraic`] and fast math.
     pub const fn fast() -> Self {
-        Numerics { reduced: Reduced::TF32_MATMUL.union(Reduced::FAST_MATH).union(Reduced::HOST_PLACEMENT), ..Numerics::algebraic() }
+        Numerics { reduced: Reduced::TF32_MATMUL.union(Reduced::MATRIX_ACCUMULATE).union(Reduced::FAST_MATH).union(Reduced::HOST_PLACEMENT), ..Numerics::algebraic() }
     }
 
     /// Whether fast math is on.
@@ -173,6 +182,8 @@ impl Numerics {
                 "tf32-linalg" => numerics = numerics.with_reduced(Reduced::TF32_LINALG, on),
                 "fast-math" => numerics = numerics.with_reduced(Reduced::FAST_MATH, on),
                 "host" => numerics = numerics.with_reduced(Reduced::HOST_PLACEMENT, on),
+                "matrix-accumulate" => numerics = numerics.with_reduced(Reduced::MATRIX_ACCUMULATE, on),
+                "f16-matmul" => numerics = numerics.with_reduced(Reduced::F16_OPERANDS, on),
                 "reassociate" => numerics.reassociate = on,
                 "reformulate" => numerics.reformulate = on,
                 _ => numerics.exact_finite = on,
@@ -182,7 +193,7 @@ impl Numerics {
         Ok(numerics)
     }
 
-    const MODIFIERS: [&'static str; 7] = ["tf32-matmul", "tf32-linalg", "fast-math", "host", "reassociate", "reformulate", "exact-finite"];
+    const MODIFIERS: [&'static str; 9] = ["tf32-matmul", "tf32-linalg", "fast-math", "host", "matrix-accumulate", "f16-matmul", "reassociate", "reformulate", "exact-finite"];
 }
 
 impl Default for Numerics {
@@ -214,7 +225,7 @@ impl fmt::Display for Numerics {
         if base.exact_finite != self.exact_finite {
             write!(f, "{}exact-finite", sign(self.exact_finite))?;
         }
-        for (flag, name) in [(Reduced::TF32_MATMUL, "tf32-matmul"), (Reduced::TF32_LINALG, "tf32-linalg"), (Reduced::FAST_MATH, "fast-math"), (Reduced::HOST_PLACEMENT, "host")] {
+        for (flag, name) in [(Reduced::TF32_MATMUL, "tf32-matmul"), (Reduced::TF32_LINALG, "tf32-linalg"), (Reduced::FAST_MATH, "fast-math"), (Reduced::HOST_PLACEMENT, "host"), (Reduced::MATRIX_ACCUMULATE, "matrix-accumulate"), (Reduced::F16_OPERANDS, "f16-matmul")] {
             if base.reduced.contains(flag) != self.reduced.contains(flag) {
                 write!(f, "{}{name}", sign(self.reduced.contains(flag)))?;
             }

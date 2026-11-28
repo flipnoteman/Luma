@@ -52,6 +52,10 @@ impl Caps {
     pub(crate) const TELEMETRY: Self = Self(1 << 14);
     /// The backend has gemm tiles of its own (`Backend::gemm_tiles`, TF32 or `f32`).
     pub(crate) const GEMM_TILES: Self = Self(1 << 15);
+    /// Tensor-core products on `f16` operands (the backend has `GemmUnit::F16` tiles).
+    pub(crate) const F16_MMA: Self = Self(1 << 16);
+    /// Tensor-core products on `bf16` operands.
+    pub(crate) const BF16_MMA: Self = Self(1 << 17);
 
     /// Whether every capability of `other` is set.
     pub(crate) const fn contains(self, other: Self) -> bool {
@@ -99,6 +103,8 @@ impl Caps {
         set(!info.cpu && info.zero_copy, Caps::HOST_PATH);
         set(backend.can_time_launches(), Caps::TELEMETRY);
         set(!backend.gemm_tiles(GemmUnit::Tf32).is_empty() || !backend.gemm_tiles(GemmUnit::Fma).is_empty(), Caps::GEMM_TILES);
+        set(!backend.gemm_tiles(GemmUnit::F16).is_empty(), Caps::F16_MMA);
+        set(!backend.gemm_tiles(GemmUnit::Bf16).is_empty(), Caps::BF16_MMA);
         caps
     }
 }

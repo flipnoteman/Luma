@@ -1260,7 +1260,19 @@ impl Context {
         Ok(kernel)
     }
 
-    /// The table of the products with an epilogue hook.
+    /// The compiled kernel `make()` builds for `key` (`None`: there is none), kept by this context.
+    pub(crate) fn keyed_core(&self, key: &str, make: impl FnOnce() -> Option<KernelCore>) -> Option<Arc<KernelCore>> {
+        let key = format!("core:{key}");
+        let cached = self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned();
+        if cached.is_some() {
+            return cached;
+        }
+        let core = Arc::new(make()?);
+        self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, Arc::clone(&core));
+        Some(core)
+    }
+
+    /// The verdicts of the reference verification of matrix-unit variants.
     pub(crate) fn unit_verifier(&self) -> &luma_core::hal::verify::UnitVerifier {
         &self.inner.unit_verifier
     }

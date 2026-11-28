@@ -58,6 +58,7 @@ mod lazy_products;
 mod lazy_scalars;
 mod matmul;
 mod matmul_ragged;
+mod matmul_half;
 mod matmul_tf32;
 mod matmul_windows;
 mod memory_stats;
