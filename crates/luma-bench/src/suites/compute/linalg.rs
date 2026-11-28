@@ -42,6 +42,35 @@ fn verify(name: &str, c: &[f32], a: &[f32], b: &[f32], m: usize, k: usize, n: us
     }
 }
 
+/// The `matmul/f16` and `matmul/bf16` rows of the `m x k` by `k x n` product `(m, n, k)`, checked at a few entries against the exact product of the
+/// stored values (`4 * 2^-24 * sum|ab|` plus one rounding of the result).
+fn half_rows(h: &mut Harness, (m, n, k): (usize, usize, usize)) {
+    use half::{bf16, f16};
+    fn row<T: luma::GpuType + Copy>(h: &mut Harness, name: &str, (m, n, k): (usize, usize, usize), make: fn(f32) -> T, back: fn(T) -> f32, eps: f64, mul: fn(&luma::Array<T>, &luma::Array<T>) -> luma::Array<T>) {
+        let (ad, bd) = (values(m * k, 61, -1.0, 1.0), values(k * n, 62, -1.0, 1.0));
+        let (a16, b16): (Vec<T>, Vec<T>) = (ad.iter().map(|&x| make(x)).collect(), bd.iter().map(|&x| make(x)).collect());
+        let (a, b) = (luma::Array::from_slice_on(&h.ctx, &a16, [k, m]).unwrap(), luma::Array::from_slice_on(&h.ctx, &b16, [n, k]).unwrap());
+        // Sampled entries against the product of the stored (rounded) values.
+        let got = mul(&a, &b).to_vec().unwrap();
+        let mut worst = 0.0f64;
+        for t in 0..32usize {
+            let (r, c) = ((t * 977) % m, (t * 613) % n);
+            let (mut sum, mut abs) = (0.0f64, 0.0f64);
+            for q in 0..k {
+                let p = f64::from(back(a16[r * k + q])) * f64::from(back(b16[q * n + c]));
+                sum += p;
+                abs += p.abs();
+            }
+            let err = (f64::from(back(got[r * n + c])) - sum).abs() / (4.0 / 16_777_216.0 * abs + eps * sum.abs() + 1e-7);
+            worst = worst.max(err);
+        }
+        assert!(worst <= 1.0, "{name}: an entry is {worst:.2}x its bound");
+        h.case(name, &format!("{m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || mul(&a, &b).eval().unwrap());
+    }
+    row::<f16>(h, "matmul/f16", (m, n, k), f16::from_f32, f16::to_f32, 4.9e-4, |a, b| a.matmul(b));
+    row::<bf16>(h, "matmul/bf16", (m, n, k), bf16::from_f32, bf16::to_f32, 3.9e-3, |a, b| a.matmul(b));
+}
+
 /// `f32` and TF32 products of the same shapes (`m x k` times `k x n`, `layout` 0 = plain, 1 = the
 /// right operand a lazy transpose, 2 = the left one), timed alternately ABBA; prints the TF32
 /// error against the `f64` product. Only on devices where `matmul_tf32` runs on tensor cores.
@@ -208,6 +237,18 @@ pub fn run(h: &mut Harness) {
             let (a, b) = (upload(h, &ad, [n, n]), upload(h, &bd, [n, n]));
             verify("matmul/square", &host(&a.matmul(&b)), &ad, &bd, n, n, n, false, h.ctx.numerics().tf32_matmul());
             h.case("matmul/square", &format!("{n}"), Work::Flops(2.0 * (n as f64).powi(3)), &mut || a.matmul(&b).eval().unwrap());
+        }
+
+        // `f16` / `bf16` products (W3-R7): the half-precision matrix units where the numerics and the device allow, else the widening
+        // path. 1001 has leading dimensions the units' 16-byte copies do not read: the widening path.
+        if !cpu {
+            let sizes: &[usize] = if h.quick { &[2048] } else { &[1001, 2048, 4096] };
+            for &n in sizes {
+                half_rows(h, (n, n, n));
+            }
+            if !h.quick {
+                half_rows(h, (4096, 64, 4096));
+            }
         }
 
         // A tall-skinny projection: memory-bound with a small K.

@@ -52,13 +52,16 @@ pub fn variant_key(spec: &GemmSpec, revision: u64) -> u64 {
     super::cache::source_revision(&[&format!("{:?}", base(spec))]) ^ revision.rotate_left(29)
 }
 
+/// A half type's conversions: from `f32` to bits (round to nearest even) and back.
+type Codec = (fn(f32) -> u16, fn(u16) -> f32);
+
 /// The operands as a unit reads them.
 #[derive(Clone, Copy)]
 struct Format {
     /// Rounds one operand as the unit does (the reference multiplies the rounded values).
     round: fn(f32) -> f32,
     /// The operand's type in the buffers: 4 bytes (`f32`) or 2 (a half type, `to_bits` / `from_bits` of its encoding).
-    half: Option<(fn(f32) -> u16, fn(u16) -> f32)>,
+    half: Option<Codec>,
     /// A subnormal of the operand type (the problem sprinkles it in).
     tiny: f32,
     /// The bound of an output's error relative to the sum of the magnitudes of its products.

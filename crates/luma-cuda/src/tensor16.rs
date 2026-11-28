@@ -85,6 +85,7 @@ impl Config16 {
 
 /// The `cp.async` copy of the chunk `j` of operand `x` (eight elements) to the shared address in `dst`, then the advance of its global
 /// pointer by `step`. `k_contig` says the chunk runs along `k`. Clobbers `%r32`, `%r36`, `%p12`.
+#[allow(clippy::too_many_arguments)]
 fn copy_chunk(w: &mut Ptx, mode: Mode, k_contig: bool, x: &str, j: u32, dst: &str, kleft: &str, step: &str) {
     match mode {
         Mode::Aligned => {
