@@ -1770,6 +1770,100 @@ impl<'a> Em<'a> {
 
         CudaTranslated { source: src, param_abis, array_lengths: lens }
     }
+
+    /// The NVVM IR of an epilogue hook (see [`emit_hook`]): function 0 of the module behind a plain `luma_epi` that takes the
+    /// extra operands as 64-bit addresses.
+    fn run_hook(mut self) -> Result<String, String> {
+        let m = self.m;
+        let live = m.reachable_functions();
+        let direct: Vec<Res> = m.functions.iter().map(|f| scan(&f.body)).collect();
+        let mut total = direct.clone();
+        loop {
+            let mut changed = false;
+            for i in 0..total.len() {
+                for c in direct[i].calls.clone() {
+                    let other = total[c as usize].clone();
+                    if total[i].merge(&other) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.res = total;
+        let Some(hook) = m.functions.first() else { return Err("the hook module has no function".into()) };
+        let r = self.res[0].clone();
+        if r.grid || !r.shared.is_empty() || !r.privs.is_empty() || !r.lens.is_empty() {
+            return Err("an epilogue hook reads only its operands".into());
+        }
+        if hook.ret_ty != Some(KirType::Scalar(ScalarTy::F32)) {
+            return Err("an epilogue hook returns an f32".into());
+        }
+        let extras = m.bindings.len().saturating_sub(1);
+        if extras > 4 || r.binds.iter().any(|&b| b as usize >= extras) {
+            return Err("an epilogue hook reads at most four extra operands".into());
+        }
+        let mut fns = String::new();
+        for (i, f) in m.functions.iter().enumerate() {
+            if i == 0 || live[i] {
+                fns.push_str(&self.function(i, f));
+            }
+        }
+        let mut params: Vec<String> = Vec::new();
+        let mut args: Vec<String> = Vec::new();
+        for (k, (_, t)) in hook.params.iter().enumerate() {
+            let KirType::Scalar(s) = t else { return Err("an epilogue hook takes scalar parameters".into()) };
+            params.push(format!("{} %a{k}", llty(*s)));
+            args.push(format!("{} %a{k}", llty(*s)));
+        }
+        let mut body = String::new();
+        for b in 0..extras {
+            params.push(format!("i64 %p{b}"));
+        }
+        for &b in &r.binds {
+            // Global memory: the operands are device buffers (the cast lets NVVM load them from the global space).
+            body.push_str(&format!("  %g{b} = inttoptr i64 %p{b} to i8 addrspace(1)*\n  %buf{b} = addrspacecast i8 addrspace(1)* %g{b} to i8*\n"));
+            args.push(format!("i8* %buf{b}"));
+        }
+        let mut src = String::new();
+        src.push_str(&format!("; {}\n", m.label.replace(['\n', '\r'], " ")));
+        src.push_str(TRIPLE);
+        src.push_str(DATALAYOUT);
+        for h in self.helpers.values() {
+            src.push_str(h);
+        }
+        src.push_str(&fns);
+        src.push_str(&format!("define float @luma_epi({}) nounwind {{\nentry:\n{body}  %r = call float @f0({})\n  ret float %r\n}}\n", params.join(", "), args.join(", ")));
+        for d in &self.decls {
+            src.push_str(d);
+            src.push('\n');
+        }
+        src.push_str("!nvvmir.version = !{!21}\n!21 = !{i32 2, i32 0}\n");
+        src.push_str(TBAA);
+        Ok(src)
+    }
+}
+
+/// NVVM IR of the epilogue hook `module` (see `luma_core::HookId` for its shape): `define float @luma_epi(acc, row, col, n,
+/// scalars..., i64 p0.., )` with no kernel, whose PTX is a `.func` the product's store stage inlines. The helper functions the
+/// hook calls are `alwaysinline`, and what libdevice adds is its own; nothing of it is emitted as a separate function.
+pub fn emit_hook(module: &KernelModule) -> Result<String, String> {
+    let n = module.bindings.len();
+    Em {
+        m: module,
+        active: vec![true; n],
+        abi: vec![None; n],
+        res: Vec::new(),
+        init_shared: false,
+        clamp_shared: false,
+        decls: BTreeSet::new(),
+        helpers: BTreeMap::new(),
+        jumps: Vec::new(),
+        conv: conv::analyse(module),
+    }
+    .run_hook()
 }
 
 /// Translates `module` to NVVM IR. `used` is the reachability mask of bindings

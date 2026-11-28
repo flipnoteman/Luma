@@ -15,7 +15,7 @@
 use luma_core::GemmSpec;
 
 use crate::gemm_copy::{self, Mode};
-use crate::ptx::Ptx;
+use crate::ptx::{Hook, Ptx};
 
 /// The shape of a kernel: output tile, warps and pipeline depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,8 +88,17 @@ impl Config {
 
 /// The PTX of the kernel `main` for `config`.
 pub(crate) fn ptx(config: &Config) -> String {
+    ptx_hooked(config, None).expect("a product without a hook always generates")
+}
+
+/// [`ptx`] with the epilogue `hook` applied to every output before it is stored (after the whole K sum of the slice): the kernel then
+/// takes the hook's operands as parameters `pe0..` between `pb` and `pu`, and its scalars as the words of `pu` after the eight of the
+/// product. The hook is called on every accumulator, first, with `row` and `col` clamped into the matrix, and the stores follow
+/// (guarded as before): a load of the hook never waits for a store. `Err` if the hook's text is not one the expander takes.
+pub(crate) fn ptx_hooked(config: &Config, hook: Option<&Hook>) -> Result<String, String> {
     let Config { bm, bn, wm, wn, stages, bk, lhs_t, rhs_t, group, mode, half } = *config;
     assert!(!half || bm == bn, "a half-work product has square tiles");
+    assert!(!half || hook.is_none(), "a half-work product takes no hook");
     let threads = config.threads();
     let (warp_rows, warp_cols) = (bm / wm, bn / wn);
     let (mt, nt) = (warp_rows / 16, warp_cols / 8);
@@ -105,14 +114,21 @@ pub(crate) fn ptx(config: &Config) -> String {
     let mut w = Ptx { text: String::new() };
     w.text.push_str(".version 7.0\n.target sm_80\n.address_size 64\n\n");
     w.text.push_str(".extern .shared .align 16 .b8 smem[];\n\n");
-    w.text.push_str(&format!(
-        ".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n    .param .align 16 .b8 pu[{}]\n)\n",
-        gemm_copy::UNIFORM_BYTES
-    ));
+    let operands = hook.map_or(0, |hook| hook.operands);
+    let scalars = hook.map_or(0, |hook| hook.scalars);
+    w.text.push_str(".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n");
+    for e in 0..operands {
+        w.text.push_str(&format!("    .param .u64 pe{e},\n"));
+    }
+    w.text.push_str(&format!("    .param .align 16 .b8 pu[{}]\n)\n", gemm_copy::UNIFORM_BYTES + 4 * scalars as usize));
     w.text.push_str(&format!(".maxntid {threads}, 1, 1\n{{\n"));
     w.text.push_str(
         "    .reg .pred %p<16>;\n    .reg .b32 %r<64>;\n    .reg .b64 %rd<64>;\n    .reg .f32 %f<2>;\n",
     );
+    if hook.is_some() {
+        // The hook's operands' addresses, its scalars, `m - 1` and `n - 1`, and the clamped row and column.
+        w.text.push_str(&format!("    .reg .b64 %hp<{}>;\n    .reg .b32 %hs<{}>;\n    .reg .b32 %hm<2>;\n    .reg .b32 %hr, %hk, %hc;\n", operands.max(1), scalars.max(1)));
+    }
     // Accumulators, fragments, per-thread copy state.
     w.text.push_str(&format!("    .reg .f32 %c<{}>;\n", mt * nt * 4));
     w.text.push_str(&format!("    .reg .b32 %fa<{}>;\n", mt * 4));
@@ -408,6 +424,42 @@ pub(crate) fn ptx(config: &Config) -> String {
     p!(w, "add.u32 %r28, %r28, %r12;");
     p!(w, "shl.b32 %r29, %r8, 1;");
     p!(w, "add.u32 %r28, %r28, %r29;"); // col of fragment (0,0)
+    if let Some(hook) = hook {
+        for e in 0..operands {
+            p!(w, "ld.param.u64 %hp{e}, [pe{e}];");
+        }
+        for k in 0..scalars {
+            p!(w, "ld.param.u32 %hs{k}, [pu+{}];", gemm_copy::UNIFORM_BYTES as u32 + 4 * k);
+        }
+        p!(w, "sub.u32 %hm0, %r0, 1;");
+        p!(w, "sub.u32 %hm1, %r1, 1;");
+        let mut site = 0u32;
+        for i in 0..mt {
+            for h in 0..2u32 {
+                for j in 0..nt {
+                    let c = (i * nt + j) * 4 + h * 2;
+                    p!(w, "add.u32 %r30, %r27, {};", i * 16 + h * 8);
+                    p!(w, "add.u32 %r32, %r28, {};", j * 8);
+                    for q in 0..2u32 {
+                        let col = if q == 0 {
+                            "%r32"
+                        } else {
+                            p!(w, "add.u32 %hc, %r32, 1;");
+                            "%hc"
+                        };
+                        p!(w, "min.u32 %hr, %r30, %hm0;");
+                        p!(w, "min.u32 %hk, {col}, %hm1;");
+                        let acc = format!("%c{}", c + q);
+                        let mut args: Vec<(String, u32)> = vec![(acc.clone(), 32), ("%hr".into(), 32), ("%hk".into(), 32), ("%r1".into(), 32)];
+                        args.extend((0..scalars).map(|k| (format!("%hs{k}"), 32)));
+                        args.extend((0..operands).map(|e| (format!("%hp{e}"), 64)));
+                        w.text.push_str(&hook.expand(site, &args, &acc)?);
+                        site += 1;
+                    }
+                }
+            }
+        }
+    }
     if half {
         // Element by element: the elements of the lower triangle (of the matrix, so of a diagonal tile too) at `C[row * n + col]`,
         // and those below the diagonal, or any of an off-diagonal tile, also at `C[col * n + row]`. A diagonal tile's upper triangle
@@ -475,7 +527,7 @@ pub(crate) fn ptx(config: &Config) -> String {
     }
     p!(w, "ret;");
     w.text.push_str("}\n");
-    w.text
+    Ok(w.text)
 }
 
 #[cfg(test)]

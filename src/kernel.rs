@@ -245,7 +245,7 @@ pub(crate) fn build_core_native(
     let native = native.filter(|_| all_bound).and_then(|spec| match spec {
         Native::LineSolve(spec) => backend.compile_line_solve(&spec),
         Native::Matmul(spec) => backend.compile_matmul(&spec),
-        Native::Gemm(spec) => backend.compile_gemm(&spec),
+        Native::Gemm(spec) => backend.compile_gemm(&spec, None),
         Native::BatchedMatmul => backend.compile_batched_matmul(),
     });
     if native.is_none() && matches!(requested, Some(Native::Matmul(_) | Native::Gemm(_))) {

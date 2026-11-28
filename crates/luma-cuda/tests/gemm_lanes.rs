@@ -48,7 +48,7 @@ fn bytes(data: &[f32]) -> Vec<u8> {
 }
 
 fn kernel(backend: &CudaBackend, spec: &GemmSpec) -> CompiledKernel {
-    let raw = backend.compile_gemm(spec).expect("the backend plans the product");
+    let raw = backend.compile_gemm(spec, None).expect("the backend plans the product");
     let start = Instant::now();
     while !raw.is_ready() {
         assert!(start.elapsed() < Duration::from_secs(60), "the kernel never finished compiling");

@@ -161,6 +161,7 @@ mod coarsen;
 pub(crate) mod comprehension;
 pub(crate) mod cost;
 mod inline;
+mod epi_hook;
 mod kirgen;
 mod launch;
 pub(crate) mod lineage;

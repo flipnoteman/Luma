@@ -46,6 +46,9 @@ const NARROW_DIV: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
 }
 ";
 
+/// The key of the combined value in the inputs of a [`Frame`] (an epilogue program's `Ref::Acc`).
+pub(super) const ACC: u32 = u32::MAX;
+
 /// The IR type of a register holding `ty`: a `bool` is a `u32` of 0 or 1 there.
 pub(super) fn reg(ty: ElemTy) -> KirType {
     match ty {
@@ -207,6 +210,8 @@ pub(super) struct Lower<'a> {
     uni: Option<Uni>,
     /// Index of the field `s0` of the uniform.
     s0: u32,
+    /// Set for an epilogue hook (a function, not a kernel): scalar `k` is parameter `k + base` of the function, not a field of the uniform.
+    pub(super) scalar_params: Option<u32>,
     /// Per input, its binding (`None`: it has none, or only segments).
     pub(super) ins: Vec<Option<u32>>,
     /// Per input, the bindings of its segments (`in{k}_{s}`).
@@ -235,6 +240,7 @@ impl<'a> Lower<'a> {
             lib,
             uni: None,
             s0: 0,
+            scalar_params: None,
             ins: Vec::new(),
             segs: Vec::new(),
             ghosts: Vec::new(),
@@ -279,6 +285,9 @@ impl<'a> Lower<'a> {
 
     /// Scalar operand `k`: field `s{k}` of the uniform.
     pub(super) fn scalar(&self, fb: &FnBuilder<'_>, k: u32) -> Val {
+        if let Some(base) = self.scalar_params {
+            return fb.param(base + k);
+        }
         match &self.uni {
             Some(uni) if ((self.s0 + k) as usize) < uni.tys.len() => uni.field(fb, self.s0 + k),
             _ => self.fail(fb, format!("scalar {k} is not in the uniform")),
@@ -315,7 +324,10 @@ impl<'a> Lower<'a> {
                 None => self.fail(fb, format!("t{k} is read before it is computed")),
             },
             Ref::Sub(k) => self.fail(fb, format!("sub-program {k} is not an operand")),
-            Ref::Acc => self.fail(fb, "the combined value is an operand of epilogue programs only".to_owned()),
+            Ref::Acc => match f.a.get(&(ACC, at)) {
+                Some(&v) => v,
+                None => self.fail(fb, "the combined value is an operand of epilogue programs only".to_owned()),
+            },
         }
     }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::emit::Emit;
 use super::epilogue::{EpiMap, EpiProgram};
+use super::gemm_hook;
 use super::strategy::{BitClass, Estimate, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
@@ -413,6 +414,13 @@ const fn epilogued(mut strategy: Strategy) -> Strategy {
     strategy
 }
 
+/// Whether the strategy `id` applies `ContractionView::epilogue` itself: the native tensor-core products (TF32), through the hook of
+/// their store stage (`gemm_hook`). The exact (`f32`) kernel is not hooked: ptxas gives it 125 registers instead of 153 for any change
+/// to its store stage, and it loses 1-6 % (spike D).
+const fn takes_epilogue(id: StrategyId) -> bool {
+    matches!(id, StrategyId::GEMM_TF32 | StrategyId::GEMM_TF32_RAGGED | StrategyId::GEMM_TF32_PADDED)
+}
+
 /// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
 /// first of the table that fits runs.
 #[allow(clippy::too_many_arguments)]
@@ -427,7 +435,7 @@ const fn entry(
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, replayable: matches!(id.1, 1 | 4 | 7..=9), reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: takes_epilogue(id), partners: false, replayable: matches!(id.1, 1 | 4 | 7..=9), reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
 }
 
 /// A ragged or a padded kernel: new in this part, so not a baseline (its kernel may be compiling, or over the variant budget: the
@@ -442,7 +450,7 @@ const fn cut(id: StrategyId, name: &'static str, needs: Caps, numerics: NumClass
         baseline: false,
         group,
         prologue: false,
-        epilogue: false,
+        epilogue: takes_epilogue(id),
         partners: false,
         // The ragged kernels are plain launches over the evaluated operands; the padded ones make copies (new nodes the plan does not know).
         replayable: matches!(id.1, 2 | 5),
@@ -704,6 +712,11 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
     let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, layouts) } else { 0 };
+    if let Some(program) = view.epilogue.filter(|_| takes_epilogue(params.by))
+        && let Some(storage) = launch_hooked(ctx, &sides, &plan, params.geom, layouts, program)?
+    {
+        return Ok(Lowered::Done(Output::Epilogued(smallvec::smallvec![storage])));
+    }
     done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)), None)?)
 }
 
@@ -1001,6 +1014,59 @@ fn epilogue_of(view: &ContractionView<'_>, geom: Geometry, plan: &Plan) -> Resul
 /// The last element of a `rows x cols` matrix stored with `ld` columns from `off`, one past it: what the kernels index with 32 bits.
 fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
     if rows == 0 || cols == 0 { 0 } else { u64::from(off) + u64::from(rows - 1) * u64::from(ld) + u64::from(cols) }
+}
+
+/// The product of `sides` with the epilogue `program` applied by the hooked native kernel, `None` where that is not possible and the
+/// plain product runs (the caller applies the program as a separate pass, bit for bit the same): a split product (the epilogue
+/// cannot run per slice), operands that are not evaluated, a kernel that is still compiling or that the backend cannot build, an
+/// epilogue operand that is a window of another array, a program that is not one the hook computes.
+fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geometry, layouts: [Layout; 2], program: &EpiProgram) -> Result<Option<Arc<Storage>>, Failure> {
+    let (MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)) = (&sides[0], &sides[1]) else { return Ok(None) };
+    if plan.slices != 1 {
+        return Ok(None);
+    }
+    let plain = Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split };
+    let Some(core) = gemm_hook::kernel(ctx, plain, program)? else { return Ok(None) };
+    if !core.raw.is_ready() {
+        return Ok(None);
+    }
+    let mut operands: Vec<Arc<Storage>> = Vec::with_capacity(program.inputs.len());
+    for input in &program.inputs {
+        let storage = match &input.src {
+            Src::Buffer(storage) => Arc::clone(storage),
+            Src::Node(node) => Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?),
+            Src::Scalar(_) => return Ok(None),
+        };
+        if storage.window().is_some() || storage.segments() != 1 {
+            return Ok(None);
+        }
+        operands.push(storage);
+    }
+    let Geometry { m, n, k } = geom;
+    let [lhs, rhs] = layouts;
+    let (a_extent, b_extent) = (
+        if lhs.transposed { extent(lhs.off, k, m, lhs.ld) } else { extent(lhs.off, m, k, lhs.ld) },
+        if rhs.transposed { extent(rhs.off, n, k, rhs.ld) } else { extent(rhs.off, k, n, rhs.ld) },
+    );
+    if a_extent > u64::from(u32::MAX) || b_extent > u64::from(u32::MAX) {
+        return Err(LumaError::DimensionTooLarge { shape: [n as usize, m as usize, 1, 1] }.into());
+    }
+    let len = Shape::from([n as usize, m as usize, 1, 1]).validate()?;
+    let out_storage = Arc::new(Storage::new(ctx, len, ElemLayout::plain(4)));
+    let out_pin = out_storage.pin_single()?;
+    let out_bytes = out_storage.byte_len();
+    let pins = operands.iter().map(|storage| storage.pin_read(0).map(|pin| (pin, storage.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let mut words: Vec<u32> = vec![m, n, k, plan.kc, lhs.ld, rhs.ld, lhs.off, rhs.off];
+    words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
+    let mut args: Vec<RawArg<'_>> = Vec::with_capacity(5 + pins.len());
+    args.push(RawArg::write(out_pin.buffer(), out_bytes));
+    args.push(RawArg::read(a.buffer(), *a_bytes));
+    args.push(RawArg::read(b.buffer(), *b_bytes));
+    args.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    ctx.launch(&core, plan.groups, [n, m, 1], &args)?;
+    drop(args);
+    Ok(Some(out_storage))
 }
 
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.

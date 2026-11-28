@@ -1358,7 +1358,17 @@ pub struct GemmSpec {
     /// A half-work product of a matrix with itself (see [`MatmulSpec::half`]): `rows == cols`, the grid `[T (T + 1) / 2, 1, 1]`,
     /// every output of the lower triangle of tiles computed as the full kernel does and stored with its transpose.
     pub half: bool,
+    /// The epilogue hook the kernel applies to each output before it stores it (see [`HookId`]); `None`: the plain product.
+    pub hook: Option<HookId>,
 }
+
+/// The identity of an epilogue hook of a [`GemmSpec`]: a hash of the structure of the program it was made from, so that a kernel is
+/// keyed on it. The hook itself is the [`kir::KernelModule`](crate::kir::KernelModule) passed to [`Backend::compile_gemm`]: its
+/// function 0 is `luma_epi(acc: f32, row: u32, col: u32, n: u32, scalars...) -> f32` (`scalars` are the uniform's words after the
+/// eight of the product, `f32`, `u32` or `i32`; `n` is the output's column count), and its bindings `0..e` are the `e` read-only
+/// extra operands that function reads (indexed by the function itself); the entry point of the module is not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HookId(pub u64);
 
 /// How a [`GemmSpec`] kernel copies its operands from global memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1377,7 +1387,7 @@ impl GemmSpec {
     /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
     /// transposed, in `f32` (`exact`) or TF32, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
     pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, exact: bool) -> Self {
-        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4, half: false }
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4, half: false, hook: None }
     }
 
     /// The same product copying its operands with `lanes`.
@@ -1388,6 +1398,10 @@ impl GemmSpec {
     /// The same product as a half-work one (see [`GemmSpec::half`]).
     pub const fn with_half(self) -> Self {
         GemmSpec { half: true, ..self }
+
+    /// The same product applying the epilogue hook `hook` to every output (the module is passed to [`Backend::compile_gemm`]).
+    pub const fn with_hook(self, hook: HookId) -> Self {
+        GemmSpec { hook: Some(hook), ..self }
     }
 }
 
@@ -1645,9 +1659,16 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn gemm_ragged(&self) -> bool {
         false
     }
-    /// The code of a matrix product with one of the tiles of [`Backend::gemm_tiles`].
-    fn compile_gemm(&self, _spec: &GemmSpec) -> Option<RawKernel> {
+    /// The code of a matrix product with one of the tiles of [`Backend::gemm_tiles`]. With `spec.hook` set, `hook` is the module of
+    /// that [`HookId`] and the kernel applies its function 0 to each output (after the whole K sum) before storing it: the launch
+    /// then passes the hook's `e` extra operands as read-only storage arguments between `b` and the uniform, and the uniform's words
+    /// after the eight of the product are the hook's scalars. `None` if the backend has no such kernel (`gemm_hooks`).
+    fn compile_gemm(&self, _spec: &GemmSpec, _hook: Option<&Arc<crate::kir::KernelModule>>) -> Option<RawKernel> {
         None
+    }
+    /// Whether [`Backend::compile_gemm`] takes epilogue hooks for the products on the tensor-core tiles (`exact == false`).
+    fn gemm_hooks(&self) -> bool {
+        false
     }
     /// The native code of a batched matrix product (`Builtin::Bmm` of `luma`), `None` to compile
     /// the shader instead (always `None` unless [`Backend::native_matmul`]). The launch is the

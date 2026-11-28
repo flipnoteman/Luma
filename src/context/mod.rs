@@ -56,6 +56,8 @@ struct Inner {
     /// Kernels of the dense linear algebra by a key that determines their source (see
     /// [`Context::keyed_kernel`]).
     keyed_kernels: Mutex<std::collections::HashMap<String, Arc<KernelCore>>>,
+    /// The tensor-core products with an epilogue hook, least recently used first (see `jit::structured::gemm_hook`).
+    hooked_gemms: Mutex<crate::jit::structured::gemm_hook::Table>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
@@ -876,6 +878,7 @@ impl Context {
                 builtins: BuildCache::default(),
                 chirps: Mutex::new(std::collections::HashMap::new()),
                 jit: JitState::new(&limits, &options.effective_numerics()),
+                hooked_gemms: Mutex::new(Default::default()),
                 kernels: BuildCache::default(),
                 module_kernels: Mutex::default(),
                 keyed_kernels: Mutex::default(),
@@ -1251,6 +1254,11 @@ impl Context {
         let kernel = build(&make())?;
         self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.to_owned(), kernel.core());
         Ok(kernel)
+    }
+
+    /// The table of the products with an epilogue hook.
+    pub(crate) fn hooked_gemms(&self) -> &Mutex<crate::jit::structured::gemm_hook::Table> {
+        &self.inner.hooked_gemms
     }
 
     /// The cache of custom kernels (see [`KernelBuilder::build`]).

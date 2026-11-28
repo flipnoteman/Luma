@@ -340,8 +340,30 @@ const MAX_TIMED: usize = 64;
 const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
 
 /// The matrix product of `spec` (tensor cores, or `f32` on the CUDA cores), loaded from its PTX.
-fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, BackendError> {
-    let (source, threads, bytes) = if spec.exact {
+///
+/// With `hook`, the module of `spec.hook` (see [`luma_core::HookId`]): its function is compiled by NVVM like any elementwise
+/// kernel's body, and its PTX is expanded at the stores of the tensor-core kernel ([`crate::ptx::Hook`]), which then takes the hook's
+/// operands as extra parameters and its scalars in the uniform.
+fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelModule>) -> Result<CudaKernel, BackendError> {
+    let mut extra = (0u32, 0u32);
+    let (source, threads, bytes) = if let Some(module) = hook {
+        if spec.exact {
+            return Err(BackendError::Unsupported("the exact product takes no epilogue hook".into()));
+        }
+        let started = Instant::now();
+        let optimized = kir::optimize_for_target(module, true);
+        let ir = codegen::emit_hook(&optimized).map_err(|e| BackendError::Unsupported(format!("epilogue hook: {e}")))?;
+        let (major, minor) = shared.cc;
+        let operands = module.bindings.len().saturating_sub(1) as u32;
+        let scalars = module.functions.first().map_or(0, |f| f.params.len().saturating_sub(4)) as u32;
+        let text = shared.nvvm.compile(&ir, major, minor).map_err(|e| BackendError::ShaderCompile(format!("epilogue hook of {spec:?}:\n{e}")))?;
+        let hook = crate::ptx::Hook::parse(&text, operands, scalars).map_err(|e| BackendError::Unsupported(format!("epilogue hook: {e}")))?;
+        let config = crate::tensor::Config::of(spec);
+        let ptx = crate::tensor::ptx_hooked(&config, Some(&hook)).map_err(|e| BackendError::Unsupported(format!("epilogue hook: {e}")))?;
+        log::debug!("luma-cuda: epilogue hook of {spec:?}: NVVM and splice {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        extra = (operands, scalars);
+        (hook.reconcile(&ptx), config.threads(), config.shared_bytes())
+    } else if spec.exact {
         let config = crate::sgemm::Config::of(spec);
         (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
     } else {
@@ -356,7 +378,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, 
             luma_core::GemmLanes::Vec4Tails => "tails",
             _ => "scalar",
         };
-        let name = format!("{}-{}x{}-{}{}-{lanes}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed));
+        let name = format!("{}-{}x{}-{}{}-{lanes}{}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.hook.map_or(String::new(), |id| format!("-hook{:08x}", id.0 as u32)));
         let _ = std::fs::write(dir.join(name), &source);
     }
     shared.ctx.bind_to_thread().map_err(gpu)?;
@@ -385,7 +407,11 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, 
         func,
         workgroup: [threads, 1, 1],
         shared_bytes: bytes,
-        param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: crate::gemm_copy::UNIFORM_BYTES }],
+        param_abis: [CudaArgAbi::DevicePtr; 3]
+            .into_iter()
+            .chain(std::iter::repeat_n(CudaArgAbi::DevicePtr, extra.0 as usize))
+            .chain([CudaArgAbi::InlineUniform { size: crate::gemm_copy::UNIFORM_BYTES + 4 * extra.1 as usize }])
+            .collect(),
         array_lengths: Vec::new(),
         strides: Vec::new(),
     })
@@ -1580,13 +1606,22 @@ impl Backend for CudaBackend {
         self.shared.cc.0 >= 8
     }
 
-    fn compile_gemm(&self, spec: &GemmSpec) -> Option<RawKernel> {
+    fn gemm_hooks(&self) -> bool {
+        self.shared.cc.0 >= 8
+    }
+
+    fn compile_gemm(&self, spec: &GemmSpec, hook: Option<&Arc<KernelModule>>) -> Option<RawKernel> {
+        // A hooked product needs its module, and only the tensor-core kernels take one.
+        if spec.hook.is_some() && (hook.is_none() || spec.exact || spec.half || !self.gemm_hooks()) {
+            return None;
+        }
         // Loaded on a worker thread (which binds the context in `compile_gemm_ptx`): a failure
         // arrives at the first resolve.
         let shared = Arc::clone(&self.shared);
         let spec = *spec;
+        let hook = hook.cloned();
         Some(RawKernel::spawn(move || {
-            compile_gemm_ptx(&shared, &spec).inspect_err(|error| log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}"))
+            compile_gemm_ptx(&shared, &spec, hook.as_deref()).inspect_err(|error| log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}"))
         }))
     }
 
@@ -2110,7 +2145,7 @@ mod tests {
 
     /// The kernel of `spec` as a launchable one, once compiled.
     fn gemm_kernel(backend: &CudaBackend, spec: &GemmSpec) -> CompiledKernel {
-        let raw = backend.compile_gemm(spec).expect("the backend plans the product");
+        let raw = backend.compile_gemm(spec, None).expect("the backend plans the product");
         wait_ready(&raw);
         let binding = |name: &str, kind| BindingInfo { name: name.into(), kind, element_stride: None, min_size: None };
         let bindings = vec![
@@ -2138,7 +2173,7 @@ mod tests {
     #[test]
     fn a_gemm_kernel_compiles_in_the_background() {
         let Some((backend, spec)) = gemm_backend() else { return };
-        let raw = backend.compile_gemm(&spec).expect("the backend plans the product");
+        let raw = backend.compile_gemm(&spec, None).expect("the backend plans the product");
         // Loading the PTX takes a driver call on a worker thread: it is not done on return.
         assert!(!raw.is_ready(), "compile_gemm returned a loaded module");
         wait_ready(&raw);
