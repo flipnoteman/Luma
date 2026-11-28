@@ -1019,6 +1019,7 @@ fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
 /// The product of `sides` with the epilogue `program` applied by the hooked native kernel, `None` where that is not possible and the
 /// plain product runs (the caller applies the program as a separate pass, bit for bit the same): a split product (the epilogue
 /// cannot run per slice), operands that are not evaluated, a kernel that is still compiling or that the backend cannot build, a program that is not one the hook computes.
+#[inline(never)]
 fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geometry, (layouts, tri): ([Layout; 2], u32), program: &EpiProgram) -> Result<Option<Arc<Storage>>, Failure> {
     let (MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)) = (&sides[0], &sides[1]) else { return Ok(None) };
     if plan.slices != 1 {
@@ -1084,6 +1085,15 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     Ok(Some(out_storage))
 }
 
+/// The kernel of a product that applies `epilogue` at its stores, recorded: its inputs stay pinned while it is.
+#[inline(never)]
+fn launch_applied(ctx: &Context, sides: [MatmulSide; 2], kernel: jit::MatmulKernel, words: &[u32], plan: &Plan, out: RawArg<'_>, applied: &Applied) -> Result<(), Failure> {
+    let input_pins = applied.inputs.iter().map(|input| input.pin_single_read().map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let inputs: Vec<RawArg<'_>> = input_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)).collect();
+    jit::matmul_epilogue(ctx, sides, kernel, words, &[], plan.groups, out, &inputs, &applied.scalars)?;
+    Ok(())
+}
+
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
 /// `layouts` are the operands' leading dimensions and offsets for the backend's own kernels (which read eight words of uniform),
 /// `None` for the shader kernels.
@@ -1125,22 +1135,17 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         None => &uniform[..4],
     };
     let out = RawArg::write(target, target_bytes);
-    // The epilogue's inputs stay pinned while the kernel is recorded.
-    let input_pins = match epilogue {
-        Some(applied) => applied.inputs.iter().map(|input| input.pin_single_read().map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?,
-        None => Vec::new(),
-    };
-    match sides {
-        sides if epilogue.is_some() => {
-            let inputs: Vec<RawArg<'_>> = input_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)).collect();
-            jit::matmul_epilogue(ctx, sides, kernel, words, &[], plan.groups, out, &inputs, epilogue.map_or(&[][..], |applied| &applied.scalars))?;
+    if let Some(applied) = epilogue {
+        launch_applied(ctx, sides, kernel, words, &plan, out, applied)?;
+    } else {
+        match sides {
+            // Both operands evaluated: nothing to fuse, the kernel reads their buffers (what `jit::matmul` does for such sides).
+            [MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)] => {
+                let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;
+                ctx.launch(&core, plan.groups, [n32, m32, 1], &[out, RawArg::read(a.buffer(), a_bytes), RawArg::read(b.buffer(), b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
+            }
+            sides => jit::matmul(ctx, sides, kernel, words, plan.groups, out)?,
         }
-        // Both operands evaluated: nothing to fuse, the kernel reads their buffers (what `jit::matmul` does for such sides).
-        [MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)] => {
-            let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;
-            ctx.launch(&core, plan.groups, [n32, m32, 1], &[out, RawArg::read(a.buffer(), a_bytes), RawArg::read(b.buffer(), b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
-        }
-        sides => jit::matmul(ctx, sides, kernel, words, plan.groups, out)?,
     }
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
