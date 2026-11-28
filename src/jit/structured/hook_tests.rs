@@ -54,7 +54,7 @@ fn program(instrs: Vec<Instr>, inputs: Vec<(&A, EpiMap)>, scalars: Vec<f32>) -> 
 
 /// The product through the strategy `by`, with `epilogue`; `None` for the output if the strategy did not apply it.
 fn product(ctx: &Context, lhs: &A, rhs: &A, by: StrategyId, epilogue: Option<&EpiProgram>) -> (Vec<f32>, bool) {
-    let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32: Tf32Request::Exact }, location: Location::caller(), epilogue, partners: &[] };
+    let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32: Tf32Request::Exact, half: false }, location: Location::caller(), epilogue, partners: &[] };
     let output = execute_in(&CONTRACTION_STRATEGIES, ctx, &Subject::Contraction(&view), Some(by)).ok().unwrap();
     let applied = matches!(output, Output::Epilogued(_));
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1]];
