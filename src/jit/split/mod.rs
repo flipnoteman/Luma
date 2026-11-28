@@ -644,6 +644,17 @@ pub(super) fn defer(
     super::plancache::taint("a launch was deferred into a schedule");
     let out_bytes: u64 = outputs.iter().map(|out| out.byte_len()).sum();
     let mut step = Some(step);
+    // A step whose arrays do not fit in the budget one slab each cannot run in any stage: refused now, so the evaluation falls back to
+    // smaller groups (a commit that fails later poisons what the steps wrote).
+    if let Some(budget) = ctx.pager().budget() {
+        let need = single_step_floor(outputs, inputs);
+        if need > budget {
+            return Err(LumaError::Gpu(format!(
+                "out of memory: the step {} needs {need} bytes for one slab of each array it binds, and the memory budget is {budget} bytes",
+                writer.0
+            )));
+        }
+    }
     loop {
         let schedule = open_schedule(ctx)?;
         // The size bound commits before the next step is recorded, not after this one: the arrays of the step that filled the
@@ -682,6 +693,22 @@ pub(super) fn defer(
         }
         return Ok(());
     }
+}
+
+/// Bytes of the least device memory a stage of this one step needs: one slab of every array it binds (see `plan::floor_bytes`).
+fn single_step_floor(outputs: &[&Storage], inputs: &[Arc<Storage>]) -> u64 {
+    let mut seen: Vec<*const Segment> = Vec::with_capacity(outputs.len() + inputs.len());
+    let mut total = 0;
+    for seg in outputs.iter().map(|out| out.as_seg()).chain(inputs.iter().map(|input| input.as_seg())) {
+        let key = Arc::as_ptr(&seg.segments()[0]);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let meta = seg.meta();
+        total += if seg.segment_count() == 1 { meta.layout.bytes(meta.len) } else { meta.layout.bytes(meta.seg_len) };
+    }
+    total
 }
 
 impl Open {
