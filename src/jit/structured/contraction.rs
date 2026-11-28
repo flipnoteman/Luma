@@ -947,6 +947,11 @@ struct Applied {
     scalars: Vec<u32>,
 }
 
+/// The longest epilogue the shader kernels apply at their stores: a longer one (a `gelu` after the bias is ten instructions with a
+/// `tanh`) lengthens the store stage of the tile kernels more than its separate pass costs (wgpu, RTX 3090, `dense/gelu` 1024^3: 1.14 x
+/// the separate pass), while the short ones (`relu(acc + bias)`) win 5 to 30 %.
+const SHADER_EPILOGUE_INSTRS: usize = 6;
+
 /// Whether the shader kernels can apply `program`: one stored value, and per element `f32` arithmetic of the operations the elementwise
 /// kernels write inline (no helper functions, no bit operations), over `f32` inputs and scalars.
 fn epilogue_fits(program: &EpiProgram) -> bool {
@@ -966,6 +971,7 @@ fn epilogue_fits(program: &EpiProgram) -> bool {
         kind && args_ok && instr.op.ty == ElemTy::F32
     };
     program.outputs.len() == 1
+        && program.instrs.len() <= SHADER_EPILOGUE_INSTRS
         && program.uses_acc()
         && program.validate(0).is_ok()
         && program.instrs.iter().all(f32_instr)
