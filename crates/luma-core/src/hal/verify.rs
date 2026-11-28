@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmOut, GemmSpec, GemmUnit, RawArg};
+use super::{Backend, BindingInfo, Buffer, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmOut, GemmSpec, GemmUnit, RawArg};
 
 /// Magic of a stored verdict.
 const UNIT_MAGIC: [u8; 8] = *b"LUMAUNV1";
@@ -82,7 +82,7 @@ fn format(unit: GemmUnit) -> Option<Format> {
         GemmUnit::Tf32 => Some(Format { round: exact, half: None, tiny: 1.0e-40, bound: TF32_BOUND, big: 1.0e4 }),
         // The products of two halves are exact in `f32`: the same bound as the exact chain. A `big` of 100 (f16) keeps the products and
         // their sums finite in `f32` (and mostly under the `f16` range of the output).
-        GemmUnit::F16 => Some(Format { round: |x| f16_to_f32(f32_to_f16(x)), half: Some((f32_to_f16, f16_to_f32)), tiny: 1.0e-6, bound: ACC_BOUND, big: 100.0 }),
+        GemmUnit::F16 | GemmUnit::CoopF16 => Some(Format { round: |x| f16_to_f32(f32_to_f16(x)), half: Some((f32_to_f16, f16_to_f32)), tiny: 1.0e-6, bound: ACC_BOUND, big: 100.0 }),
         GemmUnit::Bf16 => Some(Format { round: |x| bf16_to_f32(f32_to_bf16(x)), half: Some((f32_to_bf16, bf16_to_f32)), tiny: 1.0e-40, bound: ACC_BOUND, big: 3.0e4 }),
         #[allow(unreachable_patterns, reason = "GemmUnit is non_exhaustive: units of other crates' backends")]
         _ => None,
@@ -313,14 +313,24 @@ impl Problem {
             }
         };
         let max = u64::MAX;
-        let a_buf = backend.alloc_filled(&bytes(&self.a.data), max).map_err(|e| e.to_string())?;
-        let b_buf = backend.alloc_filled(&bytes(&self.b.data), max).map_err(|e| e.to_string())?;
+        // Mappable storage where the device shares memory with the host, else a device buffer written by an upload.
+        let fill = |data: &[f32]| -> Result<Buffer, String> {
+            let data = bytes(data);
+            if backend.info().zero_copy {
+                return backend.alloc_filled(&data, max).map_err(|e| e.to_string());
+            }
+            let buffer = backend.create_buffer(data.len().next_multiple_of(4) as u64, BufferUsage::STORAGE | BufferUsage::COPY_DST, false).ok_or("no memory for an operand")?;
+            backend.record_upload(&buffer, &data, max).map_err(|e| e.to_string())?;
+            Ok(buffer)
+        };
+        let a_buf = fill(&self.a.data)?;
+        let b_buf = fill(&self.b.data)?;
         let slices = self.slices();
         let out_bytes = match spec.out {
             GemmOut::F32 => 4,
             _ => 2,
         };
-        let c_buf = backend.create_buffer((slices * m * n * out_bytes) as u64, BufferUsage::STORAGE, false).ok_or("no memory for the result")?;
+        let c_buf = backend.create_buffer((slices * m * n * out_bytes) as u64, BufferUsage::STORAGE | BufferUsage::COPY_SRC, false).ok_or("no memory for the result")?;
         let mut uniform = Vec::new();
         for word in [m, n, k, self.kc(), self.a.ld, self.b.ld, self.a.off, self.b.off] {
             uniform.extend_from_slice(&(word as u32).to_le_bytes());
@@ -470,7 +480,7 @@ mod tests {
 
     fn specs() -> Vec<GemmSpec> {
         let mut specs = Vec::new();
-        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16] {
+        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16, GemmUnit::CoopF16] {
             for lanes in [GemmLanes::Vec4, GemmLanes::Vec4Tails, GemmLanes::Scalar] {
                 for (lhs_t, rhs_t) in [(false, false), (true, false), (false, true), (true, true)] {
                     specs.push(GemmSpec::new(64, 64, lhs_t, rhs_t, unit).with_lanes(lanes));

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
-    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
+    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, GemmSpec, GemmUnit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
     Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
 use luma_core::hal::{check_transfer, copy_parallel, size_class};
@@ -581,6 +581,30 @@ fn luma_features(features: wgpu::Features) -> Features {
     out
 }
 
+/// The tiles of `GemmUnit::CoopF16` the device runs. The kernels assume 4 subgroups of 32 per workgroup and `16 x 16` fragments of `f16`
+/// (NVIDIA through Vulkan); every variant is verified against a reference on its first use, so a device that takes the module but
+/// computes it differently is disabled by its verdict. `LUMA_COOP=off` is the kill switch.
+fn coop_tiles(info: &DeviceInfo) -> &'static [(u32, u32)] {
+    static TILES: [(u32, u32); 2] = crate::coop::TILES;
+    if std::env::var("LUMA_COOP").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off") || v.trim() == "0") {
+        return &[];
+    }
+    let on = info.features.contains(Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && info.features.contains(Features::SHADER_F16)
+        && info.features.contains(Features::SUBGROUP)
+        && info.profile == TuningProfile::Nvidia
+        && info.subgroup_size == Some((32, 32));
+    if !on {
+        return &[];
+    }
+    let fits = |&(rows, cols): &(u32, u32)| {
+        let spec = GemmSpec::new(rows, cols, true, true, GemmUnit::CoopF16);
+        crate::coop::workgroup_bytes(&spec) <= u64::from(info.limits.max_workgroup_storage_bytes)
+    };
+    let count = TILES.iter().take_while(|tile| fits(tile)).count();
+    &TILES[..count]
+}
+
 const APPLE_VENDOR: u32 = 0x106B;
 const NVIDIA_VENDOR: u32 = 0x10DE;
 
@@ -640,6 +664,9 @@ pub struct WgpuBackend {
     uniform_align: u64,
     storage_offset_align: u64,
     max_dynamic_uniforms: u32,
+    /// The tiles of the cooperative-matrix `f16` unit (`GemmUnit::CoopF16`) this device runs: none unless its feature, its 32-wide
+    /// subgroups and the workgroup memory of the kernels are there (and `LUMA_COOP` does not say `off`).
+    coop_tiles: &'static [(u32, u32)],
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
     batch: Mutex<Batch>,
@@ -750,6 +777,7 @@ impl WgpuBackend {
             storage_offset_align: u64::from(limits.min_storage_buffer_offset_alignment).max(4),
             max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
             max_buffer_bytes,
+            coop_tiles: coop_tiles(&info),
             info,
             batch: Mutex::new(batch),
             gpu,
@@ -1394,6 +1422,43 @@ impl Backend for WgpuBackend {
             .validate(&parsed)
             .map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)))?;
         self.build(parsed, codegen::ENTRY, &numbers, &infos, module.workgroup_size, label, trust)
+    }
+
+    fn kernel_revision(&self) -> u64 {
+        static REVISION: OnceLock<u64> = OnceLock::new();
+        *REVISION.get_or_init(|| luma_core::hal::cache::source_revision(&[include_str!("coop.rs")]))
+    }
+
+    fn gemm_tiles(&self, unit: GemmUnit) -> &[(u32, u32)] {
+        match unit {
+            GemmUnit::CoopF16 => self.coop_tiles,
+            _ => &[],
+        }
+    }
+
+    /// The cooperative-matrix product of `spec` (`GemmUnit::CoopF16` only): the module is parsed and built on the calling thread.
+    fn compile_gemm(&self, spec: &GemmSpec, _hook: Option<&Arc<KernelModule>>) -> Option<RawKernel> {
+        if spec.unit != GemmUnit::CoopF16 || !self.coop_tiles.contains(&(spec.rows, spec.cols)) {
+            return None;
+        }
+        let source = crate::coop::source(spec)?;
+        let module = naga::front::wgsl::parse_str(&source).map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)));
+        let label = format!("coop-f16-{}x{}-{}{}-{:?}-{:?}", spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.lanes, spec.out);
+        let binding = |name: &str, kind| BindingInfo { name: name.into(), kind, element_stride: None, min_size: None };
+        let bindings = [
+            binding("c", BindingKind::StorageReadWrite),
+            binding("a", BindingKind::StorageRead),
+            binding("b", BindingKind::StorageRead),
+            BindingInfo { min_size: Some(32), ..binding("p", BindingKind::Uniform) },
+        ];
+        let built = module.and_then(|module| self.compile_naga(&module, "main", &bindings, [crate::coop::THREADS, 1, 1], &label, KernelTrust::Trusted).unwrap_or(Err(BackendError::Unsupported("no naga".into()))));
+        match built {
+            Ok(raw) => Some(raw),
+            Err(error) => {
+                log::warn!("luma-wgpu: the cooperative-matrix product {spec:?} did not compile: {error}");
+                None
+            }
+        }
     }
 
     fn compile_naga(

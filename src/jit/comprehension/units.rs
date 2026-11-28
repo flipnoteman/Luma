@@ -22,6 +22,8 @@ pub(crate) enum UnitId {
     CudaF16,
     /// `bf16` tensor cores (CUDA `mma.m16n8k16`), `f32` accumulation.
     CudaBf16,
+    /// `f16` cooperative matrices (`coop_mat16x16<f16>` through wgpu on Vulkan), `f32` accumulation.
+    CoopF16,
 }
 
 /// One matrix unit.
@@ -52,7 +54,7 @@ pub(crate) struct UnitDesc {
 }
 
 /// The units, in preference order.
-pub(crate) static UNITS: [UnitDesc; 4] = [
+pub(crate) static UNITS: [UnitDesc; 5] = [
     UnitDesc {
         id: UnitId::CudaTf32,
         gemm: GemmUnit::Tf32,
@@ -108,6 +110,21 @@ pub(crate) static UNITS: [UnitDesc; 4] = [
         rate: 55_000.0,
         ragged_max_fmas: u64::MAX,
     },
+    // The cooperative-matrix unit (wgpu): the same operand and accumulation semantics as `CudaF16`; its rate is measured at 4096^3 on an
+    // RTX 3090 (see the CHANGELOG of W3-R7), its edges are in the kernel.
+    UnitDesc {
+        id: UnitId::CoopF16,
+        gemm: GemmUnit::CoopF16,
+        shape: [16, 16, 16],
+        subgroup: 32,
+        a: ElemTy::F16,
+        b: ElemTy::F16,
+        acc: ElemTy::F32,
+        needs: Caps::COOP_F16,
+        reduced: Reduced::MATRIX_ACCUMULATE,
+        rate: 20_000.0,
+        ragged_max_fmas: u64::MAX,
+    },
 ];
 
 /// The unit of a `MatmulTile::Gemm*`'s `exact` flag (the flag stays in the tile: its `Debug` text is a kernel label that decisions
@@ -124,6 +141,7 @@ impl UnitDesc {
             GemmUnit::Tf32 => &UNITS[0],
             GemmUnit::F16 => &UNITS[2],
             GemmUnit::Bf16 => &UNITS[3],
+            GemmUnit::CoopF16 => &UNITS[4],
             _ => &UNITS[1],
         }
     }
@@ -161,10 +179,10 @@ mod tests {
 
     #[test]
     fn each_gemm_unit_has_its_row() {
-        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16] {
+        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16, GemmUnit::CoopF16] {
             assert_eq!(UnitDesc::of(unit).gemm, unit);
         }
-        assert_eq!(UNITS.iter().map(|u| u.id).collect::<Vec<_>>(), [UnitId::CudaTf32, UnitId::Fma, UnitId::CudaF16, UnitId::CudaBf16]);
+        assert_eq!(UNITS.iter().map(|u| u.id).collect::<Vec<_>>(), [UnitId::CudaTf32, UnitId::Fma, UnitId::CudaF16, UnitId::CudaBf16, UnitId::CoopF16]);
     }
 
     /// The reference verification through a context: a verified variant is accepted on its first call (with a decision recording the

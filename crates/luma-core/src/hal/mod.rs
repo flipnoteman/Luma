@@ -1391,6 +1391,10 @@ pub enum GemmUnit {
     F16,
     /// `bf16` tensor cores: as [`GemmUnit::F16`] on `bf16` elements.
     Bf16,
+    /// Cooperative-matrix `f16` units (Vulkan through wgpu): the operands and accumulation of [`GemmUnit::F16`], in `16 x 16`
+    /// fragments. `Vec4` and `Vec4Tails` lanes (leading dimensions and offsets multiples of 8); a half output (`GemmOut::F16`)
+    /// needs `Vec4` lanes (an even `n`).
+    CoopF16,
 }
 
 /// What a [`GemmSpec`] kernel stores.

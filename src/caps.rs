@@ -56,6 +56,9 @@ impl Caps {
     pub(crate) const F16_MMA: Self = Self(1 << 16);
     /// Tensor-core products on `bf16` operands.
     pub(crate) const BF16_MMA: Self = Self(1 << 17);
+    /// Cooperative-matrix products on `f16` operands (the backend has `GemmUnit::CoopF16` tiles: wgpu on a Vulkan device whose subgroup
+    /// is 32 wide and that reports the cooperative-matrix feature).
+    pub(crate) const COOP_F16: Self = Self(1 << 18);
 
     /// Whether every capability of `other` is set.
     pub(crate) const fn contains(self, other: Self) -> bool {
@@ -105,6 +108,7 @@ impl Caps {
         set(!backend.gemm_tiles(GemmUnit::Tf32).is_empty() || !backend.gemm_tiles(GemmUnit::Fma).is_empty(), Caps::GEMM_TILES);
         set(!backend.gemm_tiles(GemmUnit::F16).is_empty(), Caps::F16_MMA);
         set(!backend.gemm_tiles(GemmUnit::Bf16).is_empty(), Caps::BF16_MMA);
+        set(!backend.gemm_tiles(GemmUnit::CoopF16).is_empty(), Caps::COOP_F16);
         caps
     }
 }

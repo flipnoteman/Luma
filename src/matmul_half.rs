@@ -30,26 +30,33 @@ use crate::view::PadMode;
 
 /// A half-precision element type the units take.
 pub(crate) trait HalfKind: ScalarType {
-    const UNIT: GemmUnit;
     const OUT: GemmOut;
-    const CAPS: Caps;
+    /// The unit a device with `caps` runs this type's products on, `None` where it has none: the type's tensor cores (CUDA), else the
+    /// cooperative-matrix unit (`f16` only, Vulkan through wgpu).
+    fn unit(caps: Caps) -> Option<GemmUnit>;
     /// The rounding of an `f32` array to this type (lazy).
     fn round(array: &Array<f32>) -> Array<Self>;
 }
 
 impl HalfKind for f16 {
-    const UNIT: GemmUnit = GemmUnit::F16;
     const OUT: GemmOut = GemmOut::F16;
-    const CAPS: Caps = Caps::F16_MMA;
+    fn unit(caps: Caps) -> Option<GemmUnit> {
+        if caps.contains(Caps::F16_MMA) {
+            Some(GemmUnit::F16)
+        } else {
+            caps.contains(Caps::COOP_F16).then_some(GemmUnit::CoopF16)
+        }
+    }
     fn round(array: &Array<f32>) -> Array<f16> {
         array.to_f16()
     }
 }
 
 impl HalfKind for bf16 {
-    const UNIT: GemmUnit = GemmUnit::Bf16;
     const OUT: GemmOut = GemmOut::Bf16;
-    const CAPS: Caps = Caps::BF16_MMA;
+    fn unit(caps: Caps) -> Option<GemmUnit> {
+        caps.contains(Caps::BF16_MMA).then_some(GemmUnit::Bf16)
+    }
     fn round(array: &Array<f32>) -> Array<bf16> {
         array.to_bf16()
     }
@@ -69,9 +76,10 @@ fn padded<T: HalfKind>(array: &Array<T>) -> Array<T> {
 /// the widening path runs instead.
 pub(crate) fn product<T: HalfKind>(lhs: &Array<T>, rhs: &Array<T>, lhs_t: bool, rhs_t: bool, location: &'static Location<'static>) -> Option<Array<T>> {
     let ctx = lhs.context();
-    if !ctx.same_as(rhs.context()) || !ctx.numerics().reduced.contains(Reduced::MATRIX_ACCUMULATE) || !ctx.caps().contains(T::CAPS) {
+    if !ctx.same_as(rhs.context()) || !ctx.numerics().reduced.contains(Reduced::MATRIX_ACCUMULATE) {
         return None;
     }
+    let unit = T::unit(ctx.caps())?;
     let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
     if ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
         return None;
@@ -87,13 +95,15 @@ pub(crate) fn product<T: HalfKind>(lhs: &Array<T>, rhs: &Array<T>, lhs_t: bool, 
     let (lhs, rhs) = (padded(lhs), padded(rhs));
     let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
     let (m32, n32, k32) = (m as u32, n as u32, k as u32);
-    let tiles = ctx.hal().gemm_tiles(T::UNIT);
+    let tiles = ctx.hal().gemm_tiles(unit);
     let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
     let plan = gemm_plan(m32, n32, k32, ctx.tuning(), GEMM_HALF_TILES_PER_SM, tiles, [lhs_t, rhs_t], GemmUnit::Tf32, groups, bytes).ok()?;
     let crate::matmul::MatmulTile::Gemm { rows, cols, .. } = plan.tile else { return None };
-    // A split product keeps its slices in `f32` and rounds the sum; one slice rounds in the store.
-    let out = if plan.slices == 1 { T::OUT } else { GemmOut::F32 };
-    let spec = GemmSpec::new(rows, cols, lhs_t, rhs_t, T::UNIT).with_lanes(lanes).with_out(out);
+    // A split product keeps its slices in `f32` and rounds the sum; one slice rounds in the store (where the unit stores halves: the
+    // cooperative-matrix kernels pack two columns of a row into a word, which a ragged product cannot).
+    let half_store = plan.slices == 1 && (unit != GemmUnit::CoopF16 || lanes == GemmLanes::Vec4);
+    let out = if half_store { T::OUT } else { GemmOut::F32 };
+    let spec = GemmSpec::new(rows, cols, lhs_t, rhs_t, unit).with_lanes(lanes).with_out(out);
     if !ctx.unit_verified(&spec, "matmul", location) {
         return None;
     }

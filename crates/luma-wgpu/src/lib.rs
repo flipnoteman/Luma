@@ -7,6 +7,7 @@ pub use wgpu;
 
 pub mod backend;
 pub mod codegen;
+mod coop;
 mod device;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod exit;
