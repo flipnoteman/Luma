@@ -196,3 +196,32 @@ fn the_harness_conversions_equal_the_half_crate() {
         assert!(bf16_to_f32(bits).to_bits() == b.to_f32().to_bits() || b.is_nan());
     }
 }
+
+/// The unit's rounding in the store is that of the `half` crate: a product with one non-zero term per entry is exact in `f32` (two
+/// 11-bit factors), so its `f16` result is `f16::from_f32` of it, bit for bit, over 2^20 values (whatever the unit and the order of its
+/// accumulation).
+#[test]
+fn the_stores_rounding_is_that_of_the_half_crate() {
+    let ctx = Context::new().unwrap();
+    let (m, n, k) = (256, 256, 16);
+    for seed in 0..16u64 {
+        let xs = values(m, 100 + seed, -300.0, 300.0);
+        let ys = values(n, 200 + seed, -300.0, 300.0);
+        let xs: Vec<f16> = xs.into_iter().map(f16::from_f32).collect();
+        let ys: Vec<f16> = ys.into_iter().map(f16::from_f32).collect();
+        // `a` is `m x k` with column 0 = xs, `b` is `k x n` with row 0 = ys.
+        let mut a = vec![f16::ZERO; m * k];
+        let mut b = vec![f16::ZERO; k * n];
+        for i in 0..m {
+            a[i * k] = xs[i];
+        }
+        b[..n].copy_from_slice(&ys);
+        let c = Array::from_slice_on(&ctx, &a, [k, m]).unwrap().matmul(&Array::from_slice_on(&ctx, &b, [n, k]).unwrap()).to_vec().unwrap();
+        for i in 0..m {
+            for j in 0..n {
+                let want = f16::from_f32(xs[i].to_f32() * ys[j].to_f32());
+                assert!(c[i * n + j].to_bits() == want.to_bits() || (c[i * n + j].is_nan() && want.is_nan()), "({i}, {j}): {} * {} = {} want {want}", xs[i], ys[j], c[i * n + j]);
+            }
+        }
+    }
+}
