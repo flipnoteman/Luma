@@ -244,13 +244,40 @@ pub struct MemoryModel {
     pub transpose_factor: f64,
     /// Nanoseconds per dependent load of a one-workgroup chain.
     pub latency_ns: f64,
+    /// What the transfer lanes move between host and device, `None` on backends whose lanes are the synchronous defaults.
+    pub transfer: Option<TransferModel>,
+}
+
+/// How fast the transfer lanes of a device move bytes, and what a running transfer costs the kernels beside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TransferModel {
+    /// Host to device throughput of one transfer into pinned memory, GB/s.
+    pub h2d_gbs: f64,
+    /// Device to host throughput, GB/s.
+    pub d2h_gbs: f64,
+    /// The share of a copy kernel's throughput lost while a transfer runs beside it (0: none, 1: it stops).
+    pub overlap_derate: f64,
+}
+
+impl TransferModel {
+    /// A transfer model of the given numbers (see the fields).
+    pub fn new(h2d_gbs: f64, d2h_gbs: f64, overlap_derate: f64) -> TransferModel {
+        TransferModel { h2d_gbs, d2h_gbs, overlap_derate }
+    }
 }
 
 impl MemoryModel {
+    /// This model with the transfer lanes' numbers.
+    pub fn with_transfer(mut self, transfer: Option<TransferModel>) -> MemoryModel {
+        self.transfer = transfer;
+        self
+    }
+
     /// A memory model of the given numbers (see the fields).
     #[allow(clippy::too_many_arguments)]
     pub fn new(l2_bytes: Option<u64>, l2_exact: bool, l2_gbs: f64, shared_gbs: Option<f64>, strided_factor: [f64; 3], gather_factor: f64, transpose_factor: f64, latency_ns: f64) -> MemoryModel {
-        MemoryModel { l2_bytes, l2_exact, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns }
+        MemoryModel { l2_bytes, l2_exact, l2_gbs, shared_gbs, strided_factor, gather_factor, transpose_factor, latency_ns, transfer: None }
     }
 }
 
@@ -265,7 +292,11 @@ impl fmt::Display for MemoryModel {
             None => write!(f, ", no workgroup memory figure")?,
         }
         let [s2, s8, s32] = self.strided_factor;
-        write!(f, ", strided x{s2:.2} / x{s8:.2} / x{s32:.2} (2 / 8 / 32), gather x{:.2}, transpose x{:.2}, latency {:.0} ns", self.gather_factor, self.transpose_factor, self.latency_ns)
+        write!(f, ", strided x{s2:.2} / x{s8:.2} / x{s32:.2} (2 / 8 / 32), gather x{:.2}, transpose x{:.2}, latency {:.0} ns", self.gather_factor, self.transpose_factor, self.latency_ns)?;
+        if let Some(t) = self.transfer {
+            write!(f, ", transfers {:.1} GB/s in / {:.1} GB/s out, {:.0}% of copy throughput lost beside one", t.h2d_gbs, t.d2h_gbs, t.overlap_derate * 100.0)?;
+        }
+        Ok(())
     }
 }
 

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use log::{debug, info};
 
-use super::{CostModel, MemoryModel};
+use super::{CostModel, MemoryModel, TransferModel};
 
 /// Layout version of the files; bumping it makes older files unreadable (and so replaced).
 const FORMAT: u32 = 2;
@@ -29,7 +29,7 @@ pub const PTX_MAGIC: [u8; 8] = *b"LUMAPTX1";
 pub const CPU_MAGIC: [u8; 8] = *b"LUMACPU1";
 /// Magic of the calibration file (2: measured with the faster `Df32` library, so older files
 /// are not read).
-const COST: [u8; 8] = *b"LUMACOS3";
+const COST: [u8; 8] = *b"LUMACOS4";
 /// Magic of the file with the result of the `fma` test.
 const FMA: [u8; 8] = *b"LUMAFMA ";
 /// Magic of the file noting that a calibration looked contended.
@@ -322,7 +322,7 @@ impl DiskCache {
     pub fn load_calibration(&self) -> Option<(CostModel, Option<MemoryModel>)> {
         let bytes = self.load_blob(&format!("cost-{}", self.key), COST)?;
         let numbers: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|chunk| f64::from_le_bytes(*chunk)).collect();
-        let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, l2_bytes, l2_gbs, shared_gbs, s2, s8, s32, gather, transpose, latency_ns, l2_exact] = numbers[..] else { return None };
+        let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor, l2_bytes, l2_gbs, shared_gbs, s2, s8, s32, gather, transpose, latency_ns, l2_exact, h2d, d2h, derate] = numbers[..] else { return None };
         let f64_factor = (!f64_factor.is_nan()).then_some(f64_factor);
         let sane = |x: f64| x.is_finite() && x > 0.0;
         // A model without memory numbers stores NaN in every one of them.
@@ -335,7 +335,15 @@ impl DiskCache {
             if !ok {
                 return None;
             }
-            Some(MemoryModel::new(l2_bytes.map(|bytes| bytes as u64), l2_exact == 1.0, l2_gbs, shared_gbs, [s2, s8, s32], gather, transpose, latency_ns))
+            // The transfer numbers are NaN for a device without lanes.
+            let transfer = if h2d.is_nan() {
+                None
+            } else if sane(h2d) && sane(d2h) && (0.0..=1.0).contains(&derate) {
+                Some(TransferModel::new(h2d, d2h, derate))
+            } else {
+                return None;
+            };
+            Some(MemoryModel::new(l2_bytes.map(|bytes| bytes as u64), l2_exact == 1.0, l2_gbs, shared_gbs, [s2, s8, s32], gather, transpose, latency_ns).with_transfer(transfer))
         };
         let model = CostModel::new(launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor);
         (sane(launch_us) && sane(bandwidth_gbs) && sane(f32_ops_per_ns) && sane(df32_factor) && f64_factor.is_none_or(sane)).then_some((model, memory))
@@ -356,8 +364,11 @@ impl DiskCache {
                 m.transpose_factor,
                 m.latency_ns,
                 f64::from(u8::from(m.l2_exact)),
+                m.transfer.map_or(f64::NAN, |t| t.h2d_gbs),
+                m.transfer.map_or(f64::NAN, |t| t.d2h_gbs),
+                m.transfer.map_or(f64::NAN, |t| t.overlap_derate),
             ]),
-            None => numbers.extend([f64::NAN; 10]),
+            None => numbers.extend([f64::NAN; 13]),
         }
         let bytes: Vec<u8> = numbers.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.store_blob(&format!("cost-{}", self.key), COST, &bytes);
@@ -514,6 +525,9 @@ mod tests {
         let no_size = MemoryModel::new(None, false, memory.l2_gbs, None, memory.strided_factor, memory.gather_factor, memory.transpose_factor, memory.latency_ns);
         disk.store_calibration(&with_f64, Some(&no_size));
         assert_eq!(disk.load_calibration(), Some((with_f64, Some(no_size))), "unknown sizes round-trip");
+        let lanes = memory.with_transfer(Some(TransferModel::new(24.5, 25.5, 0.125)));
+        disk.store_calibration(&with_f64, Some(&lanes));
+        assert_eq!(disk.load_calibration(), Some((with_f64, Some(lanes))), "transfer numbers round-trip");
         disk.store_cost(&with_f64);
         assert_eq!(DiskCache::open(Some(dir.clone()), "test-key".into()).load_cost(), Some(with_f64), "a second open reads it");
         assert_eq!(DiskCache::open(None, "test-key".into()).load_cost(), None, "no directory, no cache");
@@ -521,6 +535,8 @@ mod tests {
         let file = dir.join("cost-test-key.bin");
         write_blob(&file, *b"LUMACOS2", &[1u8; 40]).unwrap();
         assert_eq!(disk.load_cost(), None, "a LUMACOS2 file is ignored");
+        write_blob(&file, *b"LUMACOS3", &[1u8; 120]).unwrap();
+        assert_eq!(disk.load_cost(), None, "a LUMACOS3 file is ignored: it recalibrates once");
         std::fs::write(&file, b"garbage that is not a cost file at all").unwrap();
         assert_eq!(disk.load_cost(), None, "a corrupt file is ignored");
         write_blob(&file, COST, &[0u8; 120]).unwrap();

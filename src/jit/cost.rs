@@ -536,6 +536,65 @@ fn measure_memory(ctx: &Context, dram_gbs: f64, launch_ns: f64) -> Result<Memory
     Ok(MemoryModel::new(l2_bytes, attribute.is_some() && l2_bytes.is_some(), l2_gbs, shared_gbs, [patterns[0], patterns[1], patterns[2]], patterns[3], patterns[4], latency_ns))
 }
 
+/// Measures the transfer lanes (W1-P2b): host-to-device and device-to-host throughput of one transfer, and the share of a copy
+/// kernel's throughput a running transfer takes (`d = (T_with - T_base) / T_transfer`: kernels beside a transfer progress at
+/// `1 - d` for the transfer's duration). `None` where the lanes are the synchronous defaults (everything but CUDA) and on the CPU.
+fn measure_transfers(ctx: &Context) -> Result<Option<luma_core::TransferModel>> {
+    if ctx.is_cpu() || ctx.backend() != luma_core::BackendKind::Cuda {
+        return Ok(None);
+    }
+    const BYTES: u64 = 32 << 20;
+    let buffer = ctx.lane_buffer(BYTES)?;
+    let mut host_in = ctx.stage_alloc(BYTES, luma_core::hal::StageDir::ToDevice)?;
+    let mut host_out = ctx.stage_alloc(BYTES, luma_core::hal::StageDir::FromDevice)?;
+    host_in.as_mut_slice().fill(1);
+    let mut best_in = f64::INFINITY;
+    let mut best_out = f64::INFINITY;
+    for round in 0..=5 {
+        let start = Instant::now();
+        let ticket = ctx.transfer_in(&host_in, &buffer, BYTES, &[])?;
+        ctx.ticket_wait(&ticket)?;
+        let t_in = start.elapsed().as_secs_f64() * 1e9;
+        let start = Instant::now();
+        let ticket = ctx.transfer_out(&buffer, &mut host_out, BYTES, &[])?;
+        ctx.ticket_wait(&ticket)?;
+        let t_out = start.elapsed().as_secs_f64() * 1e9;
+        if round > 0 {
+            best_in = best_in.min(t_in);
+            best_out = best_out.min(t_out);
+        }
+    }
+
+    // A copy kernel over 64 MiB in and out, `reps` launches long enough to cover one transfer, with and without one running.
+    let n: u32 = 1 << 24;
+    let rig = Rig::new(ctx, kernel_source("", "f32", "in0[i]", "", "x"), "CostOverlap", n, n)?;
+    let derate = (|| -> Result<f64> {
+        let one = rig.time(ctx, 0, 0, 8)?;
+        let reps = ((2.0 * best_in / one).ceil() as u32).clamp(4, 256);
+        let base = rig.time(ctx, 0, 0, reps)? * f64::from(reps);
+        let words = [0u32, 0];
+        let raw = [RawArg::read(&rig.input, rig.bytes), RawArg::write(&rig.output, rig.bytes), RawArg::Uniform(bytemuck::cast_slice(&words))];
+        let mut with = f64::INFINITY;
+        for round in 0..=3 {
+            let start = Instant::now();
+            let ticket = ctx.transfer_in(&host_in, &buffer, BYTES, &[])?;
+            for _ in 0..reps {
+                launch_1d(ctx, &rig.core, rig.threads, &raw)?;
+            }
+            ctx.sync()?;
+            let ns = start.elapsed().as_secs_f64() * 1e9;
+            ctx.ticket_wait(&ticket)?;
+            if round > 0 {
+                with = with.min(ns);
+            }
+        }
+        Ok(((with - base) / best_in).clamp(0.0, 1.0))
+    })();
+    rig.release(ctx);
+    let derate = derate?;
+    Ok(Some(luma_core::TransferModel::new(BYTES as f64 / best_in, BYTES as f64 / best_out, derate)))
+}
+
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
 /// arithmetic relative to it, and the cost of a launch; and how bytes move inside it (the
 /// memory model, `None` if its measurement failed).
@@ -580,7 +639,10 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<(CostModel, Option<MemoryModel>
 
     let t_launch = time_kernel(ctx, copy(), "CostLaunch", 1, 0, LAUNCHES)?;
     let memory = match measure_memory(ctx, bandwidth_gbs, t_launch) {
-        Ok(memory) => Some(memory),
+        Ok(memory) => Some(memory.with_transfer(measure_transfers(ctx).unwrap_or_else(|err| {
+            log::debug!("luma: the transfer lane calibration failed: {err}");
+            None
+        }))),
         Err(err) => {
             log::debug!("luma: the memory hierarchy calibration failed: {err}");
             None

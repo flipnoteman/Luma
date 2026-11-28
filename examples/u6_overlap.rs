@@ -25,7 +25,9 @@ fn main() {
     let mut reference = None;
     for (label, mode) in [("off", SplitMode::Off), ("auto", SplitMode::Auto)] {
         let options = ContextOptions::from_env().memory_budget((budget as u64) << 20).split(mode);
+        let opened = Instant::now();
         let ctx = Context::with_options(options).expect("a device");
+        println!("{label:5} context open {:.0} ms, transfers {:?}", opened.elapsed().as_secs_f64() * 1e3, ctx.memory_model().and_then(|m| m.transfer));
         let mut times = Vec::new();
         for _ in 0..3 {
             let (t, out) = chain(&ctx, &xs, rounds);

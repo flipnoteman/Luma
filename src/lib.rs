@@ -220,7 +220,7 @@ pub use gpu::pager::{MemoryStats, PagingStats};
 pub use jit::split::{SplitMode, StreamStats};
 pub use numerics::{Numerics, Reduced};
 #[allow(deprecated)]
-pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
+pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, TransferModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};
 pub use luma_core::hal::HostBytes;
 pub use error::{LumaError, Result};
 pub use fields::Fields;
