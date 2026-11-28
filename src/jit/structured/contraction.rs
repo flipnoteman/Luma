@@ -609,7 +609,7 @@ fn lower_padded(ctx: &Context, view: &ContractionView<'_>, params: &ContractionP
 /// are products with exact zeros, so it is `exact_finite` (an infinity or a NaN in the zero region would have made the full range a
 /// NaN); not for an operand with an offset (a window of a triangle is not one in its own coordinates), nor a half-work product.
 #[inline(never)]
-fn triangle_word(ctx: &Context, view: &ContractionView<'_>, plan: Plan, layouts: [Layout; 2]) -> u32 {
+fn triangle_word(ctx: &Context, view: &ContractionView<'_>, layouts: [Layout; 2]) -> u32 {
     if !ctx.numerics().exact_finite || layouts.iter().any(|layout| layout.off != 0) {
         return 0;
     }
@@ -632,7 +632,7 @@ fn triangle_word(ctx: &Context, view: &ContractionView<'_>, plan: Plan, layouts:
 fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, lhs: &Array<f32>, rhs: &Array<f32>) -> Result<Lowered, Failure> {
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
-    let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, plan, layouts) } else { 0 };
+    let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, layouts) } else { 0 };
     done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)))?)
 }
 
