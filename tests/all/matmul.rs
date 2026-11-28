@@ -455,3 +455,162 @@ fn class_sums_through_a_lazy_one_hot_matrix_match_the_host() {
         }
     }
 }
+
+/// A matrix on the host: `v[i0 + d0 * i1]` is element `(i0, i1)` of the array of shape `[d0, d1]` (the row-major `d1 x d0` matrix).
+#[derive(Clone)]
+struct Mat {
+    d: [usize; 2],
+    v: Vec<f32>,
+}
+
+impl Mat {
+    fn at(&self, i0: usize, i1: usize) -> f32 {
+        self.v[i0 + self.d[0] * i1]
+    }
+    fn build(d: [usize; 2], f: impl Fn(usize, usize) -> f32) -> Mat {
+        Mat { d, v: (0..d[0] * d[1]).map(|i| f(i % d[0], i / d[0])).collect() }
+    }
+    fn array(&self, ctx: &Context) -> Array<f32> {
+        Array::from_slice_on(ctx, &self.v, self.d).unwrap()
+    }
+    /// The row-major matrix `self` (`d1 x d0`), or its transpose.
+    fn rm(&self, t: bool) -> (usize, usize, Vec<f64>) {
+        let [d0, d1] = self.d;
+        if t {
+            (d0, d1, (0..d0 * d1).map(|i| f64::from(self.at(i / d1, i % d1))).collect())
+        } else {
+            (d1, d0, self.v.iter().map(|&x| f64::from(x)).collect())
+        }
+    }
+}
+
+/// `a (r x s)` times `b (s x c)`, row-major.
+fn rm_product(a: &(usize, usize, Vec<f64>), b: &(usize, usize, Vec<f64>)) -> Vec<f64> {
+    assert_eq!(a.1, b.0);
+    let mut out = vec![0.0; a.0 * b.1];
+    for i in 0..a.0 {
+        for kk in 0..a.1 {
+            for j in 0..b.1 {
+                out[i * b.1 + j] += a.2[i * a.1 + kk] * b.2[kk * b.1 + j];
+            }
+        }
+    }
+    out
+}
+
+/// A chain of views (transpose, reshape, slice, broadcast) over a stored (or lazy) matrix, applied to the array and to its host model.
+fn view_chain(ctx: &Context, seed: u64, steps: usize) -> (Array<f32>, Mat, String) {
+    let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move |n: usize| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 33) as usize % n
+    };
+    let d = [1 + next(6), 1 + next(6)];
+    let vals = values(d[0] * d[1], seed, 1.0, 4.0).into_iter().map(f32::round).collect();
+    let mut mat = Mat { d, v: vals };
+    let mut arr = mat.array(ctx);
+    let mut log = format!("stored {d:?}");
+    if next(3) == 0 {
+        arr = &arr * 1.0f32;
+        log += " lazy";
+    }
+    for _ in 0..steps {
+        let [d0, d1] = mat.d;
+        match next(4) {
+            0 => {
+                arr = arr.transpose();
+                mat = Mat::build([d1, d0], |i, j| mat.at(j, i));
+                log += " transpose";
+            }
+            1 => {
+                let len = d0 * d1;
+                let divisors: Vec<usize> = (1..=len).filter(|x| len % x == 0).collect();
+                let x = divisors[next(divisors.len())];
+                arr = arr.reshape([x, len / x]);
+                mat = Mat { d: [x, len / x], v: mat.v };
+                log += &format!(" reshape {x}");
+            }
+            2 => {
+                let axis = next(2);
+                let extent = mat.d[axis];
+                let lo = next(extent);
+                let hi = lo + 1 + next(extent - lo);
+                arr = arr.slice(axis, lo..hi);
+                let old = mat.clone();
+                let mut nd = old.d;
+                nd[axis] = hi - lo;
+                mat = Mat::build(nd, |i, j| if axis == 0 { old.at(i + lo, j) } else { old.at(i, j + lo) });
+                log += &format!(" slice {axis} {lo}..{hi}");
+            }
+            _ => {
+                let axis = next(2);
+                if mat.d[axis] == 1 {
+                    let w = 1 + next(5);
+                    let mut nd = mat.d;
+                    nd[axis] = w;
+                    arr = arr.broadcast_to(nd);
+                    let old = mat.clone();
+                    mat = Mat::build(nd, |i, j| if axis == 0 { old.at(0, j) } else { old.at(i, 0) });
+                    log += &format!(" broadcast {axis} {w}");
+                }
+            }
+        }
+    }
+    (arr, mat, log)
+}
+
+#[test]
+fn a_reshaped_transposed_column_is_a_product_operand() {
+    // The failing case: the reshape of a transposed view shares the view's node, which keeps its own shape.
+    let ctx = exact().unwrap();
+    for len in [2usize, 3, 5] {
+        let col = Mat::build([len, 1], |i, _| (i + 1) as f32);
+        let lhs = col.array(&ctx).transpose().reshape([len, 1]);
+        let rhs = Mat::build([1, len], |_, j| (2 * j + 2) as f32);
+        let got = lhs.matmul(&rhs.array(&ctx)).to_vec().unwrap();
+        let want: Vec<f32> = rhs.rm(false).2.iter().map(|&x| x as f32).collect();
+        let dot: f32 = (0..len).map(|i| (i + 1) as f32 * want[i]).sum();
+        assert_eq!(got, vec![dot], "len {len}");
+        let got = rhs.array(&ctx).matmul(&col.array(&ctx).transpose().reshape([len, 1])).to_vec().unwrap();
+        // A `[1, len]` row times the `[len, 1]` column (`k` is 1): the outer product.
+        let outer: Vec<f32> = want.iter().flat_map(|&w| (0..len).map(move |i| (i + 1) as f32 * w)).collect();
+        assert_eq!(got, outer, "len {len} rhs");
+    }
+}
+
+#[test]
+fn chains_of_views_feed_every_product_like_their_host_matrices() {
+    let ctx = exact().unwrap();
+    for seed in 0..300u64 {
+        let (arr, x, log) = view_chain(&ctx, seed, 1 + (seed % 5) as usize);
+        let n = 1 + (seed % 7) as usize;
+        let dense = |rows: usize, cols: usize| Mat { d: [cols, rows], v: values(rows * cols, seed + 1000, 1.0, 4.0).into_iter().map(f32::round).collect() };
+        let [d0, d1] = x.d;
+        let ints = |want: Vec<f64>, got: Array<f32>, what: &str| {
+            let got: Vec<f64> = got.to_vec().unwrap().into_iter().map(f64::from).collect();
+            assert_eq!(got, want, "seed {seed} {what}: {log}");
+        };
+        // `matmul`: the chain is the left operand, the right one is dense `d0 x n` (row-major); then the other way round.
+        let b = dense(d0, n);
+        ints(rm_product(&x.rm(false), &b.rm(false)), arr.matmul(&b.array(&ctx)), "lhs");
+        let a = dense(n, d1);
+        ints(rm_product(&a.rm(false), &x.rm(false)), a.array(&ctx).matmul(&arr), "rhs");
+        // `matmul_nt` (`A Bᵀ`): `A` is the chain (`d1 x d0`), `B` is `n x d0`; and the chain as `B`.
+        let b = dense(n, d0);
+        ints(rm_product(&x.rm(false), &b.rm(true)), arr.matmul_nt(&b.array(&ctx)), "nt lhs");
+        let a = dense(n, d0);
+        ints(rm_product(&a.rm(false), &x.rm(true)), a.array(&ctx).matmul_nt(&arr), "nt rhs");
+        // `matmul_tn` (`Aᵀ B`): the chain is `A` (`d1 x d0`, so `Aᵀ` is `d0 x d1`) and `B` is `d1 x n`; and the chain as `B`.
+        let b = dense(d1, n);
+        ints(rm_product(&x.rm(true), &b.rm(false)), arr.matmul_tn(&b.array(&ctx)), "tn lhs");
+        let a = dense(d1, n);
+        ints(rm_product(&a.rm(true), &x.rm(false)), a.array(&ctx).matmul_tn(&arr), "tn rhs");
+        // `matmul_tt` (`Aᵀ Bᵀ`).
+        let b = dense(n, d1);
+        ints(rm_product(&x.rm(true), &b.rm(true)), arr.matmul_tt(&b.array(&ctx)), "tt lhs");
+        let a = dense(d0, n);
+        ints(rm_product(&a.rm(true), &x.rm(true)), a.array(&ctx).matmul_tt(&arr), "tt rhs");
+    }
+}

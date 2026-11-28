@@ -982,7 +982,9 @@ fn transposed_source(ev: &mut Eval<'_>, array: &Array<f32>) -> Option<Words> {
     let op = node.op();
     let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = op.kind else { return None };
     let unit = |from: u8| AxisMap { from, start: 0, step: 1 };
+    // A reshape of a pending view shares its node, which keeps the shape it was made with.
     let swaps = op.ty == ElemTy::F32
+        && array.shape().dims().map(|extent| u32::try_from(extent).ok()) == map.out.map(Some)
         && map.axes[0] == unit(1)
         && map.axes[1] == unit(0)
         && map.axes[2] == unit(2)

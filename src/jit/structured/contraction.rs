@@ -1107,6 +1107,11 @@ pub(crate) fn matrix_window(array: &Array<f32>) -> Option<MatrixWindow> {
     let op = node.op();
     let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = op.kind else { return None };
     let unit = |from: u8| AxisMap { from, start: 0, step: 1 };
+    // A reshape of a pending view is another handle on the same node (see `Array::reshape`): the node still has the shape it
+    // was made with, so the window is the array's only if the shapes agree.
+    if array.shape().dims().map(|extent| u32::try_from(extent).ok()) != map.out.map(Some) {
+        return None;
+    }
     if op.ty != ElemTy::F32 || map.axes[2] != unit(2) || map.axes[3] != unit(3) || map.src[2..] != [1, 1] || map.out[2..] != [1, 1] {
         return None;
     }
