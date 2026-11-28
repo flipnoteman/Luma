@@ -155,6 +155,36 @@ assert!(matches!(a.matmul(&b).to_vec(), Err(LumaError::Op { .. })));
 # Ok::<(), luma::LumaError>(())
 ```
 
+### Contractions written as subscripts: `einsum`
+
+`luma::einsum(spec, &[&a, &b, ..])` contracts any number of operands from a NumPy-style spec. Subscripts list the axes of an
+operand **slowest first**, the way a matrix is written: the `[K, M]` array above is `"mk"` (`M` rows of `K` elements), so the
+product of the example is `einsum("mk,kn->mn", &[&a, &b])`, and its transpose is `"mk,kn->nm"`. Without `->` the output is the
+labels that appear once, alphabetically. A label that is in no later operand and not in the output is summed; a label repeated
+inside one operand takes the diagonal (`"ii->i"`, `"ii"` is `a.trace()`). `...`, a repeated output label and arrays of more than
+four axes are errors, and so is a spec with an unknown label or the wrong number of operands (the result is poisoned).
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
+let b = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3])?;
+assert_eq!(einsum("mk,kn->mn", &[&a, &b]).to_vec()?, a.matmul(&b).to_vec()?);
+assert_eq!(einsum("mk,mk->", &[&a, &a]).to_vec()?, [91.0]); // the squared Frobenius norm
+assert_eq!(einsum("mk->m", &[&a]).to_vec()?, [6.0, 15.0]);
+assert_eq!(a.trace().shape(), Shape::from([1]));
+# Ok::<(), luma::LumaError>(())
+```
+
+Operands are contracted pairwise from the left. Each pair runs as the first of three lowerings that fits: `matmul` or
+`matmul_batched` (one contracted label, at most one free label per operand and two batch labels), a generic comprehension for
+anything else (Hadamard and outer products, several contracted labels, three batch labels), and, if the generic lowering cannot run
+the pair, a copy followed by one `matmul_batched`. No valid spec is refused, but only the first tier is as fast as `matmul`. The sum
+of a pair runs over its contracted labels in the order they are written, the first label slowest. Under
+`Numerics::reassociate` (`algebraic()` and `fast()`) the order of the pairs is searched instead (exhaustive up to four operands, a
+subset search up to eight, greedy above) by flops plus bytes at the device's bandwidth; the result is remembered per spec and shapes
+and differs from the left-to-right one by rounding only.
+
 ## Statistics along an axis
 
 `reduce_axis(axis, [ops])` computes one to four reductions (`Reduction::Sum`, `Min`, `Max`,
