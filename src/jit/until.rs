@@ -164,7 +164,13 @@ pub(crate) fn force_with_record<T: GpuType>(
     let mut scratch = Scratch::new(ctx);
     let mut own = ctx.recorded();
     let first_gate = gate.as_ref().filter(|_| finishes).map(|gate| (gate.id, gate.args));
-    let (storages, partial, groups) = launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, fused, &stored, ops, &mut scratch, Some(value), epi, first_gate).ok()?;
+    let (storages, partial, groups) = match launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, fused, &stored, ops, &mut scratch, Some(value), epi, first_gate) {
+        Ok(made) => made,
+        // A failed transfer is the environment's, not a limit of this launch: the separate launches would read the same file again, and past an
+        // aborted recording whose seed copy failed (the abort ran the commands for real) the probes hold nothing: no other way gives the value.
+        Err(Failure::New(error)) if matches!(error.root(), crate::LumaError::Io { .. }) => return Some(Err(Failure::New(error))),
+        Err(_) => return None,
+    };
     // Past a first pass that did not finish (several groups, no single pass): the rest, ending in `value`.
     let rest = if groups > 1 { epi } else { None };
     let last_gate = gate.as_ref().filter(|_| !finishes).map(|gate| (gate.id, gate.args));

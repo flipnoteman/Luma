@@ -950,3 +950,76 @@ fn an_iterate_until_whose_recording_aborts_keeps_the_state_a_released_buffer_was
         ],
     });
 }
+
+/// Fuzz finding of the injected I/O failures (W3 end-of-wave gate, `split_io_failures`): `iterate_until_all` over a file array whose first read fails. The
+/// recording of the step aborts at the first launch, which copies the seed (the read that fails); the fused launch of the step and its record then
+/// failed, the error was taken for a limit of the fusion, and the separate launches ran (the failed read was spent) on a probe that held nothing.
+#[test]
+fn an_iterate_until_over_a_file_array_whose_first_read_fails_does_not_run_on_an_unseeded_probe() {
+    use luma_io::{FailPlan, Fault};
+    let program = Program {
+        config: Config { max_nodes: 2, max_inlined: Some(16), max_live: Some(8), max_inputs: Some(4), ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: I32, seed: 6158030500229569234 },
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Loop { kind: IterateUntilAll, steps: 1, states: vec![2], body: vec![Binary { lhs: Var(2), rhs: Var(3), op: Minimum }], next: vec![4] },
+        ],
+    };
+    let plan = FailPlan { read: Some((0, Fault::Fail(std::io::ErrorKind::Other))), write: None };
+    if let Err(failure) = super::run_with_failure(&program, plan) {
+        panic!("{failure}\n{program:?}");
+    }
+}
+
+/// OPEN (found by `split_io_failures`, seed 13, in a run without an injected failure; no file arrays, no split): with `chunk_bytes` and `slab_bytes` set, variable 4 (the
+/// `Concat` of a `Df32` array with itself six times, after `Assign`s of a `Df32` array to another and a `Compound` on it) has element 140 -4 on luma, -3.375 on the oracle.
+#[test]
+#[ignore = "open: slab and chunk configuration, Df32 concat"]
+fn a_concat_assign_and_compound_of_df32_arrays_with_slabs_and_chunks_is_wrong() {
+    let program = Program {
+        config: Config { max_nodes: 64, max_inlined: Some(16), max_live: Some(8), max_inputs: None, chunk_bytes: Some(1024), slab_bytes: Some(4096), ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Input { dims: [7, 5, 1, 1], ty: Df32, seed: 0 },
+            View { src: 0, view: Concat { axis: 0, others: vec![0] } },
+            Assign { target: 0, path: vec![], rhs: Var(2) },
+            View { src: 2, view: Concat { axis: 0, others: vec![2, 2, 2, 2, 2] } },
+            Assign { target: 0, path: vec![], rhs: Var(2) },
+            Compound { target: 0, op: Sub, rhs: Const(-0.5) },
+            Input { dims: [9, 6, 1, 1], ty: Bool, seed: 6187493582823668260 },
+            Scan { src: 1, axis: 0, op: CumSum },
+            Select { mask: 5, a: Const(2147483600.0), b: Const(1.0), ty: I32 },
+            Assign { target: 7, path: vec![], rhs: Const(-2147483600.0) },
+            Unary { src: 2, op: Neg },
+        ],
+    };
+    check(program);
+}
+
+/// OPEN (found by `split_io_failures`, seed 20): the same cause as the test above, by another path. `iterate_until_all` over two states whose step gathers with a file array;
+/// the abort of the step's recording fails at its seed copy (the read that fails), the node being evaluated is left pending (`run_store_planned` under `force_stepped`),
+/// and its retry computes on a probe that was never seeded (0 against 0.405). A failed seed copy of an aborted recording needs to poison the probes (or the
+/// recording keep its seeds to retry), not only the fused path (see `force_with_record`).
+#[test]
+#[ignore = "open: failed seed copy of an aborted recording, evaluate_group retry"]
+fn an_iterate_until_over_two_states_whose_seed_copy_fails_does_not_run_on_unseeded_probes() {
+    use luma_io::{FailPlan, Fault};
+    let program = Program {
+        config: Config { max_nodes: 8, max_inputs: Some(4), ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Loop { kind: IterateUntilAll, steps: 1, states: vec![0, 2], body: vec![View { src: 2, view: Take { idx: 1 } }, Unary { src: 3, op: Log1p }], next: vec![6, 5] },
+        ],
+    };
+    let plan = FailPlan { read: Some((0, Fault::Short { keep: 8 })), write: None };
+    if let Err(failure) = super::run_with_failure(&program, plan) {
+        panic!("{failure}\n{program:?}");
+    }
+}

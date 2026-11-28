@@ -1617,14 +1617,16 @@ fn run_with_failure(program: &Program, plan: FailPlan) -> Result<(), String> {
     let mut machine = Machine::new(ctx.clone(), program.math, true);
     machine.cx.io = Some(Arc::new(FailingIo::new(PoolIo::new(2), plan)));
     let created = created_counts(program);
-    match execute(&mut machine, program, &created) {
+    let outcome = execute(&mut machine, program, &created);
+    drop(machine);
+    // A schedule still open commits at the next trigger, whoever pulls it (its failure is reported there): settle it first, also when the run
+    // failed (one left open would commit when the thread ends, where the CPU backend's thread-local state is gone). The failed schedule
+    // left nothing behind: a fresh array then computes on the same context.
+    let _ = ctx.sync();
+    match outcome {
         Ok(()) | Err(Fail::Limit(_)) => {}
         Err(Fail::Mismatch(what)) => return Err(what),
     }
-    drop(machine);
-    // A schedule still open commits at the next trigger, whoever pulls it (its failure is reported there): settle it first. The failed schedule
-    // left nothing behind: a fresh array then computes on the same context.
-    let _ = ctx.sync();
     let n = 3 * 256 + 5;
     let x = Array::<f32>::from_slice_on(&ctx, &vec![1.0; n], n).map_err(|e| format!("after the failure: {e}"))?;
     let y = (&x * 2.0 + 1.0).to_vec().map_err(|e| format!("after the failure: {e}"))?;
