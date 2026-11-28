@@ -549,6 +549,9 @@ impl<T: GpuType> Array<T> {
         let kept = self.props.get();
         let held = self.clone();
         self.props.set(kept);
+        // The product reads its copy only (a write through the original evaluates the product first), so the properties stay true there:
+        // a lazy product plans (the cut range of a triangle) as the eager one does.
+        held.props.set(kept);
         held
     }
 
