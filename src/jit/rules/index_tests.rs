@@ -41,7 +41,7 @@ fn plans(ctx: &Context) -> usize {
 }
 
 fn view<'a>(lhs: &'a A, rhs: &'a A, tf32: Tf32Request) -> ContractionView<'a> {
-    ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32 }, location: std::panic::Location::caller() }
+    ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: std::panic::Location::caller() }
 }
 
 #[test]

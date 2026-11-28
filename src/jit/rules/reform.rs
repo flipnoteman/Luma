@@ -308,7 +308,7 @@ fn chain_order(scope: &Scope, site: Site, _: &Numerics) -> Option<Rewrite> {
         return None;
     }
     let ctx = context_of(scope)?;
-    let mut builder = Builder { ctx: &ctx, leaves: &leaves, attrs: ContractionAttrs { tf32: attrs }, next: scope.next_id().0, add: SmallVec::new(), feeds: SmallVec::new() };
+    let mut builder = Builder { ctx: &ctx, leaves: &leaves, attrs: ContractionAttrs { tf32: attrs, half: false }, next: scope.next_id().0, add: SmallVec::new(), feeds: SmallVec::new() };
     let (_, form) = builder.build(&order, Some(root_id))?;
     Some(Rewrite { replace: smallvec![(root_id, form?)], add: builder.add, drop: producers.into_iter().collect(), feeds: builder.feeds })
 }
