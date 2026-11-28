@@ -223,10 +223,14 @@ impl Structured {
 
     /// [`Structured::force`] for the node that stands for the value: it takes the buffer itself.
     pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
-        self.record_with(|| match &self.comp().run {
+        // The plan cache records or replays the run of a value of a graph it walked (one load and a branch otherwise).
+        let entered = super::plancache::structured_enter(self);
+        let result = self.record_with(|| match &self.comp().run {
             RunState::Reduce { .. } => self.record_reduce(ctx),
             RunState::Contraction(run) => self.record_contraction(ctx, run),
-        })
+        });
+        super::plancache::structured_leave(entered, ctx, self, result);
+        result
     }
 
     /// The buffer, recorded by `record` if there is none yet.

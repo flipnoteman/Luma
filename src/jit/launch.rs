@@ -1925,8 +1925,7 @@ pub(crate) fn reduce_first_pass(
         return Ok(None);
     }
     let Some(args) = node.operands() else { return Ok(None) };
-    let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
-    drop(args);
+    let fused = emit.fused(node.len(), || flatten_bounded(node, args, Tail::Reduce(ops)).map(|(fused, _)| fused))?;
     // A reduction calls the sub-programs of circular shifts once per shift; nested or large ones
     // are cheaper staged by the store kernel of the node, whose buffer is then reduced. Programs
     // that read sub-programs through views compute each index once and are reduced directly.

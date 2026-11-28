@@ -15,6 +15,13 @@ fn ctx() -> Context {
     ctx
 }
 
+/// A context whose products are all lazy (values of their own that the walk meets).
+fn lazy_ctx() -> Context {
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.lazy = crate::jit::structured::sites::LazyMode::Always).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    ctx
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -537,4 +544,144 @@ fn the_plan_cache_replays_a_program_with_a_call() {
     assert_eq!(got, want);
     let after = ctx.jit().plan_stats();
     assert!(after.hits - before.hits >= 3, "{after:?}");
+}
+
+// -- structured values: reductions and products in a step (W3-U5) --
+
+/// A step over a one-element state that reads a reduction of an expression (an elementwise program over a buffer and a changing
+/// scalar): the reduction is a value of its own that the elementwise program reads.
+fn normalise(c: &A, u: &A, t: usize) -> A {
+    let total = (c * (1.0 + 0.01 * t as f32)).abs().sum();
+    (u * 0.5 + &total * 0.01).tanh()
+}
+
+/// Runs `steps` of `step` (eval every time) with the cache `on` or off: the bits of every state, and the reduction launches made.
+fn run_steps(ctx: &Context, on: bool, steps: usize, start: &[f32], shape: [usize; 2], step: &dyn Fn(&A, usize) -> A) -> (Vec<Vec<u32>>, u64) {
+    ctx.jit().set_plan_cache(on);
+    let before = ctx.jit().stats();
+    let mut u = A::from_slice_on(ctx, start, shape).unwrap();
+    let mut seen = Vec::new();
+    for t in 0..steps {
+        u = step(&u, t);
+        u.eval().unwrap();
+        seen.push(bits(&u.to_vec().unwrap()));
+    }
+    (seen, ctx.jit().stats().reduce_launches - before.reduce_launches)
+}
+
+#[test]
+fn a_step_with_a_reduction_hits() {
+    let ctx = ctx();
+    let c = A::from_slice_on(&ctx, &data(W * H, 31), [W, H]).unwrap();
+    let step = move |u: &A, t: usize| normalise(&c, u, t);
+    let start = data(1, 33);
+    let (want, want_launches) = run_steps(&ctx, false, 10, &start, [1, 1], &step);
+    let before = ctx.jit().plan_stats();
+    let (got, launches) = run_steps(&ctx, true, 10, &start, [1, 1], &step);
+    assert_eq!(got, want);
+    assert_eq!(launches, want_launches, "a replay launches what the evaluation launched");
+    let after = ctx.jit().plan_stats();
+    // Where the reduction runs on the host the cache is bypassed (`can_run_on_host`) or the strategy is not replayable.
+    if !ctx.can_run_on_host() && !ctx.caps().contains(crate::caps::Caps::HOST_PATH) {
+        assert!(after.hits - before.hits >= 6, "{before:?} -> {after:?}");
+    }
+}
+
+#[test]
+fn a_step_with_a_matmul_replays_one_plan() {
+    for ctx in [ctx(), lazy_ctx()] {
+        let w = A::from_slice_on(&ctx, &data(W * W, 41), [W, W]).unwrap();
+        let step = move |u: &A, t: usize| (u.matmul(&w).cbrt() * (1.0 + 0.01 * t as f32) + u * 0.5).clamp(-4.0, 4.0);
+        let start = data(W * W, 43);
+        let (want, _) = run_steps(&ctx, false, 10, &start, [W, W], &step);
+        let before = ctx.jit().plan_stats();
+        let (got, _) = run_steps(&ctx, true, 10, &start, [W, W], &step);
+        assert_eq!(got, want);
+        let after = ctx.jit().plan_stats();
+        if !ctx.can_run_on_host() && !ctx.caps().contains(crate::caps::Caps::HOST_PATH) {
+            assert!(after.hits - before.hits >= 5, "{before:?} -> {after:?}");
+        }
+    }
+}
+
+#[test]
+fn a_product_with_an_absorbed_epilogue_runs_as_ever() {
+    // The consumer is absorbed into the product (W3-U4): the step is not cached, and what it computes is the uncached path's.
+    let ctx = lazy_ctx();
+    let w = A::from_slice_on(&ctx, &data(W * W, 45), [W, W]).unwrap();
+    let step = move |u: &A, t: usize| (u.matmul(&w) * (1.0 + 0.01 * t as f32)).clamp(-4.0, 4.0);
+    let start = data(W * W, 47);
+    let (want, _) = run_steps(&ctx, false, 8, &start, [W, W], &step);
+    let (got, _) = run_steps(&ctx, true, 8, &start, [W, W], &step);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_step_with_a_reduction_and_a_matmul_and_changing_scalars_matches_the_uncached_path() {
+    let ctx = lazy_ctx();
+    let w = A::from_slice_on(&ctx, &data(W * W, 51), [W, W]).unwrap();
+    let step = move |u: &A, t: usize| {
+        let p = u.matmul(&w);
+        let total = p.abs().sum();
+        ((&p / &(&total + 1.0)) * (0.5 + 0.1 * t as f32) + u * 0.25).clamp(-4.0, 4.0)
+    };
+    let start = data(W * W, 53);
+    let (want, want_launches) = run_steps(&ctx, false, 12, &start, [W, W], &step);
+    let (got, launches) = run_steps(&ctx, true, 12, &start, [W, W], &step);
+    assert_eq!(got, want);
+    assert_eq!(launches, want_launches);
+}
+
+#[test]
+fn a_changed_shape_class_is_another_plan() {
+    let ctx = ctx();
+    let before = ctx.jit().plan_stats();
+    for (w, h) in [(W, H), (W + 5, H), (W, H + 3)] {
+        let c = A::from_slice_on(&ctx, &data(w * h, 61), [w, h]).unwrap();
+        let step = move |u: &A, t: usize| normalise(&c, u, t);
+        let start = data(1, 63);
+        let (got, _) = run_steps(&ctx, true, 6, &start, [1, 1], &step);
+        let (want, _) = run_steps(&ctx, false, 6, &start, [1, 1], &step);
+        assert_eq!(got, want, "{w}x{h}");
+    }
+    let after = ctx.jit().plan_stats();
+    // Every shape has its own plan: none that was made for another one ran.
+    if !ctx.can_run_on_host() && !ctx.caps().contains(crate::caps::Caps::HOST_PATH) {
+        assert!(after.recorded - before.recorded >= 3, "{before:?} -> {after:?}");
+    }
+}
+
+#[test]
+fn reductions_recorded_together_are_not_replayed_alone() {
+    // Two reductions of one operand are recorded in one kernel (the merged strategy, which a replay does not run): the step is not
+    // cached, and runs as ever.
+    let ctx = ctx();
+    let step = |u: &A, t: usize| {
+        let (lo, hi) = (u.min(), u.max());
+        ((u - &lo) / &(&hi - &lo + 1.0) * (1.0 + 0.01 * t as f32)).clamp(-4.0, 4.0)
+    };
+    let start = data(W * H, 71);
+    let (want, want_launches) = run_steps(&ctx, false, 8, &start, [W, H], &step);
+    let (got, launches) = run_steps(&ctx, true, 8, &start, [W, H], &step);
+    assert_eq!(got, want);
+    assert_eq!(launches, want_launches);
+}
+
+#[test]
+fn an_unused_reduction_does_not_disable_the_cache() {
+    let ctx = ctx();
+    let step = |u: &A, t: usize| {
+        // Dropped without being used: its handle is gone before the evaluation.
+        let _ = u.sum();
+        (u * (1.0 + 0.01 * t as f32) + 0.01).clamp(-4.0, 4.0)
+    };
+    let start = data(W * H, 81);
+    let (want, _) = run_steps(&ctx, false, 8, &start, [W, H], &step);
+    let before = ctx.jit().plan_stats();
+    let (got, _) = run_steps(&ctx, true, 8, &start, [W, H], &step);
+    assert_eq!(got, want);
+    let after = ctx.jit().plan_stats();
+    if !ctx.can_run_on_host() {
+        assert!(after.hits - before.hits >= 3, "{before:?} -> {after:?}");
+    }
 }

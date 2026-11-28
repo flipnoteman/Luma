@@ -420,7 +420,7 @@ const fn entry(
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, replayable: matches!(id.1, 1 | 4 | 7), reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
 }
 
 /// A ragged or a padded kernel: new in this part, so not a baseline (its kernel may be compiling, or over the variant budget: the
@@ -437,6 +437,8 @@ const fn cut(id: StrategyId, name: &'static str, needs: Caps, numerics: NumClass
         prologue: false,
         epilogue: false,
         partners: false,
+        // The ragged kernels are plain launches over the evaluated operands; the padded ones make copies (new nodes the plan does not know).
+        replayable: matches!(id.1, 2 | 5),
         reads: FitsInputs::OPERANDS,
         fits,
         cost: Some(cost_cut),

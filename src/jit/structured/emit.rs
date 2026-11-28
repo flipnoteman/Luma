@@ -2,7 +2,9 @@
 //! match in every method then grows one arm.
 
 use super::telemetry::SampleTag;
+use crate::array::Failure;
 use crate::context::{Context, RawArg, Scratch};
+use crate::jit::program::Fused;
 use crate::error::Result;
 use crate::kernel::KernelCore;
 use luma_core::Buffer;
@@ -68,6 +70,14 @@ impl<'a> Emit<'a> {
         let tag = sample.part(self.launches);
         self.launches += 1;
         Some(tag)
+    }
+
+    /// The flattened program `build` makes of an operand or an epilogue: the plan cache notes it while it records the value this
+    /// execution lowers, and hands it back while it replays it, so that a replayed value does not flatten again (see `plancache`).
+    /// `len` is the extent of the program.
+    #[inline(always)]
+    pub(in crate::jit) fn fused(&self, len: usize, build: impl FnOnce() -> Result<Fused, Failure>) -> Result<Fused, Failure> {
+        if crate::jit::plancache::structured_flags() == 0 { build() } else { crate::jit::plancache::fused_hook(len, build) }
     }
 
     pub(crate) fn copy(&mut self, src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, bytes: u64) -> Result<()> {

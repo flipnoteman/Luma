@@ -30,7 +30,7 @@ pub(super) fn boundary<'a, 'b>(subject: &'b Subject<'a>) -> &'b Boundary<'a> {
 /// An entry of a boundary family: exact, baseline, its own bit class and rank group, no cost (table order decides), no prologue
 /// or epilogue; the op runs it by matching on `id`.
 pub(super) const fn entry(id: StrategyId, name: &'static str, needs: Caps, reads: FitsInputs, split: fn(&Subject<'_>, &Params) -> SplitClass, fits: FitsFn) -> Strategy {
-    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(id.1 as u16), baseline: true, group: id.1, prologue: false, epilogue: false, partners: false, reads, fits, cost: None, split, warm: no_warm, lower: None }
+    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(id.1 as u16), baseline: true, group: id.1, prologue: false, epilogue: false, partners: false, replayable: false, reads, fits, cost: None, split, warm: no_warm, lower: None }
 }
 
 /// `strategy` taking a pending operand into its first read (`Strategy::prologue`).

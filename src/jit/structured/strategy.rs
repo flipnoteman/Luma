@@ -234,6 +234,10 @@ pub(crate) struct Strategy {
     pub(crate) epilogue: bool,
     /// Can launch the products of `ContractionView::partners` with the subject in one kernel (W3-U4 A2): it then returns [`Output::Group`].
     pub(crate) partners: bool,
+    /// `lower` is a pure function of the subject, the parameters and the context (no `select`, no live tuning, no readbacks), so the plan
+    /// cache may run it again with the parameters of an earlier run (see `plancache`, W3-U5). Audited per strategy; a strategy that is
+    /// not marked runs as ever and its value keeps the structure from being cached.
+    pub(crate) replayable: bool,
     /// What `fits` reads besides the subject (the selection cache's key).
     pub(crate) reads: FitsInputs,
     /// Today's plan and gate functions, pure: the parameters of the run, or `None` where the strategy does not apply.

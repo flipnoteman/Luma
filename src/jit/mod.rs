@@ -2668,6 +2668,7 @@ pub(crate) fn deferred_value(ctx: &Context, len: usize, ty: ElemTy, value: Arc<s
     let _ = node.deferred.set(value);
     ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
     ctx.jit().pending_nodes.fetch_add(1, Ordering::Relaxed);
+    ctx.jit().deferred_seen.store(true, Ordering::Relaxed);
     node
 }
 
@@ -3252,6 +3253,9 @@ pub(crate) struct JitState {
     /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
     /// replays only if the graph it walked is all of them.
     pending_nodes: std::sync::atomic::AtomicI64,
+    /// Whether the context ever made the leaf of a structured value: the plan cache then cannot bound the nodes a graph holds by what
+    /// its roots stand above (a value's operands are not below its leaf).
+    deferred_seen: AtomicBool,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -3373,6 +3377,7 @@ impl JitState {
             plan_skip: AtomicU32::new(0),
             decisions_on: AtomicBool::new(env_records_decisions()),
             pending_nodes: std::sync::atomic::AtomicI64::new(0),
+            deferred_seen: AtomicBool::new(false),
         }
     }
 

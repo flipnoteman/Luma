@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::strategy::{table, BitClass, Boundary, FamilyTag, FitsInputs, NumClass, Output, Params, PassMode, ReduceParams, Residencies, ResClass, Strategy, StrategyId, Subject, FAMILY_COUNT, MAX_PER_FAMILY};
+use super::strategy::{extra, table, BitClass, Boundary, FamilyTag, FitsInputs, NumClass, Output, Params, PassMode, ReduceParams, Residencies, ResClass, Strategy, StrategyId, Subject, FAMILY_COUNT, MAX_PER_FAMILY};
 use super::telemetry::{CellKey, ShapeClass};
 use crate::array::Failure;
 use crate::caps::Caps;
@@ -811,6 +811,11 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
     // never run elsewhere) is a plain chain on every other device.
     let plain = PLAIN[family.index()] || PLAIN_WITHOUT_TILES[family.index()] && !ctx.caps().contains(Caps::GEMM_TILES);
     let forced = ctx.strategy_override(family);
+    // The plan cache is replaying this value's step (which runs the strategy it recorded), or recording the run.
+    let planned = crate::jit::plancache::structured_flags();
+    if planned != 0 {
+        return execute_planned(ctx, subject, plain, forced);
+    }
     if super::contraction::is_half(subject)
         && let Some(done) = execute_half(ctx, subject, forced)
     {
@@ -822,7 +827,40 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
     {
         return done;
     }
-    execute_with(table(family), plain, ctx, subject, forced)
+    execute_with::<false>(table(family), plain, ctx, subject, forced)
+}
+
+/// [`execute`] while the plan cache replays or records: a replayed value skips `select` and runs the strategy of the recorded run
+/// (a strategy that declines goes the normal way and ends the replay); a recorded one notes the strategy that ran it.
+#[cold]
+#[inline(never)]
+fn execute_planned(ctx: &Context, subject: &Subject<'_>, plain: bool, forced: Option<StrategyId>) -> Result<Output, Failure> {
+    use super::strategy::Lowered;
+    let family = subject.family();
+    if let Some((id, params)) = crate::jit::plancache::replay_choice(family)
+        && let Some(strategy) = table(family).iter().chain(extra(family)).find(|strategy| strategy.id == id)
+        && let Some(lower) = strategy.lower
+    {
+        let telemetry = &ctx.jit().telemetry;
+        let mut begun = telemetry.begin(ctx, subject, id, strategy.needs.contains(Caps::HOST_PATH));
+        let result = lower(subject, &params, &mut begun.emit);
+        telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
+        match result? {
+            Lowered::Done(output) => return Ok(output),
+            Lowered::Declined => crate::jit::plancache::replay_declined(),
+        }
+    }
+    if super::contraction::is_half(subject)
+        && let Some(done) = execute_half(ctx, subject, forced)
+    {
+        return done;
+    }
+    if ctx.split_mode() != crate::jit::split::SplitMode::Off
+        && let Some(done) = execute_streamed(ctx, subject)
+    {
+        return done;
+    }
+    execute_with::<true>(table(family), plain, ctx, subject, forced)
 }
 
 /// A reduction over an operand of several segments on a splitting context: the streamed strategy. `None` for every other subject.
@@ -830,7 +868,7 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
 #[inline(never)]
 fn execute_streamed(ctx: &Context, subject: &Subject<'_>) -> Option<Result<Output, Failure>> {
     let Subject::Comp(reduced) = subject else { return None };
-    reduced.streamed(ctx).then(|| execute_with_res(&crate::reduce::REDUCE_STREAMED, true, ctx, subject, None, &Residencies::STREAMED))
+    reduced.streamed(ctx).then(|| execute_with_res::<false>(&crate::reduce::REDUCE_STREAMED, true, ctx, subject, None, &Residencies::STREAMED))
 }
 
 /// A Gram product (`ContractionAttrs::half`): the half-work strategy, which is in a table of its own so that a plain product never
@@ -842,7 +880,7 @@ fn execute_half(ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>
     if forced.is_some_and(|forced| forced != entries[0].id) || admit(&entries[0], subject, ctx, &Residencies::DEVICE).is_err() {
         return None;
     }
-    Some(execute_ranked(entries, ctx, subject, forced, &Residencies::DEVICE))
+    Some(execute_ranked::<false>(entries, ctx, subject, forced, &Residencies::DEVICE))
 }
 
 /// [`plain_without_tiles`] of every family's table, worked out once.
@@ -881,7 +919,7 @@ const fn plain(entries: &[Strategy]) -> bool {
 /// [`execute_in`] for a table that is a priority chain (see [`plain`]), when no one listens to the Decision: the entries are
 /// tried in table order, each one's `fits` evaluated when it is its turn, which is what the `if` chains it replaces did. Nothing
 /// is ranked or cached (a product's live `fits` walk costs no more than a lookup: see [`CACHED`]).
-fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res: &Residencies) -> Result<Output, Failure> {
+fn execute_plain<const NOTE: bool>(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res: &Residencies) -> Result<Output, Failure> {
     use super::strategy::Lowered;
     let telemetry = &ctx.jit().telemetry;
     for strategy in entries {
@@ -891,6 +929,9 @@ fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res
         let result = lower(subject, &params, &mut begun.emit);
         telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
         if let Lowered::Done(output) = result? {
+            if NOTE {
+                crate::jit::plancache::note_chosen(strategy.id, &params);
+            }
             return Ok(output);
         }
     }
@@ -899,26 +940,26 @@ fn execute_plain(entries: &[Strategy], ctx: &Context, subject: &Subject<'_>, res
 
 #[cfg(test)]
 pub(crate) fn execute_in(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
-    execute_with(entries, plain(entries), ctx, subject, forced)
+    execute_with::<false>(entries, plain(entries), ctx, subject, forced)
 }
 
 #[inline(always)]
-fn execute_with(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
-    execute_with_res(entries, plain, ctx, subject, forced, &Residencies::DEVICE)
+fn execute_with<const NOTE: bool>(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
+    execute_with_res::<NOTE>(entries, plain, ctx, subject, forced, &Residencies::DEVICE)
 }
 
 #[inline(always)]
-fn execute_with_res(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>, res: &Residencies) -> Result<Output, Failure> {
+fn execute_with_res<const NOTE: bool>(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>, res: &Residencies) -> Result<Output, Failure> {
     if forced.is_none() && plain && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
-        return execute_plain(entries, ctx, subject, res);
+        return execute_plain::<NOTE>(entries, ctx, subject, res);
     }
-    execute_ranked(entries, ctx, subject, forced, res)
+    execute_ranked::<NOTE>(entries, ctx, subject, forced, res)
 }
 
 /// [`execute_in`] through `select_in`. Kept out of line: reductions recurse through it (forcing a leaf forces another reduction),
 /// so the frame of the plain path must not carry this one's locals.
 #[inline(never)]
-fn execute_ranked(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>, res: &Residencies) -> Result<Output, Failure> {
+fn execute_ranked<const NOTE: bool>(entries: &'static [Strategy], ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>, res: &Residencies) -> Result<Output, Failure> {
     use super::strategy::Lowered;
     let telemetry = &ctx.jit().telemetry;
     let mut forced = forced;
@@ -952,6 +993,9 @@ fn execute_ranked(entries: &'static [Strategy], ctx: &Context, subject: &Subject
             telemetry.finish(ctx, begun, matches!(result, Ok(Lowered::Done(_))));
             match result? {
                 Lowered::Done(output) => {
+                    if NOTE {
+                        crate::jit::plancache::note_chosen(id, &params);
+                    }
                     if ctx.jit().recording_decisions() {
                         record(ctx, subject, entries, &selection, id, &params, &declined[..declined_len]);
                     }
@@ -1099,6 +1143,7 @@ mod tests {
             reads: FitsInputs::NONE,
             epilogue: false,
         partners: false,
+            replayable: false,
             fits,
             cost,
             split,

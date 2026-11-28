@@ -284,6 +284,50 @@ impl Structured {
         })
     }
 
+    /// For the plan cache's walk (W3-U5): hashes what makes the value a structure into `hasher` (which operation, its types and extents:
+    /// what `select` reads, since the key holds no buffer and no scalar value) and returns the operands it reads; `None` where a plan
+    /// cannot hold the value: one that is being recorded or has been, a product with an absorbed epilogue or known properties, a batched
+    /// product.
+    pub(crate) fn plan_sources(&self, hasher: &mut impl std::hash::Hasher) -> Option<SmallVec<[Src; 2]>> {
+        use std::hash::Hash;
+        if !self.is_unforced() || self.forcing.load(Ordering::Relaxed) || self.in_recording {
+            return None;
+        }
+        let comp = self.comp();
+        comp.meta.tag.hash(hasher);
+        comp.meta.ty.hash(hasher);
+        comp.meta.len.hash(hasher);
+        match &comp.run {
+            RunState::Reduce { operand, wgsl, buffer, finish, layout, .. } => {
+                if let Some(geom) = comp.meta.geom {
+                    [geom.n, geom.stride, geom.lines].hash(hasher);
+                }
+                wgsl.hash(hasher);
+                buffer.hash(hasher);
+                layout.is_packed().hash(hasher);
+                finish.epilogue.is_empty().hash(hasher);
+                let mut sources = SmallVec::new();
+                sources.push(Src::Node(Arc::clone(operand)));
+                Some(sources)
+            }
+            RunState::Contraction(run) => {
+                let ContractionKind::Matmul { attrs } = &run.kind else { return None };
+                if run.epilogue.is_some() || run.absorbed_from.load(Ordering::Relaxed) || run.inherited.get().is_some() {
+                    return None;
+                }
+                let operands = lock(&run.operands);
+                let [lhs, rhs] = operands.as_ref()?;
+                if lhs.has_props() || rhs.has_props() || lhs.failed().is_some() || rhs.failed().is_some() {
+                    return None;
+                }
+                attrs.hash(hasher);
+                lhs.shape().dims().hash(hasher);
+                rhs.shape().dims().hash(hasher);
+                Some(SmallVec::from_buf([lhs.src().ok()?, rhs.src().ok()?]))
+            }
+        }
+    }
+
     /// What a leaf standing for this value reads when it is recorded: the sources of its operands, `None` where they are not known
     /// (the value is being recorded). For the walks that look for the buffers a pending value depends on.
     pub(crate) fn sources(&self) -> Option<SmallVec<[Src; 2]>> {

@@ -43,6 +43,7 @@ const fn strategy(id: StrategyId, name: &'static str, bits: u16, fits: super::su
         prologue: true,
         epilogue: false,
         partners: false,
+        replayable: false,
         // `fits` reads the whole form (its space, accesses and body), which no key holds: never cached.
         reads: FitsInputs::LIVE,
         fits,
