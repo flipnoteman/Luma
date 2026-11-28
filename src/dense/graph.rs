@@ -381,6 +381,14 @@ impl FactorPlans {
                 let made = FactorPlan::record(ctx, &key, inputs, body);
                 let mut table = lock(&self.state);
                 match made {
+                    // A plan that alone holds more than the cap would be evicted by the next record and made again: it is replayed
+                    // this once and the key is left to the call.
+                    Ok(plan) if plan.bytes > workspace_cap(ctx) => {
+                        table.slots.insert(at, Slot::NotRecordable);
+                        let plan = Arc::new(plan);
+                        let outs = plan.replay(ctx, &storages).ok();
+                        return outs;
+                    }
                     Ok(plan) => {
                         let plan = Arc::new(plan);
                         self.recorded.fetch_add(1, Ordering::Relaxed);
@@ -861,6 +869,7 @@ mod tests {
     #[test]
     fn the_cache_records_what_it_can_and_remembers_what_it_cannot() {
         let ctx = device();
+        ctx.jit().factor_plans.set_enabled(true);
         let plans = &ctx.jit().factor_plans;
         let a = matrix(&ctx, 64, 64, 1, 3);
         let b = matrix(&ctx, 64, 2, 1, 5).reshape([2, 64]);
@@ -941,6 +950,7 @@ mod tests {
     #[test]
     fn a_context_with_plans_closes() {
         let ctx = device();
+        ctx.jit().factor_plans.set_enabled(true);
         let weak = ctx.downgrade();
         let a = matrix(&ctx, 64, 64, 1, 5);
         for _ in 0..4 {
