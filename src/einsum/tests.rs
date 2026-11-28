@@ -15,18 +15,18 @@ fn dims(subscripts: &str, sizes: &[(char, usize)]) -> [usize; 4] {
     dims
 }
 
-fn values(len: usize, seed: usize) -> Vec<f32> {
+pub(crate) fn values(len: usize, seed: usize) -> Vec<f32> {
     (0..len).map(|i| ((i * 7 + seed * 5 + i / 13) % 9) as f32 - 3.0).collect()
 }
 
-fn operand(ctx: &Context, subscripts: &str, sizes: &[(char, usize)], seed: usize) -> (Array<f32>, Vec<f32>) {
+pub(crate) fn operand(ctx: &Context, subscripts: &str, sizes: &[(char, usize)], seed: usize) -> (Array<f32>, Vec<f32>) {
     let d = dims(subscripts, sizes);
     let data = values(d.iter().product(), seed);
     (Array::from_slice_on(ctx, &data, d).unwrap(), data)
 }
 
 /// The sum over every assignment of the labels, in f64.
-fn reference(spec: &str, sizes: &[(char, usize)], data: &[Vec<f32>]) -> Vec<f64> {
+pub(crate) fn reference(spec: &str, sizes: &[(char, usize)], data: &[Vec<f32>]) -> Vec<f64> {
     let (lhs, rhs) = spec.split_once("->").unwrap_or((spec, ""));
     let inputs: Vec<&str> = lhs.split(',').collect();
     let output: String = if spec.contains("->") {
@@ -62,6 +62,11 @@ fn reference(spec: &str, sizes: &[(char, usize)], data: &[Vec<f32>]) -> Vec<f64>
         out[flat(&output, &get)] += product;
     }
     out
+}
+
+/// Switches the generic lowering of this thread off (`lowerable == false`) or on.
+pub(crate) fn set_no_generic(off: bool) {
+    super::NO_GENERIC.with(|flag| flag.set(off));
 }
 
 /// The tiers of the pairs of the last `einsum` call of this thread.
@@ -238,4 +243,14 @@ fn an_intermediate_with_more_than_four_axes_is_an_error_not_a_panic() {
     let s = [('a', 2), ('b', 2), ('c', 2), ('d', 2), ('e', 2), ('f', 2)];
     let made: Vec<Array<f32>> = ["ab", "cd", "ef", "abcdef"].iter().enumerate().map(|(n, sub)| if sub.len() > 4 { operand(&ctx, "ab", &s, n).0 } else { operand(&ctx, sub, &s, n).0 }).collect();
     assert!(einsum("ab,cd,ef,abcdef->", &[&made[0], &made[1], &made[2], &made[3]]).to_vec().is_err());
+}
+
+/// `a.transpose().reshape(..).matmul(..)` of a column fails in the native product (a bug of the base); the copy tier avoids it.
+#[test]
+fn a_transposed_operand_is_merged_through_a_copy() {
+    let ctx = reassociating();
+    super::tests::set_no_generic(true);
+    check_on(&ctx, "dc,ec,ed->", &[('c', 2), ('d', 2), ('e', 1)]);
+    check_on(&ctx, "dc,ec,ed->", &[('c', 3), ('d', 2), ('e', 2)]);
+    super::tests::set_no_generic(false);
 }

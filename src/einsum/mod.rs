@@ -29,7 +29,7 @@ use smallvec::{smallvec, SmallVec};
 
 mod path;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use path::Memo as PathMemo;
 
@@ -177,6 +177,18 @@ impl Term {
         self.array.permute_at(perm, false, "einsum", location)
     }
 
+    /// The array with the labels on the axes `want` says and their groups merged into the axes of `dims`. A reshape of a view that
+    /// is read as a different shape is evaluated first (the native product of a reshaped transposed view reads the wrong
+    /// extent), which is the copy tier 3 is named for.
+    #[track_caller]
+    fn merged(&self, want: &Slots, dims: [usize; 4], location: &'static Location<'static>) -> Array<f32> {
+        let array = self.permuted(want, location);
+        if array.shape().dims() == dims {
+            return array;
+        }
+        if array.is_read_view() { array.copy_at(location).reshape(dims) } else { array.reshape(dims) }
+    }
+
     /// This term with its labels on the axes `want` says.
     fn arranged(self, want: &Slots, location: &'static Location<'static>) -> Term {
         if self.slots == *want {
@@ -318,8 +330,8 @@ fn matmul_pair(a: &Term, b: &Term, k: u8, m: Option<u8>, n: Option<u8>, batch: &
 #[track_caller]
 fn copy_then_matmul(labels: &Labels, a: &Term, b: &Term, k: &[u8], m: &[u8], n: &[u8], batch: &[u8], location: &'static Location<'static>) -> Term {
     let [kc, mc, nc, bc] = [k, m, n, batch].map(|group| labels.product(group));
-    let lhs = a.permuted(&pack(&[k, m, batch].concat()), location).reshape([kc, mc, bc, 1]);
-    let rhs = b.permuted(&pack(&[n, k, batch].concat()), location).reshape([nc, kc, bc, 1]);
+    let lhs = a.merged(&pack(&[k, m, batch].concat()), [kc, mc, bc, 1], location);
+    let rhs = b.merged(&pack(&[n, k, batch].concat()), [nc, kc, bc, 1], location);
     let product = if batch.is_empty() { lhs.matmul(&rhs) } else { lhs.matmul_batched(&rhs) };
     let slots = pack(&[n, m, batch].concat());
     let dims = slots.map(|slot| slot.map_or(1, |label| labels.extent(label)));

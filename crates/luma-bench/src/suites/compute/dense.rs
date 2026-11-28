@@ -204,7 +204,47 @@ fn refined(h: &mut Harness) {
     });
 }
 
+/// `M z` for the row-major `rows x cols` matrix `m`.
+fn matvec_f32(m: &[f32], rows: usize, cols: usize, z: &[f64]) -> Vec<f64> {
+    (0..rows).map(|i| (0..cols).map(|j| f64::from(m[i * cols + j]) * z[j]).sum()).collect()
+}
+
+/// `einsum`: one pair (`ij,jk->ik`, which is a `matmul`) and a chain of four with thin middle axes (`ij,jk,kl,lm->im`, contracted
+/// left to right at default numerics), verified against an `f64` matrix-vector chain.
+fn einsum_rows(h: &mut Harness) {
+    let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[128, 256], &[256, 512]) } else { pick(h, &[256, 1024], &[256, 1024, 4096]) };
+    for &n in sizes {
+        let a = values(n * n, 130 + n as u64, -1.0, 1.0);
+        let b = values(n * n, 131 + n as u64, -1.0, 1.0);
+        let (al, bl) = (upload(h, &a, [n, n]), upload(h, &b, [n, n]));
+        let z: Vec<f64> = values(n, 132, -1.0, 1.0).iter().map(|&x| f64::from(x)).collect();
+        let c = host(&luma::einsum("ij,jk->ik", &[&al, &bl]));
+        let want = matvec_f32(&a, n, n, &matvec_f32(&b, n, n, &z));
+        let r = rel_diff(&matvec_f32(&c, n, n, &z), &want);
+        assert!(r < 2e-3, "einsum pair {n}: relative difference {r}");
+        let flops = 2.0 * (n as f64).powi(3);
+        h.case("einsum/pair", &format!("ij,jk->ik {n}x{n}"), Work::Flops(flops), &mut || luma::einsum("ij,jk->ik", &[&al, &bl]).eval().unwrap());
+
+        // ij (n x t), jk (t x n), kl (n x t), lm (t x n) with t = n / 8.
+        let t = (n / 8).max(1);
+        let dims = [(n, t), (t, n), (n, t), (t, n)];
+        let data: Vec<Vec<f32>> = dims.iter().enumerate().map(|(i, &(r, c))| values(r * c, 140 + i as u64, -1.0, 1.0)).collect();
+        let arrays: Vec<luma::Array<f32>> = dims.iter().zip(&data).map(|(&(r, c), d)| upload(h, d, [c, r])).collect();
+        let refs: Vec<&luma::Array<f32>> = arrays.iter().collect();
+        let got = host(&luma::einsum("ij,jk,kl,lm->im", &refs));
+        let mut want = z.clone();
+        for (&(r, c), d) in dims.iter().zip(&data).rev() {
+            want = matvec_f32(d, r, c, &want);
+        }
+        let r = rel_diff(&matvec_f32(&got, n, n, &z), &want);
+        assert!(r < 2e-3, "einsum chain4 {n}: relative difference {r}");
+        let chain_flops = 2.0 * (n * t * n + n * n * t + n * t * n) as f64;
+        h.case("einsum/chain4", &format!("ij,jk,kl,lm->im {n}x{t}"), Work::Flops(chain_flops), &mut || luma::einsum("ij,jk,kl,lm->im", &refs).eval().unwrap());
+    }
+}
+
 pub fn run(h: &mut Harness) {
+    h.guarded("einsum", einsum_rows);
     h.guarded("dense", general);
     h.guarded("dense", launches);
     h.guarded("dense", refined);

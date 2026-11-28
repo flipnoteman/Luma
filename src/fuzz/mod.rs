@@ -21,6 +21,7 @@
 
 #[path = "gen.rs"]
 mod generator;
+mod einsum;
 mod oracle;
 mod regressions;
 

@@ -54,6 +54,7 @@ pub(super) fn left_to_right(n: usize) -> Path {
 }
 
 /// The cost of `path`, `None` if a step makes a result of more than 4 axes.
+#[cfg(test)]
 pub(super) fn cost(problem: &Problem<'_>, path: &[(usize, usize)], costs: &Costs) -> Option<f64> {
     let mut terms = problem.inputs.to_vec();
     let mut total = 0.0;
