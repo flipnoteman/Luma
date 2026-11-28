@@ -585,7 +585,7 @@ fn ragged_fits(subject: &Subject<'_>, ctx: &Context, by: StrategyId) -> Option<P
     let (m, n, k) = (geom.m as usize, geom.n as usize, geom.k as usize);
     let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
     let fmas = (m as u64) * (n as u64) * (k as u64);
-    if m < GEMM_MIN_EXTENT || n < few_columns || k < RAGGED_MIN_K || fmas < RAGGED_MIN_FMAS || fmas > UnitDesc::of(unit).ragged_max_fmas {
+    if m < GEMM_MIN_EXTENT || n < few_columns || k < RAGGED_MIN_K || fmas < RAGGED_MIN_FMAS {
         return None;
     }
     if ctx.hal().gemm_tiles(unit).is_empty() || !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {

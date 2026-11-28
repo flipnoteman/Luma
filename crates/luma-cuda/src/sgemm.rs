@@ -163,6 +163,9 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32, mode: Mode) {
             p!(w, "setp.lt.u32 %v{x}{j}, %r30, {};", o.dim);
             if mode.guarded() {
                 p!(w, "sub.s32 %z{x}{j}, {}, %r30;", o.dim);
+                if mode == Mode::Tails {
+                    gemm_copy::row_bytes(w, x, j);
+                }
             }
             p!(w, "add.u32 %r31, %r13, %r28;");
             p!(w, "mad.lo.u32 %r31, %r31, {}, %r30;", o.ld);
@@ -319,7 +322,7 @@ pub(crate) fn ptx(config: &Config) -> String {
                 if region != 0 {
                     p!(w, "add.u32 %r33, %r33, {region};");
                 }
-                gemm_copy::copy_chunk(w, mode, false, x, j, "%r33", "%r19", step);
+                gemm_copy::copy_chunk_hoisted(w, mode, false, x, j, "%r33", "%r19", step);
             }
         }
         p!(w, "sub.s32 %r19, %r19, {bk};");
@@ -328,9 +331,29 @@ pub(crate) fn ptx(config: &Config) -> String {
         p!(w, "@%p2 mov.u32 %r18, 0;");
     };
     // The next tile of the staged operands into registers (zeros past the slice or the matrix).
+    let loads = std::cell::Cell::new(0u32);
     let load = |w: &mut Ptx| {
+        let tails = mode == Mode::Tails && ops.iter().any(|o| o.staged);
+        let id = loads.get();
+        loads.set(id + 1);
+        if tails {
+            // A stage inside the slice has no cut chunk: the whole-chunk loads alone (the cut ones are only in the last stage).
+            p!(w, "setp.ge.s32 %p14, %r38, {bk};");
+            p!(w, "@!%p14 bra LSLOW{id};");
+            for o in ops.iter().filter(|o| o.staged) {
+                let x = o.name;
+                for j in 0..o.per_thread {
+                    for q in 0..4 {
+                        p!(w, "mov.f32 %s{x}{j}x{q}, 0f00000000;");
+                    }
+                    p!(w, "@%v{x}{j} ld.global.v4.f32 {{%s{x}{j}x0, %s{x}{j}x1, %s{x}{j}x2, %s{x}{j}x3}}, [%g{x}{j}];");
+                }
+            }
+            p!(w, "bra LDONE{id};");
+            w.text.push_str(&format!("LSLOW{id}:\n"));
+        }
         for o in ops.iter().filter(|o| o.staged) {
-            let (x, step) = (o.name, if o.name == "a" { "%rd10" } else { "%rd11" });
+            let x = o.name;
             for j in 0..o.per_thread {
                 for q in 0..4 {
                     p!(w, "mov.f32 %s{x}{j}x{q}, 0f00000000;");
@@ -364,6 +387,14 @@ pub(crate) fn ptx(config: &Config) -> String {
                         }
                     }
                 }
+            }
+        }
+        if tails {
+            w.text.push_str(&format!("LDONE{id}:\n"));
+        }
+        for o in ops.iter().filter(|o| o.staged) {
+            let (x, step) = (o.name, if o.name == "a" { "%rd10" } else { "%rd11" });
+            for j in 0..o.per_thread {
                 p!(w, "add.u64 %g{x}{j}, %g{x}{j}, {step};");
             }
         }

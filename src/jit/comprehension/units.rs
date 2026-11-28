@@ -47,10 +47,6 @@ pub(crate) struct UnitDesc {
     /// Measured rate of the backend's own kernel at 4096^3 on an RTX 3090, flops per nanosecond, scaled by the device's
     /// `f32_ops_per_ns` against the 3090's calibration.
     pub(crate) rate: f64,
-    /// Largest product (multiply-adds) that runs on a ragged or padded kernel of the unit. The padded `f32` kernel's copy launch and
-    /// its masked copies lose what the 16-byte lanes gain on a big square (3001^3 1.05x, 4097^3 1.00x of the shader kernels, 1001^3
-    /// 1.20x on an RTX 3090), so those keep the shader kernels until the kernel is faster (follow-up). TF32 has no such cap.
-    pub(crate) ragged_max_fmas: u64,
 }
 
 /// The units, in preference order.
@@ -66,7 +62,6 @@ pub(crate) static UNITS: [UnitDesc; 5] = [
         needs: Caps::TF32,
         reduced: Reduced::TF32_MATMUL,
         rate: 27_900.0,
-        ragged_max_fmas: u64::MAX,
     },
     UnitDesc {
         id: UnitId::Fma,
@@ -79,7 +74,6 @@ pub(crate) static UNITS: [UnitDesc; 5] = [
         needs: Caps::GEMM_TILES,
         reduced: Reduced::NONE,
         rate: 22_900.0,
-        ragged_max_fmas: 4_000_000_000,
     },
     // The half-precision units multiply exactly and accumulate in `f32` (`MATRIX_ACCUMULATE`: no operand is rounded below its stored
     // precision). Their rates are measured at 4096^3 on an RTX 3090 (see the CHANGELOG of W3-R7); no ragged cap: the kernels' edges are
@@ -95,7 +89,6 @@ pub(crate) static UNITS: [UnitDesc; 5] = [
         needs: Caps::F16_MMA,
         reduced: Reduced::MATRIX_ACCUMULATE,
         rate: 55_000.0,
-        ragged_max_fmas: u64::MAX,
     },
     UnitDesc {
         id: UnitId::CudaBf16,
@@ -108,7 +101,6 @@ pub(crate) static UNITS: [UnitDesc; 5] = [
         needs: Caps::BF16_MMA,
         reduced: Reduced::MATRIX_ACCUMULATE,
         rate: 55_000.0,
-        ragged_max_fmas: u64::MAX,
     },
     // The cooperative-matrix unit (wgpu): the same operand and accumulation semantics as `CudaF16`; its rate is measured at 4096^3 on an
     // RTX 3090 (see the CHANGELOG of W3-R7), its edges are in the kernel.

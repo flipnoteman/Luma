@@ -90,6 +90,28 @@ pub(crate) fn copy_chunk(w: &mut Ptx, mode: Mode, k_contig: bool, x: &str, j: u3
     p!(w, "add.u64 %g{x}{j}, %g{x}{j}, {step};");
 }
 
+/// [`copy_chunk`] for a kernel whose `%z{x}{j}` of a chunk that runs along `m` or `n` already holds the bytes of the chunk inside its row
+/// (clamped to 0..=16, see [`row_bytes`]): the cut of a row is fixed for the whole product, so the `Tails` copy of such a chunk is the
+/// aligned one's three instructions (`setp`, `selp`, `cp.async`) with that size in place of 16.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_chunk_hoisted(w: &mut Ptx, mode: Mode, k_contig: bool, x: &str, j: u32, dst: &str, kleft: &str, step: &str) {
+    if mode == Mode::Tails && !k_contig {
+        p!(w, "setp.lt.s32 %p12, %k{x}{j}, {kleft};");
+        p!(w, "selp.b32 %r32, %z{x}{j}, 0, %p12;");
+        p!(w, "cp.async.cg.shared.global [{dst}], [%g{x}{j}], 16, %r32;");
+        p!(w, "add.u64 %g{x}{j}, %g{x}{j}, {step};");
+    } else {
+        copy_chunk(w, mode, k_contig, x, j, dst, kleft, step);
+    }
+}
+
+/// Turns `%z{x}{j}` (elements of the row left from the chunk's first column) into the bytes of the chunk that are inside, 0..=16.
+pub(crate) fn row_bytes(w: &mut Ptx, x: &str, j: u32) {
+    p!(w, "max.s32 %z{x}{j}, %z{x}{j}, 0;");
+    p!(w, "min.s32 %z{x}{j}, %z{x}{j}, 4;");
+    p!(w, "shl.b32 %z{x}{j}, %z{x}{j}, 2;");
+}
+
 /// Declares the registers of the chunks of an operand: `n` chunks of operand `x`.
 pub(crate) fn declare_chunks(text: &mut String, x: &str, n: u32) {
     text.push_str(&format!("    .reg .b64 %g{x}<{n}>;\n    .reg .b32 %d{x}<{n}>;\n    .reg .b32 %k{x}<{n}>;\n    .reg .b32 %z{x}<{n}>;\n    .reg .pred %v{x}<{n}>;\n"));
