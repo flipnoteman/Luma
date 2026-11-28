@@ -60,3 +60,55 @@ fn every_baseline_variant_passes_and_a_broken_one_fails() {
     assert_eq!(UnitVerifier::new().known(&backend, &spec), None, "a tampered verdict is not kept");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The f16 and bf16 units: every tile, orientation, lane and output through the harness (a layout the hardware reads wrongly is
+/// exactly what xla#51016 hid).
+#[test]
+fn every_half_unit_variant_passes_its_verification() {
+    use luma_core::GemmOut;
+    let dir = std::env::temp_dir().join(format!("luma-unit-verify-half-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: set before the backend opens and before any other thread of this binary reads it.
+    unsafe { std::env::set_var("LUMA_CACHE_DIR", &dir) };
+    let backend = match CudaBackend::new() {
+        Ok(backend) => backend,
+        Err(error) => {
+            println!("SKIPPED: no CUDA device ({error})");
+            return;
+        }
+    };
+    if backend.gemm_tiles(GemmUnit::F16).is_empty() {
+        println!("SKIPPED: the device has no half-precision matrix units");
+        return;
+    }
+    let verifier = UnitVerifier::new();
+    let mut count = 0;
+    let mut failures = Vec::new();
+    for unit in [GemmUnit::F16, GemmUnit::Bf16] {
+        for &(rows, cols) in backend.gemm_tiles(unit) {
+            for lanes in [GemmLanes::Vec4, GemmLanes::Vec4Tails] {
+                for (lhs_t, rhs_t) in [(false, false), (true, false), (false, true), (true, true)] {
+                    for out in [GemmOut::F32, GemmOut::F16, GemmOut::Bf16] {
+                        // A bf16 unit stores bf16, an f16 unit f16 (the other is not a combination the planner makes).
+                        if (unit == GemmUnit::F16 && out == GemmOut::Bf16) || (unit == GemmUnit::Bf16 && out == GemmOut::F16) {
+                            continue;
+                        }
+                        let spec = GemmSpec::new(rows, cols, lhs_t, rhs_t, unit).with_lanes(lanes).with_out(out);
+                        let (verdict, _) = verifier.verdict(&backend, &spec);
+                        count += 1;
+                        if !verdict.ok {
+                            failures.push(format!("{spec:?}: {verdict:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{count} variants verified");
+    // The harness is not vacuous for the half units: a swapped pair of outputs fails.
+    let broken = UnitVerifier::new();
+    broken.set_tamper(Some(std::sync::Arc::new(|_, out: &mut [f32]| out.swap(400, 401))));
+    assert!(!broken.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::F16).with_out(GemmOut::F16)).0.ok);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{} of {count} failed:\n{}", failures.len(), failures.join("\n"));
+}

@@ -14,6 +14,7 @@ mod gemm_copy;
 mod nvvm;
 mod sgemm;
 mod tensor;
+mod tensor16;
 
 pub use backend::CudaBackend;
 

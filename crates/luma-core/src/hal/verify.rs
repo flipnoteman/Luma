@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmSpec, GemmUnit, RawArg};
+use super::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmOut, GemmSpec, GemmUnit, RawArg};
 
 /// Magic of a stored verdict.
 const UNIT_MAGIC: [u8; 8] = *b"LUMAUNV1";
@@ -57,6 +57,10 @@ pub fn variant_key(spec: &GemmSpec, revision: u64) -> u64 {
 struct Format {
     /// Rounds one operand as the unit does (the reference multiplies the rounded values).
     round: fn(f32) -> f32,
+    /// The operand's type in the buffers: 4 bytes (`f32`) or 2 (a half type, `to_bits` / `from_bits` of its encoding).
+    half: Option<(fn(f32) -> u16, fn(u16) -> f32)>,
+    /// A subnormal of the operand type (the problem sprinkles it in).
+    tiny: f32,
     /// The bound of an output's error relative to the sum of the magnitudes of its products.
     bound: f64,
     /// Magnitude of the largest operands of the synthetic problem.
@@ -70,11 +74,75 @@ fn exact(x: f32) -> f32 {
 /// How the unit `unit` reads its operands, `None` for a unit this verifier does not know.
 fn format(unit: GemmUnit) -> Option<Format> {
     match unit {
-        GemmUnit::Fma => Some(Format { round: exact, bound: ACC_BOUND, big: 1.0e4 }),
+        GemmUnit::Fma => Some(Format { round: exact, half: None, tiny: 1.0e-40, bound: ACC_BOUND, big: 1.0e4 }),
         // The reference keeps the operands unrounded: the bound covers the rounding.
-        GemmUnit::Tf32 => Some(Format { round: exact, bound: TF32_BOUND, big: 1.0e4 }),
+        GemmUnit::Tf32 => Some(Format { round: exact, half: None, tiny: 1.0e-40, bound: TF32_BOUND, big: 1.0e4 }),
+        // The products of two halves are exact in `f32`: the same bound as the exact chain. A `big` of 3000 keeps the products and
+        // their sums finite in `f32` (and mostly under the `f16` range of the output).
+        GemmUnit::F16 => Some(Format { round: |x| f16_to_f32(f32_to_f16(x)), half: Some((f32_to_f16, f16_to_f32)), tiny: 1.0e-6, bound: ACC_BOUND, big: 3000.0 }),
+        GemmUnit::Bf16 => Some(Format { round: |x| bf16_to_f32(f32_to_bf16(x)), half: Some((f32_to_bf16, bf16_to_f32)), tiny: 1.0e-40, bound: ACC_BOUND, big: 3.0e4 }),
         #[allow(unreachable_patterns, reason = "GemmUnit is non_exhaustive: units of other crates' backends")]
         _ => None,
+    }
+}
+
+
+/// `x` as `bf16` bits, to nearest even, a NaN as the canonical quiet NaN.
+pub fn f32_to_bf16(x: f32) -> u16 {
+    if x.is_nan() {
+        return ((x.to_bits() >> 16) as u16 & 0x8000) | 0x7FC0;
+    }
+    let bits = x.to_bits();
+    (bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// The value of `bf16` bits.
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// `x` as `f16` bits, to nearest even (overflow gives an infinity), a NaN as the canonical quiet NaN.
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 112;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let (mut h, rem, half) = (m >> shift, m & ((1 << shift) - 1), 1u32 << (shift - 1));
+        if rem > half || (rem == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mut h = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && h & 1 == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// The value of `f16` bits.
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = i32::from((bits >> 10) & 0x1F);
+    let man = f32::from(bits & 0x3FF);
+    match exp {
+        0 => sign * man * 2f32.powi(-24),
+        31 => if man == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
     }
 }
 
@@ -119,23 +187,25 @@ impl Problem {
         let spec = base(spec);
         let format = format(spec.unit)?;
         let aligned = spec.lanes == GemmLanes::Vec4;
-        let (m, n, k) = if aligned { (spec.rows as usize + 4, spec.cols as usize + 8, 8 * 32 + 4) } else { (spec.rows as usize + 3, spec.cols as usize + 5, 8 * 32 + 5) };
+        // The 16-byte lanes need multiples of 4 elements (`f32`) or 8 (halves).
+        let word = if format.half.is_some() { 8 } else { 4 };
+        let (m, n, k) = if aligned { (spec.rows as usize + word, spec.cols as usize + 8, 8 * 32 + word) } else { (spec.rows as usize + 3, spec.cols as usize + 5, 8 * 32 + 5) };
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ variant_key(&spec, 0));
-        let up = |x: usize| x.next_multiple_of(4);
+        let up = |x: usize| x.next_multiple_of(word);
         // The scalar lanes take any leading dimension and offset; the 16-byte lanes need multiples of 4.
-        let layout = |cols: usize, odd: usize| if spec.lanes == GemmLanes::Scalar { (cols + odd, odd + 2) } else { (up(cols) + 4, 8) };
+        let layout = |cols: usize, odd: usize| if spec.lanes == GemmLanes::Scalar { (cols + odd, odd + 2) } else { (up(cols) + word, 8) };
         let (a_rows, a_cols) = if spec.lhs_transposed { (k, m) } else { (m, k) };
         let (b_rows, b_cols) = if spec.rhs_transposed { (n, k) } else { (k, n) };
         let mut fill = |rows: usize, cols: usize, odd: usize| {
             let (ld, off) = layout(cols, odd);
-            let mut data = vec![f32::NAN; off + rows * ld + 3];
+            let mut data = vec![f32::NAN; off + rows * ld + 8];
             for r in 0..rows {
                 for c in 0..cols {
                     let at = r * cols + c;
                     data[off + r * ld + c] = match at {
                         _ if at % 17 == 3 => 0.0,
                         _ if at % 19 == 5 => -0.0,
-                        _ if at % 29 == 7 => 1.0e-40,
+                        _ if at % 29 == 7 => format.tiny,
                         _ if at % 31 == 11 => rng.next() * format.big,
                         _ => rng.next(),
                     };
@@ -163,7 +233,12 @@ impl Problem {
 
     /// The number of K slices of the launch.
     fn slices(&self) -> usize {
-        self.dims.2.div_ceil(KC)
+        if self.spec.out == GemmOut::F32 { self.dims.2.div_ceil(KC) } else { 1 }
+    }
+
+    /// Elements of K per slice.
+    fn kc(&self) -> usize {
+        if self.spec.out == GemmOut::F32 { KC } else { self.dims.2 }
     }
 
     /// Compares `got`, the slices of the product one after the other (`slices * m * n` values), with the reference. Returns whether it
@@ -184,16 +259,23 @@ impl Problem {
                     mag += product.abs();
                 }
                 let value: f64 = (0..self.slices()).map(|z| f64::from(got[z * m * n + i * n + j])).sum();
+                // A half output adds its own rounding (`2^-11` of the value for `f16`, `2^-8` for `bf16`, an absolute `2^-25` where `f16`
+                // is subnormal) and overflows to an infinity.
+                let (out_eps, out_abs, overflow) = match self.spec.out {
+                    GemmOut::F16 => (4.8828125e-4, 3.0e-8, 65520.0),
+                    GemmOut::Bf16 => (3.90625e-3, 0.0, f64::INFINITY),
+                    _ => (0.0, 0.0, f64::INFINITY),
+                };
                 if !want.is_finite() {
                     ok &= value.is_nan() == want.is_nan() && !value.is_finite();
                 } else if !value.is_finite() {
-                    ok = false;
-                    worst = f64::INFINITY;
+                    // Only an output past the range of its type may be an infinity.
+                    ok &= want.abs() >= overflow * 0.999 && value.is_infinite() && value.signum() == want.signum();
                 } else {
                     let error = (value - want).abs();
                     let relative = error / mag.max(1e-30);
                     worst = worst.max(relative);
-                    ok &= error <= self.format.bound * mag + 1e-30;
+                    ok &= error <= self.format.bound * mag + out_eps * want.abs() * 1.01 + out_abs + 1e-30;
                 }
             }
         }
@@ -220,24 +302,39 @@ impl Problem {
             BindingInfo { min_size: Some(32), ..binding("u", BindingKind::Uniform) },
         ];
         let kernel = CompiledKernel::new("unit-verify".into(), raw, bindings, 4, None, [1, 1, 1]);
-        let bytes = |data: &[f32]| -> Vec<u8> { data.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let half = self.format.half;
+        let bytes = |data: &[f32]| -> Vec<u8> {
+            match half {
+                Some((encode, _)) => data.iter().flat_map(|&x| encode(x).to_le_bytes()).collect(),
+                None => data.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            }
+        };
         let max = u64::MAX;
         let a_buf = backend.alloc_filled(&bytes(&self.a.data), max).map_err(|e| e.to_string())?;
         let b_buf = backend.alloc_filled(&bytes(&self.b.data), max).map_err(|e| e.to_string())?;
         let slices = self.slices();
-        let c_buf = backend.create_buffer((slices * m * n * 4) as u64, BufferUsage::STORAGE, false).ok_or("no memory for the result")?;
+        let out_bytes = match spec.out {
+            GemmOut::F32 => 4,
+            _ => 2,
+        };
+        let c_buf = backend.create_buffer((slices * m * n * out_bytes) as u64, BufferUsage::STORAGE, false).ok_or("no memory for the result")?;
         let mut uniform = Vec::new();
-        for word in [m, n, k, KC, self.a.ld, self.b.ld, self.a.off, self.b.off] {
+        for word in [m, n, k, self.kc(), self.a.ld, self.b.ld, self.a.off, self.b.off] {
             uniform.extend_from_slice(&(word as u32).to_le_bytes());
         }
         let grid = [n.div_ceil(spec.cols as usize) as u32, m.div_ceil(spec.rows as usize) as u32, slices as u32];
         let args = [RawArg::write(&c_buf, c_buf.size()), RawArg::read(&a_buf, a_buf.size()), RawArg::read(&b_buf, b_buf.size()), RawArg::Uniform(&uniform)];
         backend.record_launch(&kernel, Dispatch::Direct(grid), [grid[0] * spec.cols, grid[1] * spec.rows, grid[2]], &args).map_err(|e| e.to_string())?;
         backend.sync(Duration::ZERO).map_err(|e| e.to_string())?;
-        let mut out = vec![MaybeUninit::<u8>::uninit(); slices * m * n * 4];
+        let mut out = vec![MaybeUninit::<u8>::uninit(); slices * m * n * out_bytes];
         backend.read_into(&c_buf, &mut out, false, Duration::ZERO).map_err(|e| e.to_string())?;
         // SAFETY: `read_into` filled every byte of `out`.
-        Ok(out.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(c.map(|byte| unsafe { byte.assume_init() }))).collect())
+        let out: Vec<u8> = out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect();
+        Ok(match spec.out {
+            GemmOut::F32 => out.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+            GemmOut::F16 => out.as_chunks::<2>().0.iter().map(|c| f16_to_f32(u16::from_le_bytes(*c))).collect(),
+            _ => out.as_chunks::<2>().0.iter().map(|c| bf16_to_f32(u16::from_le_bytes(*c))).collect(),
+        })
     }
 }
 
@@ -360,7 +457,7 @@ mod tests {
         for z in 0..problem.slices() {
             for i in 0..m {
                 for j in 0..n {
-                    let sum: f64 = (z * KC..k.min((z + 1) * KC)).map(|q| f64::from(problem.lhs(i, q)) * f64::from(problem.rhs(q, j))).sum();
+                    let sum: f64 = (z * KC..k.min((z + 1) * KC)).map(|q| f64::from((problem.format.round)(problem.lhs(i, q))) * f64::from((problem.format.round)(problem.rhs(q, j)))).sum();
                     out[z * m * n + i * n + j] = sum as f32;
                 }
             }
@@ -370,7 +467,7 @@ mod tests {
 
     fn specs() -> Vec<GemmSpec> {
         let mut specs = Vec::new();
-        for unit in [GemmUnit::Fma, GemmUnit::Tf32] {
+        for unit in [GemmUnit::Fma, GemmUnit::Tf32, GemmUnit::F16, GemmUnit::Bf16] {
             for lanes in [GemmLanes::Vec4, GemmLanes::Vec4Tails, GemmLanes::Scalar] {
                 for (lhs_t, rhs_t) in [(false, false), (true, false), (false, true), (true, true)] {
                     specs.push(GemmSpec::new(64, 64, lhs_t, rhs_t, unit).with_lanes(lanes));
@@ -391,6 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn the_half_conversions_round_to_nearest_even() {
+        // Every f16 survives the round trip (a NaN becomes the canonical one).
+        for bits in 0..=u16::MAX {
+            let value = f16_to_f32(bits);
+            if value.is_nan() {
+                assert!(f16_to_f32(f32_to_f16(value)).is_nan());
+            } else {
+                assert_eq!(f32_to_f16(value), bits, "{bits:#06x} = {value}");
+            }
+        }
+        // Ties go to even, overflow to infinity, tiny values to zero, subnormals are kept.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3C00, "tie to even (down)");
+        assert_eq!(f32_to_f16(1.0 + 3.0 * 2f32.powi(-11)), 0x3C02, "tie to even (up)");
+        assert_eq!(f32_to_f16(65519.0), 0x7BFF);
+        assert_eq!(f32_to_f16(65520.0), 0x7C00);
+        assert_eq!(f32_to_f16(-1.0e9), 0xFC00);
+        assert_eq!(f32_to_f16(2f32.powi(-25)), 0x0000, "half of the smallest subnormal ties to even");
+        assert_eq!(f32_to_f16(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_f16(f32::NAN) & 0x7FFF, 0x7E00);
+        // bf16: the high half of the bits, rounded.
+        assert_eq!(f32_to_bf16(1.0), 0x3F80);
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3F80_8000)), 0x3F80, "tie to even");
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3F81_8000)), 0x3F82);
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7F80);
+        assert_eq!(f32_to_bf16(f32::NAN) & 0x7FFF, 0x7FC0);
+        assert_eq!(bf16_to_f32(0x3F80), 1.0);
+    }
+
+    #[test]
     fn the_problem_has_the_edges_the_variant_needs() {
         let aligned = Problem::new(&GemmSpec::new(64, 64, false, false, GemmUnit::Tf32)).unwrap();
         assert_eq!(aligned.dims, (68, 72, 260));
@@ -399,6 +525,8 @@ mod tests {
         assert_eq!(ragged.dims, (131, 69, 261));
         assert!(!ragged.a.ld.is_multiple_of(4) || !ragged.a.off.is_multiple_of(4), "the scalar lanes see an unaligned operand");
         assert!(aligned.slices() > 2, "split-K is covered");
+        let half = Problem::new(&GemmSpec::new(64, 64, false, true, GemmUnit::F16)).unwrap();
+        assert!(half.dims.0.is_multiple_of(8) && half.dims.1.is_multiple_of(8) && half.dims.2.is_multiple_of(8) && half.a.ld.is_multiple_of(8) && half.a.off.is_multiple_of(8), "8-element lanes for halves");
     }
 
     #[test]

@@ -363,6 +363,9 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
         log::debug!("luma-cuda: epilogue hook of {spec:?}: NVVM and splice {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         extra = (operands, scalars);
         (hook.reconcile(&ptx), config.threads(), config.shared_bytes())
+    } else if matches!(spec.unit, GemmUnit::F16 | GemmUnit::Bf16) {
+        let config = crate::tensor16::Config16::of(spec).ok_or_else(|| BackendError::Unsupported(format!("no half-precision kernel for {spec:?}")))?;
+        (crate::tensor16::ptx(&config), config.threads(), config.shared_bytes())
     } else if spec.unit == GemmUnit::Fma {
         let config = crate::sgemm::Config::of(spec);
         (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
@@ -378,7 +381,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
             luma_core::GemmLanes::Vec4Tails => "tails",
             _ => "scalar",
         };
-        let name = format!("{}-{}x{}-{}{}-{lanes}{}.ptx", if spec.unit == GemmUnit::Fma { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.hook.map_or(String::new(), |id| format!("-hook{:08x}", id.0 as u32)));
+        let name = format!("{}-{}x{}-{}{}-{lanes}{}.ptx", match spec.unit { GemmUnit::Fma => "sgemm", GemmUnit::F16 => "tensor-f16", GemmUnit::Bf16 => "tensor-bf16", _ => "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.hook.map_or(String::new(), |id| format!("-hook{:08x}", id.0 as u32)));
         let _ = std::fs::write(dir.join(name), &source);
     }
     shared.ctx.bind_to_thread().map_err(gpu)?;
@@ -1592,7 +1595,7 @@ impl Backend for CudaBackend {
 
     fn kernel_revision(&self) -> u64 {
         static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *REVISION.get_or_init(|| cache::source_revision(&[include_str!("tensor.rs"), include_str!("sgemm.rs"), include_str!("gemm_copy.rs")]))
+        *REVISION.get_or_init(|| cache::source_revision(&[include_str!("tensor.rs"), include_str!("tensor16.rs"), include_str!("sgemm.rs"), include_str!("gemm_copy.rs")]))
     }
 
     fn gemm_tiles(&self, unit: GemmUnit) -> &[(u32, u32)] {
@@ -1600,6 +1603,7 @@ impl Backend for CudaBackend {
             (false, _) => &[],
             (true, GemmUnit::Tf32) => &TENSOR_TILES,
             (true, GemmUnit::Fma) => &crate::sgemm::TILES,
+            (true, GemmUnit::F16 | GemmUnit::Bf16) => &TENSOR_TILES,
             (true, _) => &[],
         }
     }
@@ -1618,6 +1622,10 @@ impl Backend for CudaBackend {
     }
 
     fn compile_gemm(&self, spec: &GemmSpec, hook: Option<&Arc<KernelModule>>) -> Option<RawKernel> {
+        // The half units' generator takes the plain products of its tiles and lanes.
+        if matches!(spec.unit, GemmUnit::F16 | GemmUnit::Bf16) && (self.shared.cc.0 < 8 || crate::tensor16::Config16::of(spec).is_none()) {
+            return None;
+        }
         // A hooked product needs its module, and only the tensor-core kernels take one.
         if spec.hook.is_some() && (hook.is_none() || spec.unit == GemmUnit::Fma || spec.half || !self.gemm_hooks()) {
             return None;

@@ -1357,6 +1357,8 @@ pub struct GemmSpec {
     pub rhs_transposed: bool,
     /// The matrix unit the kernel runs on.
     pub unit: GemmUnit,
+    /// What the kernel stores: `f32` (partial sums of the slices of K included), or the output rounded to a half type.
+    pub out: GemmOut,
     /// How the kernel copies the operands, and so which shapes it takes.
     pub lanes: GemmLanes,
     /// A half-work product of a matrix with itself (see [`MatmulSpec::half`]): `rows == cols`, the grid `[T (T + 1) / 2, 1, 1]`,
@@ -1382,6 +1384,25 @@ pub enum GemmUnit {
     Fma,
     /// TF32 tensor cores: `f32` operands rounded to 10 mantissa bits, `f32` accumulation.
     Tf32,
+    /// `f16` tensor cores (`mma.m16n8k16`): the operands are `f16` elements (two per 32-bit word, as the arrays store them), multiplied
+    /// exactly and accumulated in `f32`. The lanes' alignment is in units of 8 elements (16 bytes): `Vec4` takes `m`, `n`, `k`, the
+    /// leading dimensions and the offsets multiples of 8; `Vec4Tails` the leading dimensions and offsets multiples of 8, any extents;
+    /// `Scalar` is not taken.
+    F16,
+    /// `bf16` tensor cores: as [`GemmUnit::F16`] on `bf16` elements.
+    Bf16,
+}
+
+/// What a [`GemmSpec`] kernel stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GemmOut {
+    /// `f32`.
+    F32,
+    /// `f16`, rounded to nearest even in the store (two adjacent columns in one 32-bit store where aligned).
+    F16,
+    /// `bf16`, likewise.
+    Bf16,
 }
 
 /// How a [`GemmSpec`] kernel copies its operands from global memory.
@@ -1401,12 +1422,17 @@ impl GemmSpec {
     /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
     /// transposed, on `unit`, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
     pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, unit: GemmUnit) -> Self {
-        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, unit, lanes: GemmLanes::Vec4, half: false, hook: None }
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, unit, out: GemmOut::F32, lanes: GemmLanes::Vec4, half: false, hook: None }
     }
 
     /// The same product copying its operands with `lanes`.
     pub const fn with_lanes(self, lanes: GemmLanes) -> Self {
         GemmSpec { lanes, ..self }
+    }
+
+    /// The same product storing its outputs as `out` (a half output is rounded in the kernel's store; only for a single slice of K).
+    pub const fn with_out(self, out: GemmOut) -> Self {
+        GemmSpec { out, ..self }
     }
 
     /// The same product as a half-work one (see [`GemmSpec::half`]).
