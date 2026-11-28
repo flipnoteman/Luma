@@ -15,6 +15,7 @@ mod loops;
 mod matmul_build;
 mod memory;
 mod readback;
+mod slab;
 mod reduce_build;
 mod reduce_force;
 mod split;
@@ -42,6 +43,7 @@ pub fn run(h: &mut Harness) {
         ("trace", trace::run),
         ("memory", memory::run),
         ("readback", readback::run),
+        ("slab", slab::run),
         ("threads", threads::run),
         ("split", split::run),
         ("ext", ext::run),
