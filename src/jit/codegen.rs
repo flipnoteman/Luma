@@ -754,8 +754,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         if reduce {
             src.push_str("n: u32, ");
         }
-        if let Tail::Matmul { form, .. } = key.tail {
-            src.push_str("m: u32, n: u32, k: u32, kc: u32, tri: u32, ");
+        if let Tail::Matmul { form, tri, .. } = key.tail {
+            src.push_str(if tri { "m: u32, n: u32, k: u32, kc: u32, tri: u32, " } else { "m: u32, n: u32, k: u32, kc: u32, " });
             if crate::jit::comprehension::lower::contract::form(form).batch {
                 src.push_str("nb: u32, sa: u32, sb: u32, sc: u32, ");
             }
@@ -1036,7 +1036,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let elem_at = if pass.ops.roots().is_some() { key.outputs.first().map_or(last, |&at| at as usize) } else { last };
             src.push_str(&crate::scan::reduce_body(pass, out_ty(elem_at), "luma_eval", wg));
         }
-        Tail::Matmul { tile, aligned, split, lhs, rhs, form } => {
+        Tail::Matmul { tile, aligned, split, tri, lhs, rhs, form } => {
             let names = Names { views: &views, in_place: &[] };
             let mut roots = key.outputs.iter().map(|&at| at as usize);
             for (operand, function) in [(lhs, "luma_lhs"), (rhs, "luma_rhs")] {
@@ -1046,7 +1046,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             }
             let form = crate::jit::comprehension::lower::contract::form(form);
             src.push_str(&epilogue_function(&form, key.scalar_tys.len()));
-            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs, &form));
+            src.push_str(&crate::matmul::body(tile, aligned, split, tri, lhs, rhs, &form));
         }
         Tail::Solve(spec) => {
             let names = Names { views: &views, in_place: &[] };

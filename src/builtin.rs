@@ -1310,9 +1310,14 @@ pub(crate) enum Builtin {
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
     Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// [`Builtin::Matmul`] of the shader tiles with a fifth word `tri` after `kc` that cuts the range of K (`TriangularK`); a variant of its own so
+    /// that the plain kernel's key, label and text stay what they were.
+    MatmulTri { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
     /// [`Builtin::Matmul`] that applies an epilogue at its stores (W3-U4 §B): `form` is the interned form that holds it
     /// (`matmul::ContractForm`). Arguments: out, `a`, `b`, the epilogue's inputs, the uniform `{m, n, k, kc}` and its scalars.
     MatmulEpilogue { tile: crate::matmul::MatmulTile, aligned: bool, split: bool, form: u16 },
+    /// [`Builtin::MatmulEpilogue`] with the word `tri` (see [`Builtin::MatmulTri`]).
+    MatmulEpilogueTri { tile: crate::matmul::MatmulTile, aligned: bool, split: bool, form: u16 },
     /// Tiled products of a batch of matrices in one launch; see [`crate::bmm`]. Arguments: out, a,
     /// b, uniform `{m, n, k, matrices, a_stride, b_stride, _, _}`.
     Bmm(crate::bmm::Bmm),
@@ -3140,6 +3145,16 @@ fn matmul_sum_module() -> KernelModule {
 }
 
 impl Builtin {
+    /// The shader product kernel of `tile`, with the word `tri` where `tri`.
+    pub(crate) fn matmul(tile: crate::matmul::MatmulTile, aligned: bool, split: bool, tri: bool) -> Builtin {
+        if tri { Builtin::MatmulTri { tile, aligned, split } } else { Builtin::Matmul { tile, aligned, split } }
+    }
+
+    /// [`Builtin::matmul`] with the epilogue of the interned form `form`.
+    pub(crate) fn matmul_epilogue(tile: crate::matmul::MatmulTile, aligned: bool, split: bool, tri: bool, form: u16) -> Builtin {
+        if tri { Builtin::MatmulEpilogueTri { tile, aligned, split, form } } else { Builtin::MatmulEpilogue { tile, aligned, split, form } }
+    }
+
     /// The line solve a backend may run natively instead of this kernel's shader (see
     /// [`LineSolveSpec`]), if this is one: the Thomas solves, on stacked blocks or on parts that
     /// are all buffers.
@@ -3182,8 +3197,10 @@ impl Builtin {
             Builtin::SolveParts(spec) => wgsl(spec.source()),
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
             Builtin::SortLines(sort) => wgsl(sort.source()),
-            Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
-            Builtin::MatmulEpilogue { tile, aligned, split, form } => wgsl(crate::matmul::builtin_epilogue_source(tile, aligned, split, form)),
+            Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split, false)),
+            Builtin::MatmulTri { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split, true)),
+            Builtin::MatmulEpilogue { tile, aligned, split, form } => wgsl(crate::matmul::builtin_epilogue_source(tile, aligned, split, false, form)),
+            Builtin::MatmulEpilogueTri { tile, aligned, split, form } => wgsl(crate::matmul::builtin_epilogue_source(tile, aligned, split, true, form)),
             Builtin::Bmm(kernel) => wgsl(crate::bmm::source(kernel)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::MatmulSumEpilogue { form } => wgsl(crate::matmul::sum_epilogue_source(form)),

@@ -337,34 +337,36 @@ pub(crate) struct Plan {
 }
 
 /// The kernel of [`Builtin::Matmul`]: the operands are the buffers `a` and `b`.
-pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool) -> String {
+pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool, tri: bool) -> String {
     format!(
-        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, tri: u32 }}
+        "struct Params {{ m: u32, n: u32, k: u32, kc: u32{} }}
 @group(1) @binding(0) var<storage, read_write> c: array<f32>;
 @group(1) @binding(1) var<storage, read> a: array<f32>;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
 @group(1) @binding(3) var<uniform> p: Params;
 {}",
-        body(tile, aligned, split, MatmulOperand::Buffer, MatmulOperand::Buffer, &ContractForm::DEFAULT)
+        if tri { ", tri: u32" } else { "" },
+        body(tile, aligned, split, tri, MatmulOperand::Buffer, MatmulOperand::Buffer, &ContractForm::DEFAULT)
     )
 }
 
 /// The kernel of [`Builtin::MatmulEpilogue`]: [`builtin_source`] with the epilogue of the interned form `form` at its stores, its
 /// inputs the buffers `e0, ..` after `b`, its scalars the fields of the uniform after `kc`.
-pub(crate) fn builtin_epilogue_source(tile: MatmulTile, aligned: bool, split: bool, form: u16) -> String {
+pub(crate) fn builtin_epilogue_source(tile: MatmulTile, aligned: bool, split: bool, tri: bool, form: u16) -> String {
     let form = crate::jit::comprehension::lower::contract::form(form);
     let mut binding = 3;
     let inputs = crate::jit::epilogue_bindings(&form, &mut binding);
     let mut src = format!(
-        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, tri: u32, {} }}
+        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, {}{} }}
 @group(1) @binding(0) var<storage, read_write> c: array<f32>;
 @group(1) @binding(1) var<storage, read> a: array<f32>;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
 {inputs}@group(1) @binding({binding}) var<uniform> p: Params;
 {}{}",
+        if tri { "tri: u32, " } else { "" },
         crate::jit::epilogue_fields(&form, 0),
         crate::jit::epilogue_function(&form, 0),
-        body(tile, aligned, split, MatmulOperand::Buffer, MatmulOperand::Buffer, &form)
+        body(tile, aligned, split, tri, MatmulOperand::Buffer, MatmulOperand::Buffer, &form)
     );
     let helpers = crate::builtin::special_helpers(|needle| src.contains(needle));
     src.push_str(&helpers);
@@ -483,7 +485,7 @@ impl Lanes {
 /// `select(0.0, load, in_bounds)` of an index clamped into the operand and every store is
 /// guarded. With `split` the workgroup of grid layer `z` covers `K` from `z * kc` to
 /// `min(K, (z + 1) * kc)`.
-pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand, form: &ContractForm) -> String {
+pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, tri: bool, lhs: MatmulOperand, rhs: MatmulOperand, form: &ContractForm) -> String {
     let loads = Loads {
         lhs: Load { fused: lhs.fused(), lanes: if lhs == MatmulOperand::Transposed { Lanes::AlongRows } else { Lanes::AlongK } },
         rhs: Load { fused: rhs.fused(), lanes: if rhs == MatmulOperand::Transposed { Lanes::AlongK } else { Lanes::AlongRows } },
@@ -494,11 +496,11 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
     let epi = form.epilogue.is_some();
     debug_assert!(!epi || !matches!(tile, MatmulTile::T128Half | MatmulTile::GemmHalf { .. } | MatmulTile::NativeHalf { .. }), "a half-work kernel mirrors its stores: no epilogue");
     match tile {
-        MatmulTile::T128 => t128(aligned, split, &loads, false, epi),
-        MatmulTile::T128Half => t128(aligned, split, &loads, true, epi),
-        MatmulTile::T128x32 => t128x32(aligned, split, &loads, epi),
-        MatmulTile::T32x128 => t32x128(aligned, split, &loads, epi),
-        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::NativeHalf { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } | MatmulTile::GemmHalf { .. } => t32(aligned, split, &loads, form),
+        MatmulTile::T128 => t128(aligned, split, tri, &loads, false, epi),
+        MatmulTile::T128Half => t128(aligned, split, tri, &loads, true, epi),
+        MatmulTile::T128x32 => t128x32(aligned, split, tri, &loads, epi),
+        MatmulTile::T32x128 => t32x128(aligned, split, tri, &loads, epi),
+        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::NativeHalf { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } | MatmulTile::GemmHalf { .. } => t32(aligned, split, tri, &loads, form),
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads, epi),
     }
 }
@@ -650,11 +652,11 @@ fn t128_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Str
     format!("fn {name}({base}: u32, k0: u32, e: u32{args}) -> vec4<f32> {{\n{body}\n}}")
 }
 
-fn t128(aligned: bool, split: bool, loads: &Loads, half: bool, epi: bool) -> String {
+fn t128(aligned: bool, split: bool, tri: bool, loads: &Loads, half: bool, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split, (!half).then_some((128, 128)));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, (tri && !half).then_some((128, 128)));
     let end = if aligned { "" } else { ", ke" };
     // Accumulator `c{2 i + h}` holds row `i` (of 8), columns half `h`. The loops are unrolled
     // here so the accumulators stay in registers.
@@ -771,10 +773,10 @@ fn t32_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Stri
     }
 }
 
-fn t32(aligned: bool, split: bool, loads: &Loads, form: &ContractForm) -> String {
+fn t32(aligned: bool, split: bool, tri: bool, loads: &Loads, form: &ContractForm) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((32, 32)));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, tri.then_some((32, 32)));
     let end = if aligned { "" } else { ", ke" };
     // A batch writes its layer at `zi * p.sc`.
     let out = if loads.batch { "zi * p.sc + " } else { out };
@@ -867,11 +869,11 @@ fn store_vec4(aligned: bool, out: &str, row: &str, col: &str, acc: &str, epi: bo
 /// `MatmulTile::T128x32`: 128 rows by 32 columns, the rows staged as in `T128` and the columns
 /// as in `T32`; each invocation owns 8 rows (two groups of 4, 64 apart) of columns `lid.x` and
 /// `lid.x + 16`.
-fn t128x32(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
+fn t128x32(aligned: bool, split: bool, tri: bool, loads: &Loads, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((128, 32)));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, tri.then_some((128, 32)));
     let end = if aligned { "" } else { ", ke" };
     let mut decl = String::new();
     let mut update = String::new();
@@ -941,10 +943,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 
 /// `MatmulTile::T32x128`: 32 rows by 128 columns, the rows staged as in `T32` and the columns
 /// as in `T128`; each invocation owns rows `lid.y` and `lid.y + 16`, two groups of 4 columns.
-fn t32x128(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
+fn t32x128(aligned: bool, split: bool, tri: bool, loads: &Loads, epi: bool) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
-    let Range { declare, k_begin, k_end, out } = range(aligned, split, Some((32, 128)));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split, tri.then_some((32, 128)));
     let end = if aligned { "" } else { ", ke" };
     let mut decl = String::new();
     let mut update = String::new();
@@ -1107,4 +1109,44 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         cols - 1,
         rows - 1
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shader kernel of the plain products (no `TriangularK`).
+    fn plain_sources() -> String {
+        let tiles = [MatmulTile::T128, MatmulTile::T128x32, MatmulTile::T32x128, MatmulTile::T32, MatmulTile::T128Half, MatmulTile::Skinny { rows: 2, cols: 2, groups: 4, width: 64, along_k: true }];
+        let mut text = String::new();
+        for tile in tiles {
+            for (aligned, split) in [(false, false), (true, false), (false, true), (true, true)] {
+                text.push_str(&builtin_source(tile, aligned, split, false));
+                if !matches!(tile, MatmulTile::T128Half) {
+                    text.push_str(&builtin_epilogue_source(tile, aligned, split, false, 0));
+                }
+            }
+        }
+        text
+    }
+
+    /// The kernels of the products without a triangular operand pay nothing for `TriangularK`: their text is that of the shader kernels
+    /// before the word `tri` existed (FNV-1a of every tile, `aligned` and `split` of `builtin_source` and `builtin_epilogue_source`, as `integ` @ `59b63118` made them).
+    #[test]
+    fn plain_kernels_are_the_text_they_were_before_the_triangle_word() {
+        let text = plain_sources();
+        assert!(!text.contains("tri"), "a plain kernel names the triangle word");
+        let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(hash, 10_462_107_819_584_685_462, "the text of the plain kernels changed (len {})", text.len());
+    }
+
+    #[test]
+    fn the_triangular_kernels_cut_the_range_of_k() {
+        for tile in [MatmulTile::T128, MatmulTile::T128x32, MatmulTile::T32x128, MatmulTile::T32] {
+            for (aligned, split) in [(false, false), (true, false), (false, true), (true, true)] {
+                let text = builtin_source(tile, aligned, split, true);
+                assert!(text.contains("kc: u32, tri: u32") && text.contains("p.tri == 4u"), "{tile:?} {aligned} {split}");
+            }
+        }
+    }
 }

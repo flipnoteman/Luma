@@ -2407,6 +2407,8 @@ pub(crate) struct MatmulKernel {
     pub(crate) tile: MatmulTile,
     pub(crate) aligned: bool,
     pub(crate) split: bool,
+    /// The kernel reads the word `tri` (`TriangularK`) after `kc` and cuts the range of K by it (the shader tiles of a product with a triangular operand).
+    pub(crate) tri: bool,
     /// The generic contraction the kernel computes (`matmul::ContractForm`); 0 is the product the library makes.
     pub(crate) form: u16,
 }
@@ -2477,7 +2479,7 @@ fn flatten_operands(
             (true, false) => MatmulOperand::Fused,
             (true, true) => MatmulOperand::Transposed,
         };
-        let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, lhs: operand(0), rhs: operand(1), form: kernel.form };
+        let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, tri: kernel.tri, lhs: operand(0), rhs: operand(1), form: kernel.form };
         let fused = flatten(&roots, tail)?;
         drop(roots);
         let epilogue_inputs = crate::jit::comprehension::lower::contract::form(kernel.form).epilogue.as_ref().map_or(0, |epi| epi.inputs.len());
@@ -2548,7 +2550,7 @@ pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
 }
 
 /// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM
-/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc, tri` (the shader kernels; `tri` is `TriangularK`'s word) (see `matmul::body`), and for the backend's native tiles
+/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc` (the shader kernels, and `tri` after `kc` where `kernel.tri`) (see `matmul::body`), and for the backend's native tiles
 /// (`Native`, `Gemm`, `GemmRagged`) also `lda, ldb, a_off, b_off`, the leading dimensions and element offsets of the operand
 /// matrices in their buffers (see `GemmSpec`).
 /// Operands that are lazy expressions are fused into the kernel when they can be (see
@@ -2613,7 +2615,7 @@ pub(crate) fn matmul_epilogue(
             return Err(Failure::New(LumaError::Gpu("matrix product operand neither evaluated nor fused".into())));
         };
         if form.epilogue.is_some() {
-            let core = ctx.builtin(Builtin::MatmulEpilogue { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, form: kernel.form }, "f32")?;
+            let core = ctx.builtin(Builtin::matmul_epilogue(kernel.tile, kernel.aligned, kernel.split, kernel.tri, kernel.form), "f32")?;
             let mut uniform = Vec::with_capacity(words.len() + epilogue_scalars.len());
             uniform.extend_from_slice(words);
             uniform.extend_from_slice(epilogue_scalars);
@@ -2624,7 +2626,7 @@ pub(crate) fn matmul_epilogue(
             ctx.launch(&core, groups, size, &raw)?;
             return Ok(());
         }
-        let core = ctx.builtin(Builtin::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split }, "f32")?;
+        let core = ctx.builtin(Builtin::matmul(kernel.tile, kernel.aligned, kernel.split, kernel.tri), "f32")?;
         ctx.launch(&core, groups, size, &[out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
         return Ok(());
     };

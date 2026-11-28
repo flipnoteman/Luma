@@ -50,6 +50,16 @@ fn every_coop_variant_passes_its_verification() {
     let broken = UnitVerifier::new();
     broken.set_tamper(Some(std::sync::Arc::new(|_, out: &mut [f32]| out.swap(400, 401))));
     assert!(!broken.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::CoopF16).with_out(GemmOut::F16)).0.ok);
+    // A kernel that is right to the last ulp but not the same in two launches (a race inside a workgroup) fails: the tamper flips one low bit
+    // in every second run.
+    let racy = UnitVerifier::new();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    racy.set_tamper(Some(std::sync::Arc::new(move |_, out: &mut [f32]| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 1 {
+            out[300] = f32::from_bits(out[300].to_bits() ^ 1);
+        }
+    })));
+    assert!(!racy.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::CoopF16).with_out(GemmOut::F16)).0.ok, "launches that differ are not verified");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{} of {count} failed:\n{}", failures.len(), failures.join("\n"));
 }

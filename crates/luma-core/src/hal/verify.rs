@@ -439,24 +439,40 @@ impl UnitVerifier {
         (verdict, waited)
     }
 
-    /// Runs the verification; `None` if it could not run, else the verdict and whether it is to be stored.
+    /// Runs the verification; `None` if it could not run, else the verdict and whether it is to be stored. The kernel runs twice on the
+    /// problem and the two outputs must be bit-identical: a race inside a workgroup (shared memory read before the barrier that
+    /// completes it) can stay within the error bound while the output changes from launch to launch.
     fn run(&self, backend: &dyn Backend, spec: &GemmSpec, variant: u64) -> Option<(UnitVerdict, bool)> {
         let problem = Problem::new(spec)?;
-        let mut got = match problem.run(backend) {
-            Ok(got) => got,
-            Err(error) => {
-                log::debug!("luma: verifying {spec:?}: {error}");
-                return None;
-            }
-        };
         // A tampered run is a test's: its verdict is not kept.
         let tamper = self.tamper.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(tamper) = &tamper {
-            tamper(spec, &mut got);
+        let mut runs = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let mut got = match problem.run(backend) {
+                Ok(got) => got,
+                Err(error) => {
+                    log::debug!("luma: verifying {spec:?}: {error}");
+                    return None;
+                }
+            };
+            if let Some(tamper) = &tamper {
+                tamper(spec, &mut got);
+            }
+            runs.push(got);
         }
-        let (ok, max_rel_err) = problem.judge(&got);
-        Some((UnitVerdict { variant, ok, max_rel_err }, tamper.is_none()))
+        let (ok, max_rel_err) = problem.judge(&runs[0]);
+        let reproducible = bit_identical(&runs[0], &runs[1]);
+        if ok && !reproducible {
+            log::warn!("luma: the matrix kernel {spec:?} gave different results in two identical launches");
+        }
+        let max_rel_err = if reproducible { max_rel_err } else { f32::INFINITY };
+        Some((UnitVerdict { variant, ok: ok && reproducible, max_rel_err }, tamper.is_none()))
     }
+}
+
+/// Whether two outputs are the same bits (every NaN equal to every NaN: a payload is not a race).
+fn bit_identical(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()))
 }
 
 #[cfg(test)]
@@ -564,6 +580,21 @@ mod tests {
             // A truncated result.
             assert!(!problem.judge(&right[1..]).0, "{spec:?}: wrong length");
         }
+    }
+
+    #[test]
+    fn reproducibility_is_bit_equality() {
+        let problem = Problem::new(&GemmSpec::new(64, 64, false, false, GemmUnit::Fma)).unwrap();
+        let right = host_kernel(&problem);
+        assert!(bit_identical(&right, &right.clone()), "NaNs of different payloads are the same result");
+        let mut racy = right.clone();
+        let at = right.iter().position(|x| x.is_finite() && *x != 0.0).unwrap();
+        racy[at] = f32::from_bits(racy[at].to_bits() ^ 1);
+        assert!(problem.judge(&racy).0, "one ulp stays inside the error bound: only the second launch can tell");
+        assert!(!bit_identical(&right, &racy));
+        assert!(!bit_identical(&right, &right[1..]));
+        assert!(bit_identical(&[f32::NAN], &[-f32::NAN]));
+        assert!(!bit_identical(&[0.0], &[-0.0]));
     }
 
     #[test]

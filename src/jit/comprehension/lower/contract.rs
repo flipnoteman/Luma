@@ -255,9 +255,9 @@ impl Prepared {
         let storage = Arc::new(Storage::new(ctx, len, ElemTy::F32.layout()));
         let pin = storage.pin_single()?;
         let id = intern_form(ContractForm { mac: self.mac.clone(), batch: self.batch > 1, epilogue: None });
-        let kernel = jit::MatmulKernel { tile, aligned, split: false, form: id };
+        let kernel = jit::MatmulKernel { tile, aligned, split: false, tri: false, form: id };
         let extra: &[u32] = if self.batch > 1 { &[batch, m * k, k * n, m * n] } else { &[] };
-        jit::matmul_with(ctx, sides, kernel, &[m, n, k, k, 0], extra, [x, y, batch.max(1)], RawArg::write(pin.buffer(), storage.byte_len()))?;
+        jit::matmul_with(ctx, sides, kernel, &[m, n, k, k], extra, [x, y, batch.max(1)], RawArg::write(pin.buffer(), storage.byte_len()))?;
         drop(pin);
         jit::check_finite(ctx, &storage, ElemTy::F32)?;
         Ok(storage)

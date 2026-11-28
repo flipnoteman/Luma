@@ -733,7 +733,7 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
 #[inline(never)]
 fn gemm_split_epilogue(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, sides: [MatmulSide; 2], layouts: [Layout; 2], plan: &Plan, tri: u32) -> Result<Result<Lowered, [MatmulSide; 2]>, Failure> {
     if let Some(applied) = epilogue_of(view, params.geom)? {
-        return Ok(Ok(finish(launch(ctx, sides, *plan, params.geom, Some((layouts, tri)), Some(&applied))?, true)?));
+        return Ok(Ok(finish(launch(ctx, sides, *plan, params.geom, Some(layouts), tri, Some(&applied))?, true)?));
     }
     Ok(Err(sides))
 }
@@ -1171,7 +1171,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
         None => (out_pin.buffer(), out_bytes),
     };
-    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: epilogue.filter(|_| plan.slices == 1).map_or(0, |applied| applied.form) };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, tri: layouts.is_none() && tri != 0, form: epilogue.filter(|_| plan.slices == 1).map_or(0, |applied| applied.form) };
     let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0];
     let words = match words {
         Some(extra) => {
@@ -1180,10 +1180,10 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
             uniform[8] = tri;
             &uniform[..8 + usize::from(tri != 0)]
         }
-        // The shader kernels: `m, n, k, kc, tri`.
+        // The shader kernels: `m, n, k, kc`, and `tri` after them for a triangular operand (the kernel of `tri` reads it).
         None => {
             uniform[4] = tri;
-            &uniform[..5]
+            &uniform[..4 + usize::from(tri != 0)]
         }
     };
     let out = RawArg::write(target, target_bytes);
@@ -1194,7 +1194,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         match sides {
             // Both operands evaluated: nothing to fuse, the kernel reads their buffers (what `jit::matmul` does for such sides).
             [MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)] => {
-                let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;
+                let core = ctx.builtin(Builtin::matmul(plan.tile, plan.aligned, plan.split, kernel.tri), "f32")?;
                 ctx.launch(&core, plan.groups, [n32, m32, 1], &[out, RawArg::read(a.buffer(), a_bytes), RawArg::read(b.buffer(), b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
             }
             sides => jit::matmul(ctx, sides, kernel, words, plan.groups, out)?,
