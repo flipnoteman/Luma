@@ -303,6 +303,11 @@ impl Storage {
         self.file.as_ref()
     }
 
+    /// The storage this one aliases the segments of (see [`Array::probe`]).
+    pub(crate) fn alias_owner(&self) -> Option<&Arc<Storage>> {
+        self.owner.as_ref()
+    }
+
     /// Whether nothing may write the storage: it borrows the buffers of another one, or it is a
     /// file opened without `writable()`.
     pub(crate) fn is_read_only(&self) -> bool {

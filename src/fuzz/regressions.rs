@@ -459,6 +459,7 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
             chunk_bytes: None,
             memory_budget: None,
             slab_bytes: None,
+            split: false,
             file_leaves: false,
             cost: Test,
         },
@@ -766,7 +767,7 @@ fn i32_and_with_a_saturating_constant_is_not_the_identity() {
 #[test]
 fn bool_xor_reduce_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, file_leaves: false, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, split: false, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
@@ -782,7 +783,7 @@ fn bool_xor_reduce_promote_df32() {
 #[test]
 fn bool_loop_state_promote_df32() {
     check(Program {
-        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, file_leaves: false, cost: Test },
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, slab_bytes: None, split: false, file_leaves: false, cost: Test },
         math: false,
         stmts: vec![
             Input { dims: [300, 1, 1, 1], ty: Bool, seed: 0 },
@@ -914,6 +915,21 @@ fn an_iterate_all_stencil_with_pinned_slabs() {
             View { src: 0, view: Pad { widths: vec![(0, 0), (0, 0)], mode: Edge } },
             Loop { kind: IterateAll, steps: 4, states: vec![1], body: vec![Compare { lhs: 1, rhs: Const(2.0), op: Equal }, View { src: 3, view: ShiftClamp { offs: vec![0, -4] } }, Scan { src: 2, axis: 0, op: CumSum }], next: vec![5] },
             Put { target: 3, idx: vec![9, 6, 1, 26, 12, 27, 2, 11, 7, 17, 37, 23, 20, 29, 16, 18, 8, 33, 3, 31, 4, 24, 36, 0, 30, 5, 32, 13, 15, 28, 34, 22, 35, 10, 21], vals: Var(3) },
+        ],
+    });
+}
+
+/// Fuzz finding of the split dimension: `iterate_all` over an array of several segments (steps run on an alias, the probe), then `write` to the array: the loop's
+/// result read the new data, because `absorb` passed the probe's reader nodes on to the owner but not the schedules holding its deferred steps.
+#[test]
+fn a_write_after_an_iterate_over_segments_commits_the_schedule_of_its_probe() {
+    check(Program {
+        config: Config { split: true, chunk_bytes: Some(1024), ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
+            Loop { kind: IterateAll, steps: 3, states: vec![0], body: vec![Unary { src: 1, op: Sqrt }], next: vec![2] },
+            Write { target: 0, seed: 15014408748156108059 },
         ],
     });
 }

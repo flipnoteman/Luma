@@ -502,6 +502,8 @@ fn deferred_here(ctx: &Context, key: &FusedKey, outputs: &[&Storage], inputs: &[
         && (outputs.iter().any(|out| out.segments() > 1) || inputs.iter().any(|input| input.is_streamed()))
         && !ctx.check_finite()
         && !ctx.recording_here()
+        // A step that cannot hold one slab of each array it binds in the budget runs the way `off` runs it (kernel-major, paging).
+        && ctx.pager().budget().is_none_or(|budget| single_step_floor(outputs, inputs) <= budget)
 }
 
 /// Whether a canonical-block reduction recorded now waits in this thread's schedule (see [`deferred`]; a reduction has no key): the
@@ -704,14 +706,25 @@ pub(super) fn defer(
             open.push(step.take().expect("a step is recorded once"), outputs, inputs, reaches, in_place, segments, writer, out_bytes);
         };
         for input in inputs {
-            input.readers.add_schedule(&schedule);
+            note_reader(input, &schedule);
         }
         for (o, out) in outputs.iter().enumerate() {
             if in_place(o) {
-                out.readers.add_schedule(&schedule);
+                note_reader(out, &schedule);
             }
         }
         return Ok(());
+    }
+}
+
+/// Registers `schedule` as a reader of `storage` and of what it aliases (an `iterate` probe reads the owner's segments: a write to the owner
+/// commits the schedule too).
+fn note_reader(storage: &Storage, schedule: &Arc<Schedule>) {
+    storage.readers.add_schedule(schedule);
+    let mut owner = storage.alias_owner();
+    while let Some(next) = owner {
+        next.readers.add_schedule(schedule);
+        owner = next.alias_owner();
     }
 }
 

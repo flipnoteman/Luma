@@ -26,6 +26,9 @@ mod oracle;
 mod regressions;
 
 use std::cell::RefCell;
+use std::sync::Arc;
+
+use luma_io::{FailPlan, FailingIo, Fault, PoolIo, TileIo};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use proptest::prelude::*;
@@ -282,6 +285,8 @@ struct Cx {
     math: bool,
     /// Inputs are file arrays (see `Config::file_leaves`).
     files: bool,
+    /// The I/O engine of the file arrays (the injected-failure runs): a failure of luma is then expected, and ends the program.
+    io: Option<Arc<dyn TileIo>>,
 }
 
 fn get<T: Num>(env: &Env, i: usize) -> &Array<T> {
@@ -554,7 +559,7 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
         Stmt::Input { dims, ty, seed } => by_ty!(*ty, T => {
             let data: Vec<T> = generator::values(*seed, *ty, oracle::len_of(*dims), cx.math).into_iter().map(T::from_f32).collect();
             let array = if cx.files && matches!(*ty, Ty::F32 | Ty::U32 | Ty::I32) {
-                file_leaf(ctx, &data, Shape::new(*dims))?
+                file_leaf(ctx, &data, Shape::new(*dims), cx.io.clone())?
             } else {
                 Array::<T>::from_slice_on(ctx, &data, Shape::new(*dims))?
             };
@@ -1054,12 +1059,16 @@ fn limit_or_fail(error: &LumaError, what: &str) -> Fail {
 }
 
 /// `data` as a writable file array (programs write to their inputs): written to a temporary file, which is unlinked as soon as it is open.
-fn file_leaf<T: crate::GpuType>(ctx: &Context, data: &[T], shape: Shape) -> Result<Array<T>, LumaError> {
+fn file_leaf<T: crate::GpuType>(ctx: &Context, data: &[T], shape: Shape, io: Option<Arc<dyn TileIo>>) -> Result<Array<T>, LumaError> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!("luma-fuzz-{}-{}.f", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let repr = T::to_repr(data);
     std::fs::write(&path, bytemuck::cast_slice::<_, u8>(&repr)).map_err(|e| LumaError::Gpu(format!("fuzz file: {e}")))?;
-    let array = Array::<T>::open_on(ctx, &path, crate::FileOptions::raw().shape(shape).writable());
+    let mut options = crate::FileOptions::raw().shape(shape).writable();
+    if let Some(io) = io {
+        options = options.engine(io);
+    }
+    let array = Array::<T>::open_on(ctx, &path, options);
     let _ = std::fs::remove_file(&path);
     array
 }
@@ -1074,7 +1083,7 @@ struct Machine {
 
 impl Machine {
     fn new(ctx: Context, math: bool, files: bool) -> Machine {
-        Machine { cx: Cx { ctx, math, files }, luma: Vec::new(), host: Vec::new() }
+        Machine { cx: Cx { ctx, math, files, io: None }, luma: Vec::new(), host: Vec::new() }
     }
 
     fn truncate(&mut self, len: usize) {
@@ -1091,11 +1100,19 @@ impl Machine {
         if l.dims() != h.dims || l.ty() != h.ty {
             return Err(Fail::Mismatch(format!("{describe}: luma is {:?} {:?}", l.ty(), l.dims())));
         }
-        let got = l.read().map_err(|e| limit_or_fail(&e, &format!("{describe}: reading")))?;
+        let got = l.read().map_err(|e| self.failed(&e, &format!("{describe}: reading")))?;
         match first_difference(self.cx.math, h.ty, &got, &h.data()) {
             Some((k, l, h)) => Err(Fail::Mismatch(format!("{describe}: element {k} is {l} on luma, {h} on the oracle"))),
             None => Ok(()),
         }
+    }
+
+    /// An error of luma: a limit or a failure, or, when I/O failures are injected, the expected end of the program.
+    fn failed(&self, error: &LumaError, what: &str) -> Fail {
+        if self.cx.io.is_some() {
+            return Fail::Limit(format!("{what}: injected failure: {error}"));
+        }
+        limit_or_fail(error, what)
     }
 
     fn check_all(&self, at: &str) -> Result<(), Fail> {
@@ -1160,6 +1177,7 @@ impl Machine {
             (Err(h), Err(l)) if kind_of(&l) == h => Ok(()),
             (Err(h), Err(l)) => Err(Fail::Mismatch(format!("{at}: luma failed with {l}, the oracle with {h:?}"))),
             (Err(h), Ok(())) => Err(Fail::Mismatch(format!("{at}: luma succeeded where the oracle fails with {h:?}"))),
+            (Ok(()), Err(l)) if self.cx.io.is_some() => Err(Fail::Limit(format!("{at}: injected failure: {l}"))),
             (Ok(()), Err(l)) => Err(Fail::Mismatch(format!("{at}: luma failed where the oracle succeeds: {l}"))),
         }
     }
@@ -1198,7 +1216,7 @@ impl Machine {
                 .and_then(|()| eval_group::<i32>(&self.luma, &vars))
                 .and_then(|()| eval_group::<bool>(&self.luma, &vars))
                 .and_then(|()| eval_group::<Df32>(&self.luma, &vars));
-            evaluated.map_err(|e| limit_or_fail(&e, &format!("{at}: eval (step {t})")))?;
+            evaluated.map_err(|e| self.failed(&e, &format!("{at}: eval (step {t})")))?;
         }
         Ok(())
     }
@@ -1238,7 +1256,7 @@ impl Machine {
             }
         }
         let run = once();
-        let (results, luma_steps) = run.map_err(|e| limit_or_fail(&e, &format!("{at}: loop")))?;
+        let (results, luma_steps) = run.map_err(|e| self.failed(&e, &format!("{at}: loop")))?;
         if let Some(luma_steps) = luma_steps
             && luma_steps != host_steps
         {
@@ -1261,6 +1279,11 @@ impl Arr {
 
 /// The context of a program under its configuration; `None` if the device refuses it.
 fn engine(config: &Config) -> Option<Context> {
+    engine_mode(config, config.split.then_some(crate::SplitMode::Auto))
+}
+
+/// [`engine`] with the split mode `mode` (`None`: the environment's, `LUMA_SPLIT`).
+fn engine_mode(config: &Config, mode: Option<crate::SplitMode>) -> Option<Context> {
     // File leaves page in small segments through a small budget, so that they are read, dropped and read again.
     let (chunk_bytes, memory_budget) = if config.file_leaves {
         (Some(config.chunk_bytes.unwrap_or(1024)), Some(config.memory_budget.unwrap_or(1 << 14)))
@@ -1270,6 +1293,9 @@ fn engine(config: &Config) -> Option<Context> {
     let mut options = ContextOptions::from_env().calibrate(false).numerics(if config.fast_math { crate::Numerics::fast() } else { crate::Numerics::default() });
     if config.df_split {
         options = options.df_fma(false);
+    }
+    if let Some(mode) = mode {
+        options = options.split(mode);
     }
     if let Some(bytes) = chunk_bytes {
         options = options.chunk_bytes(bytes);
@@ -1345,16 +1371,72 @@ enum Filter {
     Shapes,
 }
 
-/// Runs `program` on `ctx` and the oracle; `Err` describes the first difference.
-fn run_on(ctx: Context, program: &Program, filter: Filter) -> Result<(), String> {
-    let mut machine = Machine::new(ctx, program.math, program.config.file_leaves);
-    let created = created_counts(program);
-    let outcome = program
+fn execute(machine: &mut Machine, program: &Program, created: &[usize]) -> Result<(), Fail> {
+    program
         .stmts
         .iter()
         .enumerate()
         .try_for_each(|(k, stmt)| machine.step(stmt, &format!("statement {k}"), Some(created[k])))
-        .and_then(|()| machine.check_all("at the end"));
+        .and_then(|()| machine.check_all("at the end"))
+}
+
+/// Whether `stmt` sums floats in an order the split changes (a reduction of several segments combines canonical blocks under split, in the
+/// order of the segments without it): its results, and everything computed from them, are only comparable with a tolerance.
+fn sums_floats(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Reduce { op: RedOp::Sum, .. } | Stmt::AxisReduce { op: RedOp::Sum, .. } | Stmt::SumWhere { .. } => true,
+        Stmt::Loop { body, .. } => body.iter().any(sums_floats),
+        _ => false,
+    }
+}
+
+/// The oracle of the split dimension: a program that ran with split on gives bit-for-bit the values it gives with split off, for every variable
+/// that no float sum reaches (maps, integer, bit-packed and single-segment results are unchanged by slab-major execution). The sums themselves
+/// were compared with the host oracle (with its tolerance) as in every run.
+fn split_baseline(machine: &Machine, program: &Program, created: &[usize]) -> Result<(), Fail> {
+    // `slab_bytes: Some` runs `SplitMode::Auto` too (`engine_mode`), so it is a split program as well; the baseline has neither.
+    if !(program.config.split || program.config.slab_bytes.is_some()) || machine.cx.io.is_some() {
+        return Ok(());
+    }
+    let mut config = program.config.clone();
+    config.split = false;
+    config.slab_bytes = None;
+    let Some(ctx) = engine_mode(&config, Some(crate::SplitMode::Off)) else { return Ok(()) };
+    let mut baseline = Machine::new(ctx, program.math, program.config.file_leaves);
+    execute(&mut baseline, program, created)?;
+    let mut tainted = vec![false; machine.luma.len()];
+    let mut next = 0;
+    for (k, stmt) in program.stmts.iter().enumerate() {
+        let range = next..next + created[k];
+        next = range.end;
+        let touched = sums_floats(stmt) || stmt.mentions().iter().any(|&i| tainted.get(i).copied().unwrap_or(false));
+        if touched {
+            let len = tainted.len();
+            for i in stmt.mentions().into_iter().chain(range).filter(|&i| i < len) {
+                tainted[i] = true;
+            }
+        }
+    }
+    for (i, (a, b)) in machine.luma.iter().zip(&baseline.luma).enumerate() {
+        let (Some(a), Some(b)) = (a, b) else { continue };
+        if tainted[i] {
+            continue;
+        }
+        let (a, b) = (a.read().map_err(|e| limit_or_fail(&e, "split run"))?, b.read().map_err(|e| limit_or_fail(&e, "baseline run"))?);
+        let same = a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()));
+        if !same {
+            return Err(Fail::Mismatch(format!("split baseline: variable {i} differs between split auto and off")));
+        }
+    }
+    Ok(())
+}
+
+/// Runs `program` on `ctx` and the oracle; `Err` describes the first difference.
+fn run_on(ctx: Context, program: &Program, filter: Filter) -> Result<(), String> {
+    let mut machine = Machine::new(ctx, program.math, program.config.file_leaves);
+    let created = created_counts(program);
+    let outcome = execute(&mut machine, program, &created);
+    let outcome = outcome.and_then(|()| split_baseline(&machine, program, &created));
     match outcome {
         Ok(()) => Ok(()),
         Err(Fail::Limit(what)) => {
@@ -1467,6 +1549,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             |c, d| c.chunk_bytes = d.chunk_bytes,
             |c, d| c.memory_budget = d.memory_budget,
             |c, d| c.slab_bytes = d.slab_bytes,
+            |c, d| c.split = d.split,
             |c, d| c.file_leaves = d.file_leaves,
             |c, d| c.cost = d.cost,
         ];
@@ -1517,6 +1600,45 @@ fn programs() {
         format!("{}\n{}", run_filtered(&minimal, Filter::Messages).err().unwrap_or_default(), minimal.rust())
     };
     drive("tests/proptest-regressions/fuzz_programs.txt", generator::programs(), describe, |program| run_random(&program));
+}
+
+// -- Injected I/O failures --
+
+/// `program` over file arrays on a split context whose `n`-th read (or write) fails: luma either gives the oracle's values or an error at the
+/// statement that needed the failed transfer (a deferred step fails where its outputs are read), and the context keeps working afterwards.
+fn run_with_failure(program: &Program, plan: FailPlan) -> Result<(), String> {
+    let mut config = program.config.clone();
+    config.split = true;
+    config.file_leaves = true;
+    let Some(ctx) = engine(&config) else { return Ok(()) };
+    let mut machine = Machine::new(ctx.clone(), program.math, true);
+    machine.cx.io = Some(Arc::new(FailingIo::new(PoolIo::new(2), plan)));
+    let created = created_counts(program);
+    match execute(&mut machine, program, &created) {
+        Ok(()) | Err(Fail::Limit(_)) => {}
+        Err(Fail::Mismatch(what)) => return Err(what),
+    }
+    drop(machine);
+    // A schedule still open commits at the next trigger, whoever pulls it (its failure is reported there): settle it first. The failed schedule
+    // left nothing behind: a fresh array then computes on the same context.
+    let _ = ctx.sync();
+    let n = 3 * 256 + 5;
+    let x = Array::<f32>::from_slice_on(&ctx, &vec![1.0; n], n).map_err(|e| format!("after the failure: {e}"))?;
+    let y = (&x * 2.0 + 1.0).to_vec().map_err(|e| format!("after the failure: {e}"))?;
+    if y != vec![3.0f32; n] {
+        return Err("after the failure: a fresh array computes wrong values".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn split_io_failures() {
+    let plans = (0u64..40, any::<bool>(), any::<bool>()).prop_map(|(n, write, short)| {
+        let fault = if short { Fault::Short { keep: 8 } } else { Fault::Fail(std::io::ErrorKind::Other) };
+        if write { FailPlan { read: None, write: Some((n / 4, fault)) } } else { FailPlan { read: Some((n, fault)), write: None } }
+    });
+    let describe = |(program, plan): (Program, FailPlan)| format!("{}\n{plan:?}\n{}", run_with_failure(&program, plan).err().unwrap_or_default(), program.rust());
+    drive("tests/proptest-regressions/fuzz_split_io.txt", (generator::programs(), plans), describe, |(program, plan)| run_with_failure(&program, plan));
 }
 
 // -- Traced programs --
@@ -1633,7 +1755,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     if program.stmts.iter().any(|stmt| matches!(stmt, Stmt::Loop { .. })) {
         return Err(Fail::Limit("a program with a loop".into()));
     }
-    let cx = Cx { ctx: ctx.clone(), math: program.math, files: false };
+    let cx = Cx { ctx: ctx.clone(), math: program.math, files: false, io: None };
     let other = with_other_data(program);
     let (host_a, outcomes) = host_run(program);
     let (host_b, outcomes_b) = host_run(&other);
@@ -1657,7 +1779,7 @@ fn traced_on(ctx: &Context, program: &Program) -> Result<(), Fail> {
     let record = std::sync::Arc::clone(&ran);
     let stmts = program.stmts.clone();
     let host_outcomes = outcomes.clone();
-    let inside = Cx { ctx: ctx.clone(), math: program.math, files: false };
+    let inside = Cx { ctx: ctx.clone(), math: program.math, files: false, io: None };
     let compiled = crate::trace::trace(move |inp| {
         let mut env: Env = Vec::new();
         let (mut next, mut stopped) = (0, None);

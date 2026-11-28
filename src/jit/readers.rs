@@ -196,10 +196,19 @@ impl Readers {
     /// buffer it produced.
     pub(crate) fn absorb(&self, other: &Readers) {
         let moved = other.take();
-        if moved.is_empty() {
+        // The schedules with a deferred step that reads the other buffer (an alias's, a placeholder's) are the new owner's readers too.
+        let schedules = lock(&other.list).schedules.take();
+        if moved.is_empty() && schedules.is_none() {
             return;
         }
-        lock(&self.list).nodes.extend(moved);
+        let mut list = lock(&self.list);
+        list.nodes.extend(moved);
+        if let Some(schedules) = schedules {
+            match list.schedules.as_mut() {
+                Some(known) => known.extend(*schedules),
+                None => list.schedules = Some(schedules),
+            }
+        }
     }
 
     /// Whether a reader that `consider` accepts is still pending. Only accepted readers are

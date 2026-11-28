@@ -143,6 +143,9 @@ pub struct Config {
     /// Bytes of a slab of the schedules of arrays split over several buffers (`ContextOptions::slab_bytes`; `Some` also turns
     /// `SplitMode::Auto` on, so that slabs below segments, ghosts and expansions run).
     pub slab_bytes: Option<u64>,
+    /// `LUMA_SPLIT=auto` for the program (slab-major execution of the streamed arrays); otherwise the environment's mode. Programs with it also run
+    /// with split off, and the results are compared (see `split_baseline`).
+    pub split: bool,
     /// The `f32`, `u32` and `i32` inputs are written to a temporary file and opened read-only as file arrays (with small segments and budget, see `engine`).
     pub file_leaves: bool,
     pub cost: CostChoice,
@@ -173,6 +176,7 @@ impl Config {
             chunk_bytes: None,
             memory_budget: None,
             slab_bytes: None,
+            split: false,
             file_leaves: false,
             cost: CostChoice::Test,
         }
@@ -2149,7 +2153,12 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         prop::sample::select(vec![None, None, Some(256u64), Some(1 << 12), Some(1 << 16)]),
         prop::sample::select(vec![CostChoice::Test, CostChoice::SlowLaunch, CostChoice::SlowArithmetic]),
     );
-    (limits, flags, memory).prop_map(|(limits, flags, memory)| Config {
+    // Streaming combinations of the split dimension: small segments, with the budget below the data or not.
+    let split = (
+        prop::bool::weighted(0.4),
+        prop::sample::select(vec![(1024u64, None), (1024, Some(1u64 << 14)), (1024, Some(1 << 20)), (4096, None), (4096, Some(1 << 20))]),
+    );
+    (limits, flags, memory, split).prop_map(|(limits, flags, memory, split)| Config {
         max_nodes: limits.0,
         max_inlined: limits.1,
         max_live: limits.2,
@@ -2160,8 +2169,9 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         staging: flags.4,
         fast_math: flags.3,
         df_split: flags.5,
-        chunk_bytes: memory.0,
-        memory_budget: memory.1,
+        chunk_bytes: if split.0 { memory.0.or(Some(split.1.0)) } else { memory.0 },
+        memory_budget: if split.0 { memory.1.or(split.1.1) } else { memory.1 },
+        split: split.0,
         file_leaves: memory.2,
         cost: memory.4,
         slab_bytes: memory.3,
