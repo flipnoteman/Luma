@@ -487,9 +487,10 @@ fn triangular_solves_route_under_reformulate_and_diagonal_ones_under_exact_finit
     // The diagonal solve is exact for finite inputs, so it runs under `exact_finite` alone and not under `reformulate` alone.
     let finite = ctx_with(Numerics::parse("default+exact-finite").unwrap());
     let reformulating = ctx_with(Numerics::parse("default+reformulate").unwrap());
-    let wanted: Vec<f32> = (0..n * 3).map(|i| rhs[i] / v[i / 3]).collect();
-    let routed = on(&finite, &v, [n, 1]).diag_matrix(0).solve(&on(&finite, &rhs, [3, n]));
-    assert_eq!(bits(&routed), wanted.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "exact_finite: b / d");
+    // On the device the same division `b / d`, as an expression (the host's quotient may differ in the last bit from the GPU's).
+    let (b_dev, d_dev) = (on(&finite, &rhs, [3, n]), on(&finite, &v, [1, n]).broadcast_to([3, n]));
+    let routed = on(&finite, &v, [n, 1]).diag_matrix(0).solve(&b_dev);
+    assert_eq!(bits(&routed), bits(&(&b_dev / &d_dev)), "exact_finite: b / d");
     let (a, b) = (on(&reformulating, &v, [n, 1]).diag_matrix(0), on(&reformulating, &rhs, [3, n]));
     assert_eq!(bits(&a.solve(&b)), bits(&a.cache().solve(&b)), "reformulate alone: the dense path");
     // A vector right-hand side.
