@@ -89,6 +89,15 @@ impl<T: ScalarType> Array<T> {
 
     /// [`Array::diag`] reporting failures at `location`.
     pub(crate) fn diag_at(&self, k: isize, location: &'static Location<'static>) -> Array<T> {
+        // The diagonal of a product that has not been forced is computed from the operands (rule 6b of W3-R4R5).
+        if k == 0
+            && self.structured().is_some()
+            && let Some(this) = (self as &dyn std::any::Any).downcast_ref::<Array<f32>>()
+            && let Some(product) = crate::jit::rules::diag_of_product(this, location)
+            && let Some(array) = (&product as &dyn std::any::Any).downcast_ref::<Array<T>>()
+        {
+            return array.clone();
+        }
         let [m, n, b2, b3] = self.shape().dims();
         let len = diag_len(m, n, k).unwrap_or(1);
         let out = Shape::new([len, 1, b2, b3]);

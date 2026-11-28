@@ -28,8 +28,9 @@ pub(crate) struct T1Rule {
     pub(crate) apply: fn(&Comprehension, &Numerics) -> Option<Comprehension>,
 }
 
-/// The rules of the library. Empty: R4 adds rules 1, 3, 5 and 12.
-pub(crate) static T1_RULES: &[T1Rule] = &[];
+/// The rules of the library: the index algebra of W3-R4R5 (rules 1, 3, 11, 5, 6a; 6b changes the output shape and is called by
+/// `diag`; 12 waits for W3-U4).
+pub(crate) static T1_RULES: &[T1Rule] = &super::index::INDEX_RULES;
 
 /// Rounds of the hook, as many as `create` makes.
 const ROUNDS: usize = 4;
@@ -103,7 +104,20 @@ pub(super) fn check_rewrite(old: &Comprehension, new: &Comprehension) {
             }));
             all
         };
-        let had = sources(old);
+        let mut had = sources(old);
+        // An expression the old form read is looked through: what it reads is read by the new one (a view composed into a map,
+        // rule 1; the vector of a `diag_matrix`, rule 6a).
+        let mut at = 0;
+        while at < had.len() && had.len() < 64 {
+            if let Src::Node(node) = &had[at]
+                && node.is_pending()
+                && node.deferred_value().is_none()
+                && let Some(operands) = node.operands()
+            {
+                had.extend(operands.into_iter().filter(|src| !matches!(src, Src::Scalar(_))));
+            }
+            at += 1;
+        }
         for src in sources(new) {
             debug_assert!(had.iter().any(|have| same_src(have, &src)), "a rewrite reads a source the original did not");
         }

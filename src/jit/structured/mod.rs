@@ -21,6 +21,7 @@ pub(crate) mod lazy;
 pub(crate) mod opaque;
 pub(crate) mod select;
 pub(crate) mod sites;
+pub(crate) use sites::wants_unforced;
 pub(crate) mod strategy;
 pub(crate) mod telemetry;
 

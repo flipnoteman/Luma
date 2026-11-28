@@ -76,8 +76,8 @@ pub(crate) struct RuleInfo {
 }
 
 macro_rules! registry {
-    ($( $id:ident, $name:literal, $class:ident, $gate:ident, $dominates:literal, $harness:literal; )*) => {
-        /// The rules of `simplify.rs`, by the name of their [`RuleInfo`]; the index in [`RULES`].
+    ($( $tier:ident $id:ident, $name:literal, $class:ident, $gate:ident, $dominates:literal, $harness:literal; )*) => {
+        /// The rules, by the name of their [`RuleInfo`]; the index in [`RULES`].
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         #[repr(u16)]
         pub(crate) enum Rid { $( $id, )* }
@@ -89,7 +89,7 @@ macro_rules! registry {
                 name: $name,
                 class: Class::$class,
                 gate: Class::$gate,
-                tier: Tier::T1Elementwise,
+                tier: Tier::$tier,
                 dominates: $dominates,
                 harness: $harness,
                 order: Rid::$id as u16,
@@ -102,63 +102,73 @@ macro_rules! registry {
 // inside the exact-finite pass the three reformulating arms that always sat there (B6) keep their place.
 registry! {
     // exact
-    PartOfMake, "part_of_make", Exact, Exact, true, "complex real of make";
-    MakeOfParts, "make_of_parts", Exact, Exact, true, "complex make of the parts";
-    MulOne, "mul_one", Exact, Exact, true, "mul by one";
-    MulNegOne, "mul_neg_one", Exact, Exact, true, "mul by minus one";
-    MulZeroInt, "mul_zero_int", Exact, Exact, true, "u32 mul zero";
-    DivOne, "div_one", Reformulating, Exact, true, "div by one";
-    SubZero, "sub_zero", Exact, Exact, true, "sub plus zero";
-    SubSameInt, "sub_same_int", Exact, Exact, true, "u32 sub self";
-    AddNegZeroFloat, "add_neg_zero_float", Exact, Exact, true, "add minus zero";
-    AddZeroInt, "add_zero_int", Exact, Exact, true, "u32 add zero";
-    MinMaxSame, "minmax_same", Exact, Exact, true, "min same";
-    RemOneUint, "rem_one_uint", Exact, Exact, true, "u32 rem one";
-    BitOrZero, "bitor_zero", Exact, Exact, true, "u32 or zero";
-    BitXorZero, "bitxor_zero", Exact, Exact, true, "u32 xor zero";
-    BitXorSame, "bitxor_same", Exact, Exact, true, "u32 xor self";
-    BitOpSame, "bitop_same", Exact, Exact, true, "u32 and self";
-    BitAndZero, "bitand_zero", Exact, Exact, true, "u32 and zero";
-    BitAndOnes, "bitand_ones", Exact, Exact, true, "u32 and all ones";
-    ShiftMod32, "shift_mod32", Exact, Exact, true, "unit:simplify_binary_shift_by_a_multiple_of_32";
-    ShiftZero, "shift_zero", Exact, Exact, true, "u32 shl zero";
-    NegNeg, "neg_neg", Exact, Exact, true, "neg neg";
-    ConjConj, "conj_conj", Exact, Exact, true, "complex conj conj";
-    BitNotBitNot, "bitnot_bitnot", Exact, Exact, true, "u32 not not";
-    AbsAbsNeg, "abs_abs_neg", Exact, Exact, true, "abs abs";
-    RoundFamily, "round_family", Exact, Exact, true, "floor floor";
-    ShlShl, "shl_shl", Exact, Exact, true, "u32 shl shl";
-    ShrShr, "shr_shr", Exact, Exact, true, "u32 shr shr";
-    RotlRotl, "rotl_rotl", Exact, Exact, true, "u32 rotl rotl";
-    SignSign, "sign_sign", Exact, Exact, true, "sign sign";
-    SelectScalarMask, "select_scalar_mask", Exact, Exact, true, "unit:simplify_scalar_select_picks_a_branch";
-    SelectNotSwap, "select_not_swap", Exact, Exact, true, "select of a negated mask";
-    SelectSame, "select_same", Exact, Exact, true, "select same";
-    CmpSameInt, "cmp_same_int", Exact, Exact, true, "u32 le self";
-    LtGtSame, "lt_gt_same", Exact, Exact, true, "lt same";
-    CastThroughF64, "cast_through_f64", Exact, Exact, true, "cast through f64";
+    T1Elementwise PartOfMake, "part_of_make", Exact, Exact, true, "complex real of make";
+    T1Elementwise MakeOfParts, "make_of_parts", Exact, Exact, true, "complex make of the parts";
+    T1Elementwise MulOne, "mul_one", Exact, Exact, true, "mul by one";
+    T1Elementwise MulNegOne, "mul_neg_one", Exact, Exact, true, "mul by minus one";
+    T1Elementwise MulZeroInt, "mul_zero_int", Exact, Exact, true, "u32 mul zero";
+    T1Elementwise DivOne, "div_one", Reformulating, Exact, true, "div by one";
+    T1Elementwise SubZero, "sub_zero", Exact, Exact, true, "sub plus zero";
+    T1Elementwise SubSameInt, "sub_same_int", Exact, Exact, true, "u32 sub self";
+    T1Elementwise AddNegZeroFloat, "add_neg_zero_float", Exact, Exact, true, "add minus zero";
+    T1Elementwise AddZeroInt, "add_zero_int", Exact, Exact, true, "u32 add zero";
+    T1Elementwise MinMaxSame, "minmax_same", Exact, Exact, true, "min same";
+    T1Elementwise RemOneUint, "rem_one_uint", Exact, Exact, true, "u32 rem one";
+    T1Elementwise BitOrZero, "bitor_zero", Exact, Exact, true, "u32 or zero";
+    T1Elementwise BitXorZero, "bitxor_zero", Exact, Exact, true, "u32 xor zero";
+    T1Elementwise BitXorSame, "bitxor_same", Exact, Exact, true, "u32 xor self";
+    T1Elementwise BitOpSame, "bitop_same", Exact, Exact, true, "u32 and self";
+    T1Elementwise BitAndZero, "bitand_zero", Exact, Exact, true, "u32 and zero";
+    T1Elementwise BitAndOnes, "bitand_ones", Exact, Exact, true, "u32 and all ones";
+    T1Elementwise ShiftMod32, "shift_mod32", Exact, Exact, true, "unit:simplify_binary_shift_by_a_multiple_of_32";
+    T1Elementwise ShiftZero, "shift_zero", Exact, Exact, true, "u32 shl zero";
+    T1Elementwise NegNeg, "neg_neg", Exact, Exact, true, "neg neg";
+    T1Elementwise ConjConj, "conj_conj", Exact, Exact, true, "complex conj conj";
+    T1Elementwise BitNotBitNot, "bitnot_bitnot", Exact, Exact, true, "u32 not not";
+    T1Elementwise AbsAbsNeg, "abs_abs_neg", Exact, Exact, true, "abs abs";
+    T1Elementwise RoundFamily, "round_family", Exact, Exact, true, "floor floor";
+    T1Elementwise ShlShl, "shl_shl", Exact, Exact, true, "u32 shl shl";
+    T1Elementwise ShrShr, "shr_shr", Exact, Exact, true, "u32 shr shr";
+    T1Elementwise RotlRotl, "rotl_rotl", Exact, Exact, true, "u32 rotl rotl";
+    T1Elementwise SignSign, "sign_sign", Exact, Exact, true, "sign sign";
+    T1Elementwise SelectScalarMask, "select_scalar_mask", Exact, Exact, true, "unit:simplify_scalar_select_picks_a_branch";
+    T1Elementwise SelectNotSwap, "select_not_swap", Exact, Exact, true, "select of a negated mask";
+    T1Elementwise SelectSame, "select_same", Exact, Exact, true, "select same";
+    T1Elementwise CmpSameInt, "cmp_same_int", Exact, Exact, true, "u32 le self";
+    T1Elementwise LtGtSame, "lt_gt_same", Exact, Exact, true, "lt same";
+    T1Elementwise CastThroughF64, "cast_through_f64", Exact, Exact, true, "cast through f64";
     // exact finite (the arms that were fast-only, in their old order)
-    AddNegToSub, "add_neg_to_sub", Exact, ExactFinite, true, "add neg";
-    AddNegToSubLeft, "add_neg_to_sub_left", Exact, ExactFinite, true, "neg add";
-    SubNegToAdd, "sub_neg_to_add", Exact, ExactFinite, true, "sub neg";
-    SubSameFloat, "sub_same_float", ExactFinite, ExactFinite, true, "sub same";
-    CmpSameFloat, "cmp_same_float", ExactFinite, ExactFinite, true, "le same";
+    T1Elementwise AddNegToSub, "add_neg_to_sub", Exact, ExactFinite, true, "add neg";
+    T1Elementwise AddNegToSubLeft, "add_neg_to_sub_left", Exact, ExactFinite, true, "neg add";
+    T1Elementwise SubNegToAdd, "sub_neg_to_add", Exact, ExactFinite, true, "sub neg";
+    T1Elementwise SubSameFloat, "sub_same_float", ExactFinite, ExactFinite, true, "sub same";
+    T1Elementwise CmpSameFloat, "cmp_same_float", ExactFinite, ExactFinite, true, "le same";
     // reassociating
-    ReassociateMulMul, "reassociate_mul_mul", Reassociating, Reassociating, true, "mul chain";
-    ReassociateAddAdd, "reassociate_add_add", Reassociating, Reassociating, true, "add chain";
-    ReassociateAddSub, "reassociate_add_sub", Reassociating, Reassociating, true, "sub then add";
-    ReassociateSubAdd, "reassociate_sub_add", Reassociating, Reassociating, true, "add then sub";
-    ReassociateSubSub, "reassociate_sub_sub", Reassociating, Reassociating, true, "sub chain";
-    DivConstToMul, "div_const_to_mul", Reassociating, Reassociating, true, "div by constant";
-    PowfOne, "powf_one", Reassociating, Reassociating, true, "powf one";
-    PowfTwo, "powf_two", Reassociating, Reassociating, true, "powf two";
-    PowfNegOne, "powf_neg_one", Reassociating, Reassociating, true, "powf minus one";
-    PowfHalf, "powf_half", Reassociating, Reassociating, true, "powf half";
+    T1Elementwise ReassociateMulMul, "reassociate_mul_mul", Reassociating, Reassociating, true, "mul chain";
+    T1Elementwise ReassociateAddAdd, "reassociate_add_add", Reassociating, Reassociating, true, "add chain";
+    T1Elementwise ReassociateAddSub, "reassociate_add_sub", Reassociating, Reassociating, true, "sub then add";
+    T1Elementwise ReassociateSubAdd, "reassociate_sub_add", Reassociating, Reassociating, true, "add then sub";
+    T1Elementwise ReassociateSubSub, "reassociate_sub_sub", Reassociating, Reassociating, true, "sub chain";
+    T1Elementwise DivConstToMul, "div_const_to_mul", Reassociating, Reassociating, true, "div by constant";
+    T1Elementwise PowfOne, "powf_one", Reassociating, Reassociating, true, "powf one";
+    T1Elementwise PowfTwo, "powf_two", Reassociating, Reassociating, true, "powf two";
+    T1Elementwise PowfNegOne, "powf_neg_one", Reassociating, Reassociating, true, "powf minus one";
+    T1Elementwise PowfHalf, "powf_half", Reassociating, Reassociating, true, "powf half";
     // reformulating
-    AddZeroFloat, "add_zero_float", Reformulating, Reformulating, true, "add zero";
-    MulZeroFloat, "mul_zero_float", Reformulating, Reformulating, true, "mul zero";
-    DivSameFloat, "div_same_float", Reformulating, Reformulating, true, "div same";
-    PowfZero, "powf_zero", Reformulating, Reformulating, true, "powf zero";
+    T1Elementwise AddZeroFloat, "add_zero_float", Reformulating, Reformulating, true, "add zero";
+    T1Elementwise MulZeroFloat, "mul_zero_float", Reformulating, Reformulating, true, "mul zero";
+    T1Elementwise DivSameFloat, "div_same_float", Reformulating, Reformulating, true, "div same";
+    T1Elementwise PowfZero, "powf_zero", Reformulating, Reformulating, true, "powf zero";
+    // tier 1 for comprehensions: index algebra (W3-R4R5), exact first, then reformulating (their gate is their class)
+    T1Comprehension ContractView, "contract_view", Exact, Exact, true, "contract_view";
+    T1Comprehension ContractK1, "contract_k1", Exact, Exact, true, "contract_k1";
+    T1Comprehension DiagOfProduct, "diag_of_product", Exact, Exact, true, "diag_of_product";
+    T1Comprehension GramSymmetric, "gram_symmetric", Exact, Exact, true, "gram_symmetric";
+    T1Comprehension ContractIdentity, "contract_identity", Reformulating, Reformulating, true, "contract_identity";
+    T1Comprehension ContractDiag, "contract_diag", Reformulating, Reformulating, true, "contract_diag";
+    // tier 2: reformulating products (W3-R4R5); cost-accepted
+    T2 ChainOrder, "chain_order", Reassociating, Reassociating, false, "chain_order";
+    T2 SumOfProduct, "sum_of_product", Reformulating, Reformulating, false, "sum_of_product";
 }
 
 /// The rule `id` fired. Nothing in release: a rewrite is a branch and a copy of the operands, and every instruction here is

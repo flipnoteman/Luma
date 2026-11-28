@@ -13,6 +13,7 @@
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::numerics::Numerics;
 use crate::tuning::Tuning;
 
 /// `LUMA_LAZY`: when a library op launches. Removed before 0.6.0 with the other switches (`Site` is then hard-wired).
@@ -36,6 +37,12 @@ impl LazyMode {
             _ => None,
         }
     }
+}
+
+/// Whether the numerics let a rule of tier 2 rewrite a product or a reduction that is not forced yet.
+#[inline(always)]
+pub(crate) fn wants_unforced(numerics: &Numerics) -> bool {
+    numerics.reassociate || numerics.reformulate
 }
 
 /// What a call does.
@@ -144,10 +151,17 @@ impl Sites {
     /// first used. `Never` is eager and `Always` lazy whatever the
     /// slot says; `Site` is lazy where the slot absorbed or partnered, and for the probe of every `tuning.lazy_probe_every`-th call
     /// (counted before it is incremented, so the first call of a site probes).
+    ///
+    /// Under numerics that let a rule reassociate or reformulate, a product (and a reduction) is lazy whatever the mode says, so that
+    /// the rules of tier 2 (sum of a product, chain order) find the producers unforced (W3-R4R5). A mode that is `Never` and numerics
+    /// that allow neither stay on the eager path; the cost is a later GPU start in loops under `algebraic()`/`fast()`.
     #[inline]
-    pub(crate) fn decide(&self, location: &'static Location<'static>, tuning: &Tuning, recording: bool) -> (Laziness, SiteSlot) {
-        if recording || tuning.lazy == LazyMode::Never {
+    pub(crate) fn decide(&self, location: &'static Location<'static>, tuning: &Tuning, recording: bool, numerics: &Numerics) -> (Laziness, SiteSlot) {
+        if recording {
             return (Laziness::Eager, SiteSlot::NONE);
+        }
+        if tuning.lazy == LazyMode::Never {
+            return (if wants_unforced(numerics) { Laziness::Lazy } else { Laziness::Eager }, SiteSlot::NONE);
         }
         match tuning.lazy {
             LazyMode::Always => (Laziness::Lazy, SiteSlot::NONE),
@@ -204,7 +218,7 @@ mod tests {
     #[test]
     fn an_unseen_site_is_eager() {
         let sites = Sites::default();
-        let (laziness, slot) = sites.decide(here(), &tuned(LazyMode::Site, 0), false);
+        let (laziness, slot) = sites.decide(here(), &tuned(LazyMode::Site, 0), false, &Numerics::default());
         assert_eq!(laziness, Laziness::Eager);
         assert_ne!(slot, SiteSlot::NONE);
     }
@@ -263,11 +277,24 @@ mod tests {
         let sites = Sites::default();
         let location = here();
         sites.set_attached(SiteKey::of(location), 1, 1);
-        assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 1), false).0, Laziness::Eager);
+        assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 1), false, &Numerics::default()).0, Laziness::Eager);
         let fresh = Sites::default();
-        assert_eq!(fresh.decide(location, &tuned(LazyMode::Always, 0), false).0, Laziness::Lazy);
+        assert_eq!(fresh.decide(location, &tuned(LazyMode::Always, 0), false, &Numerics::default()).0, Laziness::Lazy);
         // `Site` reads the slot.
-        assert_eq!(sites.decide(location, &tuned(LazyMode::Site, 0), false).0, Laziness::Lazy);
+        assert_eq!(sites.decide(location, &tuned(LazyMode::Site, 0), false, &Numerics::default()).0, Laziness::Lazy);
+    }
+
+    #[test]
+    fn numerics_that_reassociate_or_reformulate_make_a_product_lazy_in_every_mode_but_a_recording() {
+        let sites = Sites::default();
+        let location = here();
+        for numerics in [Numerics::algebraic(), Numerics::fast()] {
+            assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 0), false, &numerics).0, Laziness::Lazy);
+            assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 0), true, &numerics).0, Laziness::Eager);
+        }
+        for numerics in [Numerics::default(), Numerics::strict()] {
+            assert_eq!(sites.decide(location, &tuned(LazyMode::Never, 0), false, &numerics).0, Laziness::Eager);
+        }
     }
 
     #[test]
@@ -276,7 +303,7 @@ mod tests {
         let location = here();
         sites.set_attached(SiteKey::of(location), 1, 1);
         for mode in [LazyMode::Never, LazyMode::Site, LazyMode::Always] {
-            assert_eq!(sites.decide(location, &tuned(mode, 1), true).0, Laziness::Eager, "{mode:?}");
+            assert_eq!(sites.decide(location, &tuned(mode, 1), true, &Numerics::algebraic()).0, Laziness::Eager, "{mode:?}");
         }
     }
 

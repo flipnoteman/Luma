@@ -38,6 +38,16 @@ pub(crate) enum E {
     Matmul(Box<E>, Box<E>),
     Transpose(Box<E>),
     Diag(Box<E>),
+    /// The identity matrix whose side is the number of rows of variable `u8` (a rule that multiplies by one writes a square
+    /// shape for that variable).
+    Eye(u8),
+    /// `of` broadcast along `axis` (axis 0 is the fastest dimension) to the extent of whatever it meets: the elementwise
+    /// operations broadcast an extent-1 axis, so this is the value of `of`, written where a rule says "broadcast".
+    Bcast { axis: u8, of: Box<E> },
+    /// The sum of the diagonal, as a 1 x 1 matrix (the diagonal added in ascending order from `+0.0`).
+    Trace(Box<E>),
+    /// `a` and `b` joined along `axis` (axis 0 is the fastest dimension: the columns of a row).
+    Cat { axis: u8, a: Box<E>, b: Box<E> },
 }
 
 /// Which pass of `simplify` implements a rule, and whether it makes the program strictly shorter.
@@ -108,7 +118,9 @@ impl E {
         match self {
             E::Var(i) => usize::from(*i) + 1,
             E::Const(_) => 0,
-            E::Neg(a) | E::Unary(_, a) | E::Powf(a, _) | E::Transpose(a) | E::Diag(a) | E::Sum { of: a, .. } => a.vars(),
+            E::Neg(a) | E::Unary(_, a) | E::Powf(a, _) | E::Transpose(a) | E::Diag(a) | E::Trace(a) | E::Bcast { of: a, .. } | E::Sum { of: a, .. } => a.vars(),
+            E::Eye(i) => usize::from(*i) + 1,
+            E::Cat { a, b, .. } => a.vars().max(b.vars()),
             E::Add(a, b) | E::Sub(a, b) | E::Mul(a, b) | E::Div(a, b) | E::Min(a, b) | E::Max(a, b) | E::Cmp(_, a, b) | E::Matmul(a, b) => a.vars().max(b.vars()),
             E::Select(a, b, c) => a.vars().max(b.vars()).max(c.vars()),
         }
@@ -189,5 +201,70 @@ pub(crate) fn rules() -> Vec<Rule> {
         rule("transpose of a product", Reassociating, E::Transpose(bx(E::Matmul(bx(x(0)), bx(x(1))))), E::Matmul(bx(E::Transpose(bx(x(1)))), bx(E::Transpose(bx(x(0))))), mm, Some(2e-5), None, Gate::None),
         rule("sum of a sum", Reassociating, E::Sum { axis: 0, of: bx(add(x(0), x(1))) }, add(E::Sum { axis: 0, of: bx(x(0)) }, E::Sum { axis: 0, of: bx(x(1)) }), pair, Some(2e-5), None, Gate::None),
         rule("diag of a transpose", Exact, E::Diag(bx(E::Transpose(bx(x(0))))), E::Diag(bx(x(0))), sq, None, None, Gate::None),
+    ]
+    .into_iter()
+    .chain(index_rules())
+    .chain(reform_rules())
+    .collect()
+}
+
+pub(super) fn matmul(a: E, b: E) -> E {
+    E::Matmul(bx(a), bx(b))
+}
+
+pub(super) fn tr(a: E) -> E {
+    E::Transpose(bx(a))
+}
+
+/// The rules of W3-R4R5 whose lhs and rhs are programs of matrices (`contract_view` ... `contract_diag`). The rules of tier 2
+/// (sum of a product, invariant factors, chain order) follow in [`reform_rules`].
+pub(super) fn index_rules() -> Vec<Rule> {
+    use Class::{Exact, Reformulating};
+    let none = Gate::None;
+    let sq: &'static [&'static [usize]] = &[&[3, 3]];
+    vec![
+        // 1: `aᵀ·b` read through the view, or the product of the swapped operands transposed: every entry adds the same products in
+        // the same order of `k`.
+        rule("contract_view", Exact, matmul(tr(x(0)), x(1)), tr(matmul(tr(x(1)), x(0))), &[&[3, 2], &[3, 4]], None, None, none),
+        // 3: a product of one term: `a·b + 0.0` (the sum starts at `+0.0`, so a `-0` product is `+0`).
+        rule("contract_k1", Exact, matmul(x(0), x(1)), add(mul(x(0), x(1)), k(0.0)), &[&[3, 1], &[1, 2]], None, None, none),
+        // 6b: the diagonal of a product is one sum of products per element.
+        rule("diag_of_product", Exact, E::Diag(bx(matmul(x(0), x(1)))), E::Sum { axis: 0, of: bx(mul(x(0), tr(x(1)))) }, &[&[3, 4], &[4, 3]], None, None, none),
+        // 11: `aᵀa` is its own transpose, bit for bit.
+        rule("gram_symmetric", Exact, matmul(tr(x(0)), x(0)), tr(matmul(tr(x(0)), x(0))), &[&[4, 3]], None, None, none),
+        // 5: `a·I`.
+        rule("contract_identity", Reformulating, matmul(x(0), E::Eye(0)), x(0), sq, Some(2e-5), Some("a NaN or infinity in a spreads over a row of the product (x * 0); -0 becomes +0"), none),
+        // 6a: `a·diag(v)` with `v` a row vector of the diagonal.
+        rule(
+            "contract_diag",
+            Reformulating,
+            matmul(x(0), mul(E::Eye(0), E::Bcast { axis: 1, of: bx(x(1)) })),
+            mul(x(0), E::Bcast { axis: 1, of: bx(x(1)) }),
+            &[&[3, 3], &[1, 3]],
+            Some(2e-5),
+            Some("a NaN or infinity in a spreads over a row of the product (x * 0); -0 becomes +0"),
+            none,
+        ),
+    ]
+}
+
+/// The rules of tier 2 of W3-R4R5 as expressions: `sum_of_product` and `chain_order`.
+pub(super) fn reform_rules() -> Vec<Rule> {
+    use Class::{Reassociating, Reformulating};
+    let sum = |axis, of| E::Sum { axis, of: bx(of) };
+    vec![
+        // 7: the sum of all the entries of a product is the product of the column sums of `a` and the row sums of `b`.
+        rule(
+            "sum_of_product",
+            Reformulating,
+            sum(0, sum(1, matmul(x(0), x(1)))),
+            matmul(sum(1, x(0)), sum(0, x(1))),
+            &[&[3, 4], &[4, 5]],
+            Some(1e-4),
+            Some("an infinity or NaN in a or b reaches the result through fewer terms (x * 0); -0 sums differ"),
+            Gate::None,
+        ),
+        // 9: `(a·b)·v` is `a·(b·v)`; the rounding differs.
+        rule("chain_order", Reassociating, matmul(matmul(x(0), x(1)), x(2)), matmul(x(0), matmul(x(1), x(2))), &[&[3, 4], &[4, 5], &[5, 1]], Some(1e-4), None, Gate::None),
     ]
 }

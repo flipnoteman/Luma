@@ -12,7 +12,10 @@
 
 #![allow(dead_code, reason = "the registry is read by the tests and the tooling, and the tables of tiers 1 (comprehension) and 2 are empty until R4 and R5 add rules")]
 
+mod chain;
+mod index;
 mod measure;
+mod reform;
 mod registry;
 mod scope;
 mod t1;
@@ -22,10 +25,13 @@ mod engine_tests;
 #[cfg(test)]
 mod harness;
 #[cfg(test)]
+mod index_tests;
+#[cfg(test)]
 mod table;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use index::{Product, diag_of_product, needs_t1, product as product_hook};
 pub(crate) use registry::{Rid, RuleId, hit, rules_hash};
 pub(crate) use scope::MAX_SCOPE_COMPS;
 pub(crate) use t1::{T1_RULES, t1};

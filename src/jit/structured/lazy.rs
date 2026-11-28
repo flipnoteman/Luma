@@ -30,6 +30,7 @@ use crate::context::Context;
 use crate::error::LumaError;
 use crate::gpu::lock;
 use crate::jit::comprehension::{Algebra, Comprehension, OpTag};
+use crate::jit::rules;
 use crate::jit::{Computing, ElemTy, Node, Src};
 use crate::shape::Shape;
 
@@ -79,14 +80,33 @@ pub(crate) enum ContractionKind {
 /// the shape a failure keeps (see `Array::resolve`).
 pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, shape: Shape, location: &'static Location<'static>) -> Array<f32> {
     let ctx = lhs.context();
+    // The rules of tier 1 (W3-R4R5): a few tests of the operands say whether any of them may apply.
+    let mut tagged = None;
+    if rules::needs_t1(ctx, lhs, rhs) {
+        match rules::product_hook(ctx, lhs, rhs, attrs, location) {
+            rules::Product::Replaced(array) => return array,
+            rules::Product::Props(props) => tagged = Some(props),
+            rules::Product::Unchanged => {}
+        }
+    }
+    let product = launch_product(lhs, rhs, attrs, shape, location);
+    match tagged {
+        Some(props) => product.with_props(props),
+        None => product,
+    }
+}
+
+fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, shape: Shape, location: &'static Location<'static>) -> Array<f32> {
+    let ctx = lhs.context();
     let tuning = ctx.tuning();
-    // The default mode never reads the site: the eager path is what it was before sites existed.
-    if tuning.lazy != LazyMode::Never {
+    // The default mode never reads the site: the eager path is what it was before sites existed (unless the numerics want the
+    // product unforced for the rules of tier 2).
+    if tuning.lazy != LazyMode::Never || super::sites::wants_unforced(ctx.numerics_ref()) {
         let view = ContractionView { lhs, rhs, attrs, location };
         match view.check() {
             Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
             Ok(geom) => {
-                let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here());
+                let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
                 if laziness == Laziness::Lazy {
                     return lazy_product(ctx, &view, geom, slot, shape);
                 }
@@ -112,11 +132,11 @@ fn lazy_product(ctx: &Context, view: &ContractionView<'_>, geom: Geometry, slot:
 pub(crate) fn batched(lhs: &Array<f32>, rhs: &Array<f32>, g: &bmm::Geometry, shape: Shape, location: &'static Location<'static>) -> Option<Array<f32>> {
     let ctx = lhs.context();
     let tuning = ctx.tuning();
-    if tuning.lazy == LazyMode::Never {
+    if tuning.lazy == LazyMode::Never && !super::sites::wants_unforced(ctx.numerics_ref()) {
         return None;
     }
     let Ok(Some(launch)) = bmm::plan(lhs, rhs, g) else { return None };
-    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here());
+    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
     if laziness == Laziness::Eager {
         return None;
     }
@@ -176,6 +196,31 @@ impl Structured {
     /// Records the product into a new buffer: the operands are taken (so they are released when it returns), the strategy the registry
     /// selects runs, and a failure is tagged with the operation and the call that made the value. Nothing is read back.
     pub(super) fn record_contraction(&self, ctx: &Context, run: &ContractionRun) -> Result<Arc<Storage>, Arc<LumaError>> {
+        // The rewrite engine plans the value first (one load and a branch while no rule of tier 2 is allowed): a chain of products in
+        // another order, a reduction of a product that is never formed. The operands are taken once the plan ran.
+        if ctx.jit().rules.t2_active
+            && matches!(run.kind, ContractionKind::Matmul { .. })
+            && lock(&run.operands).is_some()
+            && let Some(planned) = {
+                self.forcing.store(true, Ordering::Relaxed);
+                let planned = rules::plan(ctx, self);
+                self.forcing.store(false, Ordering::Relaxed);
+                planned
+            }
+        {
+            self.forcing.store(true, Ordering::Relaxed);
+            let leaf_id = run.leaf_id.load(Ordering::Relaxed);
+            let held = ctx.jit().hold_requested_reading(leaf_id);
+            let computing = Computing::enter(leaf_id);
+            let outcome = rules::run_planned(ctx, self, &planned);
+            drop(computing);
+            ctx.jit().release_requested(held);
+            self.forcing.store(false, Ordering::Relaxed);
+            drop(lock(&run.operands).take());
+            drop(lock(&self.comp().form).take());
+            ctx.jit().sites.note_forced_alone(run.slot);
+            return outcome.map_err(|error| Arc::new(LumaError::Op { op: self.name, location: self.location, source: error }));
+        }
         let Some([lhs, rhs]) = lock(&run.operands).take() else {
             return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(LumaError::Gpu("a lazy product was recorded twice".into())) }));
         };
@@ -276,7 +321,12 @@ impl ContractionView<'_> {
             return None;
         }
         let geom = self.check().ok()?;
-        Some(Comprehension::contract(self.lhs.src().ok()?, self.rhs.src().ok()?, geom, self.attrs))
+        let mut form = Comprehension::contract(self.lhs.src().ok()?, self.rhs.src().ok()?, geom, self.attrs);
+        if self.lhs.has_props() || self.rhs.has_props() {
+            form.inputs[0].props = self.lhs.props();
+            form.inputs[1].props = self.rhs.props();
+        }
+        Some(form)
     }
 
     /// The errors a launch would give that depend on buffer sizes: an operand that is evaluated in several buffers, a result that needs

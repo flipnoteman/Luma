@@ -619,6 +619,21 @@ pub(crate) fn build(ctx: &Context, form: &Comprehension) -> Array<f32> {
     Array::resolve(ctx, shape, result, "comprehension", location)
 }
 
+/// The lazy array of an elementwise form (no reduce dim): the nodes of its body over the whole output, not evaluated, so that what
+/// reads it fuses them. `None` for a form with a reduce dim or one the lowering cuts into several tiles.
+pub(crate) fn elementwise(ctx: &Context, form: &Comprehension, location: &'static Location<'static>) -> Option<Array<f32>> {
+    if form.has_reduce() {
+        return None;
+    }
+    let plan = prepare(form)?;
+    if plan.reduces || plan.tiles() != 1 || plan.unrolls() || !plan.folded.is_empty() || !plan.outer.is_empty() {
+        return None;
+    }
+    let tiling = plan.tiling();
+    let node = plan.body(ctx, &Origin6([0; MAX_DIMS]), &tiling.extent, location).ok()?;
+    Some(Array::from_node(ctx, Shape::from(output_dims(form)), node))
+}
+
 /// The extents of the output axes of a form.
 pub(crate) fn output_dims(form: &Comprehension) -> [usize; 4] {
     let mut dims = [1usize; 4];

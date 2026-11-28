@@ -433,6 +433,12 @@ impl Structured {
             let storage = self.force(ctx).as_ref().map_err(|error| LumaError::clone(error))?;
             return Ok(T::from_repr(ctx.read_storage::<T::Repr>(storage)?, geom.lines as usize));
         }
+        // A value the rewrite engine planned (a sum of a product that is never formed) is forced through its plan, not read by the
+        // routes below, which know nothing of it.
+        if ctx.jit().rules.t2_active && self.is_unforced() && rules::plan(ctx, self).is_some() {
+            let storage = self.force(ctx).as_ref().map_err(|error| LumaError::clone(error))?;
+            return Ok(T::from_repr(ctx.read_storage::<T::Repr>(storage)?, self.ops().as_slice().len()));
+        }
         if std::mem::size_of::<T::Repr>() == 4
             && let Some(words) = crate::host::reduced_words(self, ctx)
         {
@@ -631,6 +637,8 @@ impl<T: ScalarType> Array<T> {
         let operand = match (self.pending(), src) {
             (Some(node), _) => Some((Src::Node(Arc::clone(node)), false)),
             (None, src @ Src::Buffer(_)) if wgsl == "f32" => Some((src, true)),
+            // A product that is not forced stays that way under numerics that let a rule of tier 2 rewrite it (`sum(a·b)`).
+            (None, src @ Src::Node(_)) if wgsl == "f32" && crate::jit::structured::wants_unforced(ctx.numerics_ref()) && self.structured().is_some_and(|value| value.is_unforced()) => Some((src, false)),
             _ => None,
         };
         if let Some((operand, buffer)) = operand {

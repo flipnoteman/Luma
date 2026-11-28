@@ -42,8 +42,8 @@ pub(crate) struct T2Rule {
     pub(crate) apply: fn(&Scope, Site, &Numerics) -> Option<Rewrite>,
 }
 
-/// The rules of the library. Empty: R4 and R5 add them.
-pub(crate) static T2_RULES: &[T2Rule] = &[];
+/// The rules of the library: chain order and sum of a product (W3-R4R5; rule 4 and rule 8 wait for W3-U4).
+pub(crate) static T2_RULES: &[T2Rule] = &super::reform::REFORM_RULES;
 
 /// What a rule changes in the scope.
 #[derive(Clone, Default)]
@@ -335,7 +335,11 @@ pub(crate) fn run(ctx: &Context, root: &Structured, planned: &Planned) -> Result
     let mut outputs: SmallVec<[Arc<Storage>; 4]> = SmallVec::new();
     for step in &planned.steps {
         let output = match &step.form {
-            None => select::execute(ctx, &Subject::Comp(root)),
+            None => match &root.comp().run {
+                crate::jit::structured::RunState::Reduce { .. } => select::execute(ctx, &Subject::Comp(root)),
+                // A lazy product keeps its operands until it is recorded, which is where its plan is made: an unchanged root has no step.
+                crate::jit::structured::RunState::Contraction(_) => Err(crate::array::Failure::from(LumaError::Unsupported("a product runs through its own strategy".into()))),
+            },
             Some(form) => {
                 let mut form = form.clone();
                 for &(access, from) in &step.feeds {

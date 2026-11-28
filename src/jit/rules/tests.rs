@@ -29,7 +29,7 @@ fn the_registry_is_sorted_and_its_ids_are_its_indices() {
     let mut names: Vec<_> = RULES.iter().map(|info| info.name).collect();
     names.sort_unstable();
     assert!(names.windows(2).all(|pair| pair[0] != pair[1]), "names are unique");
-    assert!(RULES.iter().all(|info| info.tier == Tier::T1Elementwise), "no production rule of the other tiers");
+    assert!(RULES.iter().all(|info| matches!(info.tier, Tier::T1Elementwise | Tier::T1Comprehension | Tier::T2)));
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn every_elementwise_rule_fires_in_the_harness() {
         }
         let _ = &table;
     }
-    for info in RULES {
+    for info in RULES.iter().filter(|info| info.tier == Tier::T1Elementwise) {
         assert!(fired.contains(&info.id), "{} is hit by no harness lhs", info.name);
     }
 }
@@ -179,7 +179,7 @@ fn rules_fire_only_when_allowed() {
             fired.extend(ids);
         }
         // Under every subset the fired set is the rules of the allowed gates.
-        for info in RULES {
+        for info in RULES.iter().filter(|info| info.tier == Tier::T1Elementwise) {
             assert_eq!(fired.contains(&info.id), info.allowed(&n), "{} under {n}", info.name);
         }
         let _ = (&table, &typed);
@@ -229,17 +229,20 @@ fn a_trace_made_under_other_rules_is_not_replayed() {
 }
 
 #[test]
-fn the_production_tables_are_empty_and_no_context_activates_the_engine() {
-    assert!(T1_RULES.is_empty() && super::t2::T2_RULES.is_empty());
+fn the_production_tables_hold_the_index_rules_and_build_no_scope_for_reductions() {
+    // The exact rules of tier 1 run under every numerics; tier 2 has no rule yet.
+    assert!(T1_RULES.iter().all(|rule| rule.info.tier == Tier::T1Comprehension) && !T1_RULES.is_empty());
+    assert!(super::t2::T2_RULES.iter().all(|rule| rule.info.tier == Tier::T2));
     for numerics in [Numerics::strict(), Numerics::default(), Numerics::algebraic(), Numerics::fast()] {
         let ctx = open(numerics);
-        assert!(!ctx.jit().rules.t1_active && !ctx.jit().rules.t2_active, "{numerics}");
-        // Forcing structured values plans nothing and builds no scope.
+        assert!(ctx.jit().rules.t1_active, "{numerics}");
+        assert_eq!(ctx.jit().rules.t2_active, Algebra::current() >= Algebra::On && super::t2::T2_RULES.iter().any(|rule| rule.info.allowed(&numerics)), "{numerics}");
+        // Forcing structured values builds no scope while no rule of tier 2 is allowed.
         trace::clear();
         let x = crate::array::Array::from_slice_on(&ctx, &(0..2000).map(|i| (i % 5) as f32).collect::<Vec<_>>(), 2000).unwrap();
         let sums: Vec<_> = (0..4).map(|k| (&x * (k as f32 + 1.0)).sum()).collect();
         let dependent = (&x * &sums[0]).sum();
         assert!(sums.iter().all(|s| s.item().unwrap() >= 0.0) && dependent.item().unwrap() >= 0.0);
-        assert_eq!(trace::scopes_built(), 0);
+        assert_eq!(trace::scopes_built() == 0, !ctx.jit().rules.t2_active, "{numerics}");
     }
 }

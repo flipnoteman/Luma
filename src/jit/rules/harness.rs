@@ -27,6 +27,13 @@ struct T<V> {
     data: Vec<V>,
 }
 
+impl<V: Copy> T<V> {
+    /// The element at row `r`, column `c` of this matrix broadcast to a larger one: an extent of 1 repeats.
+    fn at(&self, r: usize, c: usize) -> V {
+        self.data[(if self.rows == 1 { 0 } else { r }) * self.cols + if self.cols == 1 { 0 } else { c }]
+    }
+}
+
 trait Num: Copy {
     fn add(self, o: Self) -> Self;
     fn sub(self, o: Self) -> Self;
@@ -199,7 +206,7 @@ impl Num for Zp {
 fn eval<N: Num>(e: &E, vars: &[T<N>]) -> Option<T<N>> {
     fn zip<N: Num>(a: T<N>, b: T<N>, f: impl Fn(N, N) -> Option<N>) -> Option<T<N>> {
         let (rows, cols) = (a.rows.max(b.rows), a.cols.max(b.cols));
-        let at = |t: &T<N>, i: usize| t.data[if t.data.len() == 1 { 0 } else { i }];
+        let at = |t: &T<N>, i: usize| t.at(i / cols, i % cols);
         let data = (0..rows * cols).map(|i| f(at(&a, i), at(&b, i))).collect::<Option<Vec<_>>>()?;
         Some(T { rows, cols, data })
     }
@@ -222,7 +229,7 @@ fn eval<N: Num>(e: &E, vars: &[T<N>]) -> Option<T<N>> {
         E::Select(c, a, b) => {
             let (c, a, b) = (go(c)?, go(a)?, go(b)?);
             let (rows, cols) = (c.rows.max(a.rows).max(b.rows), c.cols.max(a.cols).max(b.cols));
-            let at = |t: &T<N>, i: usize| t.data[if t.data.len() == 1 { 0 } else { i }];
+            let at = |t: &T<N>, i: usize| t.at(i / cols, i % cols);
             let data = (0..rows * cols).map(|i| at(&c, i).select(at(&a, i), at(&b, i))).collect::<Option<Vec<_>>>()?;
             Some(T { rows, cols, data })
         }
@@ -259,6 +266,28 @@ fn eval<N: Num>(e: &E, vars: &[T<N>]) -> Option<T<N>> {
             let a = go(a)?;
             let n = a.rows.min(a.cols);
             Some(T { rows: n, cols: 1, data: (0..n).map(|i| a.data[i * a.cols + i]).collect() })
+        }
+        E::Eye(i) => {
+            let n = vars[usize::from(*i)].rows;
+            let (one, zero) = (N::cst(1.0)?, N::zero());
+            Some(T { rows: n, cols: n, data: (0..n * n).map(|p| if p / n == p % n { one } else { zero }).collect() })
+        }
+        E::Bcast { of, .. } => go(of),
+        E::Trace(a) => {
+            let a = go(a)?;
+            let n = a.rows.min(a.cols);
+            Some(T { rows: 1, cols: 1, data: vec![(0..n).fold(N::zero(), |s, i| s.add(a.data[i * a.cols + i]))] })
+        }
+        E::Cat { axis, a, b } => {
+            let (a, b) = (go(a)?, go(b)?);
+            Some(if *axis == 0 {
+                assert_eq!(a.rows, b.rows, "cat shapes");
+                let data = (0..a.rows).flat_map(|i| a.data[i * a.cols..(i + 1) * a.cols].iter().chain(&b.data[i * b.cols..(i + 1) * b.cols]).copied().collect::<Vec<_>>()).collect();
+                T { rows: a.rows, cols: a.cols + b.cols, data }
+            } else {
+                assert_eq!(a.cols, b.cols, "cat shapes");
+                T { rows: a.rows + b.rows, cols: a.cols, data: a.data.iter().chain(&b.data).copied().collect() }
+            })
         }
     }
 }
@@ -398,6 +427,19 @@ fn to_val(e: &E, vars: &[Array<f32>]) -> Val {
             let A(a) = go(a) else { panic!("diag of a constant") };
             A(a.diag(0))
         }
+        E::Eye(i) => {
+            let [_, rows, ..] = vars[usize::from(*i)].shape().dims();
+            A(Array::identity_on(vars[usize::from(*i)].context(), [rows, rows]).unwrap())
+        }
+        E::Bcast { of, .. } => go(of),
+        E::Trace(a) => {
+            let A(a) = go(a) else { panic!("trace of a constant") };
+            A(a.diag(0).sum())
+        }
+        E::Cat { axis, a, b } => {
+            let (A(a), A(b)) = (go(a), go(b)) else { panic!("cat of constants") };
+            A(crate::concat(usize::from(*axis), [&a, &b]))
+        }
     }
 }
 
@@ -495,6 +537,22 @@ fn batches(rule: &Rule, kind: Kind) -> Vec<Batch> {
             }
         }
         out.push(batch);
+    }
+    if kind != Kind::Random && !elementwise {
+        // A matrix rule: every special value meets every other in some entry, whatever the random batches draw.
+        let pool: Vec<f32> = SPECIALS.iter().copied().filter(|v| kind == Kind::Specials || v.is_finite()).collect();
+        for shift in [0, 1, 5, 11] {
+            out.push(
+                rule.shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(v, s)| {
+                        let (r, c) = dims(s, LEN);
+                        (0..r * c).map(|i| pool[(i * (2 * v + 1) + shift * (v + 1) + v) % pool.len()]).collect()
+                    })
+                    .collect(),
+            );
+        }
     }
     let strategy = match kind {
         Kind::Specials => special_heavy(false),
@@ -964,6 +1022,37 @@ fn seeded_div_same_fails_exact_finite() {
 #[test]
 fn seeded_div_same_passes_reformulating() {
     run_seeded(seeded("x / x", Class::Reformulating, div(x(0), x(0)), k(1.0)));
+}
+
+/// A matrix rule seeded with a flaw: the shapes are the rule's own.
+fn seeded_matrix(name: &'static str, class: Class, lhs: E, rhs: E, shapes: &'static [&'static [usize]]) -> Rule {
+    rule(name, class, lhs, rhs, shapes, Some(2e-5), Some("seeded"), Gate::None)
+}
+
+#[test]
+#[should_panic(expected = "Exact bit check failed")]
+fn seeded_contract_k1_without_the_plus_zero_fails_on_a_negative_zero() {
+    // Without the `+ 0.0` a product of `-0` stays `-0`; the kernels' sum starts at `+0.0`.
+    run_seeded(seeded_matrix("k1 without + 0", Class::Exact, E::Matmul(bx(x(0)), bx(x(1))), mul(x(0), x(1)), &[&[3, 1], &[1, 2]]));
+}
+
+#[test]
+#[should_panic(expected = "Exact bit check failed")]
+fn seeded_contract_identity_tagged_exact_fails_on_a_nan() {
+    run_seeded(seeded_matrix("a identity exact", Class::Exact, E::Matmul(bx(x(0)), bx(E::Eye(0))), x(0), &[&[3, 3]]));
+}
+
+#[test]
+#[should_panic(expected = "ExactFinite bit check failed")]
+fn seeded_contract_identity_tagged_exact_finite_fails_on_a_negative_zero() {
+    run_seeded(seeded_matrix("a identity exact finite", Class::ExactFinite, E::Matmul(bx(x(0)), bx(E::Eye(0))), x(0), &[&[3, 3]]));
+}
+
+#[test]
+#[should_panic(expected = "Exact bit check failed")]
+fn seeded_contract_diag_tagged_exact_fails_on_a_nan() {
+    let v = || E::Bcast { axis: 1, of: bx(x(1)) };
+    run_seeded(seeded_matrix("a diag exact", Class::Exact, E::Matmul(bx(x(0)), bx(mul(E::Eye(0), v()))), mul(x(0), v()), &[&[3, 3], &[1, 3]]));
 }
 
 #[test]

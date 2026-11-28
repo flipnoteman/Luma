@@ -107,7 +107,21 @@ fn layout(h: &mut Harness, lay: Layout, m: usize, k: usize, n: usize) {
     });
 }
 
+/// The Gram matrix `x^T x` of a tall `x` (`rules/gram`, rule 11 of W3-R4R5: tagged symmetric, the half-work kernel is W3-R6's).
+fn gram(h: &mut Harness, m: usize, n: usize) {
+    let flops = 2.0 * m as f64 * n as f64 * n as f64;
+    if !fits(h, flops) {
+        return;
+    }
+    h.guarded("rules/gram", |h| {
+        let xs = values(m * n, 21, -1.0, 1.0);
+        let x = arr(h, &xs, [n, m]);
+        h.case("rules/gram", &format!("{m}x{n}"), Work::Flops(flops), &mut || matmul_tn(&x, &x).eval().unwrap());
+    });
+}
+
 pub fn run(h: &mut Harness) {
+    gram(h, 4096, 1024);
     // Latency-bound (a launch or two) up to compute-bound (4096^3).
     layer(h, Act::Relu, 32, 256, 256);
     layer(h, Act::Relu, 256, 1024, 1024);

@@ -243,8 +243,33 @@ fn einsum_rows(h: &mut Harness) {
     }
 }
 
+/// The rewrite rules of W3-R4R5 on products (`rules/*`): what a product with a diagonal matrix, a sum of a product and a chain with a
+/// vector cost as written. At the default numerics the cases measure the products as they are; under `LUMA_NUMERICS=algebraic` the
+/// rules of tier 1 and 2 replace them (`diag_scale` and `sum_of_product` by an elementwise product and two sums, `chain3` by two
+/// matrix-vector products), which is the speed-up the cases are there to show. `shared_operand` is two products of one operand: the
+/// row W3-U4's partners kernel consumes.
+fn rules(h: &mut Harness) {
+    let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[128], &[128, 256]) } else { pick(h, &[1024], &[1024, 4096]) };
+    for &n in sizes {
+        let tag = format!("{n}x{n}");
+        let (a, b) = (upload(h, &values(n * n, 41, -1.0, 1.0), [n, n]), upload(h, &values(n * n, 42, -1.0, 1.0), [n, n]));
+        let (v, d) = (upload(h, &values(n, 43, -1.0, 1.0), [1, n]), upload(h, &values(n, 44, -1.0, 1.0), [n, 1]));
+        h.case("rules/diag_scale", &tag, Work::None, &mut || a.matmul(&d.diag_matrix(0)).eval().unwrap());
+        h.case("rules/sum_of_product", &tag, Work::None, &mut || {
+            a.matmul(&b).sum().item().unwrap();
+        });
+        h.case("rules/chain3", &tag, Work::None, &mut || a.matmul(&b).matmul(&v).eval().unwrap());
+        let w2 = upload(h, &values(n * n, 45, -1.0, 1.0), [n, n]);
+        h.case("rules/shared_operand", &tag, Work::None, &mut || {
+            a.matmul(&b).eval().unwrap();
+            a.matmul(&w2).eval().unwrap();
+        });
+    }
+}
+
 pub fn run(h: &mut Harness) {
     h.guarded("einsum", einsum_rows);
+    h.guarded("dense", rules);
     h.guarded("dense", general);
     h.guarded("dense", launches);
     h.guarded("dense", refined);

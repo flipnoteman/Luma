@@ -769,7 +769,10 @@ fn a_lazy_product_holds_no_form_until_it_is_asked_and_then_remembers_it() {
     // The transposed forms are the same product over views.
     let transposed = Array::<f32>::from_slice_on(&ctx, &(0..20).map(|i| (i % 7) as f32).collect::<Vec<_>>(), [5, 4]).unwrap();
     let nt = lhs.matmul_nt(&transposed);
-    assert_eq!(nt.structured().unwrap().form(&ctx).unwrap().structure_hash(), form.structure_hash(), "a transposed operand has the same maps");
+    // The view is composed into the map by rule 1 (`contract_view`) when the form is first made, so the maps differ but the form
+    // is of the same product.
+    let moved = nt.structured().unwrap().form(&ctx).unwrap();
+    assert!(matches!(moved.origin, Origin::Rewritten(_)) && extents(&moved) == extents(&form), "a transposed operand is read through the map");
 }
 
 #[test]
