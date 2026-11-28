@@ -381,3 +381,22 @@ fn an_infeasible_stage_falls_back_in_order() {
     assert!(stats.cuts >= 1 || stats.streamed == 0, "a stage that does not fit is cut: {stats:?}");
     assert_eq!(got, chain(SplitMode::Off).0);
 }
+
+/// A store into a multi-segment file array that is dropped before the schedule committed still reaches the file: a segment with a home
+/// is never a transient.
+#[test]
+#[ignore = "review bug 2 still open: dropping a homed storage must commit its planned segments first"]
+fn a_store_into_a_dropped_file_array_reaches_the_file() {
+    let ctx = deferring();
+    let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
+    let path = std::env::temp_dir().join(format!("luma-split-test-{}-store-drop", std::process::id()));
+    let mut target = Array::<f32>::create_on(&ctx, &path, N, luma::FileOptions::raw()).unwrap();
+    (&x * 2.0 + 1.0).store(&mut target).unwrap();
+    drop(target);
+    let want: Vec<f32> = data().iter().map(|v| v * 2.0 + 1.0).collect();
+    let bytes = std::fs::read(&path).unwrap();
+    let got: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.luma", path.display()));
+    assert_eq!(got, want);
+}

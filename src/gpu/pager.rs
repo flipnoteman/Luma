@@ -571,17 +571,23 @@ impl Segment {
 
     /// Ends the plan of a committed step: the data is what the step wrote.
     pub(crate) fn clear_planned(&self) {
-        if let Some(side) = self.side.get() {
-            *lock(&side.planned) = None;
+        // The flag is stored under the cell's lock, as `plan_for` does: the two never leave the flag false beside a planned cell.
+        match self.side.get() {
+            Some(side) => {
+                let mut cell = lock(&side.planned);
+                *cell = None;
+                self.planned_flag.store(self.failure().is_some(), Ordering::Relaxed);
+            }
+            None => self.planned_flag.store(self.failure().is_some(), Ordering::Relaxed),
         }
-        self.planned_flag.store(self.failure().is_some(), Ordering::Relaxed);
     }
 
     /// Marks the data as lost: the step that was to write it failed with `error`.
     pub(crate) fn poison(&self, error: &Arc<LumaError>) {
         let side = self.side.get_or_init(Box::default);
         let _ = side.failed.set(Arc::clone(error));
-        *lock(&side.planned) = None;
+        let mut cell = lock(&side.planned);
+        *cell = None;
         self.planned_flag.store(true, Ordering::Relaxed);
     }
 
@@ -726,6 +732,8 @@ impl Segment {
 
     /// The pack and the byte offset in it if the segment still only shows a range of it.
     pub(crate) fn window(&self) -> Option<(Arc<Storage>, u64)> {
+        // A deferred write to the pack would not be seen through the range: commit it first (a failure shows at the pin).
+        let _ = self.settle();
         match &*lock(&self.state) {
             State::Window(window) => Some((Arc::clone(&window.pack), window.offset)),
             _ => None,

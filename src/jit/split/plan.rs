@@ -179,7 +179,7 @@ pub(super) fn finish(open: &Open, steps: std::ops::Range<usize>) -> Stage {
     let order = if whole_or_in_place { SlabOrder::Ascending } else { SlabOrder::ResidentFirst };
 
     // Transients: first used by a write inside the stage, last used inside it, never read through a neighbour (those edges are cut),
-    // and held by nothing but the schedule.
+    // and held by nothing but the schedule. A segment with a home (a file) is never one: dropping its array must leave the data in the file.
     let mut candidates: Vec<(u32, u64, (u32, u32))> = Vec::new();
     for (index, array) in open.arrays.iter().enumerate() {
         let Some(first_write) = array.first_write else { continue };
@@ -189,11 +189,11 @@ pub(super) fn finish(open: &Open, steps: std::ops::Range<usize>) -> Stage {
             || array.first_use != first_write
             || array.meta.len != space.len
             || array.meta.seg_len != space.seg_len
-            || array.segments.iter().any(|segment| Arc::strong_count(segment) != 1)
+            || array.segments.iter().any(|segment| Arc::strong_count(segment) != 1 || segment.home().is_some())
         {
             continue;
         }
-        candidates.push((index as u32, array.meta.layout.bytes(space.seg_len), (array.first_use, array.last_use)));
+        candidates.push((index as u32, array.meta.layout.bytes(space.len.min(space.seg_len)), (array.first_use, array.last_use)));
     }
     // One colour per group of non-overlapping live ranges of the same buffer size: the first colour whose last range ended before this
     // one starts (visiting by start gives the fewest colours).
