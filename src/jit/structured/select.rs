@@ -1081,6 +1081,7 @@ mod tests {
             prologue: false,
             reads: FitsInputs::NONE,
             epilogue: false,
+        partners: false,
             fits,
             cost,
             split,

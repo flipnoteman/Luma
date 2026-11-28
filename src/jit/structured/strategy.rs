@@ -232,6 +232,8 @@ pub(crate) struct Strategy {
     pub(crate) prologue: bool,
     /// Can take an absorbed epilogue (false for every wave-2 strategy).
     pub(crate) epilogue: bool,
+    /// Can launch the products of `ContractionView::partners` with the subject in one kernel (W3-U4 A2): it then returns [`Output::Group`].
+    pub(crate) partners: bool,
     /// What `fits` reads besides the subject (the selection cache's key).
     pub(crate) reads: FitsInputs,
     /// Today's plan and gate functions, pure: the parameters of the run, or `None` where the strategy does not apply.
@@ -453,6 +455,10 @@ pub(crate) enum Output {
     /// `EpiProgram::outputs`, in that order. A strategy that does not take the epilogue returns `Storage`, the plain value.
     #[allow(dead_code, reason = "W3-U4: the strategies that take an epilogue construct it")]
     Epilogued(smallvec::SmallVec<[Arc<Storage>; 2]>),
+    /// The strategy launched the subject's `ContractionView::partners` with it: the subject's storage, then one per partner in order,
+    /// each with its own epilogue applied.
+    #[allow(dead_code, reason = "W3-U4: the strategies that take partners construct it")]
+    Group(smallvec::SmallVec<[Arc<Storage>; 4]>),
 }
 
 impl Output {
@@ -460,6 +466,7 @@ impl Output {
         match self {
             Output::Storage(storage) => storage,
             Output::Epilogued(mut storages) => storages.swap_remove(0),
+            Output::Group(mut storages) => storages.swap_remove(0),
         }
     }
 }

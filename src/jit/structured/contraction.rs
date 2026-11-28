@@ -18,6 +18,7 @@ use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
 use crate::jit::comprehension::Props;
 use crate::jit::structured::select;
+use smallvec::SmallVec;
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::matmul::{MatmulTile, Plan, SLICE};
 use crate::numerics::Reduced;
@@ -74,8 +75,21 @@ pub(crate) struct ContractionView<'a> {
     /// What an absorbed consumer applies to each output element (W3-U4). A strategy whose `Strategy::epilogue` is set may take it: it
     /// then returns [`Output::Epilogued`]. Any other output is the plain product, and the caller applies the program as a separate
     /// elementwise pass ([`crate::jit::structured::lazy`]).
-    #[allow(dead_code, reason = "W3-U4: absorption and the strategies' hooks read it next")]
     pub(crate) epilogue: Option<&'a EpiProgram>,
+    /// Products that share `lhs` and may be launched with this one (W3-U4 A2); empty unless a strategy of the table takes partners. A
+    /// strategy with `Strategy::partners` that launches them all returns [`Output::Group`]; any other output leaves them pending.
+    #[allow(dead_code, reason = "W3-U4: the strategies that take partners read it")]
+    pub(crate) partners: &'a [Partner],
+}
+
+/// A product that shares its left operand with the one being run: its right operand and its epilogue, as strategies read them.
+#[derive(Clone)]
+#[allow(dead_code, reason = "W3-U4: the strategies that take partners read it")]
+pub(crate) struct Partner {
+    pub(crate) rhs: Array<f32>,
+    /// The program of its absorbed epilogue and the arrays of its inputs (`EpiProgram::inputs` order); all members' programs have the
+    /// same instructions.
+    pub(crate) epilogue: Option<(Arc<EpiProgram>, SmallVec<[Array<f32>; 3]>)>,
 }
 
 impl ContractionView<'_> {
@@ -136,7 +150,7 @@ impl ContractionView<'_> {
 /// The product of `lhs` and `rhs` through the registry (the body of `matmul`, `matmul_tf32`, `matmul_f32`): an evaluated array.
 #[inline(always)]
 pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, location: &'static Location<'static>) -> Outcome<Array<f32>> {
-    let view = ContractionView { lhs, rhs, attrs, location, epilogue: None };
+    let view = ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
     let geom = view.check()?;
     let ctx = lhs.context();
     let storage = select::execute(ctx, &Subject::Contraction(&view))?.into_storage();
@@ -356,6 +370,20 @@ pub(crate) fn is_half(subject: &Subject<'_>) -> bool {
     matches!(subject, Subject::Contraction(view) if view.attrs.half)
 }
 
+/// Whether some strategy of the table launches partner products with the subject (`Strategy::partners`): the partner search runs only then.
+pub(crate) const TAKES_PARTNERS: bool = any_partners(&CONTRACTION_STRATEGIES);
+
+const fn any_partners(entries: &[Strategy]) -> bool {
+    let mut at = 0;
+    while at < entries.len() {
+        if entries[at].partners {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
 /// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
 /// first of the table that fits runs.
 #[allow(clippy::too_many_arguments)]
@@ -370,7 +398,7 @@ const fn entry(
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics, bits: BitClass(bits), baseline: true, group, prologue: false, epilogue: false, partners: false, reads, fits, cost: None, split: split_global, warm: no_warm, lower: Some(lower) }
 }
 
 /// A ragged or a padded kernel: new in this part, so not a baseline (its kernel may be compiling, or over the variant budget: the
@@ -386,6 +414,7 @@ const fn cut(id: StrategyId, name: &'static str, needs: Caps, numerics: NumClass
         group,
         prologue: false,
         epilogue: false,
+        partners: false,
         reads: FitsInputs::OPERANDS,
         fits,
         cost: Some(cost_cut),
@@ -1614,7 +1643,7 @@ mod tests {
 
     #[track_caller]
     fn selected(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request) -> StrategyId {
-        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: Location::caller(), epilogue: None };
+        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: Location::caller(), epilogue: None, partners: &[] };
         select::select(ctx, &Subject::Contraction(&view), &Residencies::DEVICE).expect("the staged tiles always fit").id
     }
 
@@ -1680,7 +1709,7 @@ mod tests {
             }
             // A CPU context has neither the host path nor the backend's own tiles: those strategies do not apply.
             let [lhs, rhs] = operands(&ctx, (64, 12, 64), [false; 2]);
-            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller(), epilogue: None };
+            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller(), epilogue: None, partners: &[] };
             for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_TF32, StrategyId::GEMM_TF32_RAGGED, StrategyId::GEMM_TF32_PADDED, StrategyId::GEMM_F32, StrategyId::GEMM_F32_RAGGED, StrategyId::GEMM_F32_PADDED] {
                 let strategy = &CONTRACTION_STRATEGIES[usize::from(id.1)];
                 assert!(admit(strategy, &Subject::Contraction(&view), &ctx, &Residencies::DEVICE).is_err(), "{}", strategy.name);
@@ -1731,7 +1760,7 @@ mod tests {
         let first = cpu_with(0, None);
         let second = cpu_with(0, None);
         let attrs = ContractionAttrs { tf32: Tf32Request::Default, half: false };
-        let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller(), epilogue: None }.check();
+        let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller(), epilogue: None, partners: &[] }.check();
         let a = Array::<f32>::zeros_on(&first, [4, 3]).unwrap();
         let b = Array::<f32>::zeros_on(&first, [5, 4]).unwrap();
         assert!(matches!(check(&a, &b), Ok(Geometry { m: 3, n: 5, k: 4 })));

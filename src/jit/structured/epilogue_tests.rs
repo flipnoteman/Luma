@@ -163,3 +163,53 @@ fn an_absorbing_site_stays_lazy() {
     }
     assert_eq!(lazy, 4, "every call is a probe here, and the site absorbed");
 }
+
+// -- partners (A2) --
+
+mod partners {
+    use super::*;
+    use crate::jit::structured::contraction::{ContractionAttrs, Tf32Request};
+    use crate::jit::structured::lazy::MAX_PARTNERS;
+
+    const ATTRS: ContractionAttrs = ContractionAttrs { tf32: Tf32Request::Default };
+
+    fn product(ctx: &Context, a: &A, b: &A) -> A {
+        let c = a.matmul(b);
+        ctx.jit().register_product(c.structured().unwrap());
+        c
+    }
+
+    fn weights(ctx: &Context, n: usize, seed: usize) -> A {
+        A::from_slice_on(ctx, &ints(n * K, seed), [n, K]).unwrap()
+    }
+
+    #[test]
+    fn products_of_one_left_operand_find_each_other() {
+        let ctx = context(LazyMode::Always);
+        let (a, w1) = operands(&ctx);
+        let (w2, w3, other) = (weights(&ctx, 5, 8), weights(&ctx, 2, 9), A::from_slice_on(&ctx, &ints(K * M, 4), [K, M]).unwrap());
+        let seed = product(&ctx, &a, &w1);
+        let (c2, c3) = (product(&ctx, &a, &w2), product(&ctx, &a, &w3));
+        let _elsewhere = product(&ctx, &other, &w1);
+        let found = seed.structured().unwrap().partner_candidates(&ctx, &a, ATTRS, None);
+        assert_eq!(found.len(), 2, "the two that share `a`, not the one over another operand");
+        // A product with an absorbed epilogue has other instructions: not a partner of a plain one.
+        let scaled = &c2 * 2.0;
+        ctx.jit().register_product(scaled.structured().unwrap());
+        assert_eq!(seed.structured().unwrap().partner_candidates(&ctx, &a, ATTRS, None).len(), 2, "the derived one has an epilogue; c2 is still a plain product");
+        // A recorded one is not a candidate.
+        let _ = c3.to_vec().unwrap();
+        assert_eq!(seed.structured().unwrap().partner_candidates(&ctx, &a, ATTRS, None).len(), 1, "c3 was recorded");
+    }
+
+    #[test]
+    fn a_group_is_at_most_four_products() {
+        let ctx = context(LazyMode::Always);
+        let (a, w1) = operands(&ctx);
+        let seed = product(&ctx, &a, &w1);
+        let rest: Vec<A> = (0..6).map(|i| product(&ctx, &a, &weights(&ctx, 3, 10 + i))).collect();
+        let found = seed.structured().unwrap().partner_candidates(&ctx, &a, ATTRS, None);
+        assert_eq!(found.len(), MAX_PARTNERS - 1);
+        drop(rest);
+    }
+}

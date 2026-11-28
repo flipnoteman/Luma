@@ -44,7 +44,7 @@ const fn entry(
     fits: fn(&Subject<'_>, &Context, &Residencies) -> Option<Params>,
     lower: fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Lowered, Failure>,
 ) -> Strategy {
-    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(bits), baseline: true, group, prologue: true, epilogue: false, reads, fits, cost: None, split: split_reduce, warm: no_warm, lower: Some(lower) }
+    Strategy { id, name, needs, numerics: NumClass::Exact, bits: BitClass(bits), baseline: true, group, prologue: true, epilogue: false, partners: false, reads, fits, cost: None, split: split_reduce, warm: no_warm, lower: Some(lower) }
 }
 
 fn split_reduce(_: &Subject<'_>, _: &Params) -> SplitClass {

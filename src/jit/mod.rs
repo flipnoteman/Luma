@@ -3155,6 +3155,8 @@ pub(crate) struct JitState {
     pub(crate) sites: structured::sites::Sites,
     /// The structured values made and not yet recorded (see [`multireduce`]), oldest first.
     structured: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
+    /// The lazy products made and not yet recorded, oldest first (the partners of W3-U4 A2 look for each other here).
+    products: Mutex<Vec<std::sync::Weak<structured::Structured>>>,
     /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
     merged_seen: Mutex<FxMap<u64, u32>>,
     /// What the rewrite engine decided when the context opened, and the programs its normaliser remembers (see [`rules`]).
@@ -3315,6 +3317,7 @@ impl JitState {
             loops: Mutex::new(FxMap::default()),
             sites: structured::sites::Sites::default(),
             structured: Mutex::new(Vec::new()),
+            products: Mutex::new(Vec::new()),
             merged_seen: Mutex::new(FxMap::default()),
             selections: Mutex::new(FxMap::default()),
             einsum_paths: Mutex::new(FxMap::default()),

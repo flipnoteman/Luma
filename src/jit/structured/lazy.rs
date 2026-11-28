@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use smallvec::SmallVec;
 
 use super::epilogue::{EpiInput, EpiMap, EpiProgram, StepOperand};
-use super::contraction::{self, ContractionAttrs, ContractionView, Geometry};
+use super::contraction::{self, ContractionAttrs, ContractionView, Geometry, Partner};
 use super::select;
 use super::sites::{LazyMode, Laziness, SiteSlot};
 use super::strategy::{Output, Subject};
@@ -132,7 +132,7 @@ fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, s
     // The default mode never reads the site: the eager path is what it was before sites existed (unless the numerics want the
     // product unforced for the rules of tier 2).
     if tuning.lazy != LazyMode::Never || super::sites::wants_unforced(ctx.numerics_ref()) {
-        let view = ContractionView { lhs, rhs, attrs, location, epilogue: None };
+        let view = ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
         match view.check() {
             Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
             Ok(geom) => {
@@ -220,6 +220,9 @@ impl Structured {
         let reader = Arc::downgrade(&leaf);
         lhs.add_reader(&reader);
         rhs.add_reader(&reader);
+        if contraction::TAKES_PARTNERS {
+            ctx.jit().register_product(&value);
+        }
         (value, leaf)
     }
 
@@ -261,13 +264,7 @@ impl Structured {
         let held = ctx.jit().hold_requested_reading(leaf_id);
         let computing = Computing::enter(leaf_id);
         let outcome = match &run.kind {
-            ContractionKind::Matmul { attrs, .. } => match &run.epilogue {
-                None => {
-                    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location, epilogue: None };
-                    select::execute(ctx, &Subject::Contraction(&view)).map(Output::into_storage)
-                }
-                Some(absorbed) => self.run_absorbed(ctx, [&lhs, &rhs], *attrs, absorbed),
-            },
+            ContractionKind::Matmul { attrs, .. } => self.run_product(ctx, [&lhs, &rhs], *attrs, run),
             ContractionKind::Batched { geom, launch } => bmm::execute(ctx, &lhs, &rhs, geom, *launch),
         };
         drop(computing);
@@ -325,14 +322,14 @@ impl ContractionRun {
         let ContractionKind::Matmul { attrs, .. } = &self.kind else { return false };
         let operands = lock(&self.operands);
         let Some([lhs, rhs]) = operands.as_ref() else { return false };
-        contraction::host_fits(&ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None }, ctx)
+        contraction::host_fits(&ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None, partners: &[] }, ctx)
     }
 
     /// The form of the product of `lhs` and `rhs` made at `location`: [`ContractionView::form`] for a `matmul`, the batched builder for
     /// `matmul_batched`.
     pub(crate) fn form(&self, lhs: &Array<f32>, rhs: &Array<f32>, location: &'static Location<'static>) -> Option<Comprehension> {
         match &self.kind {
-            ContractionKind::Matmul { attrs, .. } => rules::with_operand_props(ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None }.form(), lhs, rhs),
+            ContractionKind::Matmul { attrs, .. } => rules::with_operand_props(ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None, partners: &[] }.form(), lhs, rhs),
             ContractionKind::Batched { geom, .. } => {
                 if !Algebra::builds_forms() {
                     return None;
@@ -384,28 +381,131 @@ impl ContractionView<'_> {
 // -- absorption (W3-U4) --
 
 impl Structured {
-    /// Runs a product that has an absorbed epilogue. If the value it was derived from is alive its product is computed once for both
-    /// and the last step runs over its buffer (the cost of the unfused code). Otherwise the strategy gets the whole program; one that
-    /// does not take it returns the plain product, and the program runs as one elementwise pass over it (bit for bit what the
-    /// consumers would have computed).
-    fn run_absorbed(&self, ctx: &Context, [lhs, rhs]: [&Array<f32>; 2], attrs: ContractionAttrs, absorbed: &Absorbed) -> Result<Arc<Storage>, Failure> {
-        if let Some(parent) = absorbed.parent.upgrade() {
+    /// Runs a product that has no value to wait for. With an absorbed epilogue: if the value it was derived from is alive its product
+    /// is computed once for both and the last step runs over its buffer (the cost of the unfused code); otherwise the strategy gets the
+    /// whole program, and one that does not take it returns the plain product, over which the program runs as one elementwise pass (bit
+    /// for bit what the consumers would have computed). Pending products that share the left operand go along if a strategy takes them.
+    fn run_product(&self, ctx: &Context, [lhs, rhs]: [&Array<f32>; 2], attrs: ContractionAttrs, run: &ContractionRun) -> Result<Arc<Storage>, Failure> {
+        let absorbed = run.epilogue.as_ref();
+        if let Some(absorbed) = absorbed
+            && let Some(parent) = absorbed.parent.upgrade()
+        {
             let acc = match parent.force(ctx) {
                 Ok(storage) => Arc::clone(storage),
                 Err(error) => return Err(Failure::Inherited(Arc::clone(error))),
             };
             return apply_separately(ctx, &absorbed.delta, &absorbed.delta_arrays, Src::Buffer(acc), absorbed.shape, self.location);
         }
-        let view = ContractionView { lhs, rhs, attrs, location: self.location, epilogue: Some(&absorbed.program) };
+        let candidates = if contraction::TAKES_PARTNERS { self.partner_candidates(ctx, lhs, attrs, absorbed) } else { SmallVec::new() };
+        let partners: SmallVec<[Partner; 3]> = candidates.iter().map(|candidate| candidate.partner.clone()).collect();
+        let view = ContractionView { lhs, rhs, attrs, location: self.location, epilogue: absorbed.map(|absorbed| &*absorbed.program), partners: &partners };
         match select::execute(ctx, &Subject::Contraction(&view))? {
             Output::Epilogued(storages) => Ok(storages.into_iter().next().expect("one output")),
-            Output::Storage(storage) => {
-                if ctx.jit().recording_decisions() {
-                    ctx.jit().note_decision(Decision::new("matmul", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
+            Output::Group(storages) if storages.len() == candidates.len() + 1 => {
+                let mut storages = storages.into_iter();
+                let own = storages.next().expect("the subject's output");
+                for (candidate, storage) in candidates.iter().zip(storages) {
+                    candidate.value.finish_member(storage);
+                    ctx.jit().sites.note_partnered(candidate.slot);
                 }
-                apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location)
+                if let RunState::Contraction(run) = &self.comp().run {
+                    ctx.jit().sites.note_partnered(run.slot);
+                }
+                Ok(own)
+            }
+            output => {
+                let storage = output.into_storage();
+                match absorbed {
+                    None => Ok(storage),
+                    Some(absorbed) => {
+                        if ctx.jit().recording_decisions() {
+                            ctx.jit().note_decision(Decision::new("matmul", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
+                        }
+                        apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location)
+                    }
+                }
             }
         }
+    }
+
+    /// The pending products that could be launched with this one (the subject, whose operands were taken: `lhs` is its left one): of
+    /// this thread and context, not in a recording, with the same left operand (the same buffer or node), the same attributes and the
+    /// same epilogue instructions or none, at most [`MAX_PARTNERS`]. A product that waits for a value it was derived from is not one.
+    pub(super) fn partner_candidates(&self, ctx: &Context, lhs: &Array<f32>, attrs: ContractionAttrs, absorbed: Option<&Absorbed>) -> SmallVec<[Candidate; 3]> {
+        let mut found = SmallVec::new();
+        if self.in_recording || ctx.recording_here() {
+            return found;
+        }
+        let Ok(mine) = lhs.src() else { return found };
+        for value in lock(&ctx.jit().products).iter().filter_map(Weak::upgrade) {
+            if found.len() + 1 >= MAX_PARTNERS {
+                break;
+            }
+            let RunState::Contraction(run) = &value.comp().run else { continue };
+            let ContractionKind::Matmul { attrs: theirs } = &run.kind else { continue };
+            if std::ptr::eq(Arc::as_ptr(&value), self) || *theirs != attrs || !value.is_unforced() || value.forcing.load(Ordering::Relaxed) || value.in_recording || value.thread != self.thread || value.failure().is_some() {
+                continue;
+            }
+            let same_epilogue = match (&run.epilogue, absorbed) {
+                (None, None) => true,
+                (Some(theirs), Some(mine)) => theirs.parent.strong_count() == 0 && theirs.program.instrs == mine.program.instrs && theirs.program.outputs == mine.program.outputs,
+                _ => false,
+            };
+            if !same_epilogue {
+                continue;
+            }
+            let operands = lock(&run.operands);
+            let Some([their_lhs, their_rhs]) = operands.as_ref() else { continue };
+            if their_lhs.shape() != lhs.shape() || their_lhs.src().ok().is_none_or(|theirs| !same_source(&theirs, &mine)) {
+                continue;
+            }
+            let partner = Partner { rhs: their_rhs.clone(), epilogue: run.epilogue.as_ref().map(|theirs| (Arc::clone(&theirs.program), theirs.arrays.clone())) };
+            let slot = run.slot;
+            drop(operands);
+            found.push(Candidate { value, partner, slot });
+        }
+        found
+    }
+
+    /// Takes `storage`, which a group launch computed together with another value's product, as the result: the operands are released
+    /// as if the value had been recorded alone.
+    fn finish_member(&self, storage: Arc<Storage>) {
+        if let RunState::Contraction(run) = &self.comp().run {
+            drop(lock(&run.operands).take());
+        }
+        drop(lock(&self.comp().form).take());
+        self.adopt(storage);
+    }
+}
+
+/// The most products one launch takes (the subject and its partners).
+pub(crate) const MAX_PARTNERS: usize = 4;
+
+/// A pending product that may be launched with the one being recorded.
+pub(super) struct Candidate {
+    value: Arc<Structured>,
+    partner: Partner,
+    slot: SiteSlot,
+}
+
+/// Whether two operands are the same buffer or the same pending node.
+fn same_source(a: &Src, b: &Src) -> bool {
+    match (a, b) {
+        (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+        (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+impl crate::jit::JitState {
+    /// Lists the lazy product `value` for the partner search (see [`Structured::partner_candidates`]).
+    pub(crate) fn register_product(&self, value: &Arc<Structured>) {
+        let mut list = lock(&self.products);
+        // Dead or recorded ones are dropped as the list doubles.
+        if list.len() >= 32 && list.len().is_power_of_two() {
+            list.retain(|weak| weak.upgrade().is_some_and(|value| value.is_unforced()));
+        }
+        list.push(Arc::downgrade(value));
     }
 }
 
@@ -555,6 +655,9 @@ fn absorb<T: GpuType, O: ScalarType>(this: &Array<T>, base: &Arc<Structured>, op
     let reader = Arc::downgrade(&leaf);
     for array in operands.iter().chain(&all) {
         array.add_reader(&reader);
+    }
+    if contraction::TAKES_PARTNERS {
+        ctx.jit().register_product(&value);
     }
     run.absorbed_from.store(true, Ordering::Relaxed);
     ctx.jit().sites.note_absorbed(run.slot);
