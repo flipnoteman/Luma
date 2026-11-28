@@ -349,6 +349,28 @@ pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool) -> St
     )
 }
 
+/// The kernel of [`Builtin::MatmulEpilogue`]: [`builtin_source`] with the epilogue of the interned form `form` at its stores, its
+/// inputs the buffers `e0, ..` after `b`, its scalars the fields of the uniform after `kc`.
+pub(crate) fn builtin_epilogue_source(tile: MatmulTile, aligned: bool, split: bool, form: u16) -> String {
+    let form = crate::jit::comprehension::lower::contract::form(form);
+    let mut binding = 3;
+    let inputs = crate::jit::epilogue_bindings(&form, &mut binding);
+    let mut src = format!(
+        "struct Params {{ m: u32, n: u32, k: u32, kc: u32, {} }}
+@group(1) @binding(0) var<storage, read_write> c: array<f32>;
+@group(1) @binding(1) var<storage, read> a: array<f32>;
+@group(1) @binding(2) var<storage, read> b: array<f32>;
+{inputs}@group(1) @binding({binding}) var<uniform> p: Params;
+{}{}",
+        crate::jit::epilogue_fields(&form, 0),
+        crate::jit::epilogue_function(&form, 0),
+        body(tile, aligned, split, MatmulOperand::Buffer, MatmulOperand::Buffer, &form)
+    );
+    let helpers = crate::builtin::special_helpers(|needle| src.contains(needle));
+    src.push_str(&helpers);
+    src
+}
+
 /// How the kernel reads one operand.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum MatmulOperand {
@@ -424,15 +446,23 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         rhs: Load { fused: rhs.fused(), lanes: if rhs == MatmulOperand::Transposed { Lanes::AlongK } else { Lanes::AlongRows } },
         batch: form.batch,
     };
-    debug_assert!(form.is_default() || matches!(tile, MatmulTile::T32), "a generic contraction runs on the T32 tile");
+    debug_assert!(!form.is_generic() || matches!(tile, MatmulTile::T32), "a generic contraction runs on the T32 tile");
+    debug_assert!(form.epilogue.is_none() || !split || matches!(tile, MatmulTile::Skinny { .. }), "an epilogue runs where the slices of K are not summed after");
+    let epi = form.epilogue.is_some();
+    debug_assert!(!epi || !matches!(tile, MatmulTile::T128Half | MatmulTile::GemmHalf { .. } | MatmulTile::NativeHalf { .. }), "a half-work kernel mirrors its stores: no epilogue");
     match tile {
-        MatmulTile::T128 => t128(aligned, split, &loads, false),
-        MatmulTile::T128Half => t128(aligned, split, &loads, true),
-        MatmulTile::T128x32 => t128x32(aligned, split, &loads),
-        MatmulTile::T32x128 => t32x128(aligned, split, &loads),
+        MatmulTile::T128 => t128(aligned, split, &loads, false, epi),
+        MatmulTile::T128Half => t128(aligned, split, &loads, true, epi),
+        MatmulTile::T128x32 => t128x32(aligned, split, &loads, epi),
+        MatmulTile::T32x128 => t32x128(aligned, split, &loads, epi),
         MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::NativeHalf { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } | MatmulTile::GemmHalf { .. } => t32(aligned, split, &loads, form),
-        MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
+        MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads, epi),
     }
+}
+
+/// The value a store writes: `v` itself, or with an epilogue `luma_store(r, col, v)` (row `r`, column `col` of the output).
+fn stored(epi: bool, r: &str, col: &str, v: &str) -> String {
+    if epi { format!("luma_store({r}, {col}, {v})") } else { v.to_owned() }
 }
 
 /// One operand of the kernel: whether it is a function, and how its slices are divided.
@@ -551,7 +581,7 @@ fn t128_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Str
     format!("fn {name}({base}: u32, k0: u32, e: u32{args}) -> vec4<f32> {{\n{body}\n}}")
 }
 
-fn t128(aligned: bool, split: bool, loads: &Loads, half: bool) -> String {
+fn t128(aligned: bool, split: bool, loads: &Loads, half: bool, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
@@ -566,17 +596,7 @@ fn t128(aligned: bool, split: bool, loads: &Loads, half: bool) -> String {
         for h in 0..2 {
             decl += &format!("var c{} = vec4<f32>(0.0);\n    ", i * 2 + h);
             let (row, col) = ((i / 4) * 64 + i % 4, h * 64);
-            let writes = if aligned {
-                format!(
-                    "let i = {out}r * p.n + col;
-        c[i] = v.x; c[i + 1u] = v.y; c[i + 2u] = v.z; c[i + 3u] = v.w;"
-                )
-            } else {
-                let lanes: Vec<String> = (0..4)
-                    .map(|j| format!("if (col + {j}u < p.n) {{ c[i{}] = v.{}; }}", if j == 0 { String::new() } else { format!(" + {j}u") }, LANES[j]))
-                    .collect();
-                format!("if (r < p.m) {{\n            let i = {out}r * p.n + col;\n            {}\n        }}", lanes.join("\n            "))
-            };
+            let writes = vec4_writes(aligned, out, epi);
             // A half-work kernel stores an off-diagonal tile's transpose too.
             let mirror = if !half {
                 String::new()
@@ -690,15 +710,17 @@ fn t32(aligned: bool, split: bool, loads: &Loads, form: &ContractForm) -> String
     // A batch writes its layer at `zi * p.sc`.
     let out = if loads.batch { "zi * p.sc + " } else { out };
     // Rows `lid.y` and `lid.y + 16`, columns `lid.x` and `lid.x + 16` of the tile.
+    let epi = form.epilogue.is_some();
     let store = |acc: &str, row: &str, col: &str| {
+        let value = stored(epi, "r", "col", acc);
         if aligned {
-            format!("{{ let r = row0 + {row}; let col = col0 + {col}; c[{out}r * p.n + col] = {acc}; }}\n    ")
+            format!("{{ let r = row0 + {row}; let col = col0 + {col}; c[{out}r * p.n + col] = {value}; }}\n    ")
         } else {
-            format!("{{ let r = row0 + {row}; let col = col0 + {col}; if (r < p.m && col < p.n) {{ c[{out}r * p.n + col] = {acc}; }} }}\n    ")
+            format!("{{ let r = row0 + {row}; let col = col0 + {col}; if (r < p.m && col < p.n) {{ c[{out}r * p.n + col] = {value}; }} }}\n    ")
         }
     };
     // A product that is not a sum of multiplications must not combine the zeros that pad the last slice of K.
-    let steps = if form.is_default() || aligned { "16u".to_owned() } else { format!("min(16u, {k_end} - k0)") };
+    let steps = if !form.is_generic() || aligned { "16u".to_owned() } else { format!("min(16u, {k_end} - k0)") };
     let init = form.identity();
     let (u00, u01, u10, u11) = (form.update("c00", "a0", "b0"), form.update("c01", "a0", "b1"), form.update("c10", "a1", "b0"), form.update("c11", "a1", "b1"));
     let private = if loads.batch { "var<private> zi: u32 = 0u;\n" } else { "" };
@@ -752,24 +774,31 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     )
 }
 
-/// The statements storing accumulator `acc` (a `vec4`) at row `row`, columns from `col` of a tile.
-fn store_vec4(aligned: bool, out: &str, row: &str, col: &str, acc: &str) -> String {
+/// The writes of the `vec4` `v` at row `r`, columns from `col` (both in scope), through `luma_store` with an epilogue.
+fn vec4_writes(aligned: bool, out: &str, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
-    let writes = if aligned {
-        format!("let i = {out}r * p.n + col;\n        c[i] = v.x; c[i + 1u] = v.y; c[i + 2u] = v.z; c[i + 3u] = v.w;")
+    let value = |j: usize| stored(epi, "r", &if j == 0 { "col".to_owned() } else { format!("col + {j}u") }, &format!("v.{}", LANES[j]));
+    if aligned {
+        let writes: Vec<String> = (0..4).map(|j| format!("c[i{}] = {};", if j == 0 { String::new() } else { format!(" + {j}u") }, value(j))).collect();
+        format!("let i = {out}r * p.n + col;\n        {}", writes.join(" "))
     } else {
         let lanes: Vec<String> = (0..4)
-            .map(|j| format!("if (col + {j}u < p.n) {{ c[i{}] = v.{}; }}", if j == 0 { String::new() } else { format!(" + {j}u") }, LANES[j]))
+            .map(|j| format!("if (col + {j}u < p.n) {{ c[i{}] = {}; }}", if j == 0 { String::new() } else { format!(" + {j}u") }, value(j)))
             .collect();
         format!("if (r < p.m) {{\n            let i = {out}r * p.n + col;\n            {}\n        }}", lanes.join("\n            "))
-    };
+    }
+}
+
+/// The statements storing accumulator `acc` (a `vec4`) at row `row`, columns from `col` of a tile.
+fn store_vec4(aligned: bool, out: &str, row: &str, col: &str, acc: &str, epi: bool) -> String {
+    let writes = vec4_writes(aligned, out, epi);
     format!("{{\n        let r = row0 + {row};\n        let col = col0 + {col};\n        let v = {acc};\n        {writes}\n    }}\n    ")
 }
 
 /// `MatmulTile::T128x32`: 128 rows by 32 columns, the rows staged as in `T128` and the columns
 /// as in `T32`; each invocation owns 8 rows (two groups of 4, 64 apart) of columns `lid.x` and
 /// `lid.x + 16`.
-fn t128x32(aligned: bool, split: bool, loads: &Loads) -> String {
+fn t128x32(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
@@ -783,7 +812,7 @@ fn t128x32(aligned: bool, split: bool, loads: &Loads) -> String {
             decl += &format!("var c{i}_{h} = 0.0;\n    ");
             let (row, col) = (format!("{} + lid.y * 4u", (i / 4) * 64 + i % 4), format!("{} + lid.x", h * 16));
             let guard = if aligned { String::new() } else { " if (r < p.m && col < p.n)".to_owned() };
-            let write = format!("c[{out}r * p.n + col] = c{i}_{h};");
+            let write = format!("c[{out}r * p.n + col] = {};", stored(epi, "r", "col", &format!("c{i}_{h}")));
             store += &if aligned {
                 format!("{{ let r = row0 + {row}; let col = col0 + {col}; {write} }}\n    ")
             } else {
@@ -843,7 +872,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 
 /// `MatmulTile::T32x128`: 32 rows by 128 columns, the rows staged as in `T32` and the columns
 /// as in `T128`; each invocation owns rows `lid.y` and `lid.y + 16`, two groups of 4 columns.
-fn t32x128(aligned: bool, split: bool, loads: &Loads) -> String {
+fn t32x128(aligned: bool, split: bool, loads: &Loads, epi: bool) -> String {
     let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
     let Range { declare, k_begin, k_end, out } = range(aligned, split);
@@ -854,7 +883,7 @@ fn t32x128(aligned: bool, split: bool, loads: &Loads) -> String {
     for i in 0..2 {
         for h in 0..2 {
             decl += &format!("var c{} = vec4<f32>(0.0);\n    ", i * 2 + h);
-            store += &store_vec4(aligned, out, &format!("{} + lid.y", i * 16), &format!("{} + lid.x * 4u", h * 64), &format!("c{}", i * 2 + h));
+            store += &store_vec4(aligned, out, &format!("{} + lid.y", i * 16), &format!("{} + lid.x * 4u", h * 64), &format!("c{}", i * 2 + h), epi);
         }
     }
     for u in 0..2 {
@@ -920,7 +949,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 ///
 /// Rows and columns past the output read the last row (column) and are not stored: the loop
 /// carries no bounds checks.
-fn skinny(rows: u32, cols: u32, groups: u32, width: u32, along_k: bool, loads: &Loads) -> String {
+fn skinny(rows: u32, cols: u32, groups: u32, width: u32, along_k: bool, loads: &Loads, epi: bool) -> String {
     let per_group = width / groups;
     let mut decl = String::new();
     let mut bases = String::new();
@@ -942,7 +971,7 @@ fn skinny(rows: u32, cols: u32, groups: u32, width: u32, along_k: bool, loads: &
             decl += &format!("    var c{i}_{j} = 0.0;\n");
             write += &format!("            part[o + {e}u * q] = c{i}_{j};\n");
             read += &format!("            c{i}_{j} += part[o + {e}u * q];\n");
-            store += &format!("    if (g == 0u && live && m0 + {i}u < p.m && n0 + {j}u < p.n) {{ c[ob + {i}u * p.n + {j}u] = c{i}_{j}; }}\n");
+            store += &format!("    if (g == 0u && live && m0 + {i}u < p.m && n0 + {j}u < p.n) {{ c[ob + {i}u * p.n + {j}u] = {}; }}\n", stored(epi, &format!("m0 + {i}u"), &format!("n0 + {j}u"), &format!("c{i}_{j}")));
         }
     }
     // One `k` of this invocation: all the loads first, then the multiply-adds.

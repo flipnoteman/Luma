@@ -29,6 +29,8 @@ pub(crate) mod telemetry;
 #[cfg(test)]
 mod epilogue_tests;
 #[cfg(test)]
+mod hook_tests;
+#[cfg(test)]
 mod lazy_tests;
 
 use super::comprehension::{Comprehension, OpTag};

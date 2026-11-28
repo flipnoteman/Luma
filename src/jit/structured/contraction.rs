@@ -8,7 +8,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use super::emit::Emit;
-use super::epilogue::EpiProgram;
+use super::epilogue::{EpiMap, EpiProgram};
 use super::strategy::{BitClass, Estimate, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
@@ -18,6 +18,7 @@ use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
 use crate::jit::comprehension::Props;
 use crate::jit::structured::select;
+use crate::jit::program::Ref;
 use smallvec::SmallVec;
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::matmul::{MatmulTile, Plan, SLICE};
@@ -372,8 +373,8 @@ pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 10] = [
     cut(StrategyId::GEMM_F32_RAGGED, "gemm-f32-ragged", Caps::GEMM_TILES, NumClass::Exact, 4, 4, fits_gemm_f32_ragged),
     cut(StrategyId::GEMM_F32_PADDED, "gemm-f32-padded", Caps::GEMM_TILES, NumClass::Exact, 4, 4, fits_gemm_f32_padded),
     entry(StrategyId::CONTRACTION_NATIVE_CPU, "native-cpu", Caps::NATIVE_GEMM, FitsInputs::NONE, NumClass::Exact, 5, 5, fits_native_cpu, lower_gemm),
-    entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 6, 6, fits_skinny, lower_skinny),
-    entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), FitsInputs::NONE, NumClass::Exact, 7, 7, fits_tiled, lower_tiled),
+    epilogued(entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 6, 6, fits_skinny, lower_skinny)),
+    epilogued(entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), FitsInputs::NONE, NumClass::Exact, 7, 7, fits_tiled, lower_tiled)),
 ];
 
 /// The table a Gram product (`ContractionAttrs::half`) is tried against before [`CONTRACTION_STRATEGIES`]: `select::execute` consults
@@ -404,6 +405,12 @@ const fn any_partners(entries: &[Strategy]) -> bool {
         at += 1;
     }
     false
+}
+
+/// `strategy` that applies an absorbed epilogue at its stores (see [`epilogue_of`]).
+const fn epilogued(mut strategy: Strategy) -> Strategy {
+    strategy.epilogue = true;
+    strategy
 }
 
 /// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
@@ -459,6 +466,11 @@ fn no_warm(_: &Subject<'_>, _: &Params, _: &Context) -> Result<Warm, Failure> {
 
 fn done(storage: Arc<Storage>) -> Result<Lowered, Failure> {
     Ok(Lowered::Done(Output::Storage(storage)))
+}
+
+/// [`done`] for a launch that applied the epilogue (`applied`): its one output.
+fn finish(storage: Arc<Storage>, applied: bool) -> Result<Lowered, Failure> {
+    if applied { Ok(Lowered::Done(Output::Epilogued(smallvec::smallvec![storage]))) } else { done(storage) }
 }
 
 /// What every `lower` starts from: its view and its parameters, and a way to get the plan of its strategy once the operands are
@@ -692,7 +704,7 @@ fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, l
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
     let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, layouts) } else { 0 };
-    done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)))?)
+    done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)), None)?)
 }
 
 /// `array` in a buffer of its own whose leading dimension is a multiple of 4: zero columns appended to its first axis (an expression,
@@ -844,7 +856,7 @@ fn lower_syrk(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Re
     if base == StrategyId::CONTRACTION_TILED {
         let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
         let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
-        return done(launch(ctx, sides, plan, params.geom, None)?);
+        return done(launch(ctx, sides, plan, params.geom, None, None)?);
     }
     if is_padded(base) {
         let copied = copies(view, base);
@@ -893,7 +905,8 @@ fn lower_skinny(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> 
             sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
         }
     }
-    done(launch(ctx, sides, plan, geom, None)?)
+    let applied = epilogue_of(view, geom, &plan)?;
+    finish(launch(ctx, sides, plan, geom, None, applied.as_ref())?, applied.is_some())
 }
 
 /// The staged tiles: always (the plan fails only when the grid is too large, which `lower` reports).
@@ -907,7 +920,80 @@ fn lower_tiled(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> R
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
     let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
     let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
-    done(launch(ctx, sides, plan, params.geom, None)?)
+    let applied = epilogue_of(view, params.geom, &plan)?;
+    finish(launch(ctx, sides, plan, params.geom, None, applied.as_ref())?, applied.is_some())
+}
+
+// -- epilogues --
+
+/// An epilogue a launch applies at the stores of its kernel: the interned form that holds its structure (`ContractForm`), the storages
+/// of its inputs in the order of the program, and the words of its scalars.
+struct Applied {
+    form: u16,
+    inputs: Vec<Arc<Storage>>,
+    scalars: Vec<u32>,
+}
+
+/// Whether the shader kernels can apply `program`: one stored value, and per element `f32` arithmetic of the operations the elementwise
+/// kernels write inline (no helper functions, no bit operations), over `f32` inputs and scalars.
+fn epilogue_fits(program: &EpiProgram) -> bool {
+    use crate::jit::program::Instr;
+    let f32_instr = |instr: &Instr| {
+        let kind = match instr.op.kind {
+            OpKind::Unary(op) => !op.needs_helper() && !op.is_bitwise(),
+            OpKind::Binary(op) => !op.needs_helper() && !op.is_bitwise(),
+            OpKind::Compare(_) | OpKind::Clamp | OpKind::Powf | OpKind::Select => true,
+            _ => false,
+        };
+        let args_ok = instr.args.iter().enumerate().all(|(at, arg)| match arg {
+            Ref::Unused => true,
+            Ref::Sub(_) => false,
+            _ => instr.op.operand_ty(at) == ElemTy::F32 || (at == 0 && matches!(instr.op.kind, OpKind::Select)),
+        });
+        kind && args_ok && instr.op.ty == ElemTy::F32
+    };
+    program.outputs.len() == 1
+        && program.uses_acc()
+        && program.validate(0).is_ok()
+        && program.instrs.iter().all(f32_instr)
+        && program.instrs.get(program.outputs[0] as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32)
+        && program.inputs.iter().all(|input| input.ty == ElemTy::F32)
+        && program.scalars.iter().all(|scalar| scalar.ty == ElemTy::F32)
+}
+
+/// The epilogue of `view` as `plan` can apply it: the plan writes its output once (K is not split into slices summed after), the program
+/// is one the kernels take ([`epilogue_fits`]) and its inputs are evaluated arrays of the extent their map reads. `None` runs the product
+/// plain, for the caller to apply the program as a separate pass.
+fn epilogue_of(view: &ContractionView<'_>, geom: Geometry, plan: &Plan) -> Result<Option<Applied>, Failure> {
+    let Some(program) = view.epilogue else { return Ok(None) };
+    if plan.slices > 1 || !epilogue_fits(program) {
+        return Ok(None);
+    }
+    let (m, n) = (u64::from(geom.m), u64::from(geom.n));
+    let mut inputs = Vec::with_capacity(program.inputs.len());
+    for input in &program.inputs {
+        let storage = match &input.src {
+            Src::Buffer(storage) => Arc::clone(storage),
+            Src::Node(node) => match node.force() {
+                Ok(storage) => Arc::clone(storage),
+                Err(error) => return Err(Failure::Inherited(Arc::clone(error))),
+            },
+            Src::Scalar(_) => return Ok(None),
+        };
+        let needed = match input.map {
+            EpiMap::Point => m * n,
+            EpiMap::AlongRows => m,
+            EpiMap::AlongCols => n,
+            EpiMap::Scalar => 1,
+        };
+        if storage.segments() != 1 || (storage.len() as u64) < needed {
+            return Ok(None);
+        }
+        inputs.push(storage);
+    }
+    let form = crate::jit::comprehension::lower::contract::intern_form(crate::jit::comprehension::lower::contract::ContractForm::with_epilogue(program.key()));
+    let scalars = program.scalars.iter().map(|scalar| scalar.bits as u32).collect();
+    Ok(Some(Applied { form, inputs, scalars }))
 }
 
 // -- launch --
@@ -920,7 +1006,7 @@ fn extent(off: u32, rows: u32, cols: u32, ld: u32) -> u64 {
 /// Records the product of `sides` into a new buffer: one launch of the kernel of `plan`, and the sum of its slices if it was split.
 /// `layouts` are the operands' leading dimensions and offsets for the backend's own kernels (which read eight words of uniform),
 /// `None` for the shader kernels.
-fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<([Layout; 2], u32)>) -> Result<Arc<Storage>, Failure> {
+fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, layouts: Option<([Layout; 2], u32)>, epilogue: Option<&Applied>) -> Result<Arc<Storage>, Failure> {
     let Geometry { m: m32, n: n32, k: k32 } = geom;
     let len = Shape::from([n32 as usize, m32 as usize, 1, 1]).validate()?;
     let words = match layouts {
@@ -946,7 +1032,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
         None => (out_pin.buffer(), out_bytes),
     };
-    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: 0 };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: epilogue.map_or(0, |applied| applied.form) };
     let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0];
     let words = match words {
         Some((extra, tri)) => {
@@ -958,7 +1044,16 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         None => &uniform[..4],
     };
     let out = RawArg::write(target, target_bytes);
+    // The epilogue's inputs stay pinned while the kernel is recorded.
+    let input_pins = match epilogue {
+        Some(applied) => applied.inputs.iter().map(|input| input.pin_single_read().map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
     match sides {
+        sides if epilogue.is_some() => {
+            let inputs: Vec<RawArg<'_>> = input_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)).collect();
+            jit::matmul_epilogue(ctx, sides, kernel, words, &[], plan.groups, out, &inputs, epilogue.map_or(&[][..], |applied| &applied.scalars))?;
+        }
         // Both operands evaluated: nothing to fuse, the kernel reads their buffers (what `jit::matmul` does for such sides).
         [MatmulSide::Ready(a, a_bytes), MatmulSide::Ready(b, b_bytes)] => {
             let core = ctx.builtin(Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split }, "f32")?;

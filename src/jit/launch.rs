@@ -2479,7 +2479,8 @@ fn flatten_operands(
         let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, lhs: operand(0), rhs: operand(1), form: kernel.form };
         let fused = flatten(&roots, tail)?;
         drop(roots);
-        Ok(fusable(ctx, &fused, 2 - sides.len()).then_some(fused))
+        let epilogue_inputs = crate::jit::comprehension::lower::contract::form(kernel.form).epilogue.as_ref().map_or(0, |epi| epi.inputs.len());
+        Ok(fusable(ctx, &fused, 2 - sides.len() + epilogue_inputs).then_some(fused))
     };
     loop {
         let live: Vec<usize> = (0..2).filter(|&s| slots[s].is_some()).collect();
@@ -2572,6 +2573,23 @@ pub(crate) fn matmul_with(
     groups: [u32; 3],
     out: RawArg<'_>,
 ) -> Result<(), Failure> {
+    matmul_epilogue(ctx, sides, kernel, words, extra, groups, out, &[], &[])
+}
+
+/// [`matmul_with`] for a kernel that applies an epilogue (`kernel.form` has one): `epilogue_inputs` are its inputs, bound after the
+/// operands in order, and `scalars` its scalars, the last words of the uniform.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_epilogue(
+    ctx: &crate::context::Context,
+    sides: [MatmulSide; 2],
+    kernel: MatmulKernel,
+    words: &[u32],
+    extra: &[u32],
+    groups: [u32; 3],
+    out: RawArg<'_>,
+    epilogue_inputs: &[RawArg<'_>],
+    epilogue_scalars: &[u32],
+) -> Result<(), Failure> {
     let mut slots: [Option<Arc<Node>>; 2] = [None, None];
     let mut ready: [Option<(Pin, u64)>; 2] = [None, None];
     for (s, side) in sides.into_iter().enumerate() {
@@ -2586,13 +2604,26 @@ pub(crate) fn matmul_with(
     let transposed = [0, 1].map(|s| slots[s].as_ref().is_some_and(|node| stored_transposed(node, dims[s])));
     let fused = flatten_operands(ctx, kernel, transposed, &mut slots, &mut ready)?;
     let Some(fused) = fused else {
-        if kernel.form != 0 {
+        let form = crate::jit::comprehension::lower::contract::form(kernel.form);
+        if form.is_generic() {
             return Err(Failure::New(LumaError::Unsupported("a generic contraction needs its operands fused into the kernel".into())));
         }
-        let core = ctx.builtin(Builtin::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split }, "f32")?;
         let (Some((a, a_bytes)), Some((b, b_bytes))) = (&ready[0], &ready[1]) else {
             return Err(Failure::New(LumaError::Gpu("matrix product operand neither evaluated nor fused".into())));
         };
+        if form.epilogue.is_some() {
+            let core = ctx.builtin(Builtin::MatmulEpilogue { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, form: kernel.form }, "f32")?;
+            let mut uniform = Vec::with_capacity(words.len() + epilogue_scalars.len());
+            uniform.extend_from_slice(words);
+            uniform.extend_from_slice(epilogue_scalars);
+            let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(4 + epilogue_inputs.len());
+            raw.extend([out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes)]);
+            raw.extend_from_slice(epilogue_inputs);
+            raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+            ctx.launch(&core, groups, size, &raw)?;
+            return Ok(());
+        }
+        let core = ctx.builtin(Builtin::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split }, "f32")?;
         ctx.launch(&core, groups, size, &[out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes), RawArg::Uniform(bytemuck::cast_slice(words))])?;
         return Ok(());
     };
@@ -2601,14 +2632,16 @@ pub(crate) fn matmul_with(
     drop((fused_nodes, instr_nodes, sub_roots));
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
-    let mut uniform = Vec::with_capacity(words.len() + extra.len() + scalars.len());
+    let mut uniform = Vec::with_capacity(words.len() + extra.len() + scalars.len() + epilogue_scalars.len());
     uniform.extend_from_slice(words);
     uniform.extend_from_slice(extra);
     uniform.extend_from_slice(&scalars);
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
+    uniform.extend_from_slice(epilogue_scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4 + epilogue_inputs.len());
     raw.push(out);
     raw.extend(pins.iter().map(InPin::raw));
     raw.extend(ready.iter().flatten().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend_from_slice(epilogue_inputs);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, size, &raw)?;
     Ok(())

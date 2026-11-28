@@ -19,6 +19,7 @@ use crate::context::RawArg;
 use crate::jit::comprehension::roles::{infer_contraction_roles, separate, Roles};
 use crate::jit::comprehension::{CombineOp, CombinePart, Compensation, DimKind, Epilogue, MAX_DIMS};
 use crate::jit::program::{Instr, Ref};
+use crate::jit::structured::epilogue::EpiKey;
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::matmul::MatmulTile;
 use crate::context::Context;
@@ -253,7 +254,7 @@ impl Prepared {
         let len = (self.m * self.n * self.batch) as usize;
         let storage = Arc::new(Storage::new(ctx, len, ElemTy::F32.layout()));
         let pin = storage.pin_single()?;
-        let id = intern_form(ContractForm { mac: self.mac.clone(), batch: self.batch > 1 });
+        let id = intern_form(ContractForm { mac: self.mac.clone(), batch: self.batch > 1, epilogue: None });
         let kernel = jit::MatmulKernel { tile, aligned, split: false, form: id };
         let extra: &[u32] = if self.batch > 1 { &[batch, m * k, k * n, m * n] } else { &[] };
         jit::matmul_with(ctx, sides, kernel, &[m, n, k, k], extra, [x, y, batch.max(1)], RawArg::write(pin.buffer(), storage.byte_len()))?;
@@ -272,6 +273,9 @@ pub(crate) struct ContractForm {
     /// A batch of products in the third grid dimension: the uniform has `nb, sa, sb, sc` after `kc` (the batch count and the strides
     /// of the batch in `lhs`, `rhs` and the output, in elements).
     pub(crate) batch: bool,
+    /// What the kernel applies to each output element as it stores it (W3-U4 §B, `luma_store`): the structure of an epilogue
+    /// program; its inputs are extra read bindings after `a` and `b` and its scalars the last words of the uniform.
+    pub(crate) epilogue: Option<EpiKey>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -284,11 +288,21 @@ pub(crate) enum Mac {
 }
 
 impl ContractForm {
-    pub(crate) const DEFAULT: ContractForm = ContractForm { mac: Mac::Fma, batch: false };
+    pub(crate) const DEFAULT: ContractForm = ContractForm { mac: Mac::Fma, batch: false, epilogue: None };
 
     /// Whether this is today's kernel.
     pub(crate) fn is_default(&self) -> bool {
         *self == ContractForm::DEFAULT
+    }
+
+    /// Whether the product is other than `acc = fma(a, b, acc)` over one matrix (a generic contraction, which runs on the `T32` tile).
+    pub(crate) fn is_generic(&self) -> bool {
+        self.batch || !matches!(self.mac, Mac::Fma)
+    }
+
+    /// The default product with the epilogue `epilogue` applied at its stores.
+    pub(crate) fn with_epilogue(epilogue: EpiKey) -> ContractForm {
+        ContractForm { epilogue: Some(epilogue), ..ContractForm::DEFAULT }
     }
 
     /// The accumulator update of `acc` with the loads `a` and `b`.

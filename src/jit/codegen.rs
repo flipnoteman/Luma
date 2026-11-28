@@ -32,6 +32,8 @@ use super::calls;
 use super::inline::{Inlined, Lowered, Region};
 use super::kirgen;
 use super::params;
+use super::comprehension::lower::contract::ContractForm;
+use super::structured::epilogue::EpiMap;
 use super::program::{FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::signed;
@@ -783,6 +785,9 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         for (k, ty) in key.scalar_tys.iter().enumerate() {
             let _ = write!(src, "s{k}: {}, ", ty.wgsl());
         }
+        if let Tail::Matmul { form, .. } = key.tail {
+            src.push_str(&epilogue_fields(&crate::jit::comprehension::lower::contract::form(form), key.scalar_tys.len()));
+        }
         if let Tail::Reduce(ops) = key.tail {
             src.push_str(&ops.epilogue_fields());
         }
@@ -866,6 +871,10 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                 binding += 1;
             }
         }
+    }
+    if let Tail::Matmul { form, .. } = key.tail {
+        // The inputs of the epilogue, after the operands.
+        src.push_str(&epilogue_bindings(&crate::jit::comprehension::lower::contract::form(form), &mut binding));
     }
     if let Tail::AxisReduce(pass) = key.tail
         && pass.scan
@@ -1024,7 +1033,9 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                     src.push_str(&load_function(function, key, root, inlined, &names, index, segmented));
                 }
             }
-            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs, &crate::jit::comprehension::lower::contract::form(form)));
+            let form = crate::jit::comprehension::lower::contract::form(form);
+            src.push_str(&epilogue_function(&form, key.scalar_tys.len()));
+            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs, &form));
         }
         Tail::Solve(spec) => {
             let names = Names { views: &views, in_place: &[] };
@@ -1085,6 +1096,53 @@ pub(crate) fn scalar_function(name: &str, instrs: &[Instr], out: usize, inputs: 
     let computed = body_with(instrs, &[], &NO_NAMES, "i", false, Some(&needed(instrs, &[out])), &|_, _| None);
     let ty = instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     format!("\nfn {name}({}) -> {ty} {{\n{computed}    return t{out};\n}}\n", params.join(", "))
+}
+
+/// The fields of the uniform of a product that apply an epilogue: its scalars, numbered from `base` (after the scalars of the fused
+/// operands).
+pub(crate) fn epilogue_fields(form: &ContractForm, base: usize) -> String {
+    let Some(epi) = &form.epilogue else { return String::new() };
+    epi.scalars.iter().enumerate().fold(String::new(), |mut src, (k, ty)| {
+        let _ = write!(src, "s{}: {}, ", base + k, ty.wgsl());
+        src
+    })
+}
+
+/// The bindings of the inputs `e0, e1, ..` of the epilogue of a product, from `*binding` on.
+pub(crate) fn epilogue_bindings(form: &ContractForm, binding: &mut usize) -> String {
+    let Some(epi) = &form.epilogue else { return String::new() };
+    let mut src = String::new();
+    for (j, (_, ty)) in epi.inputs.iter().enumerate() {
+        let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> e{j}: array<{}>;", ty.wgsl());
+        *binding += 1;
+    }
+    src
+}
+
+/// `fn luma_store(r: u32, col: u32, acc: f32) -> f32`: the epilogue of a product at row `r`, column `col` of the output, over the
+/// combined value `acc`; nothing without one. Its inputs are the buffers `e{j}` read at the place their map says, its scalars the
+/// fields of the uniform from `s{base}` on. The operations are those of the elementwise kernels (see [`body_with`]).
+pub(crate) fn epilogue_function(form: &ContractForm, base: usize) -> String {
+    let Some(epi) = &form.epilogue else { return String::new() };
+    let shifted = |reference: Ref| match reference {
+        Ref::Scalar(k) => Ref::Scalar(k + base as u32),
+        other => other,
+    };
+    let instrs: Vec<Instr> = epi.instrs.iter().map(|instr| Instr { op: instr.op, args: instr.args.map(shifted) }).collect();
+    let out = epi.outputs.first().map_or(instrs.len().saturating_sub(1), |&at| at as usize);
+    let mut src = String::from("\nfn luma_store(r: u32, col: u32, acc: f32) -> f32 {\n");
+    for (j, (map, ty)) in epi.inputs.iter().enumerate() {
+        let index = match map {
+            EpiMap::Point => "r * p.n + col",
+            EpiMap::AlongRows => "r",
+            EpiMap::AlongCols => "col",
+            EpiMap::Scalar => "0u",
+        };
+        let _ = writeln!(src, "    let a{j}: {} = e{j}[{index}];", ty.wgsl());
+    }
+    src.push_str(&body_with(&instrs, &[], &NO_NAMES, "i", false, Some(&needed(&instrs, &[out])), &|_, _| None));
+    let _ = write!(src, "    return t{out};\n}}\n");
+    src
 }
 
 /// One value a line solve reads at a cell: the root `at` of the program, or the buffer `pr{k}`.

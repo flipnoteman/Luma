@@ -1405,6 +1405,9 @@ pub(crate) enum Builtin {
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
     Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// [`Builtin::Matmul`] that applies an epilogue at its stores (W3-U4 §B): `form` is the interned form that holds it
+    /// (`matmul::ContractForm`). Arguments: out, `a`, `b`, the epilogue's inputs, the uniform `{m, n, k, kc}` and its scalars.
+    MatmulEpilogue { tile: crate::matmul::MatmulTile, aligned: bool, split: bool, form: u16 },
     /// Tiled products of a batch of matrices in one launch; see [`crate::bmm`]. Arguments: out, a,
     /// b, uniform `{m, n, k, matrices, a_stride, b_stride, _, _}`.
     Bmm(crate::bmm::Bmm),
@@ -3272,6 +3275,7 @@ impl Builtin {
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
             Builtin::SortLines(sort) => wgsl(sort.source()),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
+            Builtin::MatmulEpilogue { tile, aligned, split, form } => wgsl(crate::matmul::builtin_epilogue_source(tile, aligned, split, form)),
             Builtin::Bmm(kernel) => wgsl(crate::bmm::source(kernel)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
