@@ -828,7 +828,7 @@ fn execute_half(ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>
     if forced.is_some_and(|forced| forced != entries[0].id) || admit(&entries[0], subject, ctx, &Residencies::DEVICE).is_err() {
         return None;
     }
-    Some(execute_with(entries, true, ctx, subject, forced))
+    Some(execute_ranked(entries, ctx, subject, forced))
 }
 
 /// [`plain_without_tiles`] of every family's table, worked out once.
@@ -889,7 +889,7 @@ pub(crate) fn execute_in(entries: &'static [Strategy], ctx: &Context, subject: &
     execute_with(entries, plain(entries), ctx, subject, forced)
 }
 
-#[inline]
+#[inline(always)]
 fn execute_with(entries: &'static [Strategy], plain: bool, ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Result<Output, Failure> {
     if forced.is_none() && plain && !ctx.jit().recording_decisions() && ctx.tuning().explore_every == 0 {
         return execute_plain(entries, ctx, subject);

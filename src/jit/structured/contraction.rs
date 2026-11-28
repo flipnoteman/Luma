@@ -128,6 +128,7 @@ impl ContractionView<'_> {
 }
 
 /// The product of `lhs` and `rhs` through the registry (the body of `matmul`, `matmul_tf32`, `matmul_f32`): an evaluated array.
+#[inline(always)]
 pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, location: &'static Location<'static>) -> Outcome<Array<f32>> {
     let view = ContractionView { lhs, rhs, attrs, location };
     let geom = view.check()?;
@@ -248,10 +249,10 @@ fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams
         StrategyId::GEMM_F32 => f32_tiles(None),
         StrategyId::GEMM_F32_RAGGED => f32_tiles(Some(GemmLanes::Scalar)),
         StrategyId::GEMM_F32_PADDED => f32_tiles(Some(GemmLanes::Vec4Tails)),
-        StrategyId::SYRK_TILED => syrk_plan(view, ctx, params.geom, transposed),
         StrategyId::CONTRACTION_NATIVE_CPU => Some(native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)),
         StrategyId::CONTRACTION_SKINNY => skinny_plan(m, n, k, along_k(view.lhs, params.geom), groups, bytes).map(Ok),
         StrategyId::CONTRACTION_TILED => Some(tiled_plan(ctx.tuning(), m, n, k, groups, bytes)),
+        by if by == StrategyId::SYRK_TILED => syrk_plan(view, ctx, params.geom, transposed),
         _ => None,
     }
 }
@@ -335,6 +336,7 @@ pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 10] = [
 
 /// The table a Gram product (`ContractionAttrs::half`) is tried against before [`CONTRACTION_STRATEGIES`]: `select::execute` consults
 /// it only for such a product, so a plain product pays one flag test (and never evaluates `fits_syrk`).
+///
 /// A Gram product (`ContractionAttrs::half`) computes the lower triangle of its tiles and mirrors it: the bits of the full
 /// product's lower triangle, bit-symmetric (the upper triangle of the full product may differ on tensor cores, hence its own class).
 /// On the tensor cores (the default numerics of a CUDA device) it is the TF32 kernel's lower triangle: it is admitted under any numerics
@@ -608,9 +610,6 @@ fn lower_padded(ctx: &Context, view: &ContractionView<'_>, params: &ContractionP
 /// NaN); not for an operand with an offset (a window of a triangle is not one in its own coordinates), nor a half-work product.
 #[inline(never)]
 fn triangle_word(ctx: &Context, view: &ContractionView<'_>, plan: Plan, layouts: [Layout; 2]) -> u32 {
-    if !matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) {
-        return 0;
-    }
     if !ctx.numerics().exact_finite || layouts.iter().any(|layout| layout.off != 0) {
         return 0;
     }
@@ -633,7 +632,7 @@ fn triangle_word(ctx: &Context, view: &ContractionView<'_>, plan: Plan, layouts:
 fn gemm(ctx: &Context, view: &ContractionView<'_>, params: &ContractionParams, lhs: &Array<f32>, rhs: &Array<f32>) -> Result<Lowered, Failure> {
     let (sides, layouts) = native_sides(ctx, lhs, rhs)?;
     let Some(plan) = plan_or_decline(view, ctx, params, layouts.map(|layout| layout.transposed))? else { return Ok(Lowered::Declined) };
-    let tri = if view.lhs.has_props() || view.rhs.has_props() { triangle_word(ctx, view, plan, layouts) } else { 0 };
+    let tri = if matches!(plan.tile, MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. }) && (view.lhs.has_props() || view.rhs.has_props()) { triangle_word(ctx, view, plan, layouts) } else { 0 };
     done(launch(ctx, sides, plan, params.geom, Some((layouts, tri)))?)
 }
 
@@ -875,7 +874,7 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
             if a_extent > u64::from(u32::MAX) || b_extent > u64::from(u32::MAX) {
                 return Err(LumaError::DimensionTooLarge { shape: [n32 as usize, m32 as usize, 1, 1] }.into());
             }
-            Some([lhs.ld, rhs.ld, lhs.off, rhs.off, tri, 0, 0, 0])
+            Some(([lhs.ld, rhs.ld, lhs.off, rhs.off], tri))
         }
         None => None,
     };
@@ -889,12 +888,13 @@ fn launch(ctx: &Context, sides: [MatmulSide; 2], plan: Plan, geom: Geometry, lay
         None => (out_pin.buffer(), out_bytes),
     };
     let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split, form: 0 };
-    let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut uniform = [m32, n32, k32, plan.kc, 0, 0, 0, 0, 0];
     let words = match words {
-        Some(extra) => {
-            uniform[4..12].copy_from_slice(&extra);
+        Some((extra, tri)) => {
+            uniform[4..8].copy_from_slice(&extra);
             // The kernels read the ninth word (`TriangularK`) as zero when it is not passed.
-            &uniform[..if extra[4] == 0 { 8 } else { 9 }]
+            uniform[8] = tri;
+            &uniform[..8 + usize::from(tri != 0)]
         }
         None => &uniform[..4],
     };

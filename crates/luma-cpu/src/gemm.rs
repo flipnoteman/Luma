@@ -31,7 +31,7 @@ pub(crate) const UNIFORM_WORDS: usize = 8;
 impl NativeMatmul {
     /// The product of `spec`, `None` if its tile is empty.
     pub fn new(spec: &MatmulSpec) -> Option<Self> {
-        (spec.edge > 0).then(|| NativeMatmul { spec: *spec, func: group, cost: crate::exec::CostHint::default() })
+        (spec.edge > 0).then(|| NativeMatmul { spec: *spec, func: if spec.half { group_half } else { group }, cost: crate::exec::CostHint::default() })
     }
 
     /// Checks that the buffers of a launch hold every element the product touches (it trusts
@@ -83,6 +83,19 @@ impl NativeMatmul {
 
 /// One workgroup: the output tile `x + y * num_workgroups.x` over the slice of K of layer `z`.
 unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
+    // SAFETY: as `workgroup`.
+    unsafe { workgroup::<false>(ctx) }
+}
+
+/// One workgroup of a half-work product ([`MatmulSpec::half`]): [`group`] with the lower triangle of tiles as its grid, mirrored.
+unsafe extern "C" fn group_half(ctx: *const WorkgroupCtx) {
+    // SAFETY: as `workgroup`.
+    unsafe { workgroup::<true>(ctx) }
+}
+
+/// The body of [`group`] and [`group_half`]: `HALF` is a constant, so the ordinary product carries nothing of the half-work one.
+#[inline(always)]
+unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
     // SAFETY: the dispatcher passes a valid context whose `native` is the kernel it dispatched
     // and whose bindings the launch validated ([`NativeMatmul::validate`]).
     unsafe {
@@ -94,11 +107,10 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
         let [x, y, z, _] = ctx.workgroup_id;
         let tile = y as usize * ctx.num_workgroups[0] as usize + x as usize;
         let columns = n.div_ceil(edge);
-        let half = kernel.spec.half;
-        if m == 0 || n == 0 || tile >= if half { columns * (columns + 1) / 2 } else { columns * m.div_ceil(edge) } {
+        if m == 0 || n == 0 || tile >= if HALF { columns * (columns + 1) / 2 } else { columns * m.div_ceil(edge) } {
             return;
         }
-        let (row, col) = if half {
+        let (row, col) = if HALF {
             let (ty, tx) = luma_core::triangle_tile(tile as u32);
             (ty as usize * edge, tx as usize * edge)
         } else {
@@ -124,7 +136,7 @@ unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
         let a = a.cast::<f32>().add(a_off).offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
         let b = b.cast::<f32>().add(b_off).offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
         matrixmultiply::sgemm(rows, depth, cols, 1.0, a, lhs_strides.0, lhs_strides.1, b, rhs_strides.0, rhs_strides.1, 0.0, c, n as isize, 1);
-        if half {
+        if HALF {
             // The tile is the full kernel's, so the lower triangle of the output is the full product's. Its transpose goes to
             // the tile above the diagonal (written by no other workgroup); on a diagonal tile the upper half is overwritten by
             // the mirror of the lower, so the whole output is bit-symmetric.
