@@ -271,7 +271,10 @@ impl<T: ScalarType> Array<T> {
     pub(crate) fn neg_at(&self, location: &'static Location<'static>) -> Array<T> {
         let result = self.run_unary(UnOp::Neg, location);
         let negated = Array::resolve(self.context(), self.shape(), result, "neg", location);
-        if self.has_props() { negated.with_props(self.props().scaled()) } else { negated }
+        if self.has_props() {
+            self.mark_binary_props(&negated, None, BinOp::Mul);
+        }
+        negated
     }
 
     /// A lazy copy of the array's current contents (not a shared handle), reporting failures at
@@ -380,6 +383,7 @@ impl<T: ScalarType> Array<T> {
     // -- Result plumbing --
 
     #[track_caller]
+    #[inline(always)]
     pub(crate) fn binary(
         &self,
         rhs: Rhs<'_, T>,
@@ -391,6 +395,7 @@ impl<T: ScalarType> Array<T> {
     }
 
     /// [`Array::binary`] reporting failures at `location`.
+    #[inline(always)]
     pub(crate) fn binary_at(
         &self,
         rhs: Rhs<'_, T>,
@@ -415,24 +420,29 @@ impl<T: ScalarType> Array<T> {
         {
             return fused;
         }
-        // Matrix properties: a bool test on the operands (the check for `a + a.t()` is behind `is_read_view`).
+        // Matrix properties: a bool test on the operands (the check for `a + a.t()` is behind `is_read_view`); the work is out of line.
+        let other = if let Rhs::Array(other) = &rhs { Some(*other) } else { None };
         let maybe_props = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
-            && (self.has_props() || matches!(&rhs, Rhs::Array(other) if other.has_props() || other.is_read_view() || self.is_read_view()));
-        let props = if maybe_props { self.binary_props(&rhs, op, scalar_left) } else { Props::NONE };
+            && (self.has_props() || other.is_some_and(|other| other.has_props() || other.is_read_view() || self.is_read_view()));
         let result = self.run_binary(rhs, scalar_left, OpKind::Binary(op), name, location);
         let out = Array::resolve(self.context(), self.shape(), result, name, location);
-        if props.is_none() { out } else { out.with_props(props) }
+        if maybe_props {
+            self.mark_binary_props(&out, other, op);
+        }
+        out
     }
 
-    /// The matrix properties of `self op rhs` (see `crate::props`); `NONE` for what the table does not list.
+    /// Records on `out`, the result of `self op other` (`other` `None` for a scalar), the matrix properties of the table in
+    /// `crate::props`.
+    #[cold]
     #[inline(never)]
-    fn binary_props(&self, rhs: &Rhs<'_, T>, op: BinOp, _scalar_left: bool) -> Props {
-        match rhs {
+    pub(crate) fn mark_binary_props(&self, out: &Array<T>, other: Option<&Array<T>>, op: BinOp) {
+        let props = match other {
             // A scalar multiplier keeps the pattern (`-a` is the same).
-            Rhs::Scalar(_) => if op == BinOp::Mul { self.props().scaled() } else { Props::NONE },
-            Rhs::Array(other) => {
+            None => if op == BinOp::Mul { self.props().scaled() } else { Props::NONE },
+            Some(other) => {
                 if self.shape() != other.shape() {
-                    return Props::NONE;
+                    return;
                 }
                 let [m, n, ..] = self.shape().dims();
                 let mut props = Props::NONE;
@@ -446,6 +456,9 @@ impl<T: ScalarType> Array<T> {
                 }
                 props
             }
+        };
+        if !props.is_none() {
+            out.mark_props(&props);
         }
     }
 

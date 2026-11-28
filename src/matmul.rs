@@ -286,9 +286,20 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     };
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
-    let routed = if lhs.has_props() && !matches!(tf32, Tf32Request::Tf32) { crate::dense::route::route_product(lhs, rhs, location) } else { None };
+    if lhs.has_props() || rhs.has_props() {
+        return product_with_props(lhs, rhs, tf32, shape, location);
+    }
+    lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location)
+}
+
+/// A product of operands that carry matrix properties: routed (a permutation, a band) or the GEMM, with the properties of the
+/// product (see `crate::props`).
+#[cold]
+#[inline(never)]
+fn product_with_props(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request, shape: crate::Shape, location: &'static Location<'static>) -> Array<f32> {
+    let routed = if !matches!(tf32, Tf32Request::Tf32) { crate::dense::route::route_product(lhs, rhs, location) } else { None };
     let product = routed.unwrap_or_else(|| lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location));
-    if lhs.has_props() || rhs.has_props() { product.with_props(lhs.props_used().product(rhs.props_used())) } else { product }
+    product.with_props(lhs.props_used().product(rhs.props_used()))
 }
 
 /// How a product is cut into workgroups.

@@ -520,6 +520,13 @@ impl<T: GpuType> Array<T> {
         self
     }
 
+    /// Records `props` on this fresh result (through the cell: the handle stays where it is). Ignored on a poisoned array.
+    pub(crate) fn mark_props(&self, props: &Props) {
+        if !matches!(self.repr, Repr::Poisoned(_)) {
+            self.props.set(HandleProps::of(props));
+        }
+    }
+
     /// [`Array::with_props`] for a view of another array (a transpose): a valid one shares its source's buffer, which a write
     /// through the source would change under the view, so only lazy and structured views keep a property.
     pub(crate) fn with_view_props(self, props: Props) -> Self {
