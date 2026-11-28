@@ -136,7 +136,7 @@ fn the_identity_epilogue_is_the_plain_product() {
 }
 
 #[test]
-fn a_gelu_a_tanh_and_a_chain_of_scalar_steps_are_the_separate_pass() {
+fn a_tanh_and_a_chain_of_scalar_steps_are_the_separate_pass_and_a_gelu_is_over_the_limit() {
     let ctx = context();
     let shape = (40, 37, 45);
     let gelu_program = {
@@ -162,16 +162,17 @@ fn a_gelu_a_tanh_and_a_chain_of_scalar_steps_are_the_separate_pass() {
         let inner = (c + &(&cube * 0.044715)) * 0.797_884_6;
         c * &(&inner.tanh() + 1.0) * 0.5
     };
-    assert!(check(&ctx, shape, StrategyId::CONTRACTION_TILED, &gelu_program, gelu));
+    // Nine instructions: over `SHADER_EPILOGUE_INSTRS`, the plain product for the caller to apply the program to.
+    assert!(!check(&ctx, shape, StrategyId::CONTRACTION_TILED, &gelu_program, gelu));
     let tanh = program(vec![un(UnOp::Tanh, Ref::Acc)], vec![], vec![]);
     assert!(check(&ctx, shape, StrategyId::CONTRACTION_TILED, &tanh, |c| c.tanh()));
-    // A chain of eight scalar steps.
+    // A chain of six scalar steps.
     let chain = program(
-        (0..8).map(|k| if k % 2 == 0 { bin(BinOp::Mul, if k == 0 { Ref::Acc } else { Ref::Tmp(k - 1) }, Ref::Scalar(k)) } else { bin(BinOp::Add, Ref::Tmp(k - 1), Ref::Scalar(k)) }).collect(),
+        (0..6).map(|k| if k % 2 == 0 { bin(BinOp::Mul, if k == 0 { Ref::Acc } else { Ref::Tmp(k - 1) }, Ref::Scalar(k)) } else { bin(BinOp::Add, Ref::Tmp(k - 1), Ref::Scalar(k)) }).collect(),
         vec![],
-        vec![0.5, 0.25, 1.5, -0.125, 0.75, 0.0625, 2.0, -0.5],
+        vec![0.5, 0.25, 1.5, -0.125, 0.75, 0.0625],
     );
-    let steps = |c: &A| ((&(&(&(c * 0.5) + 0.25) * 1.5) + -0.125) * 0.75 + 0.0625) * 2.0 + -0.5;
+    let steps = |c: &A| (&(&(&(c * 0.5) + 0.25) * 1.5) + -0.125) * 0.75 + 0.0625;
     assert!(check(&ctx, shape, StrategyId::CONTRACTION_TILED, &chain, steps));
 }
 
