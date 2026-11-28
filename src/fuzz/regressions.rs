@@ -1022,4 +1022,45 @@ fn an_iterate_until_over_two_states_whose_seed_copy_fails_does_not_run_on_unseed
     if let Err(failure) = super::run_with_failure(&program, plan) {
         panic!("{failure}\n{program:?}");
     }
+/// Finding of the end-of-wave 3 gate (a wgpu fuzz run hung): the thread's open schedule of a split context over a file leaf was committed when the last
+/// outside handle of the context dropped only if the handles left were its segments' (it did not count the file's store, which holds one too). It never
+/// committed otherwise, and the thread kept the context, its arrays and, on wgpu, its device until it ended: 64 such contexts used up the driver's
+/// devices and every later context waited for one that never came back.
+const FILE_LEAF_SCHEDULE: fn() -> Program = || Program {
+    config: Config { split: true, file_leaves: true, ..Config::default_engine() },
+    math: false,
+    stmts: vec![
+        Input { dims: [300, 1, 1, 1], ty: F32, seed: 16878225131511299228 },
+        Binary { lhs: Var(0), rhs: Var(0), op: Minimum },
+        Binary { lhs: Var(1), rhs: Var(1), op: Sub },
+        Assign { target: 2, path: vec![], rhs: Var(2) },
+    ],
+};
+
+/// `FILE_LEAF_SCHEDULE` on a fresh context: whether the context is gone once the program is.
+fn context_is_released_after(program: &Program) -> bool {
+    let ctx = super::engine(&program.config).expect("a context opens (on wgpu: a device came back to the pool)");
+    let weak = ctx.downgrade();
+    if let Err(failure) = super::run_on(ctx, program, super::Filter::Off) {
+        panic!("{failure}\n{program:?}");
+    }
+    weak.upgrade().is_none()
+}
+
+#[test]
+fn a_schedule_over_a_file_leaf_does_not_keep_its_context_alive() {
+    assert!(context_is_released_after(&FILE_LEAF_SCHEDULE()));
+}
+
+/// More contexts than the driver has devices (63 or 64 on NVIDIA's Linux driver), made and dropped by several threads at once.
+#[test]
+fn many_threads_making_and_dropping_contexts_over_file_leaves_keep_getting_devices() {
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 24;
+    let program = FILE_LEAF_SCHEDULE();
+    let leaked: usize = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..THREADS).map(|_| scope.spawn(|| (0..PER_THREAD).filter(|_| !context_is_released_after(&program)).count())).collect();
+        workers.into_iter().map(|worker| worker.join().unwrap()).sum()
+    });
+    assert_eq!(leaked, 0, "contexts stayed alive after their program ended");
 }

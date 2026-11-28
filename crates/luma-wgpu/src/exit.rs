@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ use crate::device::PipelineStore;
 /// left out: with two or more devices in the process, the Khronos validation layer no longer
 /// finds the later ones during `exit` and aborts in `vkWaitSemaphores`.
 static DEVICES: Mutex<Vec<wgpu::Device>> = Mutex::new(Vec::new());
+/// How many devices were opened in all, those of instances with validation too (see [`DEVICES`]): what decides whether the driver's own exit handler may run.
+static OPENED: AtomicUsize = AtomicUsize::new(0);
 /// The pipeline caches the exit handler writes.
 static STORES: Mutex<Vec<Arc<PipelineStore>>> = Mutex::new(Vec::new());
 /// Set when the exit handler has run: it is registered many times (see [`arm`]) and does its
@@ -89,6 +91,7 @@ fn arm() {
 /// Makes the exit handler wait for `device` too (unless its instance has `validated` layers, see
 /// [`DEVICES`]), registering the handler.
 pub(crate) fn track(device: &wgpu::Device, validated: bool) {
+    OPENED.fetch_add(1, Ordering::Relaxed);
     if !validated
         && let Ok(mut devices) = DEVICES.lock()
     {
@@ -137,7 +140,7 @@ extern "C" fn at_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
         // has a `[vkps] Update` thread per device, and the driver's own handler segfaulted in one
         // of them on every exit of the 400 unit tests on an RTX 3090 (driver 615.71) even though
         // all were idle: with more than one device the driver's handler is never run.
-        let several = DEVICES.try_lock().is_ok_and(|devices| devices.len() > 1);
+        let several = OPENED.load(Ordering::Relaxed) > 1;
         if several || !wait_for_driver_workers() {
             // SAFETY: the GPU is idle and the pipeline cache is written. What is left to run is
             // the driver's own handler, which would hang on a lock the busy worker holds or free

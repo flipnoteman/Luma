@@ -595,7 +595,14 @@ pub(crate) fn context_dropped(ctx: &Context) {
             let all = all.try_borrow().ok()?;
             let (_, schedule) = all.0.iter().find(|(id, _)| *id == ctx.id())?;
             let open = schedule.open.try_lock().ok()?;
-            Some(1 + open.as_ref().map_or(0, |open| open.arrays.iter().map(|array| array.segments.len()).sum::<usize>()))
+            Some(1 + open.as_ref().map_or(0, |open| {
+                // Each segment holds a handle, and so does the store of each file that homes some of them (once, however many segments it homes).
+                let segments = open.arrays.iter().flat_map(|array| array.segments.iter());
+                let mut stores: Vec<*const crate::file::FileStore> = segments.clone().filter_map(|segment| segment.home()).map(|home| Arc::as_ptr(&home.store)).collect();
+                stores.sort_unstable();
+                stores.dedup();
+                segments.count() + stores.len()
+            }))
         })
         .ok()
         .flatten();
