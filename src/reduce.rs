@@ -1091,7 +1091,11 @@ fn reduce_into<T: GpuType>(
     finish: Finish,
 ) -> Result<luma_core::Buffer> {
     let count = ops.as_slice().len() as u64;
-    if !bits && !ops.as_slice().iter().any(|op| op.is_arg()) && jit::split::reduces_in_blocks(emit.ctx(), is_float_wgsl(wgsl), array.len(), T::LAYOUT) {
+    if emit.ctx().split_mode() != jit::split::SplitMode::Off
+        && !bits
+        && !ops.as_slice().iter().any(|op| op.is_arg())
+        && jit::split::reduces_in_blocks(emit.ctx(), is_float_wgsl(wgsl), array.len(), T::LAYOUT)
+    {
         return reduce_in_blocks(emit, array, elem, wgsl, ops, scratch, target, finish);
     }
     let run_passes = |emit: &mut Emit<'_>, scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
