@@ -312,6 +312,7 @@ impl<'a> Lower<'a> {
                 None => self.fail(fb, format!("t{k} is read before it is computed")),
             },
             Ref::Sub(k) => self.fail(fb, format!("sub-program {k} is not an operand")),
+            Ref::Acc => self.fail(fb, "the combined value is an operand of epilogue programs only".to_owned()),
         }
     }
 

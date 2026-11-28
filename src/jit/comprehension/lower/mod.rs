@@ -411,7 +411,7 @@ impl Prepared {
                 Ref::Input(j) => Src::Node(Arc::clone(&views[j as usize])),
                 Ref::Scalar(k) => Src::Scalar(self.form.body.scalars[k as usize]),
                 Ref::Tmp(t) => Src::Node(Arc::clone(&temps[t as usize])),
-                Ref::Unused | Ref::Sub(_) => Src::unused(),
+                Ref::Unused | Ref::Sub(_) | Ref::Acc => Src::unused(),
             };
             let args = [arg(instr.args[0]), arg(instr.args[1]), arg(instr.args[2])];
             temps.push(jit::create(ctx, len, instr.op, args, "comprehension", location)?);

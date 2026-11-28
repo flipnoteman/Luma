@@ -573,8 +573,8 @@ fn bilateral_is_two_sums_and_a_division() {
     assert_eq!(coeff(&form, 1, 0), [1, 0, 1, 0]);
     assert_eq!(parts(&form), [CombinePart::Add, CombinePart::Add]);
     let Epilogue::Program(program) = &form.epilogue else { panic!("the division is the epilogue") };
-    assert_eq!(program.len(), 1);
-    assert_eq!(program[0].op.kind, OpKind::Binary(BinOp::Div));
+    assert_eq!(program.instrs.len(), 1);
+    assert_eq!(program.instrs[0].op.kind, OpKind::Binary(BinOp::Div));
     assert_eq!(form.origin, Origin::Api(OpTag::Window(WindowOp::Bilateral)));
     form.validate().unwrap();
 }
@@ -707,7 +707,7 @@ fn a_contraction_view_has_the_form_of_the_call() {
     let (lhs, rhs) = product_operands(&ctx);
     for (request, tf32) in [(Tf32Request::Default, None), (Tf32Request::Exact, Some(false)), (Tf32Request::Tf32, Some(true))] {
         let attrs = ContractionAttrs { tf32: request, half: false };
-        let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs, location: std::panic::Location::caller() };
+        let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs, location: std::panic::Location::caller(), epilogue: None };
         let Some(form) = view.form() else {
             assert!(!Algebra::builds_forms(), "LUMA_ALGEBRA=off builds no form");
             return;
@@ -739,7 +739,7 @@ fn a_contraction_view_has_the_form_of_the_call() {
 fn a_contraction_view_of_operands_that_make_no_product_has_no_form() {
     let ctx = lazy_cpu();
     let (lhs, rhs) = (array(&ctx, 15).reshape([5, 3]), array(&ctx, 20).reshape([5, 4]));
-    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Default, half: false }, location: std::panic::Location::caller() };
+    let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Default, half: false }, location: std::panic::Location::caller(), epilogue: None };
     assert!(view.form().is_none(), "the shapes do not match");
 }
 

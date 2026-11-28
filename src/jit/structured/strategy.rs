@@ -449,12 +449,17 @@ pub(crate) enum Lowered {
 /// What a lowered value is.
 pub(crate) enum Output {
     Storage(Arc<Storage>),
+    /// The strategy applied the epilogue of its subject (`ContractionView::epilogue`): one storage per entry of
+    /// `EpiProgram::outputs`, in that order. A strategy that does not take the epilogue returns `Storage`, the plain value.
+    #[allow(dead_code, reason = "W3-U4: the strategies that take an epilogue construct it")]
+    Epilogued(smallvec::SmallVec<[Arc<Storage>; 2]>),
 }
 
 impl Output {
     pub(crate) fn into_storage(self) -> Arc<Storage> {
         match self {
             Output::Storage(storage) => storage,
+            Output::Epilogued(mut storages) => storages.swap_remove(0),
         }
     }
 }

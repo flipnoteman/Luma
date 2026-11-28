@@ -448,6 +448,8 @@ pub enum DecisionSite {
     PlanReplay,
     /// A schedule of deferred kernels over streamed arrays was committed: `chosen` counts its stages, slabs and arrays (never ids).
     Schedule,
+    /// A consumer of a structured value was absorbed into its epilogue, or not (`absorbed <n> ops`, `separate: <reason>`).
+    Epilogue,
 }
 
 /// What became of a candidate that was not chosen.

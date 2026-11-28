@@ -12,6 +12,7 @@ use crate::builtin::{BinOp, CmpOp, Finish, ReduceList, ReduceOp, UnOp};
 use crate::image::window::Op as WindowOp;
 use crate::image::{Border, ConvSpec};
 use crate::jit::program::{Instr, Ref};
+use crate::jit::structured::epilogue::EpiProgram;
 use crate::jit::structured::contraction::{ContractionAttrs, Geometry, Tf32Request};
 use crate::jit::{Edge, ElemTy, Gen, Op, OpKind, Scalar, Src};
 use crate::reduce::AxisGeom;
@@ -442,7 +443,7 @@ fn program(f: impl FnOnce(&mut Asm) -> Ref) -> Epilogue {
     let mut asm = Asm::new();
     let out = f(&mut asm);
     debug_assert_eq!(out, Ref::Tmp(asm.instrs.len() as u32 - 1), "the program's last instruction is its value");
-    Epilogue::Program(Arc::new(asm.instrs))
+    Epilogue::Program(Arc::new(EpiProgram::of_parts(asm.instrs)))
 }
 
 impl Comprehension {

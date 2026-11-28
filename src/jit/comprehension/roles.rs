@@ -193,6 +193,7 @@ fn deps(instrs: &[Instr], r: Ref, memo: &mut [Option<u8>]) -> Option<u8> {
     match r {
         Ref::Input(j) => 1u8.checked_shl(j),
         Ref::Scalar(_) | Ref::Unused => Some(0),
+        Ref::Acc => None,
         Ref::Tmp(t) => {
             if let Some(known) = memo[t as usize] {
                 return Some(known);

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) mod boundary;
 pub(crate) mod contraction;
 pub(crate) mod emit;
+pub(crate) mod epilogue;
 pub(crate) mod families;
 pub(crate) mod lazy;
 pub(crate) mod opaque;

@@ -39,6 +39,8 @@ pub(crate) enum Ref {
     Tmp(u32),
     /// A sub-program, evaluated at the element a shift reads (operand 0 of a shift only).
     Sub(u32),
+    /// The combined value an epilogue program (W3-U4, `structured::epilogue`) is applied to; only in those programs.
+    Acc,
 }
 
 impl std::hash::Hash for Ref {
@@ -49,6 +51,7 @@ impl std::hash::Hash for Ref {
             Ref::Scalar(k) => (2, k),
             Ref::Tmp(k) => (3, k),
             Ref::Sub(k) => (4, k),
+            Ref::Acc => (5, 0),
         };
         state.write_u64(tag << 32 | u64::from(value));
     }
@@ -2271,6 +2274,7 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
                     Ref::Tmp(_) => {}
                     Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
                     Ref::Input(_) => {}
+                    Ref::Acc => return Err(format!("{here}: operand {slot} is the combined value of an epilogue")),
                     Ref::Scalar(s) => {
                         let end = s as usize + instr.op.operand_ty(slot).slots();
                         if end > scalars {

@@ -26,6 +26,7 @@ use crate::image::window::Op as WindowOp;
 use crate::image::ConvSpec;
 use crate::jit::program::{Instr, Ref};
 use crate::jit::rules::RuleId;
+use crate::jit::structured::epilogue::EpiProgram;
 use crate::jit::{Edge, ElemTy, Scalar, Src};
 
 pub(crate) mod build;
@@ -182,7 +183,7 @@ pub(crate) enum Epilogue {
     Steps(Finish),
     /// A program over the combined values: `Ref::Input(j)` is combined part `j`, its last instruction the result (the bilateral
     /// division of the two sums, the Sobel magnitude). W3-U4 absorbs consumers into it.
-    Program(Arc<Vec<Instr>>),
+    Program(Arc<EpiProgram>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -448,16 +449,8 @@ impl Comprehension {
                 }
             }
         }
-        if let Epilogue::Program(instrs) = &self.epilogue {
-            for instr in instrs.iter() {
-                for arg in instr.args {
-                    match arg {
-                        Ref::Input(j) if j as usize >= parts => return Err(FormError::Body("an epilogue input is not a combined part")),
-                        Ref::Tmp(t) if t as usize >= instrs.len() => return Err(FormError::Body("an epilogue temporary is not an instruction")),
-                        _ => {}
-                    }
-                }
-            }
+        if let Epilogue::Program(program) = &self.epilogue {
+            program.validate(parts).map_err(FormError::Body)?;
         }
         let mut followed = [false; MAX_DIMS];
         for dim in self.output.dim_of_axis.iter().flatten() {
@@ -567,9 +560,9 @@ impl Comprehension {
                 h.write_u8(1);
                 finish.epilogue.hash(&mut h);
             }
-            Epilogue::Program(instrs) => {
+            Epilogue::Program(program) => {
                 h.write_u8(2);
-                instrs.hash(&mut h);
+                program.hash_structure(&mut h);
             }
         }
         self.output.dim_of_axis.hash(&mut h);

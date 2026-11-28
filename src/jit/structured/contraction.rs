@@ -8,6 +8,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use super::emit::Emit;
+use super::epilogue::EpiProgram;
 use super::strategy::{BitClass, Estimate, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
@@ -70,6 +71,11 @@ pub(crate) struct ContractionView<'a> {
     pub(crate) rhs: &'a Array<f32>,
     pub(crate) attrs: ContractionAttrs,
     pub(crate) location: &'static Location<'static>,
+    /// What an absorbed consumer applies to each output element (W3-U4). A strategy whose `Strategy::epilogue` is set may take it: it
+    /// then returns [`Output::Epilogued`]. Any other output is the plain product, and the caller applies the program as a separate
+    /// elementwise pass ([`crate::jit::structured::lazy`]).
+    #[allow(dead_code, reason = "W3-U4: absorption and the strategies' hooks read it next")]
+    pub(crate) epilogue: Option<&'a EpiProgram>,
 }
 
 impl ContractionView<'_> {
@@ -130,10 +136,10 @@ impl ContractionView<'_> {
 /// The product of `lhs` and `rhs` through the registry (the body of `matmul`, `matmul_tf32`, `matmul_f32`): an evaluated array.
 #[inline(always)]
 pub(crate) fn run(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, location: &'static Location<'static>) -> Outcome<Array<f32>> {
-    let view = ContractionView { lhs, rhs, attrs, location };
+    let view = ContractionView { lhs, rhs, attrs, location, epilogue: None };
     let geom = view.check()?;
     let ctx = lhs.context();
-    let Output::Storage(storage) = select::execute(ctx, &Subject::Contraction(&view))?;
+    let storage = select::execute(ctx, &Subject::Contraction(&view))?.into_storage();
     Ok(Array::from_storage(ctx, [geom.n as usize, geom.m as usize, 1, 1].into(), storage))
 }
 
@@ -1608,7 +1614,7 @@ mod tests {
 
     #[track_caller]
     fn selected(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>, tf32: Tf32Request) -> StrategyId {
-        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: Location::caller() };
+        let view = ContractionView { lhs, rhs, attrs: ContractionAttrs { tf32, half: false }, location: Location::caller(), epilogue: None };
         select::select(ctx, &Subject::Contraction(&view), &Residencies::DEVICE).expect("the staged tiles always fit").id
     }
 
@@ -1674,7 +1680,7 @@ mod tests {
             }
             // A CPU context has neither the host path nor the backend's own tiles: those strategies do not apply.
             let [lhs, rhs] = operands(&ctx, (64, 12, 64), [false; 2]);
-            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller() };
+            let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: ContractionAttrs { tf32: Tf32Request::Tf32, half: false }, location: Location::caller(), epilogue: None };
             for id in [StrategyId::CONTRACTION_HOST, StrategyId::GEMM_TF32, StrategyId::GEMM_TF32_RAGGED, StrategyId::GEMM_TF32_PADDED, StrategyId::GEMM_F32, StrategyId::GEMM_F32_RAGGED, StrategyId::GEMM_F32_PADDED] {
                 let strategy = &CONTRACTION_STRATEGIES[usize::from(id.1)];
                 assert!(admit(strategy, &Subject::Contraction(&view), &ctx, &Residencies::DEVICE).is_err(), "{}", strategy.name);
@@ -1725,7 +1731,7 @@ mod tests {
         let first = cpu_with(0, None);
         let second = cpu_with(0, None);
         let attrs = ContractionAttrs { tf32: Tf32Request::Default, half: false };
-        let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller() }.check();
+        let check = |lhs: &Array<f32>, rhs: &Array<f32>| ContractionView { lhs, rhs, attrs, location: Location::caller(), epilogue: None }.check();
         let a = Array::<f32>::zeros_on(&first, [4, 3]).unwrap();
         let b = Array::<f32>::zeros_on(&first, [5, 4]).unwrap();
         assert!(matches!(check(&a, &b), Ok(Geometry { m: 3, n: 5, k: 4 })));

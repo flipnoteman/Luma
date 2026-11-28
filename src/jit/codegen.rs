@@ -50,6 +50,8 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
+        // The combined value of an epilogue program: the name its hook function gives the parameter (W3-U4 part B).
+        Ref::Acc => "acc".to_owned(),
     }
 }
 

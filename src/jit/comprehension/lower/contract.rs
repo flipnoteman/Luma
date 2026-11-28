@@ -212,7 +212,7 @@ impl Operand<'_> {
                 self.temps.insert(t, Arc::clone(&node));
                 Ok(Src::Node(node))
             }
-            Ref::Unused | Ref::Sub(_) => Ok(Src::unused()),
+            Ref::Unused | Ref::Sub(_) | Ref::Acc => Ok(Src::unused()),
         }
     }
 }

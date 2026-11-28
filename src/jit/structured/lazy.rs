@@ -103,7 +103,7 @@ fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, s
     // The default mode never reads the site: the eager path is what it was before sites existed (unless the numerics want the
     // product unforced for the rules of tier 2).
     if tuning.lazy != LazyMode::Never || super::sites::wants_unforced(ctx.numerics_ref()) {
-        let view = ContractionView { lhs, rhs, attrs, location };
+        let view = ContractionView { lhs, rhs, attrs, location, epilogue: None };
         match view.check() {
             Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
             Ok(geom) => {
@@ -233,7 +233,7 @@ impl Structured {
         let computing = Computing::enter(leaf_id);
         let outcome = match &run.kind {
             ContractionKind::Matmul { attrs, .. } => {
-                let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location };
+                let view = ContractionView { lhs: &lhs, rhs: &rhs, attrs: *attrs, location: self.location, epilogue: None };
                 select::execute(ctx, &Subject::Contraction(&view)).map(Output::into_storage)
             }
             ContractionKind::Batched { geom, launch } => bmm::execute(ctx, &lhs, &rhs, geom, *launch),
@@ -285,14 +285,14 @@ impl ContractionRun {
         let ContractionKind::Matmul { attrs, .. } = &self.kind else { return false };
         let operands = lock(&self.operands);
         let Some([lhs, rhs]) = operands.as_ref() else { return false };
-        contraction::host_fits(&ContractionView { lhs, rhs, attrs: *attrs, location }, ctx)
+        contraction::host_fits(&ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None }, ctx)
     }
 
     /// The form of the product of `lhs` and `rhs` made at `location`: [`ContractionView::form`] for a `matmul`, the batched builder for
     /// `matmul_batched`.
     pub(crate) fn form(&self, lhs: &Array<f32>, rhs: &Array<f32>, location: &'static Location<'static>) -> Option<Comprehension> {
         match &self.kind {
-            ContractionKind::Matmul { attrs, .. } => rules::with_operand_props(ContractionView { lhs, rhs, attrs: *attrs, location }.form(), lhs, rhs),
+            ContractionKind::Matmul { attrs, .. } => rules::with_operand_props(ContractionView { lhs, rhs, attrs: *attrs, location, epilogue: None }.form(), lhs, rhs),
             ContractionKind::Batched { geom, .. } => {
                 if !Algebra::builds_forms() {
                     return None;
