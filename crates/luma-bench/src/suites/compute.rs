@@ -16,6 +16,7 @@
 //! * `approx`, `warp`, `filters`: `approx1`/`approx2` interpolation, `resize`/`rotate`/`transform`
 //!   image warps, and `fir` / `iir` filters (see `resample`);
 //! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`);
+//! * `props`: banded solves and banded products by matrix properties (see `props`);
 //! * `structure`: `tile`, `diag`, `identity`, `lower`/`upper`, `iota`, `replace` and `diff1`/`diff2` as
 //!   kernels of their own (the structural half of ArrayFire's array API).
 //!
@@ -32,6 +33,7 @@ mod dense;
 mod dense_svd;
 mod linalg;
 mod physics;
+mod props;
 mod resample;
 mod scans;
 mod signal;
@@ -99,6 +101,7 @@ pub fn run(h: &mut Harness) {
     crypto::run(h);
     special::run(h);
     structure::run(h);
+    props::run(h);
     dense::run(h);
     dense_svd::run(h);
 }

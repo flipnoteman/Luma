@@ -280,7 +280,7 @@ impl crate::array::Array<f32> {
     pub(crate) fn props_used(&self) -> Props {
         let props = self.props();
         #[cfg(debug_assertions)]
-        if !props.is_none() && USES.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+        if !props.is_none() && USES.fetch_add(1, Ordering::Relaxed).is_multiple_of(16) {
             self.check_claim(props);
         }
         props
