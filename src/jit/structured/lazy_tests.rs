@@ -570,7 +570,11 @@ fn in_site_mode_a_site_is_lazy_once_it_has_something_to_attach_to() {
     fn product_here(a: &A, b: &A) -> (A, &'static Location<'static>) {
         (a.matmul(b), Location::caller())
     }
-    let ctx = Context::with_tuning(options(), |tuning| tuning.lazy = LazyMode::Site).unwrap();
+    let ctx = Context::with_tuning(options(), |tuning| {
+        tuning.lazy = LazyMode::Site;
+        tuning.lazy_probe_every = 0;
+    })
+    .unwrap();
     let Operands { a, b, ha, hb } = operands(&ctx);
     let mut was_lazy = Vec::new();
     for round in 0..20 {

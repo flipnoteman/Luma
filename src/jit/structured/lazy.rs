@@ -419,7 +419,7 @@ impl Structured {
                     None => Ok(storage),
                     Some(absorbed) => {
                         if ctx.jit().recording_decisions() {
-                            ctx.jit().note_decision(Decision::new("matmul", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
+                            ctx.jit().note_decision(Decision::new("epilogue", self.location, DecisionSite::Epilogue, "separate: no epilogue kernel"));
                         }
                         apply_separately(ctx, &absorbed.program, &absorbed.arrays, Src::Buffer(storage), absorbed.shape, self.location)
                     }
@@ -459,7 +459,7 @@ impl Structured {
             if their_lhs.shape() != lhs.shape() || their_lhs.src().ok().is_none_or(|theirs| !same_source(&theirs, &mine)) {
                 continue;
             }
-            let partner = Partner { rhs: their_rhs.clone(), epilogue: run.epilogue.as_ref().map(|theirs| (Arc::clone(&theirs.program), theirs.arrays.clone())) };
+            let partner = Partner { rhs: their_rhs.hold(), epilogue: run.epilogue.as_ref().map(|theirs| (Arc::clone(&theirs.program), theirs.arrays.clone())) };
             let slot = run.slot;
             drop(operands);
             found.push(Candidate { value, partner, slot });
@@ -630,7 +630,7 @@ fn absorb<T: GpuType, O: ScalarType>(this: &Array<T>, base: &Arc<Structured>, op
         note("separate: limit".to_owned());
         return None;
     };
-    let operands = lock(&run.operands).as_ref().map(|[lhs, rhs]| [lhs.clone(), rhs.clone()])?;
+    let operands = lock(&run.operands).as_ref().map(|[lhs, rhs]| [lhs.hold(), rhs.hold()])?;
     let mut all: SmallVec<[Array<f32>; 3]> = run.epilogue.as_ref().map(|parent| parent.arrays.clone()).unwrap_or_default();
     all.extend(arrays.iter().cloned());
     let count = program.instrs.len();
@@ -638,7 +638,7 @@ fn absorb<T: GpuType, O: ScalarType>(this: &Array<T>, base: &Arc<Structured>, op
         array.record_for_reader();
     }
     let derived = ContractionRun {
-        operands: Mutex::new(Some(operands.clone())),
+        operands: Mutex::new(Some([operands[0].hold(), operands[1].hold()])),
         kind: ContractionKind::Matmul { attrs: *attrs },
         slot: run.slot,
         inherited: OnceLock::new(),

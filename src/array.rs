@@ -511,6 +511,19 @@ impl<T: GpuType> Clone for Array<T> {
 }
 
 impl<T: GpuType> Array<T> {
+    /// A handle on the same data that a lazy value keeps as its operand: [`Clone::clone`] without the loss of this array's properties. The
+    /// handle is private to the value and never written, and a write into this array evaluates the value first (`Readers`), so the
+    /// properties stay true for as long as this array keeps them.
+    pub(crate) fn hold(&self) -> Array<T> {
+        let repr = match &self.repr {
+            Repr::Valid(storage) => Repr::Valid(Arc::clone(storage)),
+            Repr::Lazy(node) => Repr::Lazy(node.share()),
+            Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
+            Repr::Structured(value, leaf) => Repr::Structured(Arc::clone(value), leaf.clone()),
+        };
+        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, props: PropsCell::default(), _marker: PhantomData }
+    }
+
     // -- Construction --
 
     /// Allocates a valid array of `shape` whose contents are unspecified.
@@ -596,7 +609,7 @@ impl<T: GpuType> Array<T> {
         if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f32>() {
             return None;
         }
-        let same = self.clone();
+        let same = self.hold();
         Some(Array { ctx: same.ctx, shape: same.shape, repr: same.repr, view: same.view, read_view: same.read_view, props: same.props, _marker: PhantomData })
     }
 

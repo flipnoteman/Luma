@@ -157,7 +157,7 @@ pub(crate) struct Tuning {
     /// across workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
     pub(crate) single_pass_reduce: bool,
     /// When library ops (the matrix product first) launch: at the call, or when the value is used (see `jit::structured::sites`).
-    /// `LUMA_LAZY` overrides; `Never` in wave 2, `Site` once an op can absorb an epilogue (W3-U4).
+    /// `LUMA_LAZY` overrides; `Site` since W3-U4 (a product can absorb an epilogue).
     pub(crate) lazy: LazyMode,
     /// A lazy site probes (makes one call lazy) at its first call and every this many calls after it; 0: never. At most 256 and a
     /// power of two. `LUMA_LAZY_PROBE` overrides.
@@ -276,8 +276,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
-        lazy: LazyMode::Never,
-        lazy_probe_every: 0,
+        lazy: LazyMode::Site,
+        lazy_probe_every: 256,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,
@@ -319,8 +319,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
-        lazy: LazyMode::Never,
-        lazy_probe_every: 0,
+        lazy: LazyMode::Site,
+        lazy_probe_every: 256,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,
@@ -364,8 +364,8 @@ impl Tuning {
         axis_defer_weight: 0,
         axis_defer_cells: 0,
         single_pass_reduce: false,
-        lazy: LazyMode::Never,
-        lazy_probe_every: 0,
+        lazy: LazyMode::Site,
+        lazy_probe_every: 256,
         telemetry_every: 32,
         telemetry_min: 8,
         explore_every: 0,

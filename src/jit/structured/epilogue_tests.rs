@@ -141,7 +141,7 @@ fn a_write_to_a_bias_after_creation_does_not_change_the_product() {
         let bias = A::from_slice_on(&eager, &ints(N * M, 4), [N, M]).unwrap();
         (&a.matmul(&b) + &bias).to_vec().unwrap()
     };
-    bias.write(&vec![99.0; N * M]).unwrap();
+    bias.write(&[99.0; N * M]).unwrap();
     assert_eq!(out.to_vec().unwrap(), want);
 }
 

@@ -75,6 +75,7 @@ pub(crate) struct ContractionView<'a> {
     /// What an absorbed consumer applies to each output element (W3-U4). A strategy whose `Strategy::epilogue` is set may take it: it
     /// then returns [`Output::Epilogued`]. Any other output is the plain product, and the caller applies the program as a separate
     /// elementwise pass ([`crate::jit::structured::lazy`]).
+    #[allow(dead_code, reason = "W3-U4: the strategies that take an epilogue read it")]
     pub(crate) epilogue: Option<&'a EpiProgram>,
     /// Products that share `lhs` and may be launched with this one (W3-U4 A2); empty unless a strategy of the table takes partners. A
     /// strategy with `Strategy::partners` that launches them all returns [`Output::Group`]; any other output leaves them pending.
@@ -89,8 +90,11 @@ pub(crate) struct Partner {
     pub(crate) rhs: Array<f32>,
     /// The program of its absorbed epilogue and the arrays of its inputs (`EpiProgram::inputs` order); all members' programs have the
     /// same instructions.
-    pub(crate) epilogue: Option<(Arc<EpiProgram>, SmallVec<[Array<f32>; 3]>)>,
+    pub(crate) epilogue: Option<PartnerEpilogue>,
 }
+
+/// A partner's epilogue program and the arrays of its inputs.
+pub(crate) type PartnerEpilogue = (Arc<EpiProgram>, SmallVec<[Array<f32>; 3]>);
 
 impl ContractionView<'_> {
     /// The extents, if the operands are of one context and their shapes are those of a product that fits `u32`.
