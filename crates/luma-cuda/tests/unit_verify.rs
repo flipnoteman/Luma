@@ -6,8 +6,12 @@ use luma_core::hal::verify::UnitVerifier;
 use luma_core::{Backend, GemmLanes, GemmSpec, GemmUnit};
 use luma_cuda::CudaBackend;
 
+/// The cache directory is a process-wide environment variable: the tests take turns.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn every_baseline_variant_passes_and_a_broken_one_fails() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("luma-unit-verify-cuda-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: set before any thread of this process reads it; this binary has one test.
@@ -66,6 +70,7 @@ fn every_baseline_variant_passes_and_a_broken_one_fails() {
 #[test]
 fn every_half_unit_variant_passes_its_verification() {
     use luma_core::GemmOut;
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("luma-unit-verify-half-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: set before the backend opens and before any other thread of this binary reads it.
@@ -106,6 +111,7 @@ fn every_half_unit_variant_passes_its_verification() {
     }
     println!("{count} variants verified");
     // The harness is not vacuous for the half units: a swapped pair of outputs fails.
+    let _ = std::fs::remove_dir_all(&dir);
     let broken = UnitVerifier::new();
     broken.set_tamper(Some(std::sync::Arc::new(|_, out: &mut [f32]| out.swap(400, 401))));
     assert!(!broken.verdict(&backend, &GemmSpec::new(64, 64, false, true, GemmUnit::F16).with_out(GemmOut::F16)).0.ok);
