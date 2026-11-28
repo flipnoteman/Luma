@@ -1069,6 +1069,8 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     // A small operand is a window of a pack: bound as the range of the pack's buffer that it is (or copied out, see `InPin::of`).
     let pins = operands.iter().map(|storage| jit::launch::InPin::of(storage.as_seg())).collect::<Result<Vec<_>, _>>()?;
     let mut words: Vec<u32> = vec![m, n, k, plan.kc, lhs.ld, rhs.ld, lhs.off, rhs.off];
+    // The hook's scalars follow the product's own words (`gemm_copy::UNIFORM_BYTES` of the backend).
+    words.resize(gemm_hook::PRODUCT_WORDS, 0);
     words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
     let mut args: Vec<RawArg<'_>> = Vec::with_capacity(5 + pins.len());
     args.push(RawArg::write(out_pin.buffer(), out_bytes));

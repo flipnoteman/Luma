@@ -18,6 +18,10 @@ use crate::jit::epi_hook;
 use crate::kernel::KernelCore;
 use crate::matmul::MatmulTile;
 
+/// Words of the uniform before the hook's scalars: the product's own (`gemm_copy::UNIFORM_BYTES / 4` in luma-cuda; 12 once W3-R6's
+/// triangular word and the three reserved ones are in).
+pub(crate) const PRODUCT_WORDS: usize = 8;
+
 /// Hooked kernels per context.
 pub(crate) const MAX_HOOKED: usize = 64;
 
@@ -90,7 +94,7 @@ fn build(ctx: &Context, plain: Builtin, spec: GemmSpec, id: luma_core::HookId, p
     let mut bindings: Vec<BindingInfo> = base.bindings[..3].to_vec();
     bindings.extend((0..operands).map(|k| BindingInfo { name: format!("e{k}"), kind: BindingKind::StorageRead, element_stride: Some(4), min_size: None }));
     let mut uniform = base.bindings[3].clone();
-    uniform.min_size = Some(32 + 4 * program.scalars.len() as u32);
+    uniform.min_size = Some(4 * (PRODUCT_WORDS + program.scalars.len()) as u32);
     bindings.push(uniform);
     let label: Arc<str> = Arc::from(format!("{} + epilogue {:08x}", base.label, id.0 as u32));
     Ok(Some(Arc::new(CompiledKernel::new(label, raw, bindings, 4 + operands, None, base.workgroup))))
