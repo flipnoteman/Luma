@@ -99,6 +99,11 @@ fn segment_len(ctx: &Context, layout: ElemLayout) -> usize {
 }
 
 impl Storage {
+    /// How many segments an array of `len` elements of `layout` has on `ctx`.
+    pub(crate) fn segment_count_of(ctx: &Context, len: usize, layout: ElemLayout) -> usize {
+        len.div_ceil(segment_len(ctx, layout))
+    }
+
     /// A storage of `len` elements of `layout` whose segments have no buffers yet; they are
     /// allocated when first pinned, so this cannot fail.
     pub(crate) fn new(ctx: &Context, len: usize, layout: ElemLayout) -> Self {

@@ -88,6 +88,11 @@ impl JitState {
         list.push(Arc::downgrade(reduced));
     }
 
+    /// The registered value that is `reduced`, if it is one (a schedule step remembers its value, see `jit::split::Origin`).
+    pub(crate) fn registered(&self, reduced: &Structured) -> Option<Arc<Structured>> {
+        lock(&self.structured).iter().filter_map(Weak::upgrade).find(|candidate| std::ptr::eq(Arc::as_ptr(candidate), reduced))
+    }
+
     /// Whether the kernel of the merged group of structure `hash` is due (see `Tuning::reduce_multi_after`): it has been recorded
     /// `after` times one by one. With `count`, this recording is counted; without, it is only asked about (the group is
     /// about to be recorded).

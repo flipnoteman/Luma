@@ -12,7 +12,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
 use crate::jit::structured::emit::Emit;
 use crate::jit::structured::select;
-use crate::jit::structured::strategy::{Output, PassMode, Subject};
+use crate::jit::structured::strategy::{Output, Params, PassMode, StrategyId, Subject};
 use crate::gpu::lock;
 use crate::jit::comprehension::{Algebra, Comprehension, OpTag};
 use crate::jit::rules;
@@ -39,7 +39,7 @@ use crate::shape::Shape;
 const AHEAD_KERNELS: usize = 8;
 
 mod strategies;
-pub(crate) use strategies::REDUCE_STRATEGIES;
+pub(crate) use strategies::{REDUCE_STREAMED, REDUCE_STRATEGIES};
 
 /// The lines an axis reduction runs over: `lines` lines of `n` cells, `stride` apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,6 +350,35 @@ impl Structured {
             return Ok(storage);
         }
         self.record_alone(&mut emit, PassMode::Auto, self.comp().meta.ty == ElemTy::Bool).map_err(Failure::into_error)
+    }
+
+    /// Whether the passes of this reduction are canonical blocks (the strategy of [`ResClass::Streamed`], see `jit::split`): a float
+    /// reduction of a whole array that spans several segments, in a context that splits.
+    pub(crate) fn streamed(&self, ctx: &Context) -> bool {
+        let comp = self.comp();
+        let RunState::Reduce { operand, layout, .. } = &comp.run else { return false };
+        comp.meta.tag.is_whole_reduce()
+            && !layout.is_packed()
+            && !self.ops().as_slice().iter().any(|op| op.is_arg())
+            && jit::split::reduces_in_blocks(ctx, matches!(comp.meta.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 | ElemTy::F16 | ElemTy::BF16), operand.len(), comp.meta.ty.layout())
+    }
+
+    /// Records this reduction as canonical blocks: into this thread's schedule where that is allowed, else run at once.
+    pub(crate) fn record_canonical(&self, emit: &mut Emit<'_>, strategy: StrategyId, params: Params) -> std::result::Result<Arc<Storage>, Failure> {
+        let ctx = emit.ctx();
+        let comp = self.comp();
+        let RunState::Reduce { operand, wgsl, elem, layout, finish, .. } = &comp.run else { unreachable!("a reduction") };
+        let ops = self.ops();
+        let result = Arc::new(Storage::new(ctx, ops.as_slice().len(), *layout));
+        let array = Array::<u32>::from_node(ctx, Shape::from(operand.len()), Arc::clone(operand));
+        let fused = match array.pending() {
+            Some(node) => jit::reduce_blocks_source(node, ops).map_err(Failure::into_error)?,
+            None => None,
+        };
+        let origin = jit::split::Origin::Structured { value: ctx.jit().registered(self), strategy, params };
+        let spec = jit::split::Spec { ops, wgsl, cell: *elem, finish: *finish };
+        jit::split::record_reduction(ctx, fused, || array.storage().map(Arc::clone), spec, &result, jit::split::deferred_reduction(ctx), origin, (self.name, self.location))?;
+        Ok(result)
     }
 
     /// Records this reduction's own passes into a buffer: `bits` for a packed `bool` value.
@@ -1062,6 +1091,9 @@ fn reduce_into<T: GpuType>(
     finish: Finish,
 ) -> Result<luma_core::Buffer> {
     let count = ops.as_slice().len() as u64;
+    if !bits && !ops.as_slice().iter().any(|op| op.is_arg()) && jit::split::reduces_in_blocks(emit.ctx(), is_float_wgsl(wgsl), array.len(), T::LAYOUT) {
+        return reduce_in_blocks(emit, array, elem, wgsl, ops, scratch, target, finish);
+    }
     let run_passes = |emit: &mut Emit<'_>, scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
         finish_passes(emit, mode, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
     };
@@ -1112,6 +1144,44 @@ fn reduce_into<T: GpuType>(
         }
     }
     run_passes(emit, scratch, collect, len_u32(results.len())?, true, target, finish)
+}
+
+/// Whether the reduction of elements of the WGSL type `wgsl` is of floats (their sums depend on the order).
+fn is_float_wgsl(wgsl: &str) -> bool {
+    wgsl.contains("f32") || wgsl.contains("f64") || wgsl.contains("f16")
+}
+
+/// [`reduce_into`] of a float array of several segments in a context that splits: canonical blocks (see `jit::split`), run now. The
+/// values are in `target`, or in a scratch buffer.
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+fn reduce_in_blocks<T: GpuType>(
+    emit: &mut Emit<'_>,
+    array: &Array<T>,
+    elem: u64,
+    wgsl: &'static str,
+    ops: ReduceList,
+    scratch: &mut Scratch<'_>,
+    target: Option<&luma_core::Buffer>,
+    finish: Finish,
+) -> Result<luma_core::Buffer> {
+    let ctx = emit.ctx();
+    let count = ops.as_slice().len() as u64;
+    let result = Arc::new(Storage::new(ctx, count as usize, ElemLayout::plain(elem as usize)));
+    let fused = match array.pending() {
+        Some(node) => jit::reduce_blocks_source(node, ops).map_err(Failure::into_error)?,
+        None => None,
+    };
+    let origin = jit::split::Origin::Structured { value: None, strategy: StrategyId::REDUCE_CANONICAL_BLOCKS, params: Params::Reduce(crate::jit::structured::strategy::ReduceParams { pass: PassMode::TwoPass, groups: 1 }) };
+    jit::split::record_reduction(ctx, fused, || array.storage().map(Arc::clone), jit::split::Spec { ops, wgsl, cell: elem, finish }, &result, false, origin, ("reduce", Location::caller()))
+        .map_err(Failure::into_error)?;
+    let pin = result.pin(0)?;
+    let out = match target {
+        Some(target) => target.clone(),
+        None => scratch.take(count * elem)?,
+    };
+    emit.copy(pin.buffer(), 0, &out, 0, count * elem)?;
+    Ok(out)
 }
 
 /// The first pass of the reduction `ops` (one op) of the `n` bit-packed elements in `words`: the

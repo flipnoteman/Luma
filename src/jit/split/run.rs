@@ -10,6 +10,7 @@ use luma_core::hal::size_class;
 use luma_core::Buffer;
 
 use super::plan::{compile, cut_stage, floor_bytes, SlabOrder, Stage};
+use super::reduce::Carries;
 use super::ring::{choose, run_slabs, Choice, Dir};
 use super::{Access, Bind, Open, Reach, SegRef, Step, StepKernel};
 use crate::context::{Context, STORAGE_USAGE};
@@ -171,15 +172,27 @@ pub(super) fn bind_all<'a>(ctx: &'a Context, open: &'a Open, steps: &'a [Step], 
         .collect()
 }
 
-/// One step on one slab: the launches the eager path makes, with the same arguments.
-pub(super) fn launch_step(ctx: &Context, step: &Step, bound: &Bound<'_>, slab: usize) -> Result<(), LumaError> {
-    let StepKernel::Store { core, key } = &step.kernel;
-    if store_tiles(key).is_some() {
-        // One launch over the one segment.
-        launch_store(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref())
-    } else {
-        launch_store_slab(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), slab)
+/// The steps on one slab: the launches the eager path makes, with the same arguments; a reduction's first pass and merge into its carry.
+pub(super) fn launch_steps(ctx: &Context, steps: &[Step], bound: &[Bound<'_>], slab: usize, carries: &Carries<'_>) -> Result<(), LumaError> {
+    let mut reduction = 0;
+    for (step, bound) in steps.iter().zip(bound) {
+        match &step.kernel {
+            StepKernel::Store { core, key } => {
+                if store_tiles(key).is_some() {
+                    // One launch over the one segment.
+                    launch_store(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref())?;
+                } else {
+                    launch_store_slab(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), slab)?;
+                }
+            }
+            StepKernel::ReduceBlocks(_) => {
+                carries.slab(reduction, step, &bound.ins, slab)?;
+                reduction += 1;
+            }
+            StepKernel::Relowered => {}
+        }
     }
+    Ok(())
 }
 
 fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Option<&Future>) -> Result<StageInfo, LumaError> {
@@ -214,6 +227,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
     }
     let fixed = |array: u32| stage.transients.iter().find(|t| t.array == array).map(|t| &buffers.buffers[t.colour]);
 
+    let carries = Carries::new(ctx, steps)?;
     let space = stage.space(open);
     let slabs = space.slabs();
     stats.stages.fetch_add(1, Ordering::Relaxed);
@@ -239,7 +253,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
             return Err(LumaError::Gpu("injected failure".into()));
         }
         stats.slabs.fetch_add(slabs as u64, Ordering::Relaxed);
-        run_slabs(ctx, open, stage, choice, &order, &fixed)?;
+        run_slabs(ctx, open, stage, choice, &order, &fixed, &carries)?;
     } else {
         let bound = bind_all(ctx, open, steps, &fixed);
         for slab in order {
@@ -248,15 +262,24 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
                 return Err(LumaError::Gpu("injected failure".into()));
             }
             stats.slabs.fetch_add(1, Ordering::Relaxed);
-            for (step, bound) in steps.iter().zip(&bound) {
-                launch_step(ctx, step, bound, slab)?;
-            }
+            launch_steps(ctx, steps, &bound, slab, &carries)?;
         }
     }
-    for step in steps {
-        let StepKernel::Store { key, .. } = &step.kernel;
-        if store_tiles(key).is_none() {
-            note_store(ctx, key);
+    // After the last slab: a store kernel that ran over all its segments counts once, a reduction folds its slab states.
+    let bound = bind_all(ctx, open, steps, &fixed);
+    let mut reduction = 0;
+    for (step, bound) in steps.iter().zip(&bound) {
+        match &step.kernel {
+            StepKernel::Store { key, .. } => {
+                if store_tiles(key).is_none() {
+                    note_store(ctx, key);
+                }
+            }
+            StepKernel::ReduceBlocks(_) => {
+                carries.finish(reduction, step, &bound.outs[0])?;
+                reduction += 1;
+            }
+            StepKernel::Relowered => {}
         }
     }
     Ok(info)

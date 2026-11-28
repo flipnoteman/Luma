@@ -1372,6 +1372,80 @@ pub(crate) fn reduce_first_pass(
     reduce_fused(emit, mode, node.len(), fused, ops, scratch, target, finish).map(Some)
 }
 
+/// The first pass of a reduction as canonical blocks (see [`ReduceList::blocked`]) over the expression behind `node`, ready to run a
+/// segment at a time: what a schedule's `ReduceBlocks` step holds. `None` where [`reduce_first_pass`] says `None` (the node is
+/// evaluated, or is better evaluated first).
+pub(crate) struct BlockSource {
+    pub(crate) core: Arc<crate::kernel::KernelCore>,
+    pub(crate) key: Arc<FusedKey>,
+    pub(crate) inputs: Vec<Arc<Storage>>,
+    pub(crate) scalars: Vec<u32>,
+    pub(crate) shifted: Option<Shifted>,
+    pub(crate) len: usize,
+    /// Elements of a full segment, `C`.
+    pub(crate) seg_len: usize,
+    /// The first pass's list, with its block.
+    pub(crate) ops: ReduceList,
+}
+
+/// The elements of a canonical block of a reduction over segments of `seg_len` elements: at most 2^16, and a divisor of `seg_len`
+/// (a power of two), so that every segment is a whole number of blocks and the block index is global.
+pub(crate) fn canonical_block(seg_len: usize) -> u32 {
+    seg_len.min(1 << 16) as u32
+}
+
+pub(crate) fn reduce_blocks_source(node: &Arc<Node>, ops: ReduceList) -> Result<Option<BlockSource>, Failure> {
+    if !node.is_pending() {
+        return Ok(None);
+    }
+    let Some(args) = node.operands() else { return Ok(None) };
+    let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
+    drop(args);
+    let ctx = node.context();
+    let max = ctx.tuning().max_recomputed;
+    if !fused.key.inlines() && fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
+        return Ok(None);
+    }
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, .. } = fused;
+    let len = node.len();
+    let layout = layout_elem(&key, &inputs, len);
+    let first = Storage::new(ctx, len, ElemLayout::plain(layout as usize));
+    let seg_len = first.as_seg().meta().seg_len;
+    let ops = ops.blocked(canonical_block(seg_len));
+    key.tail = Tail::Reduce(ops);
+    let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    Ok(Some(BlockSource { core, key: Arc::new(key), inputs, scalars, shifted, len, seg_len, ops }))
+}
+
+/// The launch of the block first pass of `core` (of `key`) over segment `j` of the `len` elements the `inputs` span: the states of the
+/// blocks of the segment go to `out`, op `k` at `k * blocks ..`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reduce_blocks_slab<I: AsSeg>(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    key: &FusedKey,
+    inputs: &[I],
+    scalars: &[u32],
+    shifted: Option<&Shifted>,
+    (len, seg_len, block): (usize, usize, u32),
+    j: usize,
+    out: &Buffer,
+    out_bytes: u64,
+) -> Result<(), LumaError> {
+    let start = j * seg_len;
+    let n = len_u32((start + seg_len).min(len) - start)?;
+    let ids = segment_ids(shifted, j)?;
+    let words = params(key, ids, Some(n), start, len, None, scalars)?;
+    let pins = pin_inputs(key, inputs, ids, j, n)?;
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
+    raw.push(RawArg::write(out, out_bytes));
+    raw.extend(pins.iter().map(InPin::raw));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    ctx.launch(core, fold_workgroups(ctx, n.div_ceil(block))?, [n, 1, 1], &raw)
+}
+
 /// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements,
 /// applying `finish` if the pass is the last. With [`Tuning::single_pass_reduce`], one segment
 /// and more than one group, the pass finishes the reduction itself (see

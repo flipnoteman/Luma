@@ -7,7 +7,7 @@ use crate::array::Failure;
 use crate::caps::Caps;
 use crate::context::Context;
 use crate::jit::structured::emit::Emit;
-use crate::jit::structured::strategy::{BitClass, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, PassMode, ReduceParams, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
+use crate::jit::structured::strategy::{ResClass, BitClass, FamilyTag, FitsInputs, Lowered, NumClass, Output, Params, PassMode, ReduceParams, Residencies, SplitClass, Strategy, StrategyId, Subject, Warm};
 
 impl StrategyId {
     pub(crate) const REDUCE_HOST: StrategyId = StrategyId(FamilyTag::Reduce, 0);
@@ -17,7 +17,14 @@ impl StrategyId {
     pub(crate) const REDUCE_SINGLE_PASS: StrategyId = StrategyId(FamilyTag::Reduce, 4);
     pub(crate) const REDUCE_TWO_PASS: StrategyId = StrategyId(FamilyTag::Reduce, 5);
     pub(crate) const REDUCE_AXIS_LINES: StrategyId = StrategyId(FamilyTag::Reduce, 6);
+    pub(crate) const REDUCE_CANONICAL_BLOCKS: StrategyId = StrategyId(FamilyTag::Reduce, 7);
 }
+
+/// The one strategy of a reduction over several segments in a context that splits: its first pass is canonical blocks, deferred into
+/// the schedule (`jit::split`, D8). It is a table of its own, selected for `ResClass::Streamed`, so that the table above (and the
+/// Decision log of every context that does not split) is what it was.
+pub(crate) const REDUCE_STREAMED: [Strategy; 1] =
+    [entry(StrategyId::REDUCE_CANONICAL_BLOCKS, "canonical-blocks", Caps::empty(), FitsInputs::NONE, 7, 0, fits_canonical, lower_canonical)];
 
 /// The reductions' table, in preference order.
 pub(crate) const REDUCE_STRATEGIES: [Strategy; 7] = [
@@ -141,6 +148,18 @@ fn lower_axis_lines(subject: &Subject<'_>, _: &Params, emit: &mut Emit<'_>) -> R
     let Some(reduced) = reduced(subject) else { return Ok(Lowered::Declined) };
     let Some(geom) = geom(reduced) else { return Ok(Lowered::Declined) };
     done(reduced.record_axis_lines(emit, geom)?)
+}
+
+// -- canonical blocks --
+
+fn fits_canonical(subject: &Subject<'_>, ctx: &Context, res: &Residencies) -> Option<Params> {
+    let reduced = reduced(subject)?;
+    (res.class == ResClass::Streamed && reduced.streamed(ctx)).then(|| params(reduced, ctx, PassMode::TwoPass))
+}
+
+fn lower_canonical(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Result<Lowered, Failure> {
+    let Some(reduced) = reduced(subject) else { return Ok(Lowered::Declined) };
+    done(reduced.record_canonical(emit, StrategyId::REDUCE_CANONICAL_BLOCKS, *params)?)
 }
 
 // -- passes --

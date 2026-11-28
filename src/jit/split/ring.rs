@@ -7,7 +7,8 @@ use luma_core::hal::{size_class, HostBytes, Stage as HostStage, StageDir, Ticket
 use luma_core::Buffer;
 
 use super::plan::Stage;
-use super::run::{bind_all, launch_step};
+use super::reduce::Carries;
+use super::run::{bind_all, launch_steps};
 use super::{Access, Open, Reach};
 use crate::context::Context;
 use crate::error::LumaError;
@@ -173,7 +174,7 @@ fn word(bytes: u64) -> u64 {
 }
 
 /// Runs the slabs of `stage` in `order` through the ring.
-pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &Choice, order: &[usize], transient: &dyn Fn(u32) -> Option<&'t Buffer>) -> Result<(), LumaError> {
+pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &Choice, order: &[usize], transient: &dyn Fn(u32) -> Option<&'t Buffer>, carries: &Carries<'_>) -> Result<(), LumaError> {
     let steps = &open.steps[stage.steps.clone()];
     let (window, n) = (choice.window, order.len());
     let mut rings: Vec<Ring> = Vec::with_capacity(choice.streams.len());
@@ -248,9 +249,7 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
                 transient(array).or_else(|| rings.iter().find(|ring| ring.array == array && ring.flags[slab]).map(|ring| &ring.bufs[slot]))
             };
             let bound = bind_all(ctx, open, steps, &fixed);
-            for (step, bound) in steps.iter().zip(&bound) {
-                launch_step(ctx, step, bound, slab)?;
-            }
+            launch_steps(ctx, steps, &bound, slab, carries)?;
         }
         let ticket = ctx.lane_barrier(&[])?;
         outstanding.tickets.push(ticket.clone());

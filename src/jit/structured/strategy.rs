@@ -491,10 +491,13 @@ pub(crate) struct Residencies {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ResClass {
     Device,
+    /// The operand spans several segments and the context splits (`LUMA_SPLIT`): a schedule runs it slab by slab.
+    Streamed,
 }
 
 impl Residencies {
     pub(crate) const DEVICE: Residencies = Residencies { class: ResClass::Device };
+    pub(crate) const STREAMED: Residencies = Residencies { class: ResClass::Streamed };
 }
 
 // -- Eager-boundary families --

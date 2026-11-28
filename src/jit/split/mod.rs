@@ -16,11 +16,14 @@
 //! `Sink::Schedule` of `Emit` (canonical-block reductions) and the re-selection hook in `compile`.
 
 mod plan;
+mod reduce;
 mod ring;
 mod run;
 mod seg;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use reduce::{applies as reduces_in_blocks, record as record_reduction, Spec};
 
 use std::cell::{Cell, RefCell};
 use std::panic::Location;
@@ -37,6 +40,8 @@ use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
 use crate::gpu::pager::Segment;
 use crate::kernel::KernelCore;
+use super::structured::strategy::{Params, SplitClass, StrategyId};
+use super::structured::Structured;
 
 pub(crate) use seg::{AsSeg, Held, SegMeta, SegRef};
 
@@ -188,10 +193,28 @@ pub(crate) struct Bind {
 pub(crate) enum StepKernel {
     /// A store kernel (the outputs of `binds[..n_out]`, then the inputs in the kernel's binding order).
     Store { core: Arc<KernelCore>, key: Arc<FusedKey> },
+    /// The canonical-block first pass of a float reduction (`binds[0]` is its one-segment result), the merge of each slab's block
+    /// states into its slot of the stage's carry, and after the last slab the fold of the carry (see `reduce`).
+    ReduceBlocks(Box<reduce::Blocks>),
+    /// A strategy chosen by the re-selection hook (D9), run whole when its stage is reached.
+    Relowered,
+}
+
+/// What a step came from.
+pub(crate) enum Origin {
+    /// An elementwise kernel or the fused first pass of a reduction: its program is in the kernel.
+    Fused,
+    /// A structured value lowered by a strategy of the registry (06 section 3.3). `value` is `None` for a reduction that is not
+    /// registered (an immediate one), which re-selection leaves alone.
+    Structured { value: Option<Arc<Structured>>, strategy: StrategyId, params: Params },
 }
 
 /// One deferred launch.
 pub(crate) struct Step {
+    pub(crate) origin: Origin,
+    /// How the step splits over slabs: `Map` for a store without shifts, `Halo` with shifts (the radius is not tracked), `Reduce` for a
+    /// first pass.
+    pub(crate) class: SplitClass,
     pub(crate) kernel: StepKernel,
     pub(crate) space: Space,
     /// Outputs first (`n_out` of them), then the inputs (in-place inputs excluded, as in `launch::pin_inputs`).
@@ -301,7 +324,7 @@ impl Schedule {
             id: NEXT_SCHEDULE_ID.fetch_add(1, Ordering::Relaxed),
             owner: std::thread::current().id(),
             ctx: ctx.clone(),
-            open: Mutex::new(Some(Open { arrays: Vec::new(), by_segments: FxMap::default(), steps: Vec::new(), out_bytes: 0 })),
+            open: Mutex::new(Some(Open::private())),
             phase: Mutex::new(Phase::Open),
             done: Condvar::new(),
         })
@@ -413,6 +436,13 @@ fn deferred_here(ctx: &Context, key: &FusedKey, outputs: &[&Storage], inputs: &[
         && !ctx.recording_here()
 }
 
+/// Whether a canonical-block reduction recorded now waits in this thread's schedule (see [`deferred`]; a reduction has no key): the
+/// context splits, the finite check does not read each result, and this thread records no graph. Otherwise it runs before its
+/// call returns, with the same blocks and the same tree.
+pub(crate) fn deferred_reduction(ctx: &Context) -> bool {
+    ctx.split_mode() != SplitMode::Off && !ctx.check_finite() && !ctx.recording_here()
+}
+
 /// How the program reads input `k`.
 fn reach_of(key: &FusedKey, k: u32) -> Reach {
     let input = Ref::Input(k);
@@ -503,7 +533,6 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
     if super::launch::store_tiles(&key).is_some() && outputs[0].segments() != 1 {
         return Err(LumaError::Gpu("tiled program on an array of several segments".into()));
     }
-    super::plancache::taint("a launch was deferred into a schedule");
     let first = outputs[0].as_seg();
     let space = Space { len: first.len(), seg_len: first.meta().seg_len };
     let mut reaches = Vec::with_capacity(inputs.len());
@@ -512,17 +541,39 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
             reaches.push(reach_of(&key, k as u32));
         }
     }
+    let class = if key.spans.is_empty() { SplitClass::Map } else { SplitClass::Halo { flat_radius: 0 } };
     let key = Arc::new(key);
     let in_place = |o: usize| key.in_place.iter().any(|&(_, output)| output as usize == o);
-    let out_bytes: u64 = outputs.iter().map(|out| out.byte_len()).sum();
-    let mut step = Some(Step {
+    let step = Step {
+        origin: Origin::Fused,
+        class,
         kernel: StepKernel::Store { core, key: Arc::clone(&key) },
         space,
         binds: Box::default(),
         n_out: outputs.len(),
         scalars: scalars.into_boxed_slice(),
         shifted,
-    });
+    };
+    defer(ctx, step, outputs, inputs, &reaches, &in_place, first.segment_count(), (name, location))
+}
+
+/// Appends `step` (its `binds` are made here) to this thread's open schedule: `outputs` are what it writes (the first `n_out`
+/// binds), `inputs` what it reads, each with how it reads it (`reaches`); `in_place(o)` says whether output `o` is read too, and
+/// `segments` is the segments of the iteration space (an input of one segment is read whole).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn defer(
+    ctx: &Context,
+    step: Step,
+    outputs: &[&Storage],
+    inputs: &[Arc<Storage>],
+    reaches: &[Reach],
+    in_place: &dyn Fn(usize) -> bool,
+    segments: usize,
+    writer: (&'static str, &'static Location<'static>),
+) -> Result<(), LumaError> {
+    super::plancache::taint("a launch was deferred into a schedule");
+    let out_bytes: u64 = outputs.iter().map(|out| out.byte_len()).sum();
+    let mut step = Some(step);
     loop {
         let schedule = open_schedule(ctx)?;
         // What another schedule plans must have run before this step is recorded after it.
@@ -540,29 +591,7 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
                 OPEN.try_with(|all| all.borrow_mut().0.retain(|(_, known)| !Arc::ptr_eq(known, &schedule))).ok();
                 continue;
             };
-            let at = open.steps.len() as u32;
-            let mut binds = Vec::with_capacity(outputs.len() + inputs.len());
-            for (o, out) in outputs.iter().enumerate() {
-                let seg = out.as_seg();
-                let array = open.array(seg, at);
-                let entry = &mut open.arrays[array as usize];
-                entry.first_write.get_or_insert(at);
-                entry.read_write |= in_place(o);
-                entry.last_use = at;
-                entry.writer.get_or_insert((name, location));
-                binds.push(Bind { array, access: if in_place(o) { Access::ReadWrite } else { Access::Write }, reach: Reach::Point });
-            }
-            for (input, &reach) in inputs.iter().zip(&reaches) {
-                let seg = input.as_seg();
-                let array = open.array(seg, at);
-                open.arrays[array as usize].last_use = at;
-                let reach = if seg.segment_count() == 1 && first.segment_count() > 1 { Reach::Whole } else { reach };
-                binds.push(Bind { array, access: Access::Read, reach });
-            }
-            let mut step = step.take().expect("a step is recorded once");
-            step.binds = binds.into_boxed_slice();
-            open.steps.push(step);
-            open.out_bytes += out_bytes;
+            open.push(step.take().expect("a step is recorded once"), outputs, inputs, reaches, in_place, segments, writer, out_bytes);
             open.steps.len() >= MAX_STEPS || ctx.pager().budget().is_some_and(|budget| open.out_bytes / MAX_OUT_BUDGETS >= budget)
         };
         for input in inputs {
@@ -574,6 +603,49 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
             }
         }
         return if full { commit_here(ctx) } else { Ok(()) };
+    }
+}
+
+impl Open {
+    /// Appends `step` and registers its arrays (see [`defer`]).
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        mut step: Step,
+        outputs: &[&Storage],
+        inputs: &[Arc<Storage>],
+        reaches: &[Reach],
+        in_place: &dyn Fn(usize) -> bool,
+        segments: usize,
+        writer: (&'static str, &'static Location<'static>),
+        out_bytes: u64,
+    ) {
+        let at = self.steps.len() as u32;
+        let mut binds = Vec::with_capacity(outputs.len() + inputs.len());
+        for (o, out) in outputs.iter().enumerate() {
+            let array = self.array(out.as_seg(), at);
+            let entry = &mut self.arrays[array as usize];
+            entry.first_write.get_or_insert(at);
+            entry.read_write |= in_place(o);
+            entry.last_use = at;
+            entry.writer.get_or_insert(writer);
+            binds.push(Bind { array, access: if in_place(o) { Access::ReadWrite } else { Access::Write }, reach: Reach::Point });
+        }
+        for (input, &reach) in inputs.iter().zip(reaches) {
+            let seg = input.as_seg();
+            let array = self.array(seg, at);
+            self.arrays[array as usize].last_use = at;
+            let reach = if seg.segment_count() == 1 && segments > 1 { Reach::Whole } else { reach };
+            binds.push(Bind { array, access: Access::Read, reach });
+        }
+        step.binds = binds.into_boxed_slice();
+        self.steps.push(step);
+        self.out_bytes += out_bytes;
+    }
+
+    /// An open schedule that is not one of a thread's (see `reduce::run_now`).
+    fn private() -> Open {
+        Open { arrays: Vec::new(), by_segments: FxMap::default(), steps: Vec::new(), out_bytes: 0 }
     }
 }
 
