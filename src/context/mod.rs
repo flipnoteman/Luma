@@ -66,6 +66,11 @@ struct Inner {
     check_finite: bool,
     /// Whether kernels over streamed arrays are deferred into schedules (see [`ContextOptions::split`]).
     split: SplitMode,
+    /// Bytes of a slab pinned by the options (0: the planner chooses), and the elements a test pinned (`usize::MAX`: none).
+    slab_bytes: u64,
+    slab_len: std::sync::atomic::AtomicUsize,
+    /// Whether a stage recomputes the producer of a halo read in the ghost zone instead of cutting (`LUMA_SLAB_EXPAND=off`: cut).
+    slab_expand: std::sync::atomic::AtomicBool,
     /// Schedules opened and not yet committed, on any thread: zero (the common case) makes every commit trigger a load.
     schedules_open: std::sync::atomic::AtomicU32,
     /// Held while a schedule runs: one runs at a time.
@@ -278,6 +283,10 @@ pub struct ContextOptions {
     /// `auto`). Results are bit-identical to kernel-major launches. Removed before 0.6.0.
     #[doc(hidden)]
     pub split: SplitMode,
+    /// Pins the bytes of the slabs of schedules (`LUMA_SLAB_BYTES`): the slab length is `slab_bytes / (widest element)` rounded down to a
+    /// power of two, within what the stage allows. For tests and reproduction. Removed before 0.6.0.
+    #[doc(hidden)]
+    pub slab_bytes: Option<u64>,
 }
 
 /// The value of the removed environment variable `name`, with a warning (once per variable) that
@@ -310,6 +319,7 @@ impl Default for ContextOptions {
             df_fma: None,
             strategy: None,
             split: SplitMode::Off,
+            slab_bytes: None,
         }
     }
 }
@@ -325,6 +335,13 @@ impl ContextOptions {
     /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
     pub fn df_fma(mut self, fused: bool) -> Self {
         self.df_fma = Some(fused);
+        self
+    }
+
+    /// Sets [`ContextOptions::slab_bytes`].
+    #[doc(hidden)]
+    pub fn slab_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.slab_bytes = bytes;
         self
     }
 
@@ -495,6 +512,7 @@ impl ContextOptions {
             }),
             strategy: std::env::var("LUMA_STRATEGY").ok().filter(|text| !text.trim().is_empty()).map(intern),
             split: std::env::var("LUMA_SPLIT").ok().and_then(|text| SplitMode::parse(&text)).unwrap_or_default(),
+            slab_bytes: bytes("LUMA_SLAB_BYTES").filter(|&b| b > 0),
         }
     }
 }
@@ -848,6 +866,9 @@ impl Context {
                 segment_bytes,
                 check_finite: options.check_finite,
                 split: options.split,
+                slab_bytes: options.slab_bytes.unwrap_or(0),
+                slab_len: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                slab_expand: std::sync::atomic::AtomicBool::new(!std::env::var("LUMA_SLAB_EXPAND").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))),
                 schedules_open: std::sync::atomic::AtomicU32::new(0),
                 schedule_lease: Mutex::new(()),
                 streams: StreamCounters::default(),
@@ -1095,6 +1116,34 @@ impl Context {
     #[inline(always)]
     pub(crate) fn split_mode(&self) -> SplitMode {
         self.inner.split
+    }
+
+    /// The bytes the options pin for a slab (0: none).
+    pub(crate) fn slab_bytes(&self) -> u64 {
+        self.inner.slab_bytes
+    }
+
+    /// The slab length a test pinned, bypassing the planner's lower bound (see [`Context::set_slab_len`]).
+    pub(crate) fn pinned_slab_len(&self) -> Option<usize> {
+        Some(self.inner.slab_len.load(std::sync::atomic::Ordering::Relaxed)).filter(|&l| l != usize::MAX)
+    }
+
+    /// Test hook: schedules run with slabs of `len` elements (a power of two the arrays' segments allow), whatever the planner would
+    /// choose, or with the planner's choice again (`None`).
+    #[doc(hidden)]
+    pub fn set_slab_len(&self, len: Option<usize>) {
+        self.inner.slab_len.store(len.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether stages expand the producers of halo reads (see `split::plan`).
+    pub(crate) fn slab_expand(&self) -> bool {
+        self.inner.slab_expand.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook: `false` cuts every halo edge instead of expanding it (what `LUMA_SLAB_EXPAND=off` sets).
+    #[doc(hidden)]
+    pub fn set_slab_expand(&self, on: bool) {
+        self.inner.slab_expand.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn schedules_open(&self) -> &std::sync::atomic::AtomicU32 {

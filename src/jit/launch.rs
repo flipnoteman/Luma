@@ -23,8 +23,8 @@ use super::codegen::direct;
 use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
 use crate::profile::{Decision, DecisionSite, SplitReason};
 use std::panic::Location;
-use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
-use super::split::{self, AsSeg, Held, SegRef};
+use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Span, Tail, MAX_STRIPS};
+use super::split::{self, AsSeg, Held, SegRef, SlabRange};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
 /// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
@@ -235,17 +235,19 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
         let mut fused = flatten(&roots, tail)?;
         let [(_, returned)] = roots;
         args = returned;
+        // An input read through a shift of an array in several segments is two bindings, the window and the ghost (see `Span::Ghost`).
+        let bindings = fused.inputs.len() + ghost_bindings(node.context(), &fused);
         // Buffers that a pack holds are read through one binding (see `pack`).
-        if fused.inputs.len() > max_inputs && !repacked {
+        if bindings > max_inputs && !repacked {
             repacked = true;
-            if super::pack::repack_inputs(node.context(), &fused, fused.inputs.len() - max_inputs) {
+            if super::pack::repack_inputs(node.context(), &fused, bindings - max_inputs) {
                 continue;
             }
         }
-        if fused.inputs.len() > max_inputs
+        if bindings > max_inputs
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
-            jit.note_cut(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
+            jit.note_cut(node.name, node.location, SplitReason::Inputs { inputs: bindings, limit: max_inputs });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;
@@ -281,6 +283,32 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
         fused.sub_roots = Vec::new();
         return Ok((fused, args));
     }
+}
+
+/// The bindings beyond one per input that `fused` needs when slabs run it over arrays in several segments: one more for each input a
+/// shift or view reads (its ghost buffer). Nothing for programs that cannot be deferred as slabs, and none unless an input is split
+/// or streamed (single-segment programs cut where they did).
+fn ghost_bindings(ctx: &crate::context::Context, fused: &Fused) -> usize {
+    if ctx.split_mode() != split::SplitMode::Auto || fused.key.tail != Tail::Store || !fused.inputs.iter().any(|input| input.segments() > 1 || input.is_streamed()) {
+        return 0;
+    }
+    let layout = out_elems(&fused.key).first().copied().unwrap_or(4);
+    let seg = fused.inputs.iter().filter(|input| input.segments() > 1).map(|input| input.segment_len()).fold(crate::array::segment_len_of_stride(ctx, layout as usize), usize::min);
+    let stride = fused.inputs.iter().map(|input| input.layout().stride() as u64).fold(layout, u64::max);
+    if !split::below_segment(ctx, seg, stride) {
+        return 0;
+    }
+    let mut shifted = vec![false; fused.inputs.len()];
+    for instr in fused.key.instrs.iter() {
+        if let OpKind::Shift(kind) = instr.op.kind
+            && !matches!(kind, ShiftKind::Take { .. } | ShiftKind::ParamTake { .. })
+            && let Ref::Input(k) = instr.args[0]
+            && let Some(flag) = shifted.get_mut(k as usize)
+        {
+            *flag = true;
+        }
+    }
+    shifted.into_iter().filter(|&flag| flag).count()
 }
 
 /// Per instruction of the main program of `key`, the index of the last instruction reading its
@@ -551,6 +579,24 @@ pub(crate) struct Shifted {
     len: usize,
     /// Per output segment and input, the ids of the segments bound as slots.
     ids: Vec<Vec<Vec<u32>>>,
+    /// What the shifted reads of the ghost inputs reach (see [`Span::Ghost`]), by input.
+    reaches: Vec<(usize, Reach)>,
+}
+
+impl Shifted {
+    /// How far past its body a slab reads through the circular shifts of its ghost inputs, in elements (views count 0: their strips
+    /// can be anywhere, the planner does not tune the slab for them).
+    pub(super) fn halo(&self) -> usize {
+        self.reaches
+            .iter()
+            .filter_map(|(_, reach)| match reach {
+                // The circular distance: the strip a wrapped delta reads only exists in the slabs next to an end of the array.
+                Reach::Deltas(deltas) => deltas.iter().map(|delta| usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX)).map(|d| d.min(self.len.saturating_sub(d))).max(),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// The input `k` of `key` among `inputs`, which lack the in-place inputs of `key` (those are
@@ -575,13 +621,15 @@ fn plan_shifts(
     len: usize,
 ) -> Result<Option<Shifted>, LumaError> {
     let layout = layout_elem(key, inputs, len);
+    // The segment length of the arrays the launch follows (see `Storage::segment_len`). Arrays of other element sizes have their
+    // own: a launch binds them by slab, which lies in one segment of each (see `launch_store`).
     let c = crate::array::segment_len_of_stride(ctx, layout as usize);
-    // Arrays of different element sizes do not share a segmentation: they only run unsplit.
-    let outs = if matches!(key.tail, Tail::Reduce(_)) { Vec::new() } else { out_elems(key) };
-    let widest = inputs.iter().map(|input| input.layout().stride() as u64).chain(outs.iter().copied()).max().map_or(layout, |w| w.max(layout));
-    let mixed = inputs.iter().any(|input| input.layout().stride() as u64 != layout) || outs.iter().any(|&bytes| bytes != layout);
-    if mixed && (len as u64 * widest > ctx.segment_bytes() || inputs.iter().any(|input| input.segments() > 1)) {
-        return Err(LumaError::Chunked("mixed element sizes on arrays split over several buffers"));
+    // A reduction folds segment by segment, which needs one segmentation (a store binds by slab instead).
+    if matches!(key.tail, Tail::Reduce(_) | Tail::AxisReduce(_)) {
+        let mixed = inputs.iter().any(|input| input.layout().stride() as u64 != layout);
+        if mixed && (len > c || inputs.iter().any(|input| input.segments() > 1)) {
+            return Err(LumaError::Chunked("mixed element sizes on arrays split over several buffers"));
+        }
     }
     // Only an input in several segments splits a program (checked first: the scan reads every instruction).
     let split = inputs.iter().any(|input| input.segments() > 1)
@@ -589,17 +637,32 @@ fn plan_shifts(
             matches!(instr.op.kind, OpKind::Shift(_))
                 && matches!(instr.args[0], Ref::Input(k) if input_at(key, inputs, k as usize).is_some_and(|input| input.segments() > 1))
         });
-    if len <= c && !split {
+    // Under a recording nothing runs slabs (see `split::deferred`), and a ghost fill copies buffers the recording replays swapped:
+    // the recorded launches keep the slots.
+    // Slabs shorter than the segment (a pin) restart the grid of a kernel with shifts or views at every slab: it needs `base`, which
+    // the segmented variant passes, even for arrays that fit one segment (they run as slabs when an input is streamed, see
+    // `split::deferred`).
+    let below = ctx.split_mode() == split::SplitMode::Auto && !ctx.recording_here() && {
+        let seg = inputs.iter().filter(|input| input.segments() > 1).map(|input| input.segment_len()).fold(c, usize::min);
+        let stride = inputs.iter().map(|input| input.layout().stride() as u64).fold(layout, u64::max);
+        split::below_segment(ctx, seg, stride)
+    };
+    // The launch runs slabs exactly when `split::deferred` defers it; an output of one segment does so only for a streamed input.
+    let runs_slabs = key.tail == Tail::Store && !ctx.check_finite() && inputs.iter().any(|input| input.is_streamed());
+    if len <= c && !split && !(below && runs_slabs && key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)))) {
         return Ok(None);
     }
     if !key.subs.is_empty() {
         return Err(LumaError::Chunked("a lazy expression read through a view or shift on arrays split over several buffers"));
     }
-    let Some((counts, ids)) = spans(key, inputs, scalars, len, c, ctx.jit().max_inputs() + 1)? else {
+    // Ghosts replace the slots in schedules that run slabs (`LUMA_SPLIT=auto`); the other modes keep the slots.
+    // They pay off only below the segment: a slab that is a segment reads whole neighbour segments, which slots bind without a copy.
+    let ghosts = below && key.tail == Tail::Store;
+    let Some((counts, ids, reaches)) = spans(key, inputs, scalars, len, c, ctx.jit().max_inputs() + 1, ghosts)? else {
         return Ok(None);
     };
     key.spans = counts;
-    Ok(Some(Shifted { len, ids }))
+    Ok(Some(Shifted { len, ids, reaches }))
 }
 
 /// `ElemLayout::stride` of every output of `key`: one per stored value, or the one value a
@@ -643,7 +706,7 @@ fn layout_elem(key: &FusedKey, inputs: &[Arc<Storage>], len: usize) -> u64 {
 }
 
 /// Slot counts per input and, per output segment and input, the segment ids to bind (see [`spans`]).
-type SegmentSpans = (Vec<u8>, Vec<Vec<Vec<u32>>>);
+type SegmentSpans = (Vec<Span>, Vec<Vec<Vec<u32>>>, Vec<(usize, Reach)>);
 
 /// For a program with shifts on arrays of `len` elements in segments of `c`: how many segments
 /// of every input its shifted reads touch at most (slots, 0 = the input is never shifted) and,
@@ -657,6 +720,7 @@ fn spans(
     len: usize,
     c: usize,
     max_bindings: usize,
+    ghosts: bool,
 ) -> Result<Option<SegmentSpans>, LumaError> {
     // Per shift instruction: its input and what it reads: the translations (read index -
     // written index) of a circular shift, over the wrapped and unwrapped parts of every shifted
@@ -708,6 +772,25 @@ fn spans(
     let input_count = key.input_tys.len();
     let segments = len.div_ceil(c);
     let last = len as i64 - 1;
+    // Inputs read through a window and a ghost: shifts and views of unpacked layouts whose strips stay small (the hull of a transposed
+    // view reads a column of the whole source and keeps its slots).
+    let mut ghost = vec![false; input_count];
+    for &(k, _) in &shifts {
+        ghost[k] = ghosts
+            && input_at(key, inputs, k).is_some_and(|input| !input.layout().is_packed())
+            && shifts.iter().filter(|(other, _)| *other == k).all(|(_, reach)| !matches!(reach, Reach::All));
+    }
+    for (k, is_ghost) in ghost.iter_mut().enumerate() {
+        if *is_ghost {
+            let limit = input_at(key, inputs, k).map_or(len, |input| input.len());
+            let reaches = shifts.iter().filter(|(other, _)| *other == k).map(|(_, reach)| reach);
+            let widest = (0..segments)
+                .map(|j| reach_strips(reaches.clone(), limit, j * c, len.min((j + 1) * c)).iter().map(|&(lo, hi)| hi - lo + 1).sum::<usize>())
+                .max()
+                .unwrap_or(0);
+            *is_ghost = widest <= 4 * c;
+        }
+    }
     let mut ids: Vec<Vec<Vec<u32>>> = Vec::with_capacity(segments);
     for j in 0..segments {
         let (a, b) = ((j * c) as i64, (len.min((j + 1) * c)) as i64);
@@ -716,12 +799,17 @@ fn spans(
             let Some(list) = lists.get_mut(*k) else {
                 return Err(LumaError::Gpu("shift of an unknown input".into()));
             };
+            if ghost[*k] {
+                continue;
+            }
             match reach {
                 Reach::Deltas(deltas) => {
+                    // The segmentation of the input itself (it differs from the output's for another element size).
+                    let cs = input_at(key, inputs, *k).map_or(c, |input| input.segment_len());
                     for delta in deltas {
                         let (lo, hi) = ((a + delta).max(0), (b - 1 + delta).min(last));
                         if lo <= hi {
-                            list.extend((lo as usize / c..=hi as usize / c).map(|id| id as u32));
+                            list.extend((lo as usize / cs..=hi as usize / cs).map(|id| id as u32));
                         }
                     }
                 }
@@ -751,7 +839,7 @@ fn spans(
     for (k, count) in counts.iter_mut().enumerate() {
         let longest = ids.iter().map(|lists| lists[k].len()).max().unwrap_or(0);
         *count = u8::try_from(longest)
-            .map_err(|_| LumaError::Chunked("a shift that reads this many buffers at once"))?;
+            .map_err(|_| LumaError::Chunked("a view or shift that reads more than 255 source segments per slab"))?;
     }
     for lists in &mut ids {
         for (list, &count) in lists.iter_mut().zip(&counts) {
@@ -759,6 +847,8 @@ fn spans(
             list.resize(usize::from(count), pad);
         }
     }
+    let spans: Vec<Span> = (0..input_count).map(|k| if ghost[k] { Span::Ghost } else if counts[k] > 0 { Span::Slots(counts[k]) } else { Span::None }).collect();
+    let reaches: Vec<(usize, Reach)> = shifts.iter().filter(|(k, _)| ghost[*k]).cloned().collect();
 
     let outputs = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Solve(_) => key.outputs.len(),
@@ -772,17 +862,25 @@ fn spans(
         | Tail::Reduce(_)
         | Tail::AxisReduce(_) => 1,
     };
+    // A ghost input is two bindings, the window (which is also its direct read) and the ghost.
     let direct = (0..input_count)
-        .filter(|&k| !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))
+        .filter(|&k| !ghost[k] && !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))
         .count();
     let slots: usize = counts.iter().map(|&count| usize::from(count)).sum();
-    if outputs + direct + slots > max_bindings {
-        return Err(LumaError::Chunked("a shift that reads this many buffers at once"));
+    let ghost_bindings = 2 * ghost.iter().filter(|&&g| g).count();
+    if outputs + direct + ghost_bindings + slots > max_bindings {
+        let per_slab = counts.iter().copied().max().map_or(0, usize::from);
+        return Err(LumaError::Chunked(if per_slab > 1 {
+            "a view or shift that reads more than the device's binding limit of source segments per slab"
+        } else {
+            "a view or shift on too many inputs for the device's binding limit"
+        }));
     }
-    Ok(Some((counts, ids)))
+    Ok(Some((spans, ids, reaches)))
 }
 
 /// What a shift instruction reads, see [`spans`].
+#[derive(Clone)]
 enum Reach {
     Deltas(Vec<i64>),
     View(ViewMap, Edge),
@@ -805,6 +903,220 @@ fn view_reach(map: &ViewMap, edge: Edge, a: usize, b: usize) -> (usize, usize) {
         step *= extent as usize;
     }
     (lo, hi)
+}
+
+/// The flat ranges `(lo, hi)` (inclusive) of an input of `limit` elements that the reads `reaches` make for the output elements
+/// `a..b`, sorted, overlapping and adjacent ones merged (`split::strips` of the design). Views give a superset (their hull).
+fn reach_strips<'r>(reaches: impl Iterator<Item = &'r Reach>, limit: usize, a: usize, b: usize) -> Vec<(usize, usize)> {
+    let last = limit as i64 - 1;
+    let mut strips: Vec<(usize, usize)> = Vec::new();
+    for reach in reaches {
+        match reach {
+            Reach::Deltas(deltas) => {
+                for delta in deltas {
+                    let (lo, hi) = ((a as i64 + delta).max(0), (b as i64 - 1 + delta).min(last));
+                    if lo <= hi {
+                        strips.push((lo as usize, hi as usize));
+                    }
+                }
+            }
+            Reach::View(map, edge) => {
+                let (lo, hi) = view_reach(map, *edge, a, b);
+                if lo < limit {
+                    strips.push((lo, hi.min(limit.saturating_sub(1))));
+                }
+            }
+            Reach::All => strips.push((0, limit.saturating_sub(1))),
+        }
+    }
+    strips.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(strips.len());
+    for (lo, hi) in strips {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// What one slab reads of a ghost input: the window (bound by offset from its segment) and the pieces copied into the ghost buffer.
+pub(super) struct GhostSlab {
+    /// The window: elements `w_lo..w_lo + w_len` of the input, in one segment (`w_len` 0: one element is bound, none is read).
+    w_lo: usize,
+    w_len: usize,
+    /// `(first element, elements, position in the ghost buffer)`, at most [`MAX_STRIPS`], in ascending order.
+    pieces: Vec<(usize, usize, usize)>,
+    ghost_elems: usize,
+    /// For an input that is a transient of the stage (its producer runs over the regions of the slab, see [`Region`]): where the
+    /// window starts in the transient's buffer, and how many elements of it the regions fill. Window and ghost are views of it.
+    resident: Option<(usize, usize)>,
+    regions: Vec<Region>,
+}
+
+/// A run of elements `lo..lo + n` of an expanded transient that its producer computes for a slab, written from element `pos` of the
+/// transient's buffer: the strips the consumer reads and its body, each started on the offset alignment.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Region {
+    pub(super) lo: usize,
+    pub(super) n: usize,
+    pub(super) pos: usize,
+}
+
+impl GhostSlab {
+    /// The slab's strips of input `k` read by `shifted`: the window is the body of the slab if the program also loads the input at its
+    /// own element (`direct`), else the longest strip, rounded down to `align` elements and trimmed to one segment; the rest of the
+    /// strips is the ghost. More than [`MAX_STRIPS`] pieces are merged, closest first (a superset).
+    pub(super) fn plan(shifted: &Shifted, k: usize, input: SegRef<'_>, slab: SlabRange, direct: bool, align: usize, resident: bool) -> GhostSlab {
+        // The producer of a transient computes what the slab reads into one buffer: the body is the window, and the strips are
+        // ghost, all inside that buffer.
+        let direct = direct || resident;
+        let (cs, limit) = (input.meta().seg_len, input.len());
+        let reaches = shifted.reaches.iter().filter(|(other, _)| *other == k).map(|(_, reach)| reach);
+        let strips = reach_strips(reaches, limit, slab.a, slab.a + slab.n);
+        let (w_lo, w_len) = if direct {
+            (slab.a, slab.n)
+        } else if let Some((lo, hi)) = strips
+            .iter()
+            // The longest piece of a strip that lies in one segment: a strip that straddles two (a shift by a few elements at a
+            // segment boundary) gives its longer side, the rest is the ghost.
+            .flat_map(|&(lo, hi)| (lo / cs..=hi / cs).map(move |j| (lo.max(j * cs), hi.min((j + 1) * cs - 1))))
+            .max_by_key(|&(lo, hi)| hi - lo)
+        {
+            let seg_start = lo / cs * cs;
+            let w_lo = (lo - lo % align.max(1)).max(seg_start);
+            (w_lo, hi - w_lo + 1)
+        } else {
+            (slab.a, 0)
+        };
+        let window = (w_lo, w_lo + w_len);
+        let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(2 * strips.len());
+        for (lo, hi) in strips {
+            let end = hi + 1;
+            if end <= window.0 || lo >= window.1 {
+                pieces.push((lo, end));
+            } else {
+                if lo < window.0 {
+                    pieces.push((lo, window.0));
+                }
+                if end > window.1 {
+                    pieces.push((window.1, end));
+                }
+            }
+        }
+        pieces.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+        for (lo, end) in pieces {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((lo, end)),
+            }
+        }
+        while merged.len() > MAX_STRIPS {
+            let at = (1..merged.len()).min_by_key(|&i| merged[i].0 - merged[i - 1].1).unwrap_or(1);
+            let next = merged.remove(at);
+            merged[at - 1].1 = next.1;
+        }
+        if resident {
+            return GhostSlab::in_regions(w_lo, w_len, &merged, limit, align);
+        }
+        let mut at = 0;
+        let pieces = merged
+            .into_iter()
+            .map(|(lo, end)| {
+                let piece = (lo, end - lo, at);
+                at += end - lo;
+                piece
+            })
+            .collect();
+        GhostSlab { w_lo, w_len, pieces, ghost_elems: at, resident: None, regions: Vec::new() }
+    }
+
+    /// The plan of an expanded transient of `limit` elements: the regions to compute (the window and the pieces, started on `align` and
+    /// merged where they touch) laid out one after the other in the buffer, and the strip table pointing into them.
+    fn in_regions(w_lo: usize, w_len: usize, pieces: &[(usize, usize)], limit: usize, align: usize) -> GhostSlab {
+        let align = align.max(1);
+        let mut wanted: Vec<(usize, usize)> = pieces.iter().copied().chain((w_len > 0).then_some((w_lo, w_lo + w_len))).collect();
+        for (lo, end) in &mut wanted {
+            *lo -= *lo % align;
+            *end = end.next_multiple_of(align).min(limit);
+        }
+        wanted.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(wanted.len());
+        for (lo, end) in wanted {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((lo, end)),
+            }
+        }
+        let mut pos = 0;
+        let regions: Vec<Region> = merged
+            .into_iter()
+            .map(|(lo, end)| {
+                let region = Region { lo, n: end - lo, pos };
+                pos += (end - lo).next_multiple_of(align);
+                region
+            })
+            .collect();
+        let used = regions.last().map_or(0, |region| region.pos + region.n);
+        let place = |element: usize| regions.iter().find(|region| region.lo <= element && element < region.lo + region.n).map_or(0, |region| region.pos + element - region.lo);
+        let table = pieces.iter().map(|&(lo, end)| (lo, end - lo, place(lo))).collect();
+        GhostSlab { w_lo, w_len, pieces: table, ghost_elems: used, resident: Some((place(w_lo), used)), regions }
+    }
+
+    /// The regions of the transient the producer computes for this slab.
+    pub(super) fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    /// Elements of the transient's buffer the regions fill.
+    pub(super) fn used(&self) -> usize {
+        self.resident.map_or(0, |(_, used)| used)
+    }
+
+    /// The uniform words of the input: the window, then `MAX_STRIPS` triples `(first, length, position)`.
+    fn words(&self) -> Vec<u32> {
+        let mut words = vec![0u32; 2 + 3 * MAX_STRIPS];
+        words[0] = self.w_lo as u32;
+        words[1] = self.w_len as u32;
+        for (s, &(lo, len, at)) in self.pieces.iter().enumerate() {
+            words[2 + 3 * s..5 + 3 * s].copy_from_slice(&[lo as u32, len as u32, at as u32]);
+        }
+        words
+    }
+
+    /// Binds the window and fills the ghost buffer from the segments of `input` (copies recorded in the batch's order).
+    fn bind(&self, input: SegRef<'_>, buffers: &mut Vec<Buffer>) -> Result<[InPin; 2], LumaError> {
+        let ctx = input.ctx();
+        if let (Some((at, used)), Some(buffer)) = (self.resident, input.fixed()) {
+            let layout = input.layout();
+            aligned(ctx, layout.bytes(at))?;
+            let window = InPin::new(Held::Fixed(buffer.at(layout.bytes(at))), layout.bytes(self.w_len.max(1)));
+            return Ok([window, InPin::new(Held::Fixed(buffer.clone()), layout.bytes(used))]);
+        }
+        let window = InPin::slab(input, SlabRange { a: self.w_lo, n: self.w_len.max(1) })?;
+        if self.pieces.is_empty() {
+            // Nothing is read beside the window: it stands for the ghost too (both are read-only).
+            return Ok([window, InPin::slab(input, SlabRange { a: self.w_lo, n: self.w_len.max(1) })?]);
+        }
+        let (cs, layout) = (input.meta().seg_len, input.layout());
+        let buffer = ctx.alloc_buffer(layout.bytes(self.ghost_elems), crate::context::STORAGE_USAGE)?;
+        for &(lo, len, at) in &self.pieces {
+            let mut done = 0;
+            while done < len {
+                let first = lo + done;
+                let j = first / cs;
+                let n = (len - done).min((j + 1) * cs - first);
+                let pin = input.pin_read(j)?;
+                ctx.copy(pin.buffer(), layout.bytes(first - j * cs), &buffer, layout.bytes(at + done), layout.bytes(n))?;
+                done += n;
+            }
+        }
+        ctx.stream_counters().ghost(layout.bytes(self.ghost_elems));
+        let ghost = InPin::new(Held::Fixed(buffer.clone()), layout.bytes(self.ghost_elems));
+        buffers.push(buffer);
+        Ok([window, ghost])
+    }
 }
 
 /// The slot ids of output segment `j` (see [`Shifted`]); `None` when the launch is plain.
@@ -853,10 +1165,51 @@ impl InPin {
         Ok(InPin::new(input.pin_read(0)?, input.byte_len()))
     }
 
+    /// Pins what `slab` of `input` is, bound from its offset in the segment (a view of the buffer that starts there).
+    fn slab(input: SegRef<'_>, slab: SlabRange) -> Result<Self, LumaError> {
+        let (j, offset) = input.locate(slab);
+        aligned(input.ctx(), offset)?;
+        let pin = input.pin_read(j)?;
+        let view = (offset != 0).then(|| pin.buffer().at(offset));
+        Ok(InPin { pin, view, bytes: input.layout().bytes(slab.n) })
+    }
+
     pub(super) fn raw(&self) -> RawArg<'_> {
         RawArg::read(self.view.as_ref().unwrap_or(self.pin.buffer()), self.bytes)
     }
 }
+
+/// Fails if the device cannot bind a buffer from `offset`. The planner starts slabs where every array is aligned (`slab::align_elems`),
+/// so this only fails for the slabs of an eager launch over arrays of element sizes whose segments are short (a few hundred bytes).
+#[inline]
+fn aligned(ctx: &crate::context::Context, offset: u64) -> Result<(), LumaError> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let align = ctx.hal().storage_offset_align();
+    if align != 0 && offset.is_multiple_of(align) {
+        Ok(())
+    } else {
+        Err(LumaError::Chunked("arrays of different element sizes whose segments are too short to be bound at an offset"))
+    }
+}
+
+/// What a launch binds to write an output: the pinned buffer from the offset of the slab, and the bytes of the slab.
+pub(super) struct OutPin {
+    pin: Held,
+    view: Option<Buffer>,
+    bytes: u64,
+}
+
+impl OutPin {
+    fn raw(&self) -> RawArg<'_> {
+        RawArg::write(self.view.as_ref().unwrap_or(self.pin.buffer()), self.bytes)
+    }
+}
+
+/// The slab a launch binds and the length of its grid.
+#[derive(Clone, Copy)]
+pub(super) struct At(SlabRange, usize);
 
 /// Pins what segment `j` (of `n` elements) of a launch binds as inputs, in the binding order of
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
@@ -892,6 +1245,50 @@ pub(super) fn pin_inputs<S: AsSeg>(
         };
         if direct(&key.instrs, k as u32) {
             pins.push(InPin::new(input.pin_read(j)?, bytes(input)));
+        }
+        for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
+            let id = id as usize;
+            pins.push(InPin::new(input.pin_read(id)?, input.segment_byte_len(id)));
+        }
+    }
+    Ok(pins)
+}
+
+/// [`pin_inputs`] for a slab: an input is bound from the offset of the slab in its segment (the slab lies in one
+/// segment of every array that is bound by it). An input of another length or in one segment bound whole stays so.
+pub(super) fn pin_inputs_at<S: AsSeg>(
+    key: &FusedKey,
+    inputs: &[S],
+    ids: Option<&[Vec<u32>]>,
+    at: At,
+    ghosts: Option<(&[Option<GhostSlab>], &mut Vec<Buffer>)>,
+) -> Result<Vec<InPin>, LumaError> {
+    let mut ghosts = ghosts;
+    let mut pins = Vec::with_capacity(inputs.len());
+    let mut stored = inputs.iter();
+    for k in 0..key.input_tys.len() {
+        if key.in_place.iter().any(|&(paired, _)| paired as usize == k) {
+            continue;
+        }
+        let Some(input) = stored.next() else {
+            return Err(LumaError::Gpu("fused program with too few inputs".into()));
+        };
+        let input = input.as_seg();
+        let Some(ids) = ids else {
+            // An input of the length of the output is bound by slab; a single buffer of
+            // another length (the source of a view) is bound whole.
+            let At(slab, total) = at;
+            pins.push(if input.segment_count() == 1 && (slab.n == input.len() || input.len() != total) { InPin::of(input)? } else { InPin::slab(input, slab)? });
+            continue;
+        };
+        if let Some((plans, buffers)) = ghosts.as_mut()
+            && let Some(Some(plan)) = plans.get(k)
+        {
+            pins.extend(plan.bind(input, buffers)?);
+            continue;
+        }
+        if direct(&key.instrs, k as u32) {
+            pins.push(InPin::slab(input, at.0)?);
         }
         for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
             let id = id as usize;
@@ -938,21 +1335,34 @@ pub(super) fn params<'a>(
 /// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]).
 pub(super) struct StoreArgs<'a> {
     pub(super) n: u32,
-    outs: Vec<(Held, u64)>,
+    outs: Vec<OutPin>,
     ins: Vec<InPin>,
     words: Cow<'a, [u32]>,
+    /// The ghost buffers of the launch, given back to the pool once it is recorded.
+    ghosts: Vec<Buffer>,
 }
 
 impl StoreArgs<'_> {
     pub(super) fn raw(&self) -> Vec<RawArg<'_>> {
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(self.outs.len() + self.ins.len() + 1);
-        raw.extend(self.outs.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
+        raw.extend(self.outs.iter().map(OutPin::raw));
         raw.extend(self.ins.iter().map(InPin::raw));
         if !self.words.is_empty() {
             raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.words)));
         }
         raw
     }
+}
+
+/// [`store_args`] of the one segment of a single output over arrays in one segment each (no shifts): what every small launch is.
+#[inline(always)]
+fn store_args_whole<'a, I: AsSeg>(key: &FusedKey, out: SegRef<'_>, inputs: &[I], scalars: &'a [u32]) -> Result<StoreArgs<'a>, LumaError> {
+    let n = len_u32(out.len())?;
+    let pin = if key.in_place.is_empty() { out.pin_overwrite(0) } else { out.pin(0) }?;
+    let outs = vec![OutPin { pin, view: None, bytes: out.segment_byte_len(0) }];
+    let ins = pin_inputs(key, inputs, None, 0, n)?;
+    let words = params(key, None, None, 0, 0, None, scalars)?;
+    Ok(StoreArgs { n, outs, ins, words, ghosts: Vec::new() })
 }
 
 /// The arguments of the launch of segment `j` of `outputs[0]`; `outputs` must not be empty.
@@ -967,27 +1377,81 @@ pub(super) fn store_args<'a, O: AsSeg, I: AsSeg>(
     let Some(first) = outputs.first() else {
         return Err(LumaError::Gpu("fused kernel without output".into()));
     };
+    let range = first.as_seg().range(j);
+    store_args_slab(key, outputs, inputs, scalars, shifted, SlabRange { a: range.start, n: range.len() })
+}
+
+/// The arguments of the launch of `slab` of the grid of `outputs[0]` (see [`SlabRange`]); `outputs` must not be empty. Segment `j` of
+/// `outputs[0]` is the slab `first.range(j)`: bound from offset 0, which is what [`store_args`] passes.
+pub(super) fn store_args_slab<'a, O: AsSeg, I: AsSeg>(
+    key: &FusedKey,
+    outputs: &[O],
+    inputs: &[I],
+    scalars: &'a [u32],
+    shifted: Option<&Shifted>,
+    slab: SlabRange,
+) -> Result<StoreArgs<'a>, LumaError> {
+    let Some(first) = outputs.first() else {
+        return Err(LumaError::Gpu("fused kernel without output".into()));
+    };
     let first = first.as_seg();
-    let range = first.range(j);
-    let n = len_u32(range.len())?;
-    let ids = segment_ids(shifted, j)?;
-    // An output that is not an in-place input is overwritten whole: a file-backed segment is not read first.
+    let n = len_u32(slab.n)?;
+    let total = first.len();
+    // The slot ids of the segment of `outputs[0]` the slab lies in: a slab inside a segment reads a subset of what the segment reads.
+    let mut slot_ids = match shifted {
+        None => None,
+        Some(_) => segment_ids(shifted, slab.a / first.meta().seg_len)?,
+    };
+    // Ghost inputs: what the slab reads beside its window goes to the ghost buffer, and its description to the uniform.
+    let mut plans: Vec<Option<GhostSlab>> = Vec::new();
+    let mut ghost_ids: Vec<Vec<u32>> = Vec::new();
+    if let Some(shifted) = shifted
+        && key.spans.iter().any(|span| span.is_ghost())
+    {
+        let align = usize::try_from(first.ctx().hal().storage_offset_align()).unwrap_or(0);
+        for (k, span) in key.spans.iter().enumerate() {
+            let input = span.is_ghost().then(|| input_at(key, inputs, k)).flatten();
+            match input {
+                Some(input) => {
+                    let plan = GhostSlab::plan(shifted, k, input.as_seg(), slab, direct(&key.instrs, k as u32), align, input.as_seg().fixed().is_some());
+                    ghost_ids.push(plan.words());
+                    plans.push(Some(plan));
+                }
+                None => {
+                    ghost_ids.push(slot_ids.and_then(|ids| ids.get(k)).cloned().unwrap_or_default());
+                    plans.push(None);
+                }
+            }
+        }
+        slot_ids = None;
+    }
+    let ids = if plans.is_empty() { slot_ids } else { Some(ghost_ids.as_slice()) };
+    // An output that is not an in-place input is overwritten whole: a file-backed segment is not read first. A slab that starts a
+    // segment may say so too (the later slabs of the segment pin it for writing as they are not the first to touch it).
     let outs = outputs
         .iter()
         .enumerate()
         .map(|(o, out)| {
             let out = out.as_seg();
-            let pin = if !key.in_place.is_empty() && key.in_place.iter().any(|&(_, output)| output as usize == o) { out.pin(j) } else { out.pin_overwrite(j) };
-            pin.map(|pin| (pin, out.segment_byte_len(j)))
+            let (j, offset) = out.locate(slab);
+            aligned(out.ctx(), offset)?;
+            let in_place = !key.in_place.is_empty() && key.in_place.iter().any(|&(_, output)| output as usize == o);
+            let starts = slab.a == 0 || slab.a.is_multiple_of(out.meta().seg_len);
+            let pin = if in_place || !starts { out.pin(j) } else { out.pin_overwrite(j) };
+            pin.map(|pin| {
+                let view = (offset != 0).then(|| pin.buffer().at(offset));
+                OutPin { pin, view, bytes: out.layout().bytes(slab.n) }
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let ins = pin_inputs(key, inputs, ids, j, n)?;
-    let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), None, scalars)?;
-    Ok(StoreArgs { n, outs, ins, words })
+    let mut ghosts = Vec::new();
+    let ins = pin_inputs_at(key, inputs, ids, At(slab, total), (!plans.is_empty()).then_some((plans.as_slice(), &mut ghosts)))?;
+    let words = params(key, ids, None, slab.a, shifted.map_or(0, |shifted| shifted.len), None, scalars)?;
+    Ok(StoreArgs { n, outs, ins, words, ghosts })
 }
 
-/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`, with the arguments
-/// of [`store_args`]. Counts as one elementwise launch.
+/// Launches the store kernel `core` of `key` once per segment of `outputs[0]` (once per slab where an array has shorter segments than
+/// that, see [`piece_len`]), with the arguments of [`store_args_slab`]. Counts as one elementwise launch.
 pub(super) fn launch_store<O: AsSeg, I: AsSeg>(
     ctx: &crate::context::Context,
     core: &crate::kernel::KernelCore,
@@ -1005,12 +1469,85 @@ pub(super) fn launch_store<O: AsSeg, I: AsSeg>(
         }
         let args = store_args(key, outputs, inputs, scalars, shifted, 0)?;
         ctx.launch(core, fold_workgroups(ctx, tiles)?, [args.n, 1, 1], &args.raw())?;
+    } else if first.segment_count() == 1 && outputs.len() == 1 && shifted.is_none() && inputs.iter().all(|input| input.as_seg().segment_count() == 1) {
+        // The usual launch: whole arrays in one segment each, bound from offset 0.
+        let args = store_args_whole(key, first, inputs, scalars)?;
+        let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)) * key.pack_factor());
+        ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
     } else {
-        for j in 0..first.segment_count() {
-            launch_store_slab(ctx, core, key, outputs, inputs, scalars, shifted, j)?;
-        }
+        launch_store_range(ctx, core, key, outputs, inputs, scalars, shifted, SlabRange { a: 0, n: first.len() })?;
     }
     note_store(ctx, key);
+    Ok(())
+}
+
+/// Launches the plain store kernel over `range`: one launch per piece of it that lies in one segment of every array (see [`piece_len`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_store_range<O: AsSeg, I: AsSeg>(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    key: &FusedKey,
+    outputs: &[O],
+    inputs: &[I],
+    scalars: &[u32],
+    shifted: Option<&Shifted>,
+    range: SlabRange,
+) -> Result<(), LumaError> {
+    let Some(first) = outputs.first() else { return Ok(()) };
+    let piece = piece_len(first.as_seg(), outputs, inputs);
+    let end = range.a + range.n;
+    let mut a = range.a;
+    while a < end {
+        // A piece ends at the next multiple of `piece` (all segment lengths are powers of two, so no segment is crossed).
+        let n = (piece - a % piece).min(end - a);
+        launch_store_slab(ctx, core, key, outputs, inputs, scalars, shifted, SlabRange { a, n })?;
+        a += n;
+    }
+    Ok(())
+}
+
+/// The elements of one launch of arrays that need not share a segmentation: the shortest segment among the outputs and the inputs
+/// split over several segments (a power of two, so slabs of it never span two segments of another array). It is the segment of
+/// `first` when every array has the same, which is the usual case.
+#[inline(always)]
+fn piece_len<O: AsSeg, I: AsSeg>(first: SegRef<'_>, outputs: &[O], inputs: &[I]) -> usize {
+    let mut piece = first.meta().seg_len;
+    for out in outputs.iter().skip(1) {
+        piece = piece.min(out.as_seg().meta().seg_len);
+    }
+    for input in inputs {
+        let input = input.as_seg();
+        if input.segment_count() > 1 {
+            piece = piece.min(input.meta().seg_len);
+        }
+    }
+    piece
+}
+
+/// Launches the producer kernel of an expanded halo edge over `region` of its transient `out` (bound to `buffer`, the transient's
+/// buffer of the stage): one launch per piece of the region that lies in one segment of every input, each writing from its place in
+/// the buffer. `key` is the producer's (plain: no shifts, one output).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_store_region<I: AsSeg>(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    key: &FusedKey,
+    out: SegRef<'_>,
+    buffer: &Buffer,
+    inputs: &[I],
+    scalars: &[u32],
+    region: Region,
+) -> Result<(), LumaError> {
+    let piece = piece_len(out, &[out], inputs);
+    let end = region.lo + region.n;
+    let mut a = region.lo;
+    while a < end {
+        let n = (piece - a % piece).min(end - a);
+        let view = buffer.at(out.layout().bytes(region.pos + (a - region.lo)));
+        let bound = out.fixed_to(Some(&view));
+        launch_store_slab::<SegRef<'_>, I>(ctx, core, key, &[bound], inputs, scalars, None, SlabRange { a, n })?;
+        a += n;
+    }
     Ok(())
 }
 
@@ -1024,7 +1561,7 @@ pub(super) fn store_tiles(key: &FusedKey) -> Option<u32> {
     }
 }
 
-/// The launch of segment `j` of a plain (not tiled) store kernel: the body of [`launch_store`]'s loop, which a schedule runs slab by slab.
+/// The launch of one slab of a plain (not tiled) store kernel: the body of [`launch_store`]'s loop, which a schedule runs slab by slab.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_store_slab<O: AsSeg, I: AsSeg>(
     ctx: &crate::context::Context,
@@ -1034,11 +1571,17 @@ pub(super) fn launch_store_slab<O: AsSeg, I: AsSeg>(
     inputs: &[I],
     scalars: &[u32],
     shifted: Option<&Shifted>,
-    j: usize,
+    slab: SlabRange,
 ) -> Result<(), LumaError> {
-    let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
+    let mut args = store_args_slab(key, outputs, inputs, scalars, shifted, slab)?;
     let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)) * key.pack_factor());
     ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
+    if !args.ghosts.is_empty() {
+        // The copies and the launch are recorded: the buffers may be reused by what is recorded next.
+        let ghosts = std::mem::take(&mut args.ghosts);
+        drop(args);
+        ghosts.into_iter().for_each(|buffer| ctx.recycle(buffer));
+    }
     Ok(())
 }
 

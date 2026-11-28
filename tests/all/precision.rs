@@ -279,9 +279,9 @@ fn arrays_split_over_buffers_keep_one_element_size_per_program() {
     let compensated = x.sum_compensated().item().unwrap();
     assert!((compensated - want as f32).abs() <= ulp(want as f32));
 
-    // A store from 4 to 8 byte elements would need two segmentations at once.
-    let err = x.to_df32().to_vec().unwrap_err();
-    assert!(matches!(err.root(), LumaError::Chunked(_)), "{err}");
+    // A store from 4 to 8 byte elements binds each array by slabs of its own segments (W3-P4: the refusal is gone).
+    let widened = x.to_df32().to_vec().unwrap();
+    assert!(widened.iter().zip(&data).all(|(g, v)| g.to_f64() == f64::from(*v)));
 
     // Arrays of 8-byte elements alone are split by their own size.
     let d: Vec<Df32> = data.iter().map(|&v| Df32::from(v)).collect();

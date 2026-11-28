@@ -739,7 +739,9 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         _ => None,
     };
     let segmented = !key.spans.is_empty();
-    let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
+    // Ghosts are read by store kernels only (see `launch::plan_shifts`).
+    debug_assert!(!key.spans.iter().any(|span| span.is_ghost()), "a ghost input of a tail that is not a store");
+    let slots = |k: usize| key.spans.get(k).map_or(0, |span| span.slots());
     // A product reads its operands at their own element indices: nothing is relative to a segment.
     let based = generates(key) && !segmented && !matmul && !axis && radix.is_none() && solve.is_none();
     let uniform = reduce || matmul || axis || radix.is_some() || solve.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based || key.runs;

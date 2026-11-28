@@ -481,6 +481,9 @@ pub enum DecisionSite {
     Schedule,
     /// A consumer of a structured value was absorbed into its epilogue, or not (`absorbed <n> ops`, `separate: <reason>`).
     Epilogue,
+    /// The slab length of a stage of a schedule: `chosen` is `L=2^k` with the elements and the ghost share, `candidates` the neighbouring
+    /// powers with their estimated cost and the bound that excluded the next one (`L_mem`, `L_pin`, `seg_len`, `cap`).
+    Slab,
 }
 
 /// What became of a candidate that was not chosen.

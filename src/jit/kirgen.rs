@@ -31,7 +31,7 @@ use super::calls;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math, uses_half};
+use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, MAX_STRIPS, calls_complex_library, calls_df_library, calls_df_math, uses_half};
 use super::staging::Staging;
 use super::stencil::WORKGROUP;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -211,6 +211,8 @@ pub(super) struct Lower<'a> {
     pub(super) ins: Vec<Option<u32>>,
     /// Per input, the bindings of its segments (`in{k}_{s}`).
     pub(super) segs: Vec<Vec<u32>>,
+    /// Per input, the binding of its ghost buffer (see `Span::Ghost`).
+    pub(super) ghosts: Vec<Option<u32>>,
     pub(super) outs: Vec<u32>,
     /// Whether the small integer outputs are bound as plain words: the kernel writes them as whole
     /// words (`Build::words`), so no atomics are needed to write or read them.
@@ -235,6 +237,7 @@ impl<'a> Lower<'a> {
             s0: 0,
             ins: Vec::new(),
             segs: Vec::new(),
+            ghosts: Vec::new(),
             outs: Vec::new(),
             plain_words: false,
             in_place,
@@ -1304,6 +1307,34 @@ impl<'a> Lower<'a> {
         if let Some(segment_len) = segment_len {
             for (k, &ty) in key.input_tys.iter().enumerate() {
                 let m = self.segs.get(k).map_or(0, Vec::len);
+                if let (Some(&Some(ghost)), Some(&Some(window))) = (self.ghosts.get(k), self.ins.get(k)) {
+                    // `ld{k}(g)`: the element `g` of the input, from the window if it lies in it, else from the strip of the ghost
+                    // buffer that holds it (the launch has made sure one does).
+                    let ret = reg(ty);
+                    let id = mb.add_function(&format!("ld{k}"), &[("g", KirType::U32)], Some(ret.clone()), |fb| {
+                        let g = fb.param(0);
+                        let r = fb.let_val("r", g - self.named(fb, &format!("w{k}_lo")));
+                        let inside = fb.lt(r, self.named(fb, &format!("w{k}_len")));
+                        fb.if_then(inside, |b| {
+                            let v = self.load_in(b, ty, window, r);
+                            b.ret(Some(v));
+                        });
+                        for s in 0..MAX_STRIPS {
+                            let off = fb.let_val(&format!("o{s}"), g - self.named(fb, &format!("g{k}_{s}_lo")));
+                            let hit = fb.lt(off, self.named(fb, &format!("g{k}_{s}_len")));
+                            fb.if_then(hit, |b| {
+                                let at = self.named(b, &format!("g{k}_{s}_at")) + off;
+                                let v = self.load_in(b, ty, ghost, at);
+                                b.ret(Some(v));
+                            });
+                        }
+                        let zero = lu(fb, 0);
+                        let v = self.load_in(fb, ty, ghost, zero);
+                        fb.ret(Some(v));
+                    });
+                    self.ld_fns.push(Some((id, ret)));
+                    continue;
+                }
                 if m == 0 {
                     self.ld_fns.push(None);
                     continue;
@@ -2088,7 +2119,8 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     };
     let wg = tuning.elementwise_workgroup;
     let segmented = !key.spans.is_empty();
-    let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
+    let slots = |k: usize| key.spans.get(k).map_or(0, |span| span.slots());
+    let ghost = |k: usize| key.spans.get(k).is_some_and(|span| span.is_ghost());
     // A product reads its operands at their own element indices: nothing is relative to a segment.
     let based = generates(key) && !segmented;
     let uniform = (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based || key.runs;
@@ -2156,15 +2188,20 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     for (k, &ty) in key.input_tys.iter().enumerate() {
         build.env.ins.push(None);
         build.env.segs.push(Vec::new());
+        build.env.ghosts.push(None);
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
         }
-        if !segmented || direct(&key.instrs, k as u32) {
+        if !segmented || direct(&key.instrs, k as u32) || ghost(k) {
             build.env.ins[k] = Some(mb.add_storage_read(&format!("in{k}"), read_elem(ty)));
         }
         for s in 0..slots(k) {
             let binding = mb.add_storage_read(&format!("in{k}_{s}"), read_elem(ty));
             build.env.segs[k].push(binding);
+        }
+        // A ghost input: the window above, then the buffer of the strips beside it.
+        if ghost(k) {
+            build.env.ghosts[k] = Some(mb.add_storage_read(&format!("in{k}_g"), read_elem(ty)));
         }
     }
     if uniform {
@@ -2175,6 +2212,16 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
             for k in 0..key.input_tys.len() {
                 for s in 0..slots(k) {
                     fields.push((format!("c{k}_{s}"), KirType::U32));
+                }
+                if ghost(k) {
+                    // The window, then the strips of the ghost buffer: first element, length, position in the buffer.
+                    fields.push((format!("w{k}_lo"), KirType::U32));
+                    fields.push((format!("w{k}_len"), KirType::U32));
+                    for s in 0..MAX_STRIPS {
+                        for part in ["lo", "len", "at"] {
+                            fields.push((format!("g{k}_{s}_{part}"), KirType::U32));
+                        }
+                    }
                 }
             }
         } else if based {

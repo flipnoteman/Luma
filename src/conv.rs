@@ -111,7 +111,7 @@ fn run_conv1d(
     let kernel_buf = (k_pin.buffer(), k_bytes);
     let c = input_storage.segment_len();
     if kernel_len > c / 2 {
-        return Err(LumaError::Chunked("conv1d with a kernel longer than half a buffer").into());
+        return Err(LumaError::Chunked("conv1d with a kernel longer than half a slab").into());
     }
     let (n, k, s, pad) = (to_i64(input_len)?, to_i64(kernel_len)?, to_i64(stride)?, to_i64(padding)?);
     let per_piece = c.min((c - kernel_len) / stride + 1);
@@ -273,7 +273,7 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>, location: &'static Lo
     let c = input_storage.segment_len();
     let k = kernel.len();
     if k > c / 16 {
-        return Err(LumaError::Chunked("conv1d_fft with a kernel longer than a sixteenth of a buffer").into());
+        return Err(LumaError::Chunked("conv1d_fft with a kernel longer than a sixteenth of a slab").into());
     }
     let n = input.len();
     let per_piece = c / 8;

@@ -156,6 +156,37 @@ impl Tail {
     }
 }
 
+/// How the segmented variant of a program reads an input through shifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Span {
+    /// Never shifted.
+    None,
+    /// Through `n` buffers, one per segment the reads of a launch touch (their ids are in the uniform).
+    Slots(u8),
+    /// Through a window (the body of the slab, or its longest strip) and a ghost buffer holding the other strips, which the launch
+    /// copies from the source segments: two bindings whatever the shift.
+    Ghost,
+}
+
+impl Span {
+    /// Buffers bound as slots (0 for `None` and `Ghost`).
+    #[inline]
+    pub(crate) fn slots(self) -> usize {
+        match self {
+            Span::Slots(n) => usize::from(n),
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_ghost(self) -> bool {
+        self == Span::Ghost
+    }
+}
+
+/// Strips of a ghost input the uniform describes (more are merged, a superset).
+pub(crate) const MAX_STRIPS: usize = 8;
+
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
 /// scalar *values* are not part of it).
 ///
@@ -185,10 +216,10 @@ pub(crate) struct FusedKey {
     /// as the kernel of `kirgen::Build::runs`, which builds the words of the runs of consecutive
     /// elements the region is made of (the uniform has their length and the words they span).
     pub(crate) runs: bool,
-    /// Per input, how many segments of it the program reads through shifts (0 = never): the
-    /// program is the segmented variant of the generated kernel, run once per segment of arrays
+    /// Per input, how the program reads it through shifts (see [`Span`]): the program is the
+    /// segmented variant of the generated kernel, run once per segment (or slab) of arrays
     /// spanning several buffers. Empty when the program runs unsegmented or has no shift.
-    pub(crate) spans: Vec<u8>,
+    pub(crate) spans: Vec<Span>,
     /// Set by `launch::run_store` like `spans` and `in_place`: the source stages the sub-programs
     /// in workgroup memory (see [`Tile`]) instead of calling them per shift.
     pub(crate) tile: Option<Tile>,

@@ -12,12 +12,12 @@ use luma_core::Buffer;
 use super::plan::{compile, cut_stage, floor_bytes, SlabOrder, Stage};
 use super::reduce::Carries;
 use super::ring::{choose, run_slabs, Choice, Dir};
-use super::{Access, Bind, Open, Reach, SegRef, Step, StepKernel};
+use super::{Access, Bind, Open, Reach, SegRef, SlabRange, Step, StepKernel};
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::gpu::hash::{FxMap, FxSet};
 use crate::gpu::pager::Segment;
-use crate::jit::launch::{launch_store, launch_store_slab, note_store, store_tiles};
+use crate::jit::launch::{launch_store, launch_store_range, launch_store_region, note_store, store_tiles, GhostSlab};
 use crate::profile::{Decision, DecisionSite};
 
 /// Where the segments of the arrays are used again, for the eviction order of [`crate::gpu::pager::Pager::reserve`].
@@ -73,7 +73,7 @@ pub(super) fn run(ctx: &Context, open: &mut Open) -> Result<(), LumaError> {
     let (mut streamed_in, mut streamed_out) = (0, 0);
     let result = (|| {
         for (at, stage) in stages.iter().enumerate() {
-            slabs += stage.space(open).slabs();
+            slabs += stage.slabs(open);
             elided += stage.transients.iter().map(|t| open.arrays[t.array as usize].meta.layout.bytes(open.arrays[t.array as usize].meta.len)).sum::<u64>();
             let info = run_stage(ctx, open, stage, at, future.as_ref())?;
             window = window.max(info.window);
@@ -116,11 +116,12 @@ fn fit(ctx: &Context, open: &Open, stages: Vec<Stage>) -> Result<Vec<Stage>, Lum
             fitted.push(stage);
             continue;
         }
-        match cut_stage(open, &stage) {
-            Some((first, second)) => {
+        match cut_stage(ctx, open, &stage) {
+            Some(halves) => {
                 ctx.stream_counters().cuts.fetch_add(1, Ordering::Relaxed);
-                work.push_front(second);
-                work.push_front(first);
+                for half in halves.into_iter().rev() {
+                    work.push_front(half);
+                }
             }
             None => {
                 let names: Vec<&str> = open.steps[stage.steps.clone()]
@@ -176,16 +177,33 @@ pub(super) fn bind_all<'a>(ctx: &'a Context, open: &'a Open, steps: &'a [Step], 
 }
 
 /// The steps on one slab: the launches the eager path makes, with the same arguments; a reduction's first pass and merge into its carry.
-pub(super) fn launch_steps(ctx: &Context, steps: &[Step], bound: &[Bound<'_>], slab: usize, carries: &Carries<'_>) -> Result<(), LumaError> {
+pub(super) fn launch_steps(ctx: &Context, open: &Open, stage: &Stage, bound: &[Bound<'_>], slab: usize, carries: &Carries<'_>) -> Result<(), LumaError> {
+    let steps = &open.steps[stage.steps.clone()];
+    let len = stage.space(open).len;
+    let a = slab * stage.slab;
+    let range = SlabRange { a, n: stage.slab.min(len - a) };
     let mut reduction = 0;
-    for (step, bound) in steps.iter().zip(bound) {
+    for (at, (step, bound)) in steps.iter().zip(bound).enumerate() {
         match &step.kernel {
             StepKernel::Store { core, key } => {
+                if let Some(edge) = stage.expansions.iter().find(|edge| edge.producer == at) {
+                    // The consumer reads this output through a ghost: compute the regions it reads (its body and its strips), once each.
+                    let consumer = &steps[edge.consumer];
+                    let Some(shifted) = consumer.shifted.as_ref() else { return Err(LumaError::Gpu("an expanded edge without shifts".into())) };
+                    let out = bound.outs[0];
+                    let Some(buffer) = out.fixed() else { return Err(LumaError::Gpu("an expanded transient without a buffer".into())) };
+                    let plan = GhostSlab::plan(shifted, edge.k, open.arrays[edge.array as usize].as_seg(ctx), range, true, stage.align, true);
+                    for &region in plan.regions() {
+                        launch_store_region(ctx, core, key, out, buffer, &bound.ins, &step.scalars, region)?;
+                        ctx.stream_counters().producer_region();
+                    }
+                    continue;
+                }
                 if store_tiles(key).is_some() {
                     // One launch over the one segment.
                     launch_store(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref())?;
                 } else {
-                    launch_store_slab(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), slab)?;
+                    launch_store_range(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), range)?;
                 }
             }
             StepKernel::ReduceBlocks(_) => {
@@ -238,8 +256,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
     let fixed = |array: u32| stage.transients.iter().find(|t| t.array == array).map(|t| &buffers.buffers[t.colour]);
 
     let carries = Carries::new(ctx, steps)?;
-    let space = stage.space(open);
-    let slabs = space.slabs();
+    let slabs = stage.slabs(open);
     stats.stages.fetch_add(1, Ordering::Relaxed);
     for transient in &stage.transients {
         let meta = open.arrays[transient.array as usize].meta;
@@ -272,7 +289,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
                 return Err(LumaError::Gpu("injected failure".into()));
             }
             stats.slabs.fetch_add(1, Ordering::Relaxed);
-            launch_steps(ctx, steps, &bound, slab, &carries)?;
+            launch_steps(ctx, open, stage, &bound, slab, &carries)?;
         }
     }
     // After the last slab: a store kernel that ran over all its segments counts once, a reduction folds its slab states.
@@ -291,6 +308,16 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
             }
             StepKernel::Relowered => {}
         }
+    }
+    if ctx.jit().recording_decisions()
+        && let Some(choice) = &stage.choice
+        && let Some((op, location)) = steps.iter().flat_map(|step| step.binds.iter()).find_map(|bind| open.arrays[bind.array as usize].writer)
+    {
+        let mut decision = Decision::new(op, location, DecisionSite::Slab, choice.chosen.clone());
+        for (label, verdict) in &choice.candidates {
+            decision = decision.candidate(label.clone(), verdict.clone());
+        }
+        ctx.jit().note_decision(decision);
     }
     Ok(info)
 }
@@ -313,9 +340,10 @@ fn slab_order(open: &Open, stage: &Stage, slabs: usize) -> Vec<usize> {
         .flat_map(|step| step.binds.iter())
         .filter(|bind| bind.access == Access::Read && bind.reach == Reach::Point)
         .map(|bind| &open.arrays[bind.array as usize])
-        .filter(|array| array.segments.len() == slabs && array.first_write.is_none_or(|at| !stage.steps.contains(&(at as usize))))
+        .filter(|array| array.meta.len == stage.space(open).len && array.meta.seg_len >= stage.slab && array.first_write.is_none_or(|at| !stage.steps.contains(&(at as usize))))
         .collect();
-    let resident = |slab: usize| inputs.iter().all(|array| array.segments[slab].on_device());
+    // The segment of an array a slab lies in.
+    let resident = |slab: usize| inputs.iter().all(|array| array.segments[slab * stage.slab / array.meta.seg_len].on_device());
     let (mut first, rest): (Vec<usize>, Vec<usize>) = (0..slabs).partition(|&slab| resident(slab));
     first.extend(rest);
     first

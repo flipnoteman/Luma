@@ -327,3 +327,44 @@ fn a_committed_schedule_leaves_the_threads_open_list() {
     let held = super::OPEN.with(|all| all.borrow().0.len());
     assert_eq!(held, 0, "a schedule that committed no longer holds its context");
 }
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+#[test]
+fn a_program_with_many_shifted_inputs_splits_instead_of_failing() {
+    let n = 3000;
+    let run = |mode: SplitMode, limit: usize| {
+        let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(mode)).expect("a device is available");
+        ctx.jit().set_max_inputs(limit);
+        // Ghosts (two bindings per shifted input) exist below segments only: a slab that is a segment binds whole neighbour segments.
+        ctx.set_slab_len(Some(128));
+        let arrays: Vec<Array<f32>> = (0..5).map(|k| Array::from_slice_on(&ctx, &(0..n).map(|i| ((i * (k + 3)) % 101) as f32).collect::<Vec<_>>(), n).unwrap()).collect();
+        let sum = arrays.iter().enumerate().skip(1).fold(arrays[0].shift(1), |acc, (k, a)| acc + a.shift(k as isize * 7 - 9));
+        let got = bits(&sum.to_vec().unwrap());
+        (got, ctx.stream_stats())
+    };
+    let (want, _) = run(SplitMode::Off, usize::MAX);
+    // Five shifted inputs are ten bindings; with room for six, operands are evaluated first and the pieces run as separate steps.
+    let (got, stats) = run(SplitMode::Auto, 6);
+    assert_eq!(got, want);
+    assert!(stats.steps >= 2, "{stats:?}");
+}
+
+#[test]
+fn a_view_with_a_huge_hull_keeps_slots_or_is_refused_narrowly() {
+    // The source of a transposed read is a column hull of the whole array: slots, or the narrowed message, never a wrong result.
+    let (rows, cols) = (64usize, 80usize);
+    let data: Vec<f32> = (0..rows * cols).map(|i| ((i * 7) % 113) as f32).collect();
+    let run = |mode: SplitMode| {
+        let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(mode)).expect("a device is available");
+        let x = Array::from_slice_on(&ctx, &data, [rows, cols]).unwrap();
+        (x.transpose() * 2.0 + 1.0).to_vec()
+    };
+    let want = run(SplitMode::Off).unwrap();
+    match run(SplitMode::Auto) {
+        Ok(got) => assert_eq!(bits(&got), bits(&want)),
+        Err(error) => assert!(format!("{error}").contains("source segments per slab") || format!("{error}").contains("binding limit"), "{error}"),
+    }
+}

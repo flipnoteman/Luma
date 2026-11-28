@@ -19,6 +19,14 @@ pub(crate) struct SegMeta {
     pub(crate) seg_len: usize,
 }
 
+/// The elements `[a, a + n)` of an index space (the launch grid): what one launch of a slab computes. For every array a launch binds by
+/// slab, the range lies in one segment (`slab length <= segment length` of each); see [`SegRef::locate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlabRange {
+    pub(crate) a: usize,
+    pub(crate) n: usize,
+}
+
 /// What a launch binds for a segment: the pinned buffer of the segment, or (for a transient of a schedule, which never has a
 /// buffer of its own) a buffer the stage owns.
 pub(crate) enum Held {
@@ -62,6 +70,12 @@ impl<'a> SegRef<'a> {
     pub(crate) fn fixed_to(mut self, buffer: Option<&'a Buffer>) -> Self {
         self.fixed = buffer;
         self
+    }
+
+    /// The buffer every segment is bound as, if this array is a transient of a stage.
+    #[inline(always)]
+    pub(crate) fn fixed(&self) -> Option<&'a Buffer> {
+        self.fixed
     }
 
     #[inline(always)]
@@ -112,6 +126,19 @@ impl<'a> SegRef<'a> {
     pub(crate) fn range(&self, j: usize) -> std::ops::Range<usize> {
         let c = self.meta.seg_len;
         j * c..self.meta.len.min((j + 1) * c)
+    }
+
+    /// The segment `slab` lies in and the byte offset of its first element in that segment's buffer. A transient (one buffer for every
+    /// slab) is bound from offset 0. The offset is a multiple of the backend's `storage_offset_align` when the slab starts on a
+    /// multiple of the aligned element count (the planner's rule, see `slab::align_elems`).
+    #[inline(always)]
+    pub(crate) fn locate(&self, slab: SlabRange) -> (usize, u64) {
+        if slab.a == 0 || self.fixed.is_some() {
+            return (0, 0);
+        }
+        let c = self.meta.seg_len;
+        debug_assert!(slab.a % c + slab.n <= c, "a slab spans two segments");
+        (slab.a / c, self.meta.layout.bytes(slab.a % c))
     }
 
     /// Bytes of data in segment `j`.

@@ -4435,7 +4435,7 @@ struct FastKernel {
     tail: program::Tail,
     in_place: Vec<(u32, u32)>,
     runs: bool,
-    spans: Vec<u8>,
+    spans: Vec<program::Span>,
     staging: Option<staging::Staging>,
     tile: Option<codegen::Tile>,
     guard: Option<u32>,

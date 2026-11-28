@@ -62,6 +62,10 @@ struct Use {
 pub(super) fn choose(ctx: &Context, open: &Open, stage: &Stage, next_stage: &dyn Fn(u32) -> u64) -> Option<Choice> {
     let budget = ctx.pager().budget()?;
     let space = stage.space(open);
+    // Ring slots and uploads are segment-sized: only a stage that runs by segments streams (see `plan::finish`).
+    if stage.slab != space.seg_len.min(space.len).max(1) {
+        return None;
+    }
     let max = ctx.max_buffer_bytes();
     let class = |bytes: u64| size_class(bytes, max).unwrap_or(bytes);
     let mut uses: Vec<Option<Use>> = vec![None; open.arrays.len()];
@@ -251,7 +255,7 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
                 transient(array).or_else(|| rings.iter().find(|ring| ring.array == array && ring.flags[slab]).map(|ring| &ring.bufs[slot]))
             };
             let bound = bind_all(ctx, open, steps, &fixed);
-            launch_steps(ctx, steps, &bound, slab, carries)?;
+            launch_steps(ctx, open, stage, &bound, slab, carries)?;
         }
         let ticket = ctx.lane_barrier(&[])?;
         outstanding.tickets.push(ticket.clone());

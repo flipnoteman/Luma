@@ -20,6 +20,7 @@ mod reduce;
 mod ring;
 mod run;
 mod seg;
+mod slab;
 #[cfg(test)]
 mod tests;
 
@@ -43,7 +44,8 @@ use crate::kernel::KernelCore;
 use super::structured::strategy::{Params, SplitClass, StrategyId};
 use super::structured::Structured;
 
-pub(crate) use seg::{AsSeg, Held, SegMeta, SegRef};
+pub(crate) use slab::below_segment;
+pub(crate) use seg::{AsSeg, Held, SegMeta, SegRef, SlabRange};
 
 /// Whether (and how) kernels over streamed arrays are deferred into schedules (`LUMA_SPLIT`).
 #[doc(hidden)]
@@ -101,6 +103,10 @@ pub struct StreamStats {
     pub window1_fallbacks: u64,
     /// Stages cut in two because one pass over the slabs did not fit.
     pub cuts: u64,
+    /// Bytes copied into ghost buffers (the strips of shifted inputs beside their windows).
+    pub ghost_bytes: u64,
+    /// Launches of producer kernels over the regions of expanded halo edges (see `plan`).
+    pub producer_regions: u64,
 }
 
 /// The counters behind [`StreamStats`].
@@ -119,6 +125,8 @@ pub(crate) struct StreamCounters {
     pub(super) streamed: AtomicU64,
     pub(super) window1_fallbacks: AtomicU64,
     pub(super) cuts: AtomicU64,
+    ghost_bytes: AtomicU64,
+    producer_regions: AtomicU64,
 }
 
 impl StreamCounters {
@@ -138,7 +146,19 @@ impl StreamCounters {
             streamed: get(&self.streamed),
             window1_fallbacks: get(&self.window1_fallbacks),
             cuts: get(&self.cuts),
+            ghost_bytes: get(&self.ghost_bytes),
+            producer_regions: get(&self.producer_regions),
         }
+    }
+
+    /// Counts producer launches of expanded halo edges.
+    pub(crate) fn producer_region(&self) {
+        self.producer_regions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts bytes copied into a ghost buffer.
+    pub(crate) fn ghost(&self, bytes: u64) {
+        self.ghost_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -179,7 +199,7 @@ pub(crate) struct Space {
 }
 
 impl Space {
-    /// Slabs (= segments) of the space.
+    /// Slabs of the space when a slab is a segment.
     pub(crate) fn slabs(&self) -> usize {
         self.len.div_ceil(self.seg_len.max(1))
     }

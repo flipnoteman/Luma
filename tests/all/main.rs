@@ -81,6 +81,7 @@ mod subgroup_divergence;
 mod sparse;
 mod spill;
 mod split;
+mod split_slabs;
 mod strategies;
 mod threads;
 mod transfer;

@@ -66,6 +66,8 @@ LUMA_SAMPLER_TILE	dev	W0	before-release	auto
 LUMA_SELCACHE	dev	W2-SELCACHE	before-release	on (off | on | verify: the strategy registry's selection cache; verify runs the full `fits` on every hit and panics on a different answer; debug builds verify 1 hit in 16)
 LUMA_SINGLE_PASS_REDUCE	dev	W0	before-release	auto
 LUMA_SMALLINT_SEEDS	test	W0	never	40
+LUMA_SLAB_BYTES	dev	W3-P4	before-release	(unset: the planner chooses; bytes of a slab of a schedule, pinned for tests and reproduction: the slab length is bytes divided by the widest element, rounded down to a power of two and clamped to what the stage allows)
+LUMA_SLAB_EXPAND	dev	W3-P4	before-release	(unset or on: a stage recomputes the producer of a halo read over the ghost zone; off: the edge is cut, the producer runs over all slabs first)
 LUMA_SPECULATE	dev	W0	before-release	on
 LUMA_SPLIT	dev	W3-U6	before-release	off (off | segment | auto: defers kernels over streamed arrays into schedules that run segment by segment; the default flips to auto with the last part of W3-U6)
 LUMA_STAGING	dev	W0	before-release	on
