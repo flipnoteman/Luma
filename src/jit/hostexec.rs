@@ -16,11 +16,11 @@ use std::sync::Arc;
 use luma_core::hal::HostRegion;
 use luma_core::Buffer;
 
-use super::placement::{self, HostEstimate, InputRes, Rates, Work};
+use super::placement::{self, HostEstimate, Rates, Work};
 use super::program::{Fused, FusedKey, Tail};
 use super::OpKind;
 use crate::builtin::{BinOp, UnOp};
-use crate::profile::{Decision, DecisionSite, Verdict};
+use crate::profile::{Decision, DecisionSite};
 use std::panic::Location;
 use luma_core::hal::HostBytes;
 use super::structured::emit::Emit;
@@ -34,6 +34,7 @@ use crate::gpu_type::ElemLayout;
 use crate::reduce::finish_passes;
 
 /// Counters of the host executor (see [`HostExec::stats`]).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostStats {
     /// Regions shown to the CPU backend without a copy.
@@ -72,10 +73,12 @@ impl HostExec {
     }
 
     /// The CPU context (its cost model and learned kernel costs price a host stage).
+    #[allow(dead_code)] // the interface of W3-U6's residency decision (pricing reads the aux context's cost model)
     pub(crate) fn context(&self) -> &Context {
         &self.cpu
     }
 
+    #[allow(dead_code)] // as `context`
     pub(crate) fn stats(&self) -> HostStats {
         HostStats { imports: self.imports.load(Ordering::Relaxed), imports_copied: self.copied.load(Ordering::Relaxed), runs: self.runs.load(Ordering::Relaxed) }
     }
@@ -122,7 +125,7 @@ impl HostExec {
     /// `fused.inputs`, in order, as laid out on the host) and writes its outputs into `outputs`, one slab per output.
     /// Programs the aux context would have to plan around (views read through shifts, staging, in-place) are refused
     /// with an error before anything runs; the caller keeps them on the device.
-    pub(crate) fn run_store(&self, fused: Fused, len: usize, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> Result<()> {
+    pub(super) fn run_store(&self, fused: Fused, len: usize, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> Result<()> {
         let Fused { mut key, mut scalars, .. } = fused;
         check_plain(&key, Tail::Store)?;
         if inputs.len() != key.input_tys.len() || outputs.len() != key.outputs.len() {
@@ -146,7 +149,8 @@ impl HostExec {
 
     /// Runs the reduction program `fused` (its tail is `Tail::Reduce(ops)`) over `inputs` and returns the final
     /// values, `elem` bytes per op. One segment of the aux context only (`Err` otherwise).
-    pub(crate) fn run_reduce(&self, fused: Fused, len: usize, inputs: &[&[u8]], wgsl: &'static str, elem: u64) -> Result<Vec<u8>> {
+    #[allow(dead_code)] // run by W3-U6's host stages; measured not to pay as an automatic placement (see the spec's Measurement)
+    pub(super) fn run_reduce(&self, fused: Fused, len: usize, inputs: &[&[u8]], wgsl: &'static str, elem: u64) -> Result<Vec<u8>> {
         let Tail::Reduce(ops) = fused.key.tail else {
             return Err(LumaError::Gpu("host reduce: not a reduction".into()));
         };
@@ -273,7 +277,6 @@ pub(super) fn try_store(ctx: &Context, fused: &Fused, len: usize, name: &'static
     if !go {
         return None;
     }
-    let _ = InputRes::Host;
     let mut out = HostBytes::filled_by(out_bytes as usize, |dst| {
         // The program writes every byte; the slab is handed over as plain bytes.
         // SAFETY: `MaybeUninit<u8>` and `u8` have the same layout, and the kernel overwrites the whole slab before it is read.
@@ -296,6 +299,7 @@ pub(super) fn try_store(ctx: &Context, fused: &Fused, len: usize, name: &'static
 mod tests {
     use super::*;
     use crate::jit::ElemTy;
+    use crate::profile::Verdict;
     use crate::{Array, ContextOptions};
 
     /// A context with 64 KiB segments and a 1 MiB budget, so arrays of 16384 floats spill to host memory in a row.
@@ -342,11 +346,12 @@ mod tests {
         let a = arrays(&ctx, 40);
         // The baseline: the same programs with the host executor off for this context (nothing is forced, and the pricing of a unified-memory
         // or CPU context keeps them on the device).
-        let programs: Vec<Box<dyn Fn(&Array<f32>, &Array<f32>) -> Array<f32>>> = vec![
+        type Program = Box<dyn Fn(&Array<f32>, &Array<f32>) -> Array<f32>>;
+        let programs: Vec<Program> = vec![
             Box::new(|x, y| x - y),
             Box::new(|x, y| (x - y).abs()),
             Box::new(|x, y| x.maximum(y)),
-            Box::new(|x, y| x.minimum(&y.abs())),
+            Box::new(|x, y| x.minimum(y.abs())),
             Box::new(|x, y| (x + y).abs().sqrt()),
             Box::new(|x, y| crate::ops::select(&x.gt(y), x, y)),
         ];

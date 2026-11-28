@@ -8,7 +8,8 @@ use luma_core::hal::{CostModel, Verdict};
 
 use super::hostexec::CPU_REDUCE_GBS;
 
-/// Where one input of a stage lives.
+/// Where one input of a stage lives (the classification W3-U6's residency decision fills `Work::in_bytes` by).
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputRes {
     /// In a device buffer: never a host input (no download is added to run on the CPU).
@@ -37,6 +38,7 @@ pub(crate) struct Work {
 }
 
 impl Work {
+    #[allow(dead_code)]
     /// Whether any input is not on the device alone: the precomputed per-step flag of the V5 host-time gate.
     pub(crate) fn any_off_device(&self) -> bool {
         self.in_bytes[1] + self.in_bytes[2] + self.in_bytes[3] > 0
