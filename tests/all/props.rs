@@ -674,7 +674,13 @@ fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products()
                 for c in 0..n {
                     assert_eq!(g[r * n + c].to_bits(), g[c * n + r].to_bits(), "{name} {rows}x{cols}: ({r}, {c}) is not symmetric");
                     if c <= r {
-                        assert_eq!(g[r * n + c].to_bits(), f[r * n + c].to_bits(), "{name} {rows}x{cols}: ({r}, {c}) differs from the full product");
+                        // The CPU's tiles are the full product's. A device's full product may split K over several workgroups
+                        // (few tiles, a long K), which the half-work kernel does not: the same sums in another order.
+                        if ctx.is_cpu() {
+                            assert_eq!(g[r * n + c].to_bits(), f[r * n + c].to_bits(), "{name} {rows}x{cols}: ({r}, {c}) differs from the full product");
+                        } else {
+                            assert!((g[r * n + c] - f[r * n + c]).abs() <= 1e-4 * (1.0 + f[r * n + c].abs()), "{name} {rows}x{cols}: ({r}, {c}) is {} against {}", g[r * n + c], f[r * n + c]);
+                        }
                     }
                 }
             }
@@ -685,9 +691,9 @@ fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products()
 #[test]
 fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
     let ctx = ctx_with(Numerics::strict());
-    let data = gram_data(512 * 192, 3);
-    let x = on(&ctx, &data, [192, 512]);
-    let other = on(&ctx, &data, [192, 512]);
+    let data = gram_data(1024 * 1024, 3);
+    let x = on(&ctx, &data, [1024, 1024]);
+    let other = on(&ctx, &data, [1024, 1024]);
     ctx.record_decisions(true);
     x.matmul_tn(&x).to_vec().unwrap();
     let gram = ctx.take_decisions();
