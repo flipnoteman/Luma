@@ -6,10 +6,17 @@
 //! host read, a host write, the writers of a buffer a step reads) *commits* the schedule first: its steps are compiled into stages
 //! and run (`run`). A step's launches are what the eager path launches, with the same arguments, so results are bit-identical.
 //!
-//! What plugs in later: `Origin::Structured` steps and `Sink::Schedule` of `Emit` (canonical-block reductions), lanes and a ring
-//! around the slab loop of `run::run_stage`, the re-selection hook in `compile`.
+//! Lineage (P1c, evict-by-recompute) is not set for deferred steps, on purpose: a lineage holds the `Arc<Storage>` inputs of the
+//! kernel, and a schedule keeps segments, not storages (a temporary whose handles are gone must not be kept alive by it). What it
+//! would buy is evicting a retained output without a readback; the outputs that matter, those of an above-budget stage, are streamed
+//! to host blocks as they are computed, so there is nothing left to evict by recompute.
+//!
+//! Streamed stages (`ring`): arrays that do not fit beside each other are not made resident; inputs go through a ring of device
+//! buffers filled by the transfer lanes and outputs to host blocks. What plugs in later: `Origin::Structured` steps and
+//! `Sink::Schedule` of `Emit` (canonical-block reductions) and the re-selection hook in `compile`.
 
 mod plan;
+mod ring;
 mod run;
 mod seg;
 #[cfg(test)]
@@ -79,6 +86,14 @@ pub struct StreamStats {
     pub upload_bytes: u64,
     /// Bytes moved from the device to host memory while schedules ran (evictions).
     pub download_bytes: u64,
+    /// Most device bytes the rings of one stage held.
+    pub ring_bytes_peak: u64,
+    /// Arrays streamed through a ring (inputs uploaded and outputs downloaded slab by slab), summed over stages.
+    pub streamed: u64,
+    /// Stages that ran with a window of one slab because two did not fit.
+    pub window1_fallbacks: u64,
+    /// Stages cut in two because one pass over the slabs did not fit.
+    pub cuts: u64,
 }
 
 /// The counters behind [`StreamStats`].
@@ -92,6 +107,10 @@ pub(crate) struct StreamCounters {
     transients: AtomicU64,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
+    pub(super) ring_bytes_peak: AtomicU64,
+    pub(super) streamed: AtomicU64,
+    pub(super) window1_fallbacks: AtomicU64,
+    pub(super) cuts: AtomicU64,
 }
 
 impl StreamCounters {
@@ -106,6 +125,10 @@ impl StreamCounters {
             transients: get(&self.transients),
             upload_bytes: get(&self.upload_bytes),
             download_bytes: get(&self.download_bytes),
+            ring_bytes_peak: get(&self.ring_bytes_peak),
+            streamed: get(&self.streamed),
+            window1_fallbacks: get(&self.window1_fallbacks),
+            cuts: get(&self.cuts),
         }
     }
 }
@@ -425,6 +448,38 @@ fn open_schedule(ctx: &Context) -> Result<Arc<Schedule>, LumaError> {
         schedule
     })
     .map_err(|_| LumaError::Gpu("a kernel was deferred while its thread was ending".into()))
+}
+
+/// Whether the calling thread is running a schedule's steps: its planned segments are not settled, it is writing them.
+pub(crate) fn executing() -> bool {
+    EXECUTING.try_with(|executing| executing.get() != 0).unwrap_or(false)
+}
+
+/// Tests: schedules committed because the last handle of their context was dropped.
+#[cfg(test)]
+pub(crate) static COMMITS_ON_DROP: AtomicU64 = AtomicU64::new(0);
+
+/// A handle of `ctx` is being dropped: commits this thread's open schedule on it if the handles that remain are only the ones the
+/// schedule itself holds (its own, and one per segment it remembers), so the context is not kept alive by steps nobody can ask for.
+pub(crate) fn context_dropped(ctx: &Context) {
+    let held = OPEN
+        .try_with(|all| {
+            let all = all.try_borrow().ok()?;
+            let (_, schedule) = all.0.iter().find(|(id, _)| *id == ctx.id())?;
+            let open = schedule.open.try_lock().ok()?;
+            Some(1 + open.as_ref().map_or(0, |open| open.arrays.iter().map(|array| array.segments.len()).sum::<usize>()))
+        })
+        .ok()
+        .flatten();
+    if let Some(held) = held
+        && ctx.handles() <= held + 1
+    {
+        #[cfg(test)]
+        COMMITS_ON_DROP.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = commit_here(ctx) {
+            log::warn!("luma: a deferred schedule failed when its context was dropped: {error}");
+        }
+    }
 }
 
 /// Commits this thread's open schedule on `ctx`, if it has one.

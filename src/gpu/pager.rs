@@ -506,6 +506,13 @@ impl Segment {
         self.settle_planned()
     }
 
+    /// Debug check at the places that read or write the data of a segment after [`Segment::settle`]: a segment is planned there only
+    /// while the thread that runs its schedule is the one reading it.
+    #[inline]
+    fn debug_settled(&self) {
+        debug_assert!(!self.is_planned() || crate::jit::split::executing(), "a planned segment was read outside `settle`");
+    }
+
     #[cold]
     fn settle_planned(&self) -> Result<()> {
         let schedule = self.side.get().and_then(|side| lock(&side.planned).as_ref().and_then(Weak::upgrade));
@@ -787,6 +794,7 @@ impl Segment {
 
     #[inline(always)]
     fn pin_settled(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
+        self.debug_settled();
         if !write {
             return self.pin_device(false, false);
         }
@@ -1117,6 +1125,7 @@ impl Segment {
     /// the device.
     pub(crate) fn write_back(&self) -> Result<()> {
         self.settle()?;
+        self.debug_settled();
         let Some(home) = self.home() else { return Ok(()) };
         if self.home_valid.load(Ordering::Acquire) {
             return Ok(());
@@ -1138,6 +1147,7 @@ impl Segment {
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
         self.settle()?;
+        self.debug_settled();
         if matches!(&*lock(&self.state), State::Away)
             && let Some(home) = self.home()
         {
@@ -1197,6 +1207,82 @@ impl Segment {
             }),
             State::Device(_) | State::Empty | State::Window(_) | State::Lineage | State::Away => None,
         }
+    }
+}
+
+/// Where a segment's data is, as a schedule's executor needs to know it (see [`Segment::place`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// No data yet (an output that was not written).
+    Empty,
+    /// In host memory only: a stage can stream it through a ring without making it resident.
+    Host,
+    /// At its home in a file only: streamable the same way.
+    Away,
+    /// In a device buffer, or somewhere that needs the pin path (a window, a lineage).
+    Other,
+}
+
+impl Segment {
+    /// Where the data is (see [`Place`]).
+    pub(crate) fn place(&self) -> Place {
+        match &*lock(&self.state) {
+            State::Empty => Place::Empty,
+            State::Host(_) => Place::Host,
+            State::Away if self.home.is_some() => Place::Away,
+            _ => Place::Other,
+        }
+    }
+
+    /// Copies the segment's data into `dst` (`dst.len()` bytes, the rest past the data is zero) from host memory or the segment's file,
+    /// without pinning it, whatever is planned. `false` when the data is anywhere else.
+    pub(crate) fn stream_read(&self, dst: &mut [u8]) -> Result<bool> {
+        match &*lock(&self.state) {
+            State::Host(data) => {
+                let n = dst.len().min(data.len());
+                dst[..n].copy_from_slice(&data.as_slice()[..n]);
+                dst[n..].fill(0);
+                Ok(true)
+            }
+            State::Away => {
+                let Some(home) = self.home() else { return Ok(false) };
+                let n = dst.len().min(home.file_bytes as usize);
+                let (data, tail) = dst.split_at_mut(n);
+                // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the read only writes initialized bytes.
+                let head = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<MaybeUninit<u8>>(), data.len()) };
+                home.store.read(home.offset, head)?;
+                tail.fill(0);
+                self.ctx.pager().io_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Makes `data` the segment's contents, in host memory (the output of a streamed stage). The segment must be empty.
+    pub(crate) fn set_host(&self, data: HostBytes) -> Result<()> {
+        let mut state = lock(&self.state);
+        if !matches!(&*state, State::Empty) {
+            return Err(LumaError::Gpu("a streamed output segment already had data".into()));
+        }
+        let pager = self.ctx.pager();
+        let len = data.len() as u64;
+        pager.host_state_bytes.fetch_add(len, Ordering::Relaxed);
+        pager.spilled_bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        *state = State::Host(data);
+        drop(state);
+        self.ctx.enforce_host_budget();
+        Ok(())
+    }
+
+    /// Bytes of data the segment holds.
+    pub(crate) fn data_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Counts `bytes` brought to the device without a pin (a ring upload).
+    pub(crate) fn note_streamed_in(&self, bytes: u64) {
+        self.ctx.pager().uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 

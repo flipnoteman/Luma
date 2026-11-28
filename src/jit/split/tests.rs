@@ -37,3 +37,20 @@ fn a_failing_commit_poisons_the_outputs() {
     let fresh = Array::from_slice_on(&ctx, &vec![3.0f32; n], n).unwrap();
     assert_eq!((&fresh + 1.0).to_vec().unwrap(), vec![4.0f32; n]);
 }
+
+#[test]
+fn dropping_the_last_handle_of_a_context_commits_its_schedule() {
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024).split(SplitMode::Auto)).expect("a device is available");
+    let n = 5 * 256 + 3;
+    let x = Array::from_slice_on(&ctx, &vec![1.0f32; n], n).unwrap();
+    // An expression too long for one kernel is cut: the cuts are deferred, and nothing asks for the result.
+    let mut y = x.clone();
+    for k in 0..300 {
+        y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs() - (&y * 0.001);
+    }
+    let before = super::COMMITS_ON_DROP.load(Ordering::Relaxed);
+    drop(y);
+    drop(x);
+    drop(ctx);
+    assert!(super::COMMITS_ON_DROP.load(Ordering::Relaxed) > before, "the schedule ran when the context was dropped");
+}

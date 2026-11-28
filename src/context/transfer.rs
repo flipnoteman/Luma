@@ -228,3 +228,42 @@ impl Context {
         })
     }
 }
+
+/// The transfer lanes of the backend (W1-P2b), as a schedule's executor uses them: ring buffers, staging memory, copies that run
+/// beside the compute lane, and the tickets that order them.
+impl Context {
+    /// A device buffer of at least `bytes` bytes that a transfer may copy into or out of (not pooled: it is freed when dropped, after
+    /// every ticket that touches it has completed).
+    pub(crate) fn lane_buffer(&self, bytes: u64) -> Result<Buffer> {
+        let max = self.max_buffer_bytes();
+        let class = size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        self.relieving(class, || Ok(self.hal().create_buffer_unordered(class, crate::context::STORAGE_USAGE)))
+    }
+
+    /// Host memory for transfers in direction `dir`.
+    pub(crate) fn stage_alloc(&self, bytes: u64, dir: luma_core::hal::StageDir) -> Result<luma_core::hal::Stage> {
+        Ok(self.hal().stage_alloc(bytes, dir)?)
+    }
+
+    /// [`luma_core::hal::Backend::transfer_in`].
+    pub(crate) fn transfer_in(&self, stage: &luma_core::hal::Stage, dst: &Buffer, bytes: u64, after: &[luma_core::hal::Ticket]) -> Result<luma_core::hal::Ticket> {
+        self.abort_recording_for("transfer")?;
+        Ok(self.hal().transfer_in(stage, dst, 0, bytes, after)?)
+    }
+
+    /// [`luma_core::hal::Backend::transfer_out`].
+    pub(crate) fn transfer_out(&self, src: &Buffer, stage: &mut luma_core::hal::Stage, bytes: u64, after: &[luma_core::hal::Ticket]) -> Result<luma_core::hal::Ticket> {
+        self.abort_recording_for("transfer")?;
+        Ok(self.hal().transfer_out(src, 0, stage, bytes, after)?)
+    }
+
+    /// [`luma_core::hal::Backend::barrier`].
+    pub(crate) fn lane_barrier(&self, after: &[luma_core::hal::Ticket]) -> Result<luma_core::hal::Ticket> {
+        Ok(self.hal().barrier(after)?)
+    }
+
+    /// Waits for `ticket`.
+    pub(crate) fn ticket_wait(&self, ticket: &luma_core::hal::Ticket) -> Result<()> {
+        Ok(self.hal().ticket_wait(ticket, SYNC_SPIN_MIN)?)
+    }
+}

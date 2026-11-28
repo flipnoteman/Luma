@@ -319,3 +319,65 @@ fn plan_cache_does_not_cache_deferred_evaluations() {
     }
     assert_eq!(ctx.plan_cache_hits(), 0, "a deferred evaluation is never a cached plan");
 }
+
+fn above_budget(mode: SplitMode, budget: u64) -> Context {
+    Context::with_options(ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(budget).split(mode)).expect("a device is available")
+}
+
+/// `y = |x * 1.5 + 1| - x` over `n` elements, a new array: the input streams in and the output streams out.
+fn map_chain(ctx: &Context, n: usize) -> (Vec<f32>, luma::StreamStats) {
+    let xs: Vec<f32> = (0..n).map(|i| (i % 1013) as f32 * 0.01 - 3.0).collect();
+    let x = Array::from_slice_on(ctx, &xs, n).unwrap();
+    let y = (&x * 1.5 + 1.0).abs() - &x;
+    let got = y.to_vec().unwrap();
+    (got, ctx.stream_stats())
+}
+
+#[test]
+fn a_streamed_stage_matches_kernel_major_and_moves_each_segment_once() {
+    let n = 1 << 20; // 4 MiB of f32 in 64 segments, four times the budget
+    let (on, stats) = map_chain(&above_budget(SplitMode::Auto, 1 << 20), n);
+    let (off, _) = map_chain(&above_budget(SplitMode::Off, 1 << 20), n);
+    assert_eq!(on.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), off.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    assert_eq!(stats.stages, 1, "{stats:?}");
+    eprintln!("{stats:?}");
+    if stats.streamed > 0 {
+        assert_eq!(stats.streamed, 2, "the input streams in and the output out: {stats:?}");
+        assert!(stats.ring_bytes_peak > 0 && stats.ring_bytes_peak <= 1 << 20, "{stats:?}");
+        assert!(stats.upload_bytes <= 4 * n as u64 + (1 << 16), "each input segment crosses once: {stats:?}");
+        assert!(stats.download_bytes >= 4 * n as u64 && stats.download_bytes <= 5 * n as u64, "the output goes to host blocks once: {stats:?}");
+    }
+}
+
+#[test]
+fn an_infeasible_stage_falls_back_in_order() {
+    let n = 1 << 20;
+    let seg = 1u64 << 16;
+    // Two slabs in flight of x and y need 4 segments; with room for 3 the window drops to one slab.
+    let (on, stats) = map_chain(&above_budget(SplitMode::Auto, 3 * seg), n);
+    let (off, _) = map_chain(&above_budget(SplitMode::Off, 3 * seg), n);
+    assert_eq!(on, off);
+    if stats.streamed > 0 {
+        assert!(stats.window1_fallbacks >= 1 && stats.cuts == 0, "window 1 comes first: {stats:?}");
+    }
+    // One slab of each of x and y does not fit in one segment: the single step fails and names itself.
+    let ctx = above_budget(SplitMode::Auto, seg);
+    let xs = vec![1.0f32; n];
+    let x = Array::from_slice_on(&ctx, &xs, n).unwrap();
+    let error = (&x * 2.0).abs().to_vec().err();
+    assert!(error.is_none_or(|e| e.to_string().contains("budget") || e.to_string().contains("memory")));
+    // The chain's stage needs a slab of the input, of the result and of each buffer the cuts store (five segments); one of its kernels
+    // needs four. With room for four the stage is cut in two, each half needing less.
+    let chain = |mode| {
+        let ctx = above_budget(mode, 4 * seg);
+        let x = Array::from_slice_on(&ctx, &xs, n).unwrap();
+        let mut y = x.clone();
+        for k in 0..300 {
+            y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs() - (&y * 0.001);
+        }
+        (y.to_vec().unwrap(), ctx.stream_stats())
+    };
+    let (got, stats) = chain(SplitMode::Auto);
+    assert!(stats.cuts >= 1 || stats.streamed == 0, "a stage that does not fit is cut: {stats:?}");
+    assert_eq!(got, chain(SplitMode::Off).0);
+}

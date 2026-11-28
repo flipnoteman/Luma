@@ -162,6 +162,16 @@ pub struct Context {
     inner: Arc<Inner>,
 }
 
+impl Drop for Context {
+    fn drop(&mut self) {
+        // A schedule this thread left open holds handles of its own (and its segments do): when they are all that keeps the context
+        // alive, nothing can ask for its steps any more, so they run now (trigger 8).
+        if self.inner.schedules_open.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            crate::jit::split::context_dropped(self);
+        }
+    }
+}
+
 static DEFAULT_CONTEXT: OnceLock<Result<Context>> = OnceLock::new();
 
 /// The process-wide default [`Context`], opened on first use.
@@ -1077,6 +1087,11 @@ impl Context {
 
     pub(crate) fn stream_counters(&self) -> &StreamCounters {
         &self.inner.streams
+    }
+
+    /// Handles to the context's state: this one, the segments' and a schedule's.
+    pub(crate) fn handles(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 
     /// Tells this context from the others of the process.

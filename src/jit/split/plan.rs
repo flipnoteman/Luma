@@ -77,7 +77,7 @@ pub(super) fn compile(open: &Open) -> Vec<Stage> {
 }
 
 /// The slab order and the transients of the stage of `steps`.
-fn finish(open: &Open, steps: std::ops::Range<usize>) -> Stage {
+pub(super) fn finish(open: &Open, steps: std::ops::Range<usize>) -> Stage {
     let space = open.steps[steps.start].space;
     let whole_or_in_place = open.steps[steps.clone()]
         .iter()
@@ -120,4 +120,37 @@ fn finish(open: &Open, steps: std::ops::Range<usize>) -> Stage {
         }
     }
     Stage { steps, order, transients, colours: colours.into_iter().map(|(bytes, _)| bytes).collect() }
+}
+
+/// Bytes of the least device memory a stage needs: one slab of every array it binds (a ring of window 1 with everything streamed)
+/// and the buffers of its transients. Below this the stage cannot run in one pass over the slabs.
+pub(super) fn floor_bytes(open: &Open, stage: &Stage) -> u64 {
+    let mut seen: Vec<bool> = vec![false; open.arrays.len()];
+    let mut total: u64 = stage.colours.iter().sum();
+    for bind in open.steps[stage.steps.clone()].iter().flat_map(|step| step.binds.iter()) {
+        let array = bind.array as usize;
+        if std::mem::replace(&mut seen[array], true) || stage.transients.iter().any(|t| t.array == bind.array) {
+            continue;
+        }
+        let entry = &open.arrays[array];
+        total += if entry.segments.len() == 1 { entry.meta.layout.bytes(entry.meta.len) } else { entry.meta.layout.bytes(entry.meta.seg_len) };
+    }
+    total
+}
+
+/// Cuts `stage` in two at the step boundary that leaves the smaller of the two floors (ties: the fewer arrays live across the
+/// cut), or `None` for a stage of one step. What the first half wrote and the second reads is no longer a transient: it is retained,
+/// which is the kernel-major behaviour for that edge only.
+pub(super) fn cut_stage(open: &Open, stage: &Stage) -> Option<(Stage, Stage)> {
+    let range = stage.steps.clone();
+    let mut best: Option<((u64, usize), Stage, Stage)> = None;
+    for at in range.start + 1..range.end {
+        let (a, b) = (finish(open, range.start..at), finish(open, at..range.end));
+        let live = open.arrays.iter().filter(|array| (array.first_use as usize) < at && (array.last_use as usize) >= at).count();
+        let key = (floor_bytes(open, &a).max(floor_bytes(open, &b)), live);
+        if best.as_ref().is_none_or(|(known, ..)| key < *known) {
+            best = Some((key, a, b));
+        }
+    }
+    best.map(|(_, a, b)| (a, b))
 }

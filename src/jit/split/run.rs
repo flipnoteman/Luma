@@ -9,8 +9,9 @@ use std::sync::atomic::Ordering;
 use luma_core::hal::size_class;
 use luma_core::Buffer;
 
-use super::plan::{compile, SlabOrder, Stage};
-use super::{Access, Bind, Open, Reach, SegRef, StepKernel};
+use super::plan::{compile, cut_stage, floor_bytes, SlabOrder, Stage};
+use super::ring::{choose, run_slabs, Choice, Dir};
+use super::{Access, Bind, Open, Reach, SegRef, Step, StepKernel};
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::gpu::hash::{FxMap, FxSet};
@@ -60,16 +61,21 @@ pub(super) fn run(ctx: &Context, open: &Open) -> Result<(), LumaError> {
     let stats = ctx.stream_counters();
     stats.schedules.fetch_add(1, Ordering::Relaxed);
     stats.steps.fetch_add(open.steps.len() as u64, Ordering::Relaxed);
-    let stages = compile(open);
+    let stages = fit(ctx, open, compile(open))?;
     let future = ctx.pager().budget().is_some().then(|| Future::new(open, &stages));
     let (up, down) = ctx.pager().traffic();
     let mut slabs = 0;
     let mut elided = 0;
+    let mut window = 0;
+    let (mut streamed_in, mut streamed_out) = (0, 0);
     let result = (|| {
         for (at, stage) in stages.iter().enumerate() {
             slabs += stage.space(open).slabs();
             elided += stage.transients.iter().map(|t| open.arrays[t.array as usize].meta.layout.bytes(open.arrays[t.array as usize].meta.len)).sum::<u64>();
-            run_stage(ctx, open, stage, at, future.as_ref())?;
+            let info = run_stage(ctx, open, stage, at, future.as_ref())?;
+            window = window.max(info.window);
+            streamed_in += info.streamed_in;
+            streamed_out += info.streamed_out;
         }
         Ok(())
     })();
@@ -77,9 +83,14 @@ pub(super) fn run(ctx: &Context, open: &Open) -> Result<(), LumaError> {
     stats.upload_bytes.fetch_add(up_after - up, Ordering::Relaxed);
     stats.download_bytes.fetch_add(down_after - down, Ordering::Relaxed);
     if result.is_ok() && ctx.jit().recording_decisions() {
-        let retained = open.arrays.iter().filter(|array| array.first_write.is_some()).count() - stages.iter().map(|stage| stage.transients.len()).sum::<usize>();
         let transients = stages.iter().map(|stage| stage.transients.len()).sum::<usize>();
-        let chosen = format!("stages={} slabs={slabs} window=1 retain={retained} stream=0 elided={transients}", stages.len());
+        let retained = (open.arrays.iter().filter(|array| array.first_write.is_some()).count() - transients).saturating_sub(streamed_out);
+        let chosen = format!(
+            "stages={} slabs={slabs} window={} retain={retained} stream={} elided={transients}",
+            stages.len(),
+            window.max(1),
+            streamed_in + streamed_out
+        );
         let writer = open.arrays.iter().find_map(|array| array.writer);
         if let Some((op, location)) = writer {
             ctx.jit().note_decision(Decision::new(op, location, DecisionSite::Schedule, chosen));
@@ -88,10 +99,43 @@ pub(super) fn run(ctx: &Context, open: &Open) -> Result<(), LumaError> {
     result
 }
 
+/// Cuts the stages that cannot run in one pass over their slabs even with every array streamed through a window of one (the last of
+/// the fallbacks of D6 this part has: window 1 and streaming outputs happen when a stage runs, a re-selection needs a registry
+/// family that gains from it, and shrinking the slab is W3-P4's). A single step that does not fit fails, naming it.
+fn fit(ctx: &Context, open: &Open, stages: Vec<Stage>) -> Result<Vec<Stage>, LumaError> {
+    let Some(budget) = ctx.pager().budget() else { return Ok(stages) };
+    let mut work: std::collections::VecDeque<Stage> = stages.into();
+    let mut fitted = Vec::with_capacity(work.len());
+    while let Some(stage) = work.pop_front() {
+        let floor = floor_bytes(open, &stage);
+        if floor <= budget {
+            fitted.push(stage);
+            continue;
+        }
+        match cut_stage(open, &stage) {
+            Some((first, second)) => {
+                ctx.stream_counters().cuts.fetch_add(1, Ordering::Relaxed);
+                work.push_front(second);
+                work.push_front(first);
+            }
+            None => {
+                let names: Vec<&str> = open.steps[stage.steps.clone()]
+                    .iter()
+                    .filter_map(|step| open.arrays[step.binds[0].array as usize].writer.map(|(name, _)| name))
+                    .collect();
+                return Err(LumaError::Gpu(format!(
+                    "out of memory: the stage of steps {names:?} needs {floor} bytes for one slab of each array it binds, and the memory budget is {budget} bytes"
+                )));
+            }
+        }
+    }
+    Ok(fitted)
+}
+
 /// The arrays one step binds, as launches take them.
-struct Bound<'a> {
-    outs: Vec<SegRef<'a>>,
-    ins: Vec<SegRef<'a>>,
+pub(super) struct Bound<'a> {
+    pub(super) outs: Vec<SegRef<'a>>,
+    pub(super) ins: Vec<SegRef<'a>>,
 }
 
 /// Buffers of a stage's transients, given back to the pool however the stage ends.
@@ -108,19 +152,55 @@ impl Drop for StageBuffers<'_> {
     }
 }
 
-fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Option<&Future>) -> Result<(), LumaError> {
+/// What a stage did, for the decision log.
+struct StageInfo {
+    window: usize,
+    streamed_in: usize,
+    streamed_out: usize,
+}
+
+/// The arrays of `steps` as launches take them. `fixed` gives the buffer an array is bound as for every segment (a transient's
+/// colour, a streamed array's ring slot), `None` for the arrays that are pinned.
+pub(super) fn bind_all<'a>(ctx: &'a Context, open: &'a Open, steps: &'a [Step], fixed: &dyn Fn(u32) -> Option<&'a Buffer>) -> Vec<Bound<'a>> {
+    steps
+        .iter()
+        .map(|step| {
+            let seg = |bind: &Bind| open.arrays[bind.array as usize].as_seg(ctx).fixed_to(fixed(bind.array));
+            Bound { outs: step.binds[..step.n_out].iter().map(seg).collect(), ins: step.binds[step.n_out..].iter().map(seg).collect() }
+        })
+        .collect()
+}
+
+/// One step on one slab: the launches the eager path makes, with the same arguments.
+pub(super) fn launch_step(ctx: &Context, step: &Step, bound: &Bound<'_>, slab: usize) -> Result<(), LumaError> {
+    let StepKernel::Store { core, key } = &step.kernel;
+    if store_tiles(key).is_some() {
+        // One launch over the one segment.
+        launch_store(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref())
+    } else {
+        launch_store_slab(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), slab)
+    }
+}
+
+fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Option<&Future>) -> Result<StageInfo, LumaError> {
     let stats = ctx.stream_counters();
     let steps = &open.steps[stage.steps.clone()];
 
-    // Transients get a slab-sized buffer per colour. Making room for them evicts by next use (the schedule knows the future).
+    // What the stage streams through a ring instead of making resident (see `ring`).
+    let next_stage = |array: u32| future.and_then(|future| future.stages_of[array as usize].iter().copied().find(|&s| s as usize > at)).map_or(u64::MAX, u64::from);
+    let choice: Option<Choice> = choose(ctx, open, stage, &next_stage);
+    let ring_bytes = choice.as_ref().map_or(0, Choice::ring_bytes);
+
+    // Transients get a slab-sized buffer per colour, streamed arrays a ring. Making room for them evicts by next use (the schedule
+    // knows the future).
     let mut buffers = StageBuffers { ctx, buffers: Vec::with_capacity(stage.colours.len()) };
     let max = ctx.max_buffer_bytes();
-    let total: u64 = stage.colours.iter().map(|&bytes| size_class(bytes, max).unwrap_or(bytes)).sum();
+    let total: u64 = stage.colours.iter().map(|&bytes| size_class(bytes, max).unwrap_or(bytes)).sum::<u64>() + ring_bytes;
     let _reservation = if total > 0 {
         let keep: FxSet<*const Segment> = steps
             .iter()
             .flat_map(|step| step.binds.iter())
-            .filter(|bind| !stage.transients.iter().any(|t| t.array == bind.array))
+            .filter(|bind| !stage.transients.iter().any(|t| t.array == bind.array) && !choice.as_ref().is_some_and(|choice| choice.streams_array(bind.array)))
             .flat_map(|bind| open.arrays[bind.array as usize].segments.iter())
             .map(|segment| std::ptr::from_ref::<Segment>(segment))
             .collect();
@@ -132,17 +212,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
     for &bytes in &stage.colours {
         buffers.buffers.push(ctx.alloc_buffer(bytes, STORAGE_USAGE)?);
     }
-    let fixed = |array: u32| {
-        stage.transients.iter().find(|t| t.array == array).map(|t| &buffers.buffers[t.colour])
-    };
-
-    let bound: Vec<Bound<'_>> = steps
-        .iter()
-        .map(|step| {
-            let seg = |bind: &Bind| open.arrays[bind.array as usize].as_seg(ctx).fixed_to(fixed(bind.array));
-            Bound { outs: step.binds[..step.n_out].iter().map(seg).collect(), ins: step.binds[step.n_out..].iter().map(seg).collect() }
-        })
-        .collect();
+    let fixed = |array: u32| stage.transients.iter().find(|t| t.array == array).map(|t| &buffers.buffers[t.colour]);
 
     let space = stage.space(open);
     let slabs = space.slabs();
@@ -152,19 +222,34 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
         stats.transient_bytes_elided.fetch_add(meta.layout.bytes(meta.len), Ordering::Relaxed);
         stats.transients.fetch_add(1, Ordering::Relaxed);
     }
-    for slab in slab_order(open, stage, slabs) {
+    let order = slab_order(open, stage, slabs);
+    let mut info = StageInfo { window: 0, streamed_in: 0, streamed_out: 0 };
+    // The single place a launch window (W3-STREAMS) opens around the stage's launches.
+    if let Some(choice) = &choice {
+        stats.streamed.fetch_add(choice.streams.len() as u64, Ordering::Relaxed);
+        stats.ring_bytes_peak.fetch_max(ring_bytes, Ordering::Relaxed);
+        if choice.window == 1 {
+            stats.window1_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        info.window = choice.window;
+        info.streamed_in = choice.streams.iter().filter(|s| s.dir == Dir::In).count();
+        info.streamed_out = choice.streams.len() - info.streamed_in;
         #[cfg(test)]
-        if super::tests::fail_here(slab) {
+        if super::tests::fail_here(order[0]) {
             return Err(LumaError::Gpu("injected failure".into()));
         }
-        stats.slabs.fetch_add(1, Ordering::Relaxed);
-        for (step, bound) in steps.iter().zip(&bound) {
-            let StepKernel::Store { core, key } = &step.kernel;
-            if store_tiles(key).is_some() {
-                // One launch over the one segment.
-                launch_store(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref())?;
-            } else {
-                launch_store_slab(ctx, core, key, &bound.outs, &bound.ins, &step.scalars, step.shifted.as_ref(), slab)?;
+        stats.slabs.fetch_add(slabs as u64, Ordering::Relaxed);
+        run_slabs(ctx, open, stage, choice, &order, &fixed)?;
+    } else {
+        let bound = bind_all(ctx, open, steps, &fixed);
+        for slab in order {
+            #[cfg(test)]
+            if super::tests::fail_here(slab) {
+                return Err(LumaError::Gpu("injected failure".into()));
+            }
+            stats.slabs.fetch_add(1, Ordering::Relaxed);
+            for (step, bound) in steps.iter().zip(&bound) {
+                launch_step(ctx, step, bound, slab)?;
             }
         }
     }
@@ -174,7 +259,7 @@ fn run_stage(ctx: &Context, open: &Open, stage: &Stage, at: usize, future: Optio
             note_store(ctx, key);
         }
     }
-    Ok(())
+    Ok(info)
 }
 
 /// The slabs of `stage` in the order it visits them.
