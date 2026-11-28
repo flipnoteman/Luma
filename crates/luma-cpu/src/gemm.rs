@@ -61,6 +61,7 @@ impl NativeMatmul {
         }
         let mut product = Self::new(spec)?;
         product.epilogue = Some(TileEpilogue { kernel: tile, inputs, scalars });
+        product.func = group_epilogue;
         Some(product)
     }
 
@@ -68,15 +69,32 @@ impl NativeMatmul {
     /// them): `bytes` are the sizes of the bindings, `words` the uniform `{m, n, k, kc, lda, ldb,
     /// a_off, b_off}` and `workgroups` the grid.
     pub(crate) fn validate(&self, bytes: &[u64], words: [u32; UNIFORM_WORDS], workgroups: [u32; 3]) -> Result<(), BackendError> {
-        let bad = |what: String| Err(BackendError::Unsupported(format!("native matrix product: {what}")));
-        let bindings = BINDINGS + self.epilogue.as_ref().map_or(0, |epilogue| epilogue.inputs);
-        if bytes.len() != bindings {
-            return bad(format!("{} bindings, expected {bindings}", bytes.len()));
+        if self.epilogue.is_some() {
+            return self.validate_epilogue(bytes, words, workgroups);
         }
-        if let Some(epilogue) = &self.epilogue
-            && bytes[bindings - 1] < 4 * (UNIFORM_WORDS + epilogue.scalars) as u64
-        {
-            return bad(format!("a uniform of {} bytes for {} scalars", bytes[bindings - 1], epilogue.scalars));
+        self.validate_plain(bytes, words, workgroups)
+    }
+
+    /// [`Self::validate`] of a product with an epilogue: its operands sit between `b` and the uniform, which holds the scalars.
+    #[cold]
+    #[inline(never)]
+    fn validate_epilogue(&self, bytes: &[u64], words: [u32; UNIFORM_WORDS], workgroups: [u32; 3]) -> Result<(), BackendError> {
+        let Some(epilogue) = &self.epilogue else { return Ok(()) };
+        let bindings = BINDINGS + epilogue.inputs;
+        if bytes.len() != bindings {
+            return Err(BackendError::Unsupported(format!("native matrix product: {} bindings, expected {bindings}", bytes.len())));
+        }
+        if bytes[bindings - 1] < 4 * (UNIFORM_WORDS + epilogue.scalars) as u64 {
+            return Err(BackendError::Unsupported(format!("native matrix product: a uniform of {} bytes for {} scalars", bytes[bindings - 1], epilogue.scalars)));
+        }
+        self.validate_plain(&[bytes[0], bytes[1], bytes[2], bytes[bindings - 1]], words, workgroups)
+    }
+
+    #[inline(always)]
+    fn validate_plain(&self, bytes: &[u64], words: [u32; UNIFORM_WORDS], workgroups: [u32; 3]) -> Result<(), BackendError> {
+        let bad = |what: String| Err(BackendError::Unsupported(format!("native matrix product: {what}")));
+        if bytes.len() != BINDINGS {
+            return bad(format!("{} bindings, expected {BINDINGS}", bytes.len()));
         }
         let [m, n, k, kc, lda, ldb, a_off, b_off] = words.map(u64::from);
         if m == 0 || n == 0 || workgroups.contains(&0) {
@@ -171,25 +189,33 @@ impl TileEpilogue {
 /// One workgroup: the output tile `x + y * num_workgroups.x` over the slice of K of layer `z`.
 unsafe extern "C" fn group(ctx: *const WorkgroupCtx) {
     // SAFETY: as `workgroup`.
-    unsafe { workgroup::<false>(ctx) }
+    unsafe { workgroup::<false, false>(ctx) }
 }
 
 /// One workgroup of a half-work product ([`MatmulSpec::half`]): [`group`] with the lower triangle of tiles as its grid, mirrored.
 unsafe extern "C" fn group_half(ctx: *const WorkgroupCtx) {
     // SAFETY: as `workgroup`.
-    unsafe { workgroup::<true>(ctx) }
+    unsafe { workgroup::<true, false>(ctx) }
 }
 
-/// The body of [`group`] and [`group_half`]: `HALF` is a constant, so the ordinary product carries nothing of the half-work one.
+/// One workgroup of a product with an epilogue: [`group`] that applies it to its tile (a function of its own, so the ordinary product
+/// carries nothing of the epilogue).
+unsafe extern "C" fn group_epilogue(ctx: *const WorkgroupCtx) {
+    // SAFETY: as `workgroup`.
+    unsafe { workgroup::<false, true>(ctx) }
+}
+
+/// The body of [`group`], [`group_half`] and [`group_epilogue`]: `HALF` and `EPI` are constants, so the ordinary product carries nothing of
+/// the half-work one or of an epilogue.
 #[inline(always)]
-unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
+unsafe fn workgroup<const HALF: bool, const EPI: bool>(ctx: *const WorkgroupCtx) {
     // SAFETY: the dispatcher passes a valid context whose `native` is the kernel it dispatched
     // and whose bindings the launch validated ([`NativeMatmul::validate`]).
     unsafe {
         let ctx = &*ctx;
         let kernel = &*ctx.native.cast::<NativeMatmul>();
         // The epilogue's operands sit between `b` and the uniform.
-        let uniform_at = BINDINGS - 1 + kernel.epilogue.as_ref().map_or(0, |epilogue| epilogue.inputs);
+        let uniform_at = if EPI { BINDINGS - 1 + kernel.epilogue.as_ref().map_or(0, |epilogue| epilogue.inputs) } else { BINDINGS - 1 };
         let [c, a, b, uniform] = [0, 1, 2, uniform_at].map(|at| *ctx.bindings.add(at));
         let [m, n, k, kc, lda, ldb, a_off, b_off] = uniform.cast::<[u32; UNIFORM_WORDS]>().read().map(|word| word as usize);
         let edge = kernel.spec.edge as usize;
@@ -213,7 +239,7 @@ unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
             for r in 0..rows {
                 std::ptr::write_bytes(c.add(r * n), 0, cols);
             }
-            if let Some(epilogue) = &kernel.epilogue {
+            if EPI && let Some(epilogue) = &kernel.epilogue {
                 epilogue.apply(ctx, (row, col, rows, cols, n), uniform);
             }
             return;
@@ -228,7 +254,7 @@ unsafe fn workgroup<const HALF: bool>(ctx: *const WorkgroupCtx) {
         let a = a.cast::<f32>().add(a_off).offset(row as isize * lhs_strides.0 + begin as isize * lhs_strides.1);
         let b = b.cast::<f32>().add(b_off).offset(begin as isize * rhs_strides.0 + col as isize * rhs_strides.1);
         matrixmultiply::sgemm(rows, depth, cols, 1.0, a, lhs_strides.0, lhs_strides.1, b, rhs_strides.0, rhs_strides.1, 0.0, c, n as isize, 1);
-        if let Some(epilogue) = &kernel.epilogue {
+        if EPI && let Some(epilogue) = &kernel.epilogue {
             epilogue.apply(ctx, (row, col, rows, cols, n), uniform);
         }
         if HALF {

@@ -260,7 +260,7 @@ impl Structured {
     }
 
     /// Gives the leaves that stand for the value in expressions its buffer.
-    #[inline]
+    #[inline(always)]
     fn hand_over(&self, storage: &Arc<Storage>) {
         if !self.has_leaves.load(Ordering::Acquire) {
             return;
