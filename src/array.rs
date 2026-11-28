@@ -451,6 +451,14 @@ impl Storage {
         self.pin(0)
     }
 
+    /// Marks the data of every segment as lost (see [`Segment::poison`]): every later use of it fails with `error`.
+    #[cold]
+    pub(crate) fn poison_segments(&self, error: &Arc<LumaError>) {
+        for segment in &self.segments {
+            segment.poison(error);
+        }
+    }
+
     pub(crate) fn was_materialized(&self) -> bool {
         self.materialized.load(Ordering::Relaxed)
     }

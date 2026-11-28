@@ -334,6 +334,25 @@ fn aborting_a_recording_concerns_only_its_thread() {
     assert!(ctx.end_recording().is_some());
 }
 
+/// A seed copy that fails for a reason that is no transfer's (here: no memory, the error the source's data is lost with) leaves the probe lost, not empty:
+/// the abort reports the error, and every later use of the probe fails with it instead of computing on what was never copied.
+#[test]
+fn a_failed_seed_copy_of_an_aborted_recording_poisons_the_probe() {
+    let ctx = ctx();
+    let x = Array::from_slice_on(&ctx, &[1.0f32; 8], 8).unwrap();
+    x.eval().unwrap();
+    let probe = x.fresh_probe().unwrap_or_else(|_| panic!("probe"));
+    let (from, to) = (Arc::clone(x.storage().unwrap_or_else(|_| panic!("storage"))), Arc::clone(probe.storage().unwrap_or_else(|_| panic!("storage"))));
+    assert!(ctx.begin_recording(vec![(Arc::clone(&from), Arc::clone(&to))]));
+    from.poison_segments(&Arc::new(LumaError::OutOfMemory { requested: 32 }));
+    let error = ctx.abort_recording_for("test").expect_err("the seed copy reads lost data");
+    assert!(matches!(error, LumaError::OutOfMemory { .. }), "{error}");
+    for pin in [to.pin_quiet(0), to.pin_read(0)] {
+        assert!(matches!(pin.map(|_| ()), Err(LumaError::OutOfMemory { .. })), "a probe the seed never reached is readable");
+    }
+    assert!(ctx.end_recording().is_none());
+}
+
 /// A kernel of luma's own whose module declares a uniform its entry point never reads: the
 /// pipeline layout has no binding for it, so the launch binds the arguments the shader uses and
 /// skips the rest, whichever of them it is.

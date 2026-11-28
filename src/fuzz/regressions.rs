@@ -1000,12 +1000,10 @@ fn a_concat_assign_and_compound_of_df32_arrays_with_slabs_and_chunks_is_wrong() 
     check(program);
 }
 
-/// OPEN (found by `split_io_failures`, seed 20): the same cause as the test above, by another path. `iterate_until_all` over two states whose step gathers with a file array;
+/// Found by `split_io_failures` (seed 20): the same cause as the test above, by another path. `iterate_until_all` over two states whose step gathers with a file array;
 /// the abort of the step's recording fails at its seed copy (the read that fails), the node being evaluated is left pending (`run_store_planned` under `force_stepped`),
-/// and its retry computes on a probe that was never seeded (0 against 0.405). A failed seed copy of an aborted recording needs to poison the probes (or the
-/// recording keep its seeds to retry), not only the fused path (see `force_with_record`).
+/// and its retry computed on a probe that was never seeded (0 against 0.405). A failed seed copy poisons the probes (see `Recording::poison_unfinished`).
 #[test]
-#[ignore = "open: failed seed copy of an aborted recording, evaluate_group retry"]
 fn an_iterate_until_over_two_states_whose_seed_copy_fails_does_not_run_on_unseeded_probes() {
     use luma_io::{FailPlan, Fault};
     let program = Program {

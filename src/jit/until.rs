@@ -166,8 +166,8 @@ pub(crate) fn force_with_record<T: GpuType>(
     let first_gate = gate.as_ref().filter(|_| finishes).map(|gate| (gate.id, gate.args));
     let (storages, partial, groups) = match launch::reduce_and_store_fused(&mut Emit::now(ctx), PassMode::Auto, len, fused, &stored, ops, &mut scratch, Some(value), epi, first_gate) {
         Ok(made) => made,
-        // A failed transfer is the environment's, not a limit of this launch: the separate launches would read the same file again, and past an
-        // aborted recording whose seed copy failed (the abort ran the commands for real) the probes hold nothing: no other way gives the value.
+        // A failed transfer is the environment's, not a limit of this launch: the separate launches would read the same file again (and the
+        // probes of an aborted recording whose seed copy failed are poisoned: no other way gives the value).
         Err(Failure::New(error)) if matches!(error.root(), crate::LumaError::Io { .. }) => return Some(Err(Failure::New(error))),
         Err(_) => return None,
     };

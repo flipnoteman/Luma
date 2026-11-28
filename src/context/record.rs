@@ -23,7 +23,7 @@ use std::sync::Arc;
 use luma_core::{Buffer, BufferUsage, Dispatch};
 
 use crate::array::Storage;
-use crate::error::Result;
+use crate::error::{LumaError, Result};
 use crate::gpu::hash::{FxMap, FxSet};
 use crate::gpu::pager::{take_dead_buffers, Accounted, Pin};
 use crate::kernel::KernelCore;
@@ -383,6 +383,9 @@ impl Context {
             }
             Ok(())
         })();
+        if let Err(error) = &result {
+            recording.poison_unfinished(error);
+        }
         for buffer in recording.retired {
             self.recycle(buffer);
         }
@@ -428,6 +431,24 @@ pub(super) fn pack_intervals(intervals: &[Interval]) -> Vec<usize> {
 }
 
 impl Recording {
+    /// Marks the data the recording was to make as lost, for the failure `error` of its seed copies or commands (whatever kind: a failed
+    /// transfer, no memory for a pin): the seeds' targets (probes that hold nothing, or part of the state) and every segment a command
+    /// writes. The traced code gets `error` from the call that aborted the recording, but it may go on (a node whose evaluation failed stays pending,
+    /// and its retry reads what the failed copy left), so every later use of that data fails with `error` too instead of computing on it.
+    #[cold]
+    fn poison_unfinished(&self, error: &LumaError) {
+        let error = Arc::new(error.clone());
+        for (_, to) in &self.seed {
+            to.poison_segments(&error);
+        }
+        for pin in &self.pins {
+            let written = self.cmds.iter().any(|cmd| cmd.args.iter().any(|arg| matches!(arg, CmdArg::Storage { buffer, writable: true, .. } if buffer == pin.buffer())));
+            if written {
+                pin.segment().poison(&error);
+            }
+        }
+    }
+
     /// A buffer of exactly `size` bytes and `usage` that the commands captured so far are done
     /// with, taken out of the recording for a new allocation: a fresh one that was released
     /// during the recording, or the buffer of a segment that only this recording's pins still
