@@ -481,7 +481,7 @@ impl<T: GpuType> Clone for Array<T> {
         };
         // The data is shared from here on, and a write through either handle would leave the properties of the other stale: neither
         // keeps them.
-        self.props.clear();
+        self.props.lose();
         Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, props: PropsCell::default(), _marker: PhantomData }
     }
 }
@@ -511,9 +511,18 @@ impl<T: GpuType> Array<T> {
         !self.props.get().is_none()
     }
 
-    /// This array with the properties `props` of its value. Ignored on a valid array (its buffer is shared with its clones, so a
-    /// write through one handle would leave the property of the other stale) and on a poisoned one.
+    /// This array, a fresh result, with the properties `props` of its value. Valid results carry them too: every share (clone,
+    /// reshape) and every write clears them. Ignored on a poisoned array.
     pub(crate) fn with_props(self, props: Props) -> Self {
+        if !matches!(self.repr, Repr::Poisoned(_)) {
+            self.props.set(HandleProps::of(&props));
+        }
+        self
+    }
+
+    /// [`Array::with_props`] for a view of another array (a transpose): a valid one shares its source's buffer, which a write
+    /// through the source would change under the view, so only lazy and structured views keep a property.
+    pub(crate) fn with_view_props(self, props: Props) -> Self {
         if matches!(self.repr, Repr::Lazy(_) | Repr::Structured(..)) {
             self.props.set(HandleProps::of(&props));
         }
@@ -1090,7 +1099,7 @@ impl<T: GpuType> Array<T> {
         }
         let len = shape.validate()?;
         // The result shares the data: a write through it must not leave properties here stale.
-        self.props.clear();
+        self.props.lose();
         if len != self.len() {
             return Err(LumaError::InvalidShape(format!(
                 "Cannot reshape {} elements {} into {} elements {shape}",

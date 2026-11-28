@@ -292,6 +292,63 @@ fn a_clone_written_through_does_not_leave_a_stale_property_on_the_original() {
     none(&twin);
 }
 
+#[test]
+fn valid_results_carry_properties_until_they_are_shared_or_written() {
+    let n = 6;
+    let up = mat(n).lower(false);
+    // The product is evaluated (or not) as the site says; either way it carries the product rule.
+    let product = up.matmul_f32(&up);
+    has(&product, &["UPPER"]);
+    // Evaluating it keeps them (the handle keeps its representation, or a fresh valid result carries them); `cache` is a share.
+    product.to_vec().unwrap();
+    has(&product, &["UPPER"]);
+    none(&product.cache());
+    // `cholesky` of a symmetric positive definite matrix is `LOWER` whatever the representation.
+    let spd = {
+        let a = mat(n);
+        &a.matmul_nt(&a) + &(&Array::<f32>::identity([n, n]).unwrap() * (n as f32))
+    };
+    let l = spd.cholesky();
+    has(&l, &["LOWER"]);
+    sound(&l);
+    l.to_vec().unwrap();
+    has(&l, &["LOWER"]);
+    // Sharing forgets, and counts what it forgot.
+    let before = Array::<f32>::lost_properties_debug();
+    let copy = l.clone();
+    none(&copy);
+    none(&l);
+    if cfg!(debug_assertions) {
+        assert_eq!(Array::<f32>::lost_properties_debug(), before + 1);
+    }
+    let mut written = mat(n).matmul_f32(&mat(n));
+    written.to_vec().unwrap();
+    written.write(&[1.0; 36]).unwrap();
+    none(&written);
+}
+
+#[test]
+fn a_gram_product_is_symmetric() {
+    let x = Array::from_slice(&(0..24).map(|i| (i % 5) as f32 - 1.5).collect::<Vec<_>>(), [4, 6]).unwrap();
+    let gram = x.matmul_tn(&x);
+    has(&gram, &["SYMMETRIC"]);
+    has(&x.matmul_nt(&x), &["SYMMETRIC"]);
+    none(&x.matmul_tn(&x.clone().abs()));
+    sound_within(&gram);
+}
+
+/// Symmetric to a few ulps (the full kernel's two triangles may differ in the last bits on tensor cores).
+fn sound_within(a: &Array<f32>) {
+    let [n, ..] = a.shape().dims();
+    let v = a.to_vec().unwrap();
+    for r in 0..n {
+        for c in 0..r {
+            let (x, y) = (v[r * n + c], v[c * n + r]);
+            assert!((x - y).abs() <= 8.0 * f32::EPSILON * x.abs().max(y.abs()), "({r}, {c}): {x} vs {y}");
+        }
+    }
+}
+
 // -- Routing --
 
 use luma::{solve_tridiagonal, Context, ContextOptions, Numerics, Triangle};

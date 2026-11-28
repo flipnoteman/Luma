@@ -84,7 +84,7 @@ impl Array<f32> {
             Ok(d) => d,
             Err(e) => return fail(ctx, b.shape(), e, "solve_banded", location),
         };
-        let Some((lo, hi)) = self.props().band else {
+        let Some((lo, hi)) = self.props_used().band else {
             let error = LumaError::InvalidShape("solve_banded: the matrix carries no band (build it with from_diagonals or diag_matrix)".into());
             return fail(ctx, b.shape(), error, "solve_banded", location);
         };
@@ -113,7 +113,7 @@ impl Array<f32> {
     /// What `solve` does for a matrix whose handle says it is diagonal or triangular, under `Numerics::reformulate`: `None` for
     /// every other call (the dense LU path then runs).
     pub(crate) fn route_solve(&self, b: &Array<f32>, location: &'static Location<'static>) -> Option<Array<f32>> {
-        let props = self.props();
+        let props = self.props_used();
         let ctx = self.context();
         if !ctx.numerics().reformulate || Dims::square(self).is_err() || !ctx.same_as(b.context()) {
             return None;
@@ -143,7 +143,7 @@ impl Array<f32> {
 
     /// `det` of a matrix known to be triangular or diagonal, under `Numerics::reformulate`: the product of its diagonal.
     pub(crate) fn route_det(&self, location: &'static Location<'static>) -> Option<Array<f32>> {
-        let props = self.props();
+        let props = self.props_used();
         let ctx = self.context();
         if !ctx.numerics().reformulate || Dims::square(self).is_err() || !(props.has(Props::LOWER) || props.has(Props::UPPER)) {
             return None;

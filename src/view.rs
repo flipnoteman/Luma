@@ -493,11 +493,23 @@ impl<T: ScalarType> Array<T> {
     #[track_caller]
     pub fn transpose(&self) -> Array<T> {
         let transposed = self.permute_at([1, 0, 2, 3], false, "transpose", Location::caller());
-        if self.has_props() { transposed.with_props(self.props().transposed()) } else { transposed }
+        if self.has_props() { transposed.with_view_props(self.props().transposed()) } else { transposed }
     }
 
     /// Whether this array is the transpose of `base` as a pending read of it (`base` itself, not a copy): conservative, false when
     /// either has been evaluated since.
+    /// Whether `other` is this very value (the same node or buffer, no view of either): a Gram product reads one operand twice.
+    pub(crate) fn is_same_value(&self, other: &Array<T>) -> bool {
+        if self.shape() != other.shape() || self.is_read_view() != other.is_read_view() {
+            return false;
+        }
+        match (self.src(), other.src()) {
+            (Ok(Src::Node(a)), Ok(Src::Node(b))) => Arc::ptr_eq(&a, &b),
+            (Ok(Src::Buffer(a)), Ok(Src::Buffer(b))) => Arc::ptr_eq(&a, &b),
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_transpose_of(&self, base: &Array<T>) -> bool {
         if !self.is_read_view() || self.shape() != base.shape() {
             return false;

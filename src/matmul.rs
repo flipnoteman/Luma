@@ -36,7 +36,7 @@ use std::panic::Location;
 use crate::array::Array;
 use luma_core::GemmLanes;
 use crate::jit::comprehension::lower::contract::ContractForm;
-use crate::jit::comprehension::OpTag;
+use crate::jit::comprehension::{OpTag, Props};
 use crate::jit::structured::contraction::{ContractionAttrs, Tf32Request};
 use crate::jit::structured::lazy;
 
@@ -221,13 +221,28 @@ impl Array<f32> {
 /// [`Array::matmul_nt`] as a function.
 #[track_caller]
 pub fn matmul_nt(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    product(lhs, &rhs.transpose(), None)
+    let out = product(lhs, &rhs.transpose(), None);
+    // `x · xᵀ` is symmetric (the half-work kernel makes it bit-symmetric; see `Props::SYMMETRIC`).
+    if lhs.is_same_value(rhs) { with_symmetric(out) } else { out }
 }
 
 /// [`Array::matmul_tn`] as a function.
 #[track_caller]
 pub fn matmul_tn(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
-    product(&lhs.transpose(), rhs, None)
+    let out = product(&lhs.transpose(), rhs, None);
+    // The Gram product `xᵀ · x`.
+    if lhs.is_same_value(rhs) { with_symmetric(out) } else { out }
+}
+
+/// `product` marked symmetric: a square result of a Gram product.
+fn with_symmetric(out: Array<f32>) -> Array<f32> {
+    let [n, m, ..] = out.shape().dims();
+    if n != m {
+        return out;
+    }
+    let mut props = out.props();
+    props.flags |= Props::SYMMETRIC;
+    out.with_props(props)
 }
 
 /// [`Array::matmul_tt`] as a function.
@@ -272,7 +287,7 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     let product = lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location);
-    if lhs.has_props() || rhs.has_props() { product.with_props(lhs.props().product(rhs.props())) } else { product }
+    if lhs.has_props() || rhs.has_props() { product.with_props(lhs.props_used().product(rhs.props_used())) } else { product }
 }
 
 /// How a product is cut into workgroups.

@@ -15,8 +15,17 @@
 //! clones, so a write through one handle would leave the others' property stale.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU64;
 
 use crate::jit::comprehension::Props;
+
+/// Properties lost to sharing so far (debug builds).
+#[cfg(debug_assertions)]
+static LOST: AtomicU64 = AtomicU64::new(0);
+/// Uses of a claim so far (debug builds): one in 16 is re-derived from the values.
+#[cfg(debug_assertions)]
+static USES: AtomicU32 = AtomicU32::new(0);
 
 /// The pattern bits (the ones about where the zeros are).
 const PATTERN: u16 = Props::DIAGONAL | Props::LOWER | Props::UPPER | Props::SYMMETRIC;
@@ -229,16 +238,89 @@ impl PropsCell {
         self.0.store(props.bits(), Ordering::Relaxed);
     }
 
-    /// Forgets the properties (the data is about to be shared, or written).
+    /// Forgets the properties (the data is about to be written).
     #[inline(always)]
     pub(crate) fn clear(&self) {
         self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// Forgets the properties because the data is about to be shared (a clone, a reshape): the value stays what it was, but a
+    /// write through either handle would leave the other's claim stale. Debug builds count what is lost, to find the paths worth
+    /// fixing (see [`Array::lost_properties_debug`]).
+    #[inline(always)]
+    pub(crate) fn lose(&self) {
+        if self.0.load(Ordering::Relaxed) != 0 {
+            #[cfg(debug_assertions)]
+            LOST.fetch_add(1, Ordering::Relaxed);
+            self.0.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 impl std::fmt::Debug for PropsCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.get().fmt(f)
+    }
+}
+
+impl crate::array::Array<f32> {
+    /// How many properties debug builds dropped because their handle was cloned or reshaped (0 in release builds).
+    #[doc(hidden)]
+    pub fn lost_properties_debug() -> u64 {
+        #[cfg(debug_assertions)]
+        return LOST.load(Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        0
+    }
+
+    /// The properties of this handle, for a consumer that is about to act on them. Debug builds re-derive one claim in 16 from
+    /// the values (a read-back) and panic if the matrix breaks it: a stale or wrong property is the correctness risk of the
+    /// whole feature. Matrices with a non-finite entry are not checked (the claims are about finite inputs).
+    #[inline(always)]
+    pub(crate) fn props_used(&self) -> Props {
+        let props = self.props();
+        #[cfg(debug_assertions)]
+        if !props.is_none() && USES.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+            self.check_claim(props);
+        }
+        props
+    }
+
+    #[cfg(debug_assertions)]
+    #[inline(never)]
+    fn check_claim(&self, props: Props) {
+        let Ok(values) = self.to_vec() else { return };
+        if values.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        let [n, m, b2, b3] = self.shape().dims();
+        let (lo, hi) = props.band.map_or((usize::MAX, usize::MAX), |(lo, hi)| (lo as usize, hi as usize));
+        let label = props.describe();
+        for z in 0..b2 * b3 {
+            let at = |r: usize, c: usize| values[z * n * m + r * n + c];
+            for r in 0..m {
+                let mut ones = 0;
+                for c in 0..n {
+                    let v = at(r, c);
+                    let zero_needed = (c > r && props.has(Props::LOWER))
+                        || (c < r && props.has(Props::UPPER))
+                        || (c != r && props.has(Props::DIAGONAL))
+                        || (r > c && r - c > lo)
+                        || (c > r && c - r > hi)
+                        || (props.has(Props::PERMUTATION) && v != 1.0);
+                    assert!(!zero_needed || v == 0.0, "matrix property claim {label} is false: entry (row {r}, col {c}) is {v}");
+                    assert!(c != r || !props.has(Props::UNIT_DIAG) || v == 1.0, "matrix property claim {label} is false: diagonal entry {r} is {v}");
+                    ones += usize::from(v == 1.0);
+                    if props.has(Props::SYMMETRIC) && m == n && c < r {
+                        let w = at(c, r);
+                        // Bit-equal when the symmetric half-work product ran; a few ulps otherwise (the full kernel's two
+                        // triangles may differ in the last bits on tensor cores).
+                        assert!((v - w).abs() <= 8.0 * f32::EPSILON * v.abs().max(w.abs()), "matrix property claim {label} is false: entries ({r}, {c}) and ({c}, {r}) are {v} and {w}");
+                    }
+                }
+                assert!(!props.has(Props::PERMUTATION) || ones == 1 || n == 0, "matrix property claim {label} is false: row {r} has {ones} ones");
+            }
+        }
     }
 }
 
