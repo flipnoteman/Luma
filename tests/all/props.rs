@@ -668,7 +668,7 @@ fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products()
         let copy = on(&ctx, &data, [cols, rows]);
         for (name, gram, full) in [("tn", x.matmul_tn(&x), x.matmul_tn(&copy)), ("nt", x.transpose().matmul_nt(&x.transpose()), x.transpose().cache().matmul_nt(&copy.transpose().cache()))] {
             let (g, f) = (gram.to_vec().unwrap(), full.to_vec().unwrap());
-            let n = if name == "tn" { cols } else { cols };
+            let n = cols;
             assert_eq!(g.len(), n * n, "{name} {rows}x{cols}");
             for r in 0..n {
                 for c in 0..n {
