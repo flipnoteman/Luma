@@ -728,14 +728,23 @@ impl<T: GpuType> Array<T> {
 
     /// `Err` with the error of a poisoned array, `Ok` otherwise. Errors reported by the GPU
     /// itself (as opposed to failed operations) only show up at synchronization points.
+    #[inline]
     pub fn check(&self) -> Result<()> {
         match self.failed() {
-            None => match self.recorded_storage().and_then(|storage| storage.segments.iter().find_map(|segment| segment.failure())) {
-                // A deferred step that failed when its schedule committed (see `jit::split`) leaves the failure on the segments it wrote.
-                Some(error) => Err(LumaError::clone(&error)),
-                None => Ok(()),
-            },
+            // Only a deferred step can leave a failure on a segment: nothing to look for when the context defers none.
+            None if self.ctx.split_mode() == crate::SplitMode::Off => Ok(()),
+            None => self.check_deferred(),
             Some(error) => Err(LumaError::clone(error)),
+        }
+    }
+
+    /// A deferred step that failed when its schedule committed (see `jit::split`) leaves the failure on the segments it wrote.
+    #[cold]
+    #[inline(never)]
+    fn check_deferred(&self) -> Result<()> {
+        match self.recorded_storage().and_then(|storage| storage.segments.iter().find_map(|segment| segment.failure())) {
+            Some(error) => Err(LumaError::clone(&error)),
+            None => Ok(()),
         }
     }
 

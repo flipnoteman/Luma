@@ -737,6 +737,7 @@ impl Segment {
     }
 
     /// [`Segment::pin`] for a command that only reads the buffer: a host copy stays valid.
+    #[inline]
     pub(crate) fn pin_read(self: &Arc<Self>) -> Result<Pin> {
         let pin = self.pin_unrecorded(false, false)?;
         self.ctx.keep_pin(&pin);

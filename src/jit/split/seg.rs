@@ -27,6 +27,7 @@ pub(crate) enum Held {
 }
 
 impl Held {
+    #[inline(always)]
     pub(crate) fn buffer(&self) -> &Buffer {
         match self {
             Held::Pinned(pin) => pin.buffer(),
@@ -51,62 +52,75 @@ pub(crate) struct SegRef<'a> {
 }
 
 impl<'a> SegRef<'a> {
+    #[inline(always)]
     pub(crate) fn new(ctx: &'a Context, meta: SegMeta, segments: &'a [Arc<Segment>], materialized: Option<&'a AtomicBool>, windowed: bool) -> Self {
         SegRef { meta, segments, ctx, materialized, windowed, fixed: None }
     }
 
     /// The same array bound to `buffer` for every segment (a transient: it has no buffer of its own).
+    #[inline(always)]
     pub(crate) fn fixed_to(mut self, buffer: Option<&'a Buffer>) -> Self {
         self.fixed = buffer;
         self
     }
 
+    #[inline(always)]
     pub(crate) fn ctx(&self) -> &'a Context {
         self.ctx
     }
 
     /// Whether the one segment may be a window (see [`SegRef::window`]).
+    #[inline(always)]
     pub(crate) fn windowed(&self) -> bool {
         self.windowed
     }
 
+    #[inline(always)]
     pub(crate) fn meta(&self) -> SegMeta {
         self.meta
     }
 
+    #[inline(always)]
     pub(crate) fn len(&self) -> usize {
         self.meta.len
     }
 
+    #[inline(always)]
     pub(crate) fn layout(&self) -> ElemLayout {
         self.meta.layout
     }
 
+    #[inline(always)]
     pub(crate) fn segments(&self) -> &'a [Arc<Segment>] {
         self.segments
     }
 
     /// Number of segments.
+    #[inline(always)]
     pub(crate) fn segment_count(&self) -> usize {
         self.segments.len()
     }
 
     /// Bytes of data in the whole array.
+    #[inline(always)]
     pub(crate) fn byte_len(&self) -> u64 {
         self.meta.layout.bytes(self.meta.len)
     }
 
     /// The elements segment `j` holds.
+    #[inline(always)]
     pub(crate) fn range(&self, j: usize) -> std::ops::Range<usize> {
         let c = self.meta.seg_len;
         j * c..self.meta.len.min((j + 1) * c)
     }
 
     /// Bytes of data in segment `j`.
+    #[inline(always)]
     pub(crate) fn segment_byte_len(&self, j: usize) -> u64 {
         self.meta.layout.bytes(self.range(j).len())
     }
 
+    #[inline(always)]
     fn segment(&self, j: usize) -> &'a Arc<Segment> {
         if let Some(flag) = self.materialized {
             flag.store(true, Ordering::Relaxed);
@@ -115,6 +129,7 @@ impl<'a> SegRef<'a> {
     }
 
     /// [`Storage::pin`].
+    #[inline(always)]
     pub(crate) fn pin(&self, j: usize) -> Result<Held> {
         match self.fixed {
             Some(buffer) => Ok(Held::Fixed(buffer.clone())),
@@ -123,6 +138,7 @@ impl<'a> SegRef<'a> {
     }
 
     /// [`Storage::pin_read`].
+    #[inline(always)]
     pub(crate) fn pin_read(&self, j: usize) -> Result<Held> {
         match self.fixed {
             Some(buffer) => Ok(Held::Fixed(buffer.clone())),
@@ -131,6 +147,7 @@ impl<'a> SegRef<'a> {
     }
 
     /// [`Storage::pin_overwrite`].
+    #[inline(always)]
     pub(crate) fn pin_overwrite(&self, j: usize) -> Result<Held> {
         match self.fixed {
             Some(buffer) => Ok(Held::Fixed(buffer.clone())),
@@ -139,6 +156,7 @@ impl<'a> SegRef<'a> {
     }
 
     /// [`Storage::window`]: the pack and the first element of this array in it, while its one segment only shows a range of it.
+    #[inline(always)]
     pub(crate) fn window(&self) -> Option<(Arc<Storage>, usize)> {
         if !self.windowed || self.segments.len() != 1 {
             return None;

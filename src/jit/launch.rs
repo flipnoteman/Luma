@@ -823,6 +823,7 @@ impl InPin {
     /// binding to is bound as that range of its pack's buffer, instead of being copied out. A
     /// recording captures buffers whole (its commands are replayed with other buffers swapped
     /// in), so it keeps copying.
+    #[inline(always)]
     fn of(input: SegRef<'_>) -> Result<Self, LumaError> {
         let ctx = input.ctx();
         if let Some((pack, at)) = input.window()
@@ -1001,6 +1002,7 @@ pub(super) fn launch_store<O: AsSeg, I: AsSeg>(
 }
 
 /// The tiles of a store kernel that runs tiled or staged (one launch over one segment), `None` for a plain one.
+#[inline(always)]
 pub(super) fn store_tiles(key: &FusedKey) -> Option<u32> {
     match (&key.tile, &key.staging) {
         (Some(tile), _) => Some(tile.tiles()),
