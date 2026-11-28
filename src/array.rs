@@ -86,6 +86,8 @@ pub(crate) struct Storage {
     /// Whether kernels over this storage may be deferred into a schedule (see `jit::split`): it has several segments or a home. A
     /// deferral predicate only; an operation that needs one buffer refuses on `segments() > 1`, never on this.
     streamed: bool,
+    /// Elements of a full segment, `C` (computed once).
+    seg_len: usize,
 }
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -109,7 +111,7 @@ impl Storage {
         let segments = (0..len.div_ceil(c))
             .map(|j| Segment::empty(ctx, layout.bytes(len.min((j + 1) * c) - j * c)))
             .collect();
-        Self::with_segments(ctx, len, layout, segments, None)
+        Self::with_segments(ctx, len, layout, c, segments, None)
     }
 
     /// A storage of `len` elements that shows the elements `offset..offset + len` of `pack` (a
@@ -121,7 +123,7 @@ impl Storage {
         debug_assert!(pack.segments.len() == 1 && !pack.layout.is_packed() && offset + len <= pack.len);
         let layout = pack.layout;
         let segment = Segment::windowed(&pack.ctx, layout.bytes(len), Arc::clone(pack), layout.bytes(offset));
-        let storage = Self::with_segments(&pack.ctx, len, layout, Box::new([segment]), None);
+        let storage = Self::with_segments(&pack.ctx, len, layout, pack.seg_len, Box::new([segment]), None);
         storage.windowed.store(true, Ordering::Relaxed);
         storage
     }
@@ -177,6 +179,7 @@ impl Storage {
             &owner.ctx,
             owner.len,
             owner.layout,
+            owner.seg_len,
             owner.segments.clone(),
             Some(Arc::clone(owner)),
         )
@@ -186,11 +189,13 @@ impl Storage {
         ctx: &Context,
         len: usize,
         layout: ElemLayout,
+        seg_len: usize,
         segments: Box<[Arc<Segment>]>,
         owner: Option<Arc<Storage>>,
     ) -> Self {
         Storage {
             streamed: segments.len() > 1,
+            seg_len,
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             len,
@@ -220,7 +225,7 @@ impl Storage {
                 Segment::homed(ctx, bytes, Home { store: Arc::clone(store), offset, file_bytes })
             })
             .collect();
-        let mut storage = Self::with_segments(ctx, len, layout, segments, None);
+        let mut storage = Self::with_segments(ctx, len, layout, c, segments, None);
         storage.file = Some(Arc::clone(store));
         storage.streamed = true;
         storage
@@ -235,7 +240,7 @@ impl Storage {
     /// [`Storage::pin`] does.
     #[inline(always)]
     pub(crate) fn as_seg(&self) -> SegRef<'_> {
-        let meta = SegMeta { len: self.len, layout: self.layout, seg_len: self.segment_len() };
+        let meta = SegMeta { len: self.len, layout: self.layout, seg_len: self.seg_len };
         SegRef::new(&self.ctx, meta, &self.segments, Some(&self.materialized), self.windowed.load(Ordering::Relaxed))
     }
 
@@ -301,7 +306,7 @@ impl Storage {
 
     /// Elements of a full segment, `C`.
     pub(crate) fn segment_len(&self) -> usize {
-        segment_len(&self.ctx, self.layout)
+        self.seg_len
     }
 
     /// The elements segment `j` holds.
@@ -404,7 +409,7 @@ impl Storage {
         // SAFETY: `buffer` holds at least `bytes` bytes and no GPU command touches it.
         f(unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) });
         let segment = Segment::filled(ctx, bytes, buffer);
-        Ok(Arc::new(Storage::with_segments(ctx, len, layout, Box::new([segment]), None)))
+        Ok(Arc::new(Storage::with_segments(ctx, len, layout, segment_len(ctx, layout), Box::new([segment]), None)))
     }
 }
 
@@ -652,7 +657,7 @@ impl<T: GpuType> Array<T> {
                 let buffer = ctx.alloc_filled(bytemuck::cast_slice(&words[layout.words(start..end)]))?;
                 segments.push(Segment::filled(ctx, bytes, buffer));
             }
-            let storage = Storage::with_segments(ctx, len, layout, segments.into_boxed_slice(), None);
+            let storage = Storage::with_segments(ctx, len, layout, c, segments.into_boxed_slice(), None);
             return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
         }
         let array = Self::alloc(ctx, shape)?;

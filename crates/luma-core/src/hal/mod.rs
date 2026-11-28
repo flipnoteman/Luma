@@ -446,6 +446,8 @@ pub enum DecisionSite {
     Extension,
     /// A cached plan was replayed: no planning decision was made.
     PlanReplay,
+    /// A schedule of deferred kernels over streamed arrays was committed: `chosen` counts its stages, slabs and arrays (never ids).
+    Schedule,
 }
 
 /// What became of a candidate that was not chosen.

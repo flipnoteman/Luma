@@ -9,8 +9,11 @@
 //! What plugs in later: `Origin::Structured` steps and `Sink::Schedule` of `Emit` (canonical-block reductions), lanes and a ring
 //! around the slab loop of `run::run_stage`, the re-selection hook in `compile`.
 
+mod plan;
 mod run;
 mod seg;
+#[cfg(test)]
+mod tests;
 
 use std::cell::{Cell, RefCell};
 use std::panic::Location;
@@ -28,7 +31,7 @@ use crate::gpu::hash::FxMap;
 use crate::gpu::pager::Segment;
 use crate::kernel::KernelCore;
 
-pub(crate) use seg::{AsSeg, SegMeta, SegRef};
+pub(crate) use seg::{AsSeg, Held, SegMeta, SegRef};
 
 /// Whether (and how) kernels over streamed arrays are deferred into schedules (`LUMA_SPLIT`).
 #[doc(hidden)]
@@ -72,6 +75,10 @@ pub struct StreamStats {
     pub transient_bytes_elided: u64,
     /// Arrays that were transients.
     pub transients: u64,
+    /// Bytes brought from host memory to the device while schedules ran (every cause: a stage's inputs, evicted segments used again).
+    pub upload_bytes: u64,
+    /// Bytes moved from the device to host memory while schedules ran (evictions).
+    pub download_bytes: u64,
 }
 
 /// The counters behind [`StreamStats`].
@@ -83,6 +90,8 @@ pub(crate) struct StreamCounters {
     slabs: AtomicU64,
     transient_bytes_elided: AtomicU64,
     transients: AtomicU64,
+    upload_bytes: AtomicU64,
+    download_bytes: AtomicU64,
 }
 
 impl StreamCounters {
@@ -95,12 +104,19 @@ impl StreamCounters {
             slabs: get(&self.slabs),
             transient_bytes_elided: get(&self.transient_bytes_elided),
             transients: get(&self.transients),
+            upload_bytes: get(&self.upload_bytes),
+            download_bytes: get(&self.download_bytes),
         }
     }
 }
 
-/// A schedule that has this many steps commits (see [`Schedule::record`]).
+/// A schedule that has this many steps commits (see [`record_store`]).
 const MAX_STEPS: usize = 512;
+
+/// A schedule whose steps write this many times the memory budget commits. Deferring holds no device memory (planned segments have no
+/// buffer until the steps run), so the bound only keeps what a thread defers finite; a bound near the budget would commit after every
+/// step over an array larger than the budget, which is the case schedules exist for.
+const MAX_OUT_BUDGETS: u64 = 64;
 
 /// How a step uses an array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +155,6 @@ impl Space {
 
 /// One array of a step, by index in the schedule's array table.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // read by stage formation
 pub(crate) struct Bind {
     pub(crate) array: u32,
     pub(crate) access: Access,
@@ -169,12 +184,16 @@ pub(crate) struct ArrayRef {
     pub(crate) meta: SegMeta,
     pub(crate) segments: Box<[Arc<Segment>]>,
     windowed: bool,
+    /// The first step that uses it.
+    pub(crate) first_use: u32,
     /// The first step that writes it, if any.
     pub(crate) first_write: Option<u32>,
+    /// Whether a step reads what it wrote over (an in-place step).
+    pub(crate) read_write: bool,
     /// The last step that uses it.
     pub(crate) last_use: u32,
     /// Name and place of the step that wrote it first (for the error of a failed commit).
-    writer: Option<(&'static str, &'static Location<'static>)>,
+    pub(crate) writer: Option<(&'static str, &'static Location<'static>)>,
 }
 
 impl ArrayRef {
@@ -193,7 +212,7 @@ pub(crate) struct Open {
 }
 
 impl Open {
-    fn array(&mut self, seg: SegRef<'_>) -> u32 {
+    fn array(&mut self, seg: SegRef<'_>, at: u32) -> u32 {
         let key = Arc::as_ptr(&seg.segments()[0]) as usize;
         let arrays = &mut self.arrays;
         *self.by_segments.entry(key).or_insert_with(|| {
@@ -201,8 +220,10 @@ impl Open {
                 meta: seg.meta(),
                 segments: seg.segments().to_vec().into_boxed_slice(),
                 windowed: seg.windowed(),
+                first_use: at,
                 first_write: None,
-                last_use: 0,
+                read_write: false,
+                last_use: at,
                 writer: None,
             });
             (arrays.len() - 1) as u32
@@ -468,16 +489,17 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
             let mut binds = Vec::with_capacity(outputs.len() + inputs.len());
             for (o, out) in outputs.iter().enumerate() {
                 let seg = out.as_seg();
-                let array = open.array(seg);
+                let array = open.array(seg, at);
                 let entry = &mut open.arrays[array as usize];
                 entry.first_write.get_or_insert(at);
+                entry.read_write |= in_place(o);
                 entry.last_use = at;
                 entry.writer.get_or_insert((name, location));
                 binds.push(Bind { array, access: if in_place(o) { Access::ReadWrite } else { Access::Write }, reach: Reach::Point });
             }
             for (input, &reach) in inputs.iter().zip(&reaches) {
                 let seg = input.as_seg();
-                let array = open.array(seg);
+                let array = open.array(seg, at);
                 open.arrays[array as usize].last_use = at;
                 let reach = if seg.segment_count() == 1 && first.segment_count() > 1 { Reach::Whole } else { reach };
                 binds.push(Bind { array, access: Access::Read, reach });
@@ -486,7 +508,7 @@ pub(super) fn record_store(ctx: &Context, step: Recorded<'_>) -> Result<(), Luma
             step.binds = binds.into_boxed_slice();
             open.steps.push(step);
             open.out_bytes += out_bytes;
-            open.steps.len() >= MAX_STEPS || ctx.pager().budget().is_some_and(|budget| open.out_bytes >= budget / 4)
+            open.steps.len() >= MAX_STEPS || ctx.pager().budget().is_some_and(|budget| open.out_bytes / MAX_OUT_BUDGETS >= budget)
         };
         for input in inputs {
             input.readers.add_schedule(&schedule);

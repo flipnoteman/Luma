@@ -219,6 +219,15 @@ impl Drop for Accounted {
     }
 }
 
+/// Orders eviction victims: smaller first, `None` keeps the segment.
+type Rank<'a> = dyn Fn(&Segment) -> Option<(u8, u64)> + 'a;
+
+/// Device memory a schedule's stage reserved (see [`Pager::reserve`]): counted as resident until dropped.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    _counted: Accounted,
+}
+
 /// Ends the pins in `pins` of every segment that nothing but those pins holds and whose buffer
 /// is in `fresh` (by id), and returns those buffers: they no longer belong to any segment (the
 /// segments are dropped without giving them to the pool) and the caller owns them. Their bytes
@@ -282,6 +291,8 @@ pub(crate) struct Pager {
     budget: Option<u64>,
     /// Bytes of array data moved to host memory so far.
     spilled_bytes: AtomicU64,
+    /// Bytes of segments brought back from host memory to the device.
+    uploaded_bytes: AtomicU64,
     /// Bytes of host memory the context may use for host copies of device data.
     host_budget: u64,
     /// Bytes of array data in [`State::Host`] now (the only copy of it).
@@ -325,6 +336,44 @@ pub(crate) struct Pager {
 }
 
 impl Pager {
+    /// Bytes brought back from host memory to the device, and bytes moved to host memory, so far (what a schedule's stats difference).
+    pub(crate) fn traffic(&self) -> (u64, u64) {
+        (self.uploaded_bytes.load(Ordering::Relaxed), self.spilled_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Makes `bytes` of device memory available (evicting by `rank`, see [`Pager::eviction_rank`]) and counts them until the
+    /// returned guard drops. `keep`: the segments the stage binds, which are never victims.
+    pub(crate) fn reserve(
+        &self,
+        ctx: &Context,
+        bytes: u64,
+        keep: &FxSet<*const Segment>,
+        next_use: &dyn Fn(&Segment) -> Option<u64>,
+    ) -> Result<Reservation> {
+        if let Some(budget) = self.budget {
+            let rank = |segment: &Segment| Pager::eviction_rank(segment, keep, next_use);
+            while self.resident_bytes.load(Ordering::Relaxed) + bytes > budget && ctx.evict_ranked(false, Some(&rank))? {
+                std::hint::spin_loop();
+            }
+        }
+        Ok(Reservation { _counted: Accounted::new(ctx, bytes) })
+    }
+
+    /// The order in which `reserve` gives up segments (Belady: the schedule knows the future): clean ones that are never used again,
+    /// clean ones by farthest next use, then dirty ones the same way. A segment of `keep` is never a victim. Clean costs nothing to
+    /// evict (a kept host copy, a valid file); dirty goes through the readback of `evict_one`.
+    fn eviction_rank(segment: &Segment, keep: &FxSet<*const Segment>, next_use: &dyn Fn(&Segment) -> Option<u64>) -> Option<(u8, u64)> {
+        if keep.contains(&std::ptr::from_ref(segment)) {
+            return None;
+        }
+        let clean = segment.has_copy.load(Ordering::Acquire) || (segment.home().is_some() && segment.home_valid.load(Ordering::Acquire));
+        let class = if clean { 0 } else { 2 };
+        Some(match next_use(segment) {
+            None => (class, 0),
+            Some(next) => (class + 1, u64::MAX - next),
+        })
+    }
+
     /// The memory budget, if the context keeps one.
     pub(crate) fn budget(&self) -> Option<u64> {
         self.budget
@@ -381,6 +430,7 @@ impl Pager {
             clock: AtomicU64::new(0),
             budget,
             spilled_bytes: AtomicU64::new(0),
+            uploaded_bytes: AtomicU64::new(0),
             host_budget,
             host_state_bytes: AtomicU64::new(0),
             host_copy_bytes: AtomicU64::new(0),
@@ -975,6 +1025,7 @@ impl Segment {
                 *state = State::Device(buffer);
                 let len = data.len() as u64;
                 pager.host_state_bytes.fetch_sub(len, Ordering::Relaxed);
+                pager.uploaded_bytes.fetch_add(len, Ordering::Relaxed);
                 // The device holds what the host does: keep the copy while the budget allows, unless this pin may change the data.
                 if !write && pager.keeps_copies() && pager.host_bytes() + len <= pager.host_budget {
                     let mut copy = lock(&self.host_copy);
@@ -1215,6 +1266,11 @@ impl Context {
     }
 
     fn evict_one_in(&self, homed_only: bool) -> Result<bool> {
+        self.evict_ranked(homed_only, None)
+    }
+
+    /// [`Context::evict_one`] choosing the victim by `rank` (smallest first; `None` keeps a segment) instead of by recency.
+    fn evict_ranked(&self, homed_only: bool, rank: Option<&Rank<'_>>) -> Result<bool> {
         if EVICTING.with(Cell::get) {
             return Ok(false);
         }
@@ -1234,12 +1290,15 @@ impl Context {
         let victim = {
             let mut resident = lock(&pager.resident);
             resident.list.retain(|weak| weak.strong_count() > 0);
-            resident
+            let candidates = resident
                 .list
                 .iter()
                 .filter_map(Weak::upgrade)
-                .filter(|segment| segment.pins.load(Ordering::Acquire) == 0 && (!homed_only || segment.home().is_some()))
-                .min_by_key(|segment| segment.stamp.load(Ordering::Relaxed))
+                .filter(|segment| segment.pins.load(Ordering::Acquire) == 0 && (!homed_only || segment.home().is_some()));
+            match rank {
+                None => candidates.min_by_key(|segment| segment.stamp.load(Ordering::Relaxed)),
+                Some(rank) => candidates.filter_map(|segment| rank(&segment).map(|rank| (rank, segment))).min_by_key(|(rank, _)| *rank).map(|(_, segment)| segment),
+            }
         };
         let Some(victim) = victim else { return Ok(false) };
         // Whether recomputing the victim beats reading it back; looked at before its state is
@@ -1396,6 +1455,7 @@ impl Context {
             recompute_evictions: pager.recompute_evictions.load(Ordering::Relaxed),
             lineage_pinned_bytes: pager.lineage_pinned_bytes.load(Ordering::Relaxed),
             io_read_bytes: pager.io_read_bytes.load(Ordering::Relaxed),
+            uploaded_bytes: pager.uploaded_bytes.load(Ordering::Relaxed),
             io_written_bytes: pager.io_written_bytes.load(Ordering::Relaxed),
             home_drops: pager.home_drops.load(Ordering::Relaxed),
             home_writebacks: pager.home_writebacks.load(Ordering::Relaxed),
@@ -1456,6 +1516,8 @@ pub struct PagingStats {
     pub lineage_pinned_bytes: u64,
     /// Bytes read from files into segments of file-backed arrays (see [`Array::open`](crate::Array::open)).
     pub io_read_bytes: u64,
+    /// Bytes of segments brought back from host memory to the device (arrays that were moved off it to make room and used again).
+    pub uploaded_bytes: u64,
     /// Bytes written back to files, at eviction, `flush` and drop.
     pub io_written_bytes: u64,
     /// Buffers of file-backed segments dropped because the file holds their data: evictions of
@@ -1520,5 +1582,31 @@ mod tests {
         pager.resident_bytes.store(750, Ordering::Relaxed);
         assert!(pager.under_pressure());
         assert!(!Pager::new(None, 0).under_pressure());
+    }
+
+    /// Three one-segment arrays on the device under a budget that holds three; `reserve` of two segments' worth evicts one.
+    fn reserve_victim(next: [Option<u64>; 3], keep: &[usize]) -> usize {
+        let options = crate::ContextOptions::from_env().memory_budget(4096).chunk_bytes(1024);
+        let ctx = Context::with_options(options).expect("a device is available");
+        let arrays: Vec<crate::Array<f32>> = (0..3).map(|k| crate::Array::from_slice_on(&ctx, &[k as f32; 256], 256).unwrap()).collect();
+        let segments: Vec<Arc<Segment>> = arrays.iter().map(|a| Arc::clone(a.recorded_storage().unwrap().only_segment())).collect();
+        assert!(segments.iter().all(|s| s.on_device()));
+        let keep: FxSet<*const Segment> = keep.iter().map(|&k| Arc::as_ptr(&segments[k])).collect();
+        let next_use = |segment: &Segment| segments.iter().position(|s| std::ptr::eq(Arc::as_ptr(s), segment)).and_then(|k| next[k]);
+        let reservation = ctx.pager().reserve(&ctx, 2048, &keep, &next_use).unwrap();
+        let evicted: Vec<usize> = (0..3).filter(|&k| !segments[k].on_device()).collect();
+        drop(reservation);
+        assert_eq!(evicted.len(), 1, "exactly one segment makes room: {evicted:?}");
+        evicted[0]
+    }
+
+    #[test]
+    fn reserve_evicts_the_farthest_next_use_first() {
+        // All used again: the one used last goes.
+        assert_eq!(reserve_victim([Some(5), Some(9), Some(2)], &[]), 1);
+        // One never used again goes before any that is.
+        assert_eq!(reserve_victim([Some(5), Some(9), None], &[]), 2);
+        // The segments the stage binds are never victims.
+        assert_eq!(reserve_victim([Some(5), Some(9), None], &[1, 2]), 0);
     }
 }

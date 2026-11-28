@@ -8,6 +8,7 @@ use crate::array::Storage;
 use crate::context::Context;
 use crate::error::Result;
 use crate::gpu::pager::{Pin, Segment};
+use luma_core::Buffer;
 use crate::gpu_type::ElemLayout;
 
 /// The shape of an array's segmentation: `len` elements of `layout` in segments of `seg_len` (the last one may be shorter).
@@ -16,6 +17,22 @@ pub(crate) struct SegMeta {
     pub(crate) len: usize,
     pub(crate) layout: ElemLayout,
     pub(crate) seg_len: usize,
+}
+
+/// What a launch binds for a segment: the pinned buffer of the segment, or (for a transient of a schedule, which never has a
+/// buffer of its own) a buffer the stage owns.
+pub(crate) enum Held {
+    Pinned(Pin),
+    Fixed(Buffer),
+}
+
+impl Held {
+    pub(crate) fn buffer(&self) -> &Buffer {
+        match self {
+            Held::Pinned(pin) => pin.buffer(),
+            Held::Fixed(buffer) => buffer,
+        }
+    }
 }
 
 /// An array as launches see it: its shape and its segments, borrowed. [`Storage::as_seg`] and `ArrayRef::as_seg` make one; the eager
@@ -29,11 +46,19 @@ pub(crate) struct SegRef<'a> {
     materialized: Option<&'a AtomicBool>,
     /// Whether the one segment may be a window of another storage's buffer (a cheap check before the segment is locked).
     windowed: bool,
+    /// The buffer every segment is bound as, for a transient array of a stage.
+    fixed: Option<&'a Buffer>,
 }
 
 impl<'a> SegRef<'a> {
     pub(crate) fn new(ctx: &'a Context, meta: SegMeta, segments: &'a [Arc<Segment>], materialized: Option<&'a AtomicBool>, windowed: bool) -> Self {
-        SegRef { meta, segments, ctx, materialized, windowed }
+        SegRef { meta, segments, ctx, materialized, windowed, fixed: None }
+    }
+
+    /// The same array bound to `buffer` for every segment (a transient: it has no buffer of its own).
+    pub(crate) fn fixed_to(mut self, buffer: Option<&'a Buffer>) -> Self {
+        self.fixed = buffer;
+        self
     }
 
     pub(crate) fn ctx(&self) -> &'a Context {
@@ -90,18 +115,27 @@ impl<'a> SegRef<'a> {
     }
 
     /// [`Storage::pin`].
-    pub(crate) fn pin(&self, j: usize) -> Result<Pin> {
-        self.segment(j).pin()
+    pub(crate) fn pin(&self, j: usize) -> Result<Held> {
+        match self.fixed {
+            Some(buffer) => Ok(Held::Fixed(buffer.clone())),
+            None => self.segment(j).pin().map(Held::Pinned),
+        }
     }
 
     /// [`Storage::pin_read`].
-    pub(crate) fn pin_read(&self, j: usize) -> Result<Pin> {
-        self.segment(j).pin_read()
+    pub(crate) fn pin_read(&self, j: usize) -> Result<Held> {
+        match self.fixed {
+            Some(buffer) => Ok(Held::Fixed(buffer.clone())),
+            None => self.segment(j).pin_read().map(Held::Pinned),
+        }
     }
 
     /// [`Storage::pin_overwrite`].
-    pub(crate) fn pin_overwrite(&self, j: usize) -> Result<Pin> {
-        self.segment(j).pin_overwrite()
+    pub(crate) fn pin_overwrite(&self, j: usize) -> Result<Held> {
+        match self.fixed {
+            Some(buffer) => Ok(Held::Fixed(buffer.clone())),
+            None => self.segment(j).pin_overwrite().map(Held::Pinned),
+        }
     }
 
     /// [`Storage::window`]: the pack and the first element of this array in it, while its one segment only shows a range of it.

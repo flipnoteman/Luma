@@ -187,3 +187,134 @@ fn an_off_context_never_defers() {
     let _ = (&x * 2.0).to_vec().unwrap();
     assert_eq!(ctx.stream_stats(), Default::default());
 }
+
+/// An expression too long for one kernel is cut into several; what the cuts store is read by the next kernel and by nothing else.
+fn long_chain(ctx: &Context, rounds: usize) -> Vec<f32> {
+    let x = Array::from_slice_on(ctx, &data(), N).unwrap();
+    let mut y = x.clone();
+    for k in 0..rounds {
+        y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs();
+    }
+    y.to_vec().unwrap()
+}
+
+#[test]
+fn dead_temporaries_are_never_materialised() {
+    let ctx = deferring();
+    let got = long_chain(&ctx, 600);
+    let off = kernel_major();
+    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), long_chain(&off, 600).iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    let stats = ctx.stream_stats();
+    assert!(stats.steps >= 2, "the chain is cut into several kernels: {stats:?}");
+    // The cuts are read by the next kernel only: one stage, one pass over the six segments, and no buffers for the cuts but the last.
+    assert_eq!(stats.stages, 1, "{stats:?}");
+    assert_eq!(stats.slabs, 6, "{stats:?}");
+    assert!(stats.transients + 1 >= stats.steps, "{stats:?}");
+    assert!(stats.transient_bytes_elided >= (stats.steps - 1) * 4 * N as u64, "{stats:?}");
+}
+
+#[test]
+fn a_halo_edge_cuts_the_stage() {
+    let on = deferring();
+    on.set_assume_idle(true);
+    let off = kernel_major();
+    off.set_assume_idle(true);
+    let run = |ctx: &Context| {
+        let x = Array::from_slice_on(ctx, &data(), N).unwrap();
+        let a = &x * 2.0;
+        a.eval().unwrap();
+        let b = a.shift(1) + &a;
+        b.eval().unwrap();
+        let c = &b - 1.0;
+        c.to_vec().unwrap()
+    };
+    assert_eq!(run(&on), run(&off));
+    let stats = on.stream_stats();
+    assert!(stats.stages >= 2, "a read through a shift of an array written in the stage is a cut: {stats:?}");
+}
+
+#[test]
+fn in_place_chains_match_the_kernel_major_path() {
+    let on = deferring();
+    let off = kernel_major();
+    let run = |ctx: &Context| {
+        let mut x = Array::from_slice_on(ctx, &data(), N).unwrap();
+        x += 1.0;
+        x *= 3.0;
+        let y = &x + 2.0;
+        x -= 0.5;
+        (x.to_vec().unwrap(), y.to_vec().unwrap())
+    };
+    assert_eq!(run(&on), run(&off));
+}
+
+#[test]
+fn decisions_record_one_schedule_per_commit() {
+    let ctx = deferring();
+    ctx.record_decisions(true);
+    let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
+    let y = (&x * 2.0).abs();
+    let _ = y.to_vec().unwrap();
+    let schedule: Vec<_> = ctx.take_decisions().into_iter().filter(|d| d.site == luma::DecisionSite::Schedule).collect();
+    assert_eq!(schedule.len(), 1, "{schedule:?}");
+    assert!(schedule[0].chosen.starts_with("stages=1 slabs=6 window=1"), "{}", schedule[0].chosen);
+}
+
+#[test]
+fn a_chain_over_an_array_above_the_budget_uploads_each_segment_once() {
+    let options = |mode| ContextOptions::from_env().chunk_bytes(1 << 16).memory_budget(1 << 20).split(mode);
+    let n = 1 << 20; // 4 MiB of f32 in 64 segments, four times the budget
+    let xs: Vec<f32> = (0..n).map(|i| (i % 1013) as f32 * 0.01).collect();
+    let run = |mode| {
+        let ctx = Context::with_options(options(mode)).expect("a device is available");
+        let x = Array::from_slice_on(&ctx, &xs, n).unwrap();
+        let before = ctx.paging_stats().uploaded_bytes;
+        let mut y = x.clone();
+        for k in 0..400 {
+            y = (&y * 1.0009 + (k % 5) as f32 * 0.25).abs();
+        }
+        let got = y.to_vec().unwrap();
+        (got, ctx.paging_stats().uploaded_bytes - before, ctx.stream_stats())
+    };
+    let (on, on_up, stats) = run(SplitMode::Auto);
+    let (off, off_up, _) = run(SplitMode::Off);
+    assert_eq!(on.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), off.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    if ctx_has_budget_paging(on_up, off_up) {
+        assert!(on_up <= 4 * n as u64 + (1 << 16), "each input segment crosses once per chain: {on_up} {stats:?}");
+        assert!(stats.steps >= 2 && stats.stages == 1, "{stats:?}");
+        assert!(off_up >= 2 * on_up, "kernel-major pages the input in once per kernel: off {off_up}, on {on_up}");
+    }
+}
+
+/// Devices that keep nothing under a budget (software ones) never page: nothing to compare there.
+fn ctx_has_budget_paging(on: u64, off: u64) -> bool {
+    on > 0 || off > 0
+}
+
+#[test]
+fn recording_disables_deferral_and_starts_from_committed_state() {
+    let on = deferring();
+    let off = kernel_major();
+    let run = |ctx: &Context| {
+        let x = Array::from_slice_on(ctx, &data(), N).unwrap();
+        // A pending streamed step, then a traced loop on a small array and on the streamed one.
+        let pending = &x * 2.0;
+        pending.eval().unwrap();
+        let small = Array::from_slice_on(ctx, &data()[..300], 300).unwrap();
+        let looped_small = small.iterate(6, |a| a * 1.01 + 0.5).to_vec().unwrap();
+        let looped_big = x.iterate(4, |a| a * 0.99 + 0.25).to_vec().unwrap();
+        (looped_small, looped_big, pending.to_vec().unwrap())
+    };
+    assert_eq!(run(&on), run(&off));
+}
+
+#[test]
+fn plan_cache_does_not_cache_deferred_evaluations() {
+    let ctx = deferring();
+    let x = Array::from_slice_on(&ctx, &data(), N).unwrap();
+    for k in 0..6 {
+        let y = ((&x * 2.0 + 1.0).sqrt() + k as f32).abs();
+        assert_eq!(y.to_vec().unwrap().len(), N);
+    }
+    assert_eq!(ctx.plan_cache_hits(), 0, "a deferred evaluation is never a cached plan");
+}

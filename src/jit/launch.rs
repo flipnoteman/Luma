@@ -24,7 +24,7 @@ use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind
 use crate::profile::{Decision, DecisionSite, SplitReason};
 use std::panic::Location;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
-use super::split::{self, AsSeg, SegRef};
+use super::split::{self, AsSeg, Held, SegRef};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
 /// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
@@ -809,13 +809,13 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
 /// What a launch binds to read an input: the pinned buffer, or a view of it that starts at the
 /// input's window (see [`Buffer::at`]), and the bytes of it.
 pub(super) struct InPin {
-    pin: Pin,
+    pin: Held,
     view: Option<Buffer>,
     bytes: u64,
 }
 
 impl InPin {
-    fn new(pin: Pin, bytes: u64) -> Self {
+    fn new(pin: Held, bytes: u64) -> Self {
         InPin { pin, view: None, bytes }
     }
 
@@ -831,7 +831,7 @@ impl InPin {
             let offset = pack.layout().bytes(at);
             let align = ctx.hal().storage_offset_align();
             if offset == 0 || (align != 0 && offset % align == 0) {
-                let pin = pack.pin_read(0)?;
+                let pin = Held::Pinned(pack.pin_read(0)?);
                 let view = (offset != 0).then(|| pin.buffer().at(offset));
                 return Ok(InPin { pin, view, bytes: input.byte_len() });
             }
@@ -924,7 +924,7 @@ pub(super) fn params<'a>(
 /// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]).
 pub(super) struct StoreArgs<'a> {
     pub(super) n: u32,
-    outs: Vec<(Pin, u64)>,
+    outs: Vec<(Held, u64)>,
     ins: Vec<InPin>,
     words: Cow<'a, [u32]>,
 }
