@@ -23,7 +23,7 @@ pub struct NativeMatmul {
     pub(crate) epilogue: Option<TileEpilogue>,
 }
 
-/// The epilogue of a product, compiled over one tile (see `Backend::compile_matmul_epilogue`).
+/// The epilogue of a product, compiled over one tile row (see `Backend::compile_matmul_epilogue`).
 #[derive(Debug)]
 pub(crate) struct TileEpilogue {
     kernel: crate::codegen::CompiledCpuKernel,
@@ -56,7 +56,7 @@ impl NativeMatmul {
     /// not one that has an epilogue (an empty tile, a half-work product) or the epilogue has more operands than a tile takes.
     pub(crate) fn with_epilogue(spec: &MatmulSpec, tile: crate::codegen::CompiledCpuKernel, bindings: usize, scalars: usize) -> Option<Self> {
         let inputs = bindings.checked_sub(2)?;
-        if spec.half || inputs > MAX_EPILOGUE_INPUTS || scalars > MAX_EPILOGUE_SCALARS || tile.plan.shared_bytes != 0 || tile.plan.scratch_bytes != 0 {
+        if spec.half || spec.edge > tile.plan.workgroup_size[0] || tile.plan.workgroup_size[1..] != [1, 1] || inputs > MAX_EPILOGUE_INPUTS || scalars > MAX_EPILOGUE_SCALARS || tile.plan.shared_bytes != 0 || tile.plan.scratch_bytes != 0 {
             return None;
         }
         let mut product = Self::new(spec)?;
@@ -146,9 +146,9 @@ impl TileEpilogue {
             for (slot, &(binding, stride)) in lengths.iter_mut().zip(&self.kernel.plan.array_lengths) {
                 *slot = u32::try_from(bytes[binding as usize] / u64::from(stride.max(1))).unwrap_or(u32::MAX);
             }
-            let tile = WorkgroupCtx {
-                grid_size: [cols as u32, rows as u32, 1, 0],
-                num_workgroups: [1, 1, 1, 0],
+            let mut tile = WorkgroupCtx {
+                grid_size: [cols as u32 * rows as u32, 1, 1, 0],
+                num_workgroups: [rows as u32, 1, 1, 0],
                 workgroup_id: [0, 0, 0, 1],
                 bindings: bindings.as_ptr(),
                 binding_bytes: bytes.as_ptr(),
@@ -158,7 +158,12 @@ impl TileEpilogue {
                 math: ctx.math,
                 native: std::ptr::null(),
             };
-            (self.kernel.exec.as_fn())(&tile);
+            // One workgroup per row of the tile.
+            let func = self.kernel.exec.as_fn();
+            for r in 0..rows as u32 {
+                tile.workgroup_id[0] = r;
+                func(&tile);
+            }
         }
     }
 }

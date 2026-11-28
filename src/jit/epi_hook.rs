@@ -71,18 +71,17 @@ pub(crate) fn hook_module(program: &EpiProgram, tuning: &Tuning) -> Result<Kerne
     Ok(finish(mb, lib.as_deref()))
 }
 
-/// Invocations of the workgroup of [`tile_module`]: a tile row is covered by this many columns at a time.
-const TILE_LANES: u32 = 32;
-
 /// The epilogue of `program` over one tile of the output as a whole kernel (a backend's native product runs it after each tile's sum,
 /// see `luma_core::Backend::compile_matmul_epilogue`): bindings `e0..` (the operands, read-only), `c` (the output, read-write) and the
-/// uniform `p`, words `rows, cols, row, col, n`, three of padding and the scalars. One workgroup applies [`luma_epi`] in place to the
-/// `rows x cols` tile at (`row`, `col`) of the `n`-wide output `c`, so its elements are the unfused pass's, bit for bit.
-pub(crate) fn tile_module(program: &EpiProgram, tuning: &Tuning) -> Result<KernelModule> {
+/// uniform `p`, words `rows, cols, row, col, n`, three of padding and the scalars. Workgroup `x` (of `rows`) applies [`luma_epi`] in
+/// place to the `cols` (at most `lanes`, the tile's edge) elements of row `x` of the tile at (`row`, `col`) of the `n`-wide output `c`, so its
+/// elements are the unfused pass's, bit for bit; the caller runs the `rows` workgroups. One workgroup has no loop: its lanes are
+/// the columns, as in an elementwise kernel.
+pub(crate) fn tile_module(program: &EpiProgram, tuning: &Tuning, lanes: u32) -> Result<KernelModule> {
     let programs: [&[super::program::Instr]; 1] = [program.instrs.as_slice()];
     let lib = helper_library(&programs, tuning, false, false)?;
     let mut env = Lower::new(lib.clone(), &[]);
-    let mut mb = ModuleBuilder::new("luma_epi_tile", "main", [TILE_LANES, 1, 1]);
+    let mut mb = ModuleBuilder::new("luma_epi_tile", "main", [lanes, 1, 1]);
     for (k, input) in program.inputs.iter().enumerate() {
         env.ins.push(Some(mb.add_storage_read(&format!("e{k}"), read_elem(input.ty))));
         env.segs.push(Vec::new());
@@ -99,19 +98,19 @@ pub(crate) fn tile_module(program: &EpiProgram, tuning: &Tuning) -> Result<Kerne
         let word = |fb: &FnBuilder<'_>, at: usize| fb.uniform_field(p, at as u32, fields[at].1.clone());
         let lid = fb.builtin(BuiltinVar::LocalInvocationId);
         let lane = fb.field(lid, 0, KirType::U32);
-        let [rows, cols, row0, col0, n] = [0, 1, 2, 3, 4].map(|at| word(&fb, at));
+        let wid = fb.builtin(BuiltinVar::WorkgroupId);
+        let r = fb.field(wid, 0, KirType::U32);
+        let [_, cols, row0, col0, n] = [0, 1, 2, 3, 4].map(|at| word(&fb, at));
         let scalars: Vec<_> = (0..program.scalars.len()).map(|k| word(&fb, 8 + k)).collect();
-        let (zero, one, lanes) = (fb.lit_u32(0), fb.lit_u32(1), fb.lit_u32(TILE_LANES));
-        fb.for_range("r", zero, rows, one, |b, r| {
+        let inside = fb.lt(lane, cols);
+        fb.if_then(inside, |b| {
             let row = b.let_val("row", row0 + r);
-            b.for_range("q", lane, cols, lanes, |b, q| {
-                let col = b.let_val("col", col0 + q);
-                let at = b.let_val("at", row * n + col);
-                let acc = b.load(c, at);
-                let args: Vec<_> = [acc, row, col, n].into_iter().chain(scalars.iter().copied()).collect();
-                let value = b.call(function, &args, KirType::F32);
-                b.store(c, at, value);
-            });
+            let col = b.let_val("col", col0 + lane);
+            let at = b.let_val("at", row * n + col);
+            let acc = b.load(c, at);
+            let args: Vec<_> = [acc, row, col, n].into_iter().chain(scalars.iter().copied()).collect();
+            let value = b.call(function, &args, KirType::F32);
+            b.store(c, at, value);
         });
         fb.finish();
     }

@@ -100,7 +100,7 @@ fn build(ctx: &Context, plain: Builtin, spec: Option<GemmSpec>, id: luma_core::H
             (ctx.hal().compile_gemm(&spec.with_hook(id), Some(&module)), PRODUCT_WORDS)
         }
         (None, Builtin::Matmul { tile: MatmulTile::Native { edge, lhs_t, rhs_t }, .. }) => {
-            let module = Arc::new(epi_hook::tile_module(program, ctx.tuning())?);
+            let module = Arc::new(epi_hook::tile_module(program, ctx.tuning(), edge)?);
             (ctx.hal().compile_matmul_epilogue(&MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: false }, &module), NATIVE_PRODUCT_WORDS)
         }
         _ => return Ok(None),
