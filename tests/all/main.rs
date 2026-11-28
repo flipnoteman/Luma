@@ -80,6 +80,7 @@ mod sort;
 mod subgroup_divergence;
 mod sparse;
 mod spill;
+mod split;
 mod strategies;
 mod threads;
 mod transfer;

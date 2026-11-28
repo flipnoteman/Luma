@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use luma_core::hal::{copy_parallel, copy_parallel_host, HostBytes};
 use luma_core::Buffer;
@@ -21,6 +21,7 @@ use crate::context::{Context, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::{FxMap, FxSet};
 use crate::jit::lineage::{Lineage, Recompute};
+use crate::jit::split::Schedule;
 use luma_core::hal::size_class;
 use crate::gpu::lock;
 
@@ -114,6 +115,13 @@ pub(crate) struct Segment {
     detached: AtomicBool,
     /// The texture of this segment's data made last (see [`crate::texture`]).
     texture: Mutex<Option<crate::texture::Cached>>,
+    /// The schedule that holds a step writing this segment (see [`crate::jit::split`]): a cell next to `state`, not a variant of
+    /// it, because an in-place step writes segments that are on the device or in host memory and must keep their state.
+    planned: Mutex<Option<Weak<Schedule>>>,
+    /// Whether `planned` is `Some` or `failed` is set: the one relaxed load the pin paths pay ([`Segment::settle`]).
+    planned_flag: AtomicBool,
+    /// Why the step that was to write this segment failed; every later use of the data fails with it.
+    failed: OnceLock<Arc<LumaError>>,
 }
 
 /// The segments that read one segment through their lineage; entries of dropped segments are
@@ -317,6 +325,11 @@ pub(crate) struct Pager {
 }
 
 impl Pager {
+    /// The memory budget, if the context keeps one.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget
+    }
+
     /// Bytes counted against the memory budget.
     #[cfg(test)]
     pub(crate) fn resident_bytes(&self) -> u64 {
@@ -419,7 +432,84 @@ impl Pager {
 impl Segment {
     /// The texture of this segment's data, see [`crate::texture`].
     pub(crate) fn texture_slot(&self) -> &Mutex<Option<crate::texture::Cached>> {
+        // A texture of a planned segment would show data a pending step is about to replace; a failure is reported by the pin.
+        let _ = self.settle();
         &self.texture
+    }
+
+    /// Commits the schedule that holds a step writing this segment (see [`crate::jit::split`]), if there is one: the data is what
+    /// the step computes from then on. One relaxed load when nothing is planned. Fails if that step failed (now or earlier).
+    /// Called before any lock of the segment is taken.
+    #[inline]
+    pub(crate) fn settle(&self) -> Result<()> {
+        if !self.planned_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.settle_planned()
+    }
+
+    #[cold]
+    fn settle_planned(&self) -> Result<()> {
+        let schedule = lock(&self.planned).as_ref().and_then(Weak::upgrade);
+        if let Some(schedule) = schedule {
+            schedule.settle()?;
+        } else if self.failed.get().is_none() {
+            // The schedule is gone without committing (it cannot be, but a stale cell must not stay).
+            self.clear_planned();
+        }
+        match self.failed.get() {
+            Some(error) => Err(LumaError::clone(error)),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a step that writes this segment is waiting in a schedule (or failed).
+    pub(crate) fn is_planned(&self) -> bool {
+        self.planned_flag.load(Ordering::Relaxed)
+    }
+
+    /// Records that a step of `schedule` writes this segment. A segment another schedule plans is settled first (that schedule commits).
+    pub(crate) fn plan_for(&self, schedule: &Arc<Schedule>) -> Result<()> {
+        loop {
+            let other = {
+                let mut cell = lock(&self.planned);
+                match cell.as_ref().map(|weak| (weak.as_ptr(), weak.upgrade())) {
+                    Some((at, _)) if std::ptr::eq(at, Arc::as_ptr(schedule)) => return Ok(()),
+                    Some((_, Some(other))) if !other.is_finished() => other,
+                    _ => {
+                        *cell = Some(Arc::downgrade(schedule));
+                        self.planned_flag.store(true, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
+            };
+            other.settle()?;
+        }
+    }
+
+    /// Settles what a step that only reads this segment must not run ahead of: a write another schedule plans.
+    pub(crate) fn settle_other(&self, schedule: &Arc<Schedule>) -> Result<()> {
+        if !self.planned_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let other = lock(&self.planned).as_ref().and_then(Weak::upgrade);
+        match other {
+            Some(other) if !Arc::ptr_eq(&other, schedule) => other.settle(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Ends the plan of a committed step: the data is what the step wrote.
+    pub(crate) fn clear_planned(&self) {
+        *lock(&self.planned) = None;
+        self.planned_flag.store(self.failed.get().is_some(), Ordering::Relaxed);
+    }
+
+    /// Marks the data as lost: the step that was to write it failed with `error`.
+    pub(crate) fn poison(&self, error: &Arc<LumaError>) {
+        let _ = self.failed.set(Arc::clone(error));
+        *lock(&self.planned) = None;
+        self.planned_flag.store(true, Ordering::Relaxed);
     }
 
     /// A segment of `bytes` bytes in `state`, with nothing else to its name yet.
@@ -442,6 +532,9 @@ impl Segment {
             home_valid: AtomicBool::new(false),
             detached: AtomicBool::new(false),
             texture: Mutex::new(None),
+            planned: Mutex::new(None),
+            planned_flag: AtomicBool::new(false),
+            failed: OnceLock::new(),
         })
     }
 
@@ -466,6 +559,9 @@ impl Segment {
             home_valid: AtomicBool::new(true),
             detached: AtomicBool::new(false),
             texture: Mutex::new(None),
+            planned: Mutex::new(None),
+            planned_flag: AtomicBool::new(false),
+            failed: OnceLock::new(),
         };
         segment.home = Some(home);
         Arc::new(segment)
@@ -520,7 +616,7 @@ impl Segment {
 
     /// Whether the segment is a window or a device buffer no command being recorded holds.
     pub(crate) fn can_adopt(&self) -> bool {
-        if self.home.is_some() {
+        if self.home.is_some() || self.is_planned() {
             return false;
         }
         match &*lock(&self.state) {
@@ -535,6 +631,9 @@ impl Segment {
     /// still run first), and the segment shows the range of `pack` that holds the same data now.
     /// `false` if the segment has no device buffer, or one that a recording holds.
     pub(crate) fn adopt(self: &Arc<Self>, pack: Arc<Storage>, offset: u64) -> bool {
+        if self.is_planned() {
+            return false;
+        }
         let mut state = lock(&self.state);
         match &*state {
             State::Window(_) => {
@@ -606,6 +705,7 @@ impl Segment {
     }
 
     fn pin_unrecorded(self: &Arc<Self>, write: bool, overwrite: bool) -> Result<Pin> {
+        self.settle()?;
         if !write {
             return self.pin_device(false, false);
         }
@@ -934,6 +1034,7 @@ impl Segment {
     /// marks it clean; the buffer stays. Does nothing for a clean segment or one that is not on
     /// the device.
     pub(crate) fn write_back(&self) -> Result<()> {
+        self.settle()?;
         let Some(home) = self.home() else { return Ok(()) };
         if self.home_valid.load(Ordering::Acquire) {
             return Ok(());
@@ -954,6 +1055,7 @@ impl Segment {
     /// Copies the segment's data into `dst` (`dst.len()` bytes), after everything recorded so
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
+        self.settle()?;
         if matches!(&*lock(&self.state), State::Away)
             && let Some(home) = self.home()
         {
@@ -976,7 +1078,8 @@ impl Segment {
     /// Calls `f` with the segment's data when the host can read it right now: held in host
     /// memory, or in an idle directly accessible device buffer. `None` otherwise.
     pub(crate) fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        if self.ctx.recording_here() {
+        // A planned segment holds stale bytes: the caller falls into the pin path, which commits.
+        if self.is_planned() || self.ctx.recording_here() {
             return None;
         }
         match &*lock(&self.state) {
@@ -991,7 +1094,7 @@ impl Segment {
 
     /// [`Segment::with_host_bytes`] with write access; a device buffer must not be pinned by a recording.
     pub(crate) fn with_host_bytes_mut<R>(self: &Arc<Self>, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
-        if self.ctx.recording_here() {
+        if self.is_planned() || self.ctx.recording_here() {
             return None;
         }
         // A write: what is evicted by lineage over this data is recomputed first (the pin path reports a failure of that).

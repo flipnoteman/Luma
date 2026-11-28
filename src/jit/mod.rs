@@ -180,6 +180,7 @@ pub(crate) fn is_wide(len: usize) -> bool {
 mod program;
 mod readers;
 mod rerun;
+pub(crate) mod split;
 mod replay;
 mod simplify;
 pub(crate) mod rules;

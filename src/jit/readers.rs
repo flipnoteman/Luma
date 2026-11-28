@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use super::split::Schedule;
 use super::{lock, Node};
 
 /// Pending lazy nodes that read one buffer (or the result of another pending node), or every
@@ -89,6 +90,9 @@ impl Extend<Weak<Node>> for Weaks {
 #[derive(Debug, Default)]
 pub(super) struct ReaderList {
     nodes: Weaks,
+    /// Schedules with a deferred step that reads the buffer (none until one does; see [`Readers::add_schedule`]).
+    #[allow(clippy::box_collection)] // 8 bytes in every list instead of 24: most buffers are never read by a schedule
+    schedules: Option<Box<Vec<Weak<Schedule>>>>,
     /// Length at which dead and evaluated entries are dropped next.
     prune_at: usize,
 }
@@ -138,6 +142,18 @@ impl Readers {
     /// atomic compare-and-swap; cloning one is cheaper).
     pub(crate) fn add_weak(&self, weak: Weak<Node>) {
         lock(&self.list).add_weak(weak);
+    }
+
+    /// Notes that a step of `schedule` reads the buffer: whoever is about to overwrite it commits the schedule first.
+    pub(crate) fn add_schedule(&self, schedule: &Arc<Schedule>) {
+        let mut list = lock(&self.list);
+        let known = list.schedules.get_or_insert_with(Box::default);
+        if !known.last().is_some_and(|last| std::ptr::eq(last.as_ptr(), Arc::as_ptr(schedule))) {
+            if known.len() >= PRUNE_MIN {
+                known.retain(|weak| weak.strong_count() > 0);
+            }
+            known.push(Arc::downgrade(schedule));
+        }
     }
 
     pub(super) fn take(&self) -> Weaks {
@@ -205,6 +221,12 @@ impl Readers {
         for node in to_force {
             // A failure is stored in the node and reported when its array is used.
             let _ = node.force();
+        }
+        // After the nodes: forcing one can defer a step that reads the buffer too. A schedule is never kept.
+        let schedules = lock(&self.list).schedules.take();
+        for schedule in schedules.iter().flat_map(|list| list.iter()).filter_map(Weak::upgrade) {
+            // A failure poisons what the steps wrote and is reported when it is used.
+            let _ = schedule.commit();
         }
     }
 }

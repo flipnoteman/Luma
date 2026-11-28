@@ -121,6 +121,7 @@ impl Context {
             return Ok(());
         }
         self.jit().evaluate_requested();
+        self.commit_schedules()?;
         self.flush_batch()
     }
 

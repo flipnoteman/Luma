@@ -11,6 +11,7 @@ use crate::gpu_type::{ElemLayout, GpuType};
 use crate::builtin::UnOp;
 use crate::jit::{ElemTy, Held, Node, Op, OpKind, Readers, Src};
 use crate::jit::comprehension::Props;
+use crate::jit::split::{SegMeta, SegRef};
 use crate::jit::structured::Structured;
 use crate::props::{HandleProps, PropsCell};
 use crate::shape::Shape;
@@ -82,13 +83,20 @@ pub(crate) struct Storage {
     /// The file the segments live in, for a storage opened or created as a file array (see
     /// [`Array::open`]).
     file: Option<Arc<FileStore>>,
+    /// Whether kernels over this storage may be deferred into a schedule (see `jit::split`): it has several segments or a home. A
+    /// deferral predicate only; an operation that needs one buffer refuses on `segments() > 1`, never on this.
+    streamed: bool,
 }
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Elements per full segment of arrays of `layout` on `ctx`.
+///
+/// A power of two for every stride (`segment_bytes / stride` rounded down), so that the canonical blocks of a float reduction (a power
+/// of two of elements) divide it (see `jit::split`). Identical to the plain quotient for strides 1, 2, 4, 8 and 16.
 fn segment_len(ctx: &Context, layout: ElemLayout) -> usize {
-    (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / layout.stride()).max(1)
+    let c = (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / layout.stride()).max(1);
+    if c.is_power_of_two() { c } else { 1 << c.ilog2() }
 }
 
 impl Storage {
@@ -182,6 +190,7 @@ impl Storage {
         owner: Option<Arc<Storage>>,
     ) -> Self {
         Storage {
+            streamed: segments.len() > 1,
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             len,
@@ -213,7 +222,21 @@ impl Storage {
             .collect();
         let mut storage = Self::with_segments(ctx, len, layout, segments, None);
         storage.file = Some(Arc::clone(store));
+        storage.streamed = true;
         storage
+    }
+
+    /// Whether kernels over this storage may be deferred into a schedule (several segments, or a home).
+    pub(crate) fn is_streamed(&self) -> bool {
+        self.streamed
+    }
+
+    /// This storage as launches take arrays (see [`SegRef`]); pinning through it marks the storage as materialized, as
+    /// [`Storage::pin`] does.
+    #[inline(always)]
+    pub(crate) fn as_seg(&self) -> SegRef<'_> {
+        let meta = SegMeta { len: self.len, layout: self.layout, seg_len: self.segment_len() };
+        SegRef::new(&self.ctx, meta, &self.segments, Some(&self.materialized), self.windowed.load(Ordering::Relaxed))
     }
 
     /// Whether the segments live in a file.
@@ -259,10 +282,6 @@ impl Storage {
     /// Number of elements.
     pub(crate) fn len(&self) -> usize {
         self.len
-    }
-
-    pub(crate) fn ctx(&self) -> &Context {
-        &self.ctx
     }
 
     /// How the elements sit in the buffers.

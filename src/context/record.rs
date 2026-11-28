@@ -162,6 +162,10 @@ impl Context {
     /// recording (active or aborted) on the context already. Other threads' recordings do not
     /// matter.
     pub(crate) fn begin_recording(&self, seed: Vec<(Arc<Storage>, Arc<Storage>)>) -> bool {
+        // A recording starts from committed state: deferred steps would otherwise run after it started and be captured.
+        if self.commit_schedules().is_err() {
+            return false;
+        }
         let id = self.inner.id;
         let began = RECORDINGS
             .try_with(|all| {

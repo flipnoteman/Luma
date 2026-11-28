@@ -216,6 +216,8 @@ pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoment
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::{MemoryStats, PagingStats};
+#[doc(hidden)]
+pub use jit::split::{SplitMode, StreamStats};
 pub use numerics::{Numerics, Reduced};
 #[allow(deprecated)]
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, Decision, DecisionSite, DeviceKind, MemoryModel, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile, Verdict};

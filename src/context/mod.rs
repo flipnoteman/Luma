@@ -9,6 +9,7 @@ use crate::numerics::Numerics;
 use crate::error::{LumaError, Result};
 use crate::jit::cost;
 use crate::jit::JitState;
+use crate::jit::split::{SplitMode, StreamCounters, StreamStats};
 use crate::jit::structured::select::StrategyOverride;
 use crate::jit::structured::strategy::{FamilyTag, StrategyId};
 use crate::gpu::pager::{Accounted, Pager};
@@ -63,6 +64,14 @@ struct Inner {
     segment_bytes: u64,
     /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
     check_finite: bool,
+    /// Whether kernels over streamed arrays are deferred into schedules (see [`ContextOptions::split`]).
+    split: SplitMode,
+    /// Schedules opened and not yet committed, on any thread: zero (the common case) makes every commit trigger a load.
+    schedules_open: std::sync::atomic::AtomicU32,
+    /// Held while a schedule runs: one runs at a time.
+    schedule_lease: Mutex<()>,
+    /// What schedules did.
+    streams: StreamCounters,
     /// The numerics policy (see [`ContextOptions::numerics`]).
     numerics: Numerics,
     /// What the device can do, computed once when the context opens.
@@ -249,6 +258,10 @@ pub struct ContextOptions {
     /// investigations: it can change which kernels run, never what a strategy of the same bit class computes.
     #[doc(hidden)]
     pub strategy: Option<&'static str>,
+    /// Defers kernels over arrays of several segments into schedules that run segment by segment (`LUMA_SPLIT` = `off` | `segment` |
+    /// `auto`). Results are bit-identical to kernel-major launches. Removed before 0.6.0.
+    #[doc(hidden)]
+    pub split: SplitMode,
 }
 
 /// The value of the removed environment variable `name`, with a warning (once per variable) that
@@ -280,6 +293,7 @@ impl Default for ContextOptions {
             tf32_matmul: true,
             df_fma: None,
             strategy: None,
+            split: SplitMode::Off,
         }
     }
 }
@@ -295,6 +309,13 @@ impl ContextOptions {
     /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
     pub fn df_fma(mut self, fused: bool) -> Self {
         self.df_fma = Some(fused);
+        self
+    }
+
+    /// Sets [`ContextOptions::split`].
+    #[doc(hidden)]
+    pub fn split(mut self, mode: SplitMode) -> Self {
+        self.split = mode;
         self
     }
 
@@ -457,6 +478,7 @@ impl ContextOptions {
                 _ => None,
             }),
             strategy: std::env::var("LUMA_STRATEGY").ok().filter(|text| !text.trim().is_empty()).map(intern),
+            split: std::env::var("LUMA_SPLIT").ok().and_then(|text| SplitMode::parse(&text)).unwrap_or_default(),
         }
     }
 }
@@ -804,6 +826,10 @@ impl Context {
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
                 check_finite: options.check_finite,
+                split: options.split,
+                schedules_open: std::sync::atomic::AtomicU32::new(0),
+                schedule_lease: Mutex::new(()),
+                streams: StreamCounters::default(),
                 numerics: options.effective_numerics(),
                 caps,
                 strategy_override,
@@ -978,6 +1004,7 @@ impl Context {
     pub fn flush(&self) -> Result<()> {
         self.jit().evaluate_requested();
         self.jit().evaluate_live();
+        self.commit_schedules()?;
         self.flush_batch()
     }
 
@@ -1032,6 +1059,35 @@ impl Context {
     /// Largest buffer that can be allocated and bound as a storage buffer.
     pub(crate) fn max_buffer_bytes(&self) -> u64 {
         self.inner.max_buffer_bytes
+    }
+
+    /// Whether kernels over streamed arrays are deferred (see [`ContextOptions::split`]).
+    #[inline(always)]
+    pub(crate) fn split_mode(&self) -> SplitMode {
+        self.inner.split
+    }
+
+    pub(crate) fn schedules_open(&self) -> &std::sync::atomic::AtomicU32 {
+        &self.inner.schedules_open
+    }
+
+    pub(crate) fn schedule_lease(&self) -> &Mutex<()> {
+        &self.inner.schedule_lease
+    }
+
+    pub(crate) fn stream_counters(&self) -> &StreamCounters {
+        &self.inner.streams
+    }
+
+    /// Tells this context from the others of the process.
+    pub(crate) fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    /// What schedules did on this context (see `LUMA_SPLIT`).
+    #[doc(hidden)]
+    pub fn stream_stats(&self) -> StreamStats {
+        self.inner.streams.snapshot()
     }
 
     /// Which segments of arrays currently hold a device buffer.

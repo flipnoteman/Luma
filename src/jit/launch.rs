@@ -24,6 +24,7 @@ use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind
 use crate::profile::{Decision, DecisionSite, SplitReason};
 use std::panic::Location;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
+use super::split::{self, AsSeg, SegRef};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
 /// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
@@ -532,7 +533,7 @@ pub(super) fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
 }
 
 /// How a program with shifts runs on arrays spanning several segments (see [`spans`]).
-pub(super) struct Shifted {
+pub(crate) struct Shifted {
     /// Elements of the arrays: the shifts wrap around this length.
     len: usize,
     /// Per output segment and input, the ids of the segments bound as slots.
@@ -541,7 +542,7 @@ pub(super) struct Shifted {
 
 /// The input `k` of `key` among `inputs`, which lack the in-place inputs of `key` (those are
 /// never read through a shift of a split array, see [`in_place_eligible`] and [`run_mapped`]).
-pub(super) fn input_at<'a>(key: &FusedKey, inputs: &'a [Arc<Storage>], k: usize) -> Option<&'a Arc<Storage>> {
+pub(super) fn input_at<'a, S>(key: &FusedKey, inputs: &'a [S], k: usize) -> Option<&'a S> {
     if key.in_place.iter().any(|&(paired, _)| paired as usize == k) {
         return None;
     }
@@ -822,7 +823,7 @@ impl InPin {
     /// binding to is bound as that range of its pack's buffer, instead of being copied out. A
     /// recording captures buffers whole (its commands are replayed with other buffers swapped
     /// in), so it keeps copying.
-    fn of(input: &Storage) -> Result<Self, LumaError> {
+    fn of(input: SegRef<'_>) -> Result<Self, LumaError> {
         let ctx = input.ctx();
         if let Some((pack, at)) = input.window()
             && !ctx.recording_here()
@@ -847,14 +848,14 @@ impl InPin {
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
 /// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
 /// at the element being computed, then once per slot.
-pub(super) fn pin_inputs(
+pub(super) fn pin_inputs<S: AsSeg>(
     key: &FusedKey,
-    inputs: &[Arc<Storage>],
+    inputs: &[S],
     ids: Option<&[Vec<u32>]>,
     j: usize,
     n: u32,
 ) -> Result<Vec<InPin>, LumaError> {
-    let bytes = |input: &Storage| input.layout().bytes(n as usize);
+    let bytes = |input: SegRef<'_>| input.layout().bytes(n as usize);
     let mut pins = Vec::with_capacity(inputs.len());
     let mut stored = inputs.iter();
     for k in 0..key.input_tys.len() {
@@ -864,10 +865,11 @@ pub(super) fn pin_inputs(
         let Some(input) = stored.next() else {
             return Err(LumaError::Gpu("fused program with too few inputs".into()));
         };
+        let input = input.as_seg();
         let Some(ids) = ids else {
             // An input of the length of the output is bound by segment; a single buffer of
             // another length (the source of a view) is bound whole.
-            pins.push(if input.segments() > 1 {
+            pins.push(if input.segment_count() > 1 {
                 InPin::new(input.pin_read(j)?, input.segment_byte_len(j))
             } else {
                 InPin::of(input)?
@@ -940,10 +942,10 @@ impl StoreArgs<'_> {
 }
 
 /// The arguments of the launch of segment `j` of `outputs[0]`; `outputs` must not be empty.
-pub(super) fn store_args<'a>(
+pub(super) fn store_args<'a, O: AsSeg, I: AsSeg>(
     key: &FusedKey,
-    outputs: &[&Storage],
-    inputs: &[Arc<Storage>],
+    outputs: &[O],
+    inputs: &[I],
     scalars: &'a [u32],
     shifted: Option<&Shifted>,
     j: usize,
@@ -951,6 +953,7 @@ pub(super) fn store_args<'a>(
     let Some(first) = outputs.first() else {
         return Err(LumaError::Gpu("fused kernel without output".into()));
     };
+    let first = first.as_seg();
     let range = first.range(j);
     let n = len_u32(range.len())?;
     let ids = segment_ids(shifted, j)?;
@@ -959,6 +962,7 @@ pub(super) fn store_args<'a>(
         .iter()
         .enumerate()
         .map(|(o, out)| {
+            let out = out.as_seg();
             let pin = if !key.in_place.is_empty() && key.in_place.iter().any(|&(_, output)| output as usize == o) { out.pin(j) } else { out.pin_overwrite(j) };
             pin.map(|pin| (pin, out.segment_byte_len(j)))
         })
@@ -970,39 +974,65 @@ pub(super) fn store_args<'a>(
 
 /// Launches the store kernel `core` of `key` once per segment of `outputs[0]`, with the arguments
 /// of [`store_args`]. Counts as one elementwise launch.
-fn launch_store(
+pub(super) fn launch_store<O: AsSeg, I: AsSeg>(
     ctx: &crate::context::Context,
     core: &crate::kernel::KernelCore,
     key: &FusedKey,
-    outputs: &[&Storage],
-    inputs: &[Arc<Storage>],
+    outputs: &[O],
+    inputs: &[I],
     scalars: &[u32],
     shifted: Option<&Shifted>,
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
-    let tiles = match (&key.tile, &key.staging) {
-        (Some(tile), _) => Some(tile.tiles()),
-        (None, Some(staging)) => Some(staging.tiles()),
-        (None, None) => None,
-    };
-    if let Some(tiles) = tiles {
-        if first.segments() != 1 {
+    let first = first.as_seg();
+    if let Some(tiles) = store_tiles(key) {
+        if first.segment_count() != 1 {
             return Err(LumaError::Gpu("tiled program on an array of several segments".into()));
         }
         let args = store_args(key, outputs, inputs, scalars, shifted, 0)?;
         ctx.launch(core, fold_workgroups(ctx, tiles)?, [args.n, 1, 1], &args.raw())?;
     } else {
-        for j in 0..first.segments() {
-            let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
-            let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)) * key.pack_factor());
-            ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
+        for j in 0..first.segment_count() {
+            launch_store_slab(ctx, core, key, outputs, inputs, scalars, shifted, j)?;
         }
     }
+    note_store(ctx, key);
+    Ok(())
+}
+
+/// The tiles of a store kernel that runs tiled or staged (one launch over one segment), `None` for a plain one.
+pub(super) fn store_tiles(key: &FusedKey) -> Option<u32> {
+    match (&key.tile, &key.staging) {
+        (Some(tile), _) => Some(tile.tiles()),
+        (None, Some(staging)) => Some(staging.tiles()),
+        (None, None) => None,
+    }
+}
+
+/// The launch of segment `j` of a plain (not tiled) store kernel: the body of [`launch_store`]'s loop, which a schedule runs slab by slab.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_store_slab<O: AsSeg, I: AsSeg>(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    key: &FusedKey,
+    outputs: &[O],
+    inputs: &[I],
+    scalars: &[u32],
+    shifted: Option<&Shifted>,
+    j: usize,
+) -> Result<(), LumaError> {
+    let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
+    let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)) * key.pack_factor());
+    ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
+    Ok(())
+}
+
+/// Counts a store kernel that ran over all its segments as one elementwise launch.
+pub(super) fn note_store(ctx: &crate::context::Context, key: &FusedKey) {
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     if key.coarsen > 1 {
         ctx.jit().stats.coarsened.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(())
 }
 
 /// The operation and location of the first output of `fused`, for the decision log (`None` for
@@ -1047,7 +1077,10 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
 /// [`run_store`] without the plan cache's recording.
 fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
-    let origin = ctx.jit().recording_decisions().then(|| origin_of(&fused)).flatten().unwrap_or(("elementwise", Location::caller()));
+    let origin = (ctx.jit().recording_decisions() || ctx.split_mode() != split::SplitMode::Off)
+        .then(|| origin_of(&fused))
+        .flatten()
+        .unwrap_or(("elementwise", Location::caller()));
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
     drop((fused_nodes, instr_nodes, sub_roots));
@@ -1103,6 +1136,11 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
         }
     };
     let refs: Vec<&Storage> = outputs.iter().collect();
+    if split::deferred(ctx, &key, &refs, &inputs) {
+        let step = split::Recorded { core, key, outputs: &refs, inputs: &inputs, scalars, shifted, name: origin.0, location: origin.1 };
+        split::record_store(ctx, step)?;
+        return Ok(outputs);
+    }
     launch_store(ctx, &core, &key, &refs, &inputs, &scalars, shifted.as_ref())?;
     if !taken_over && count == 1 && shifted.is_none() && super::lineage::wanted(ctx, &key, &outputs[0], &inputs) {
         let lineage = super::lineage::Lineage::new(core, key, scalars, len, &inputs);
@@ -1146,7 +1184,12 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     key.coarsen = super::coarsen::plan(ctx, &key, node.len());
     note_coarsen(ctx, &key, origin);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
-    launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
+    if split::deferred(ctx, &key, &[&**target], &inputs) {
+        let step = split::Recorded { core, key, outputs: &[&**target], inputs: &inputs, scalars, shifted, name: origin.0, location: origin.1 };
+        split::record_store(ctx, step)?;
+    } else {
+        launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
+    }
     check_finite(ctx, target, node.op().out_ty())?;
     // Another thread cannot have evaluated this node: its operands were taken above.
     if node.result.set(Ok(Arc::clone(target))).is_ok() {

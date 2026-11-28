@@ -66,6 +66,7 @@ LUMA_SELCACHE	dev	W2-SELCACHE	before-release	on (off | on | verify: the strategy
 LUMA_SINGLE_PASS_REDUCE	dev	W0	before-release	auto
 LUMA_SMALLINT_SEEDS	test	W0	never	40
 LUMA_SPECULATE	dev	W0	before-release	on
+LUMA_SPLIT	dev	W3-U6	before-release	off (off | segment | auto: defers kernels over streamed arrays into schedules that run segment by segment; the default flips to auto with the last part of W3-U6)
 LUMA_STAGING	dev	W0	before-release	on
 LUMA_STRATEGY	user	W2-U2	never	unset (family:strategy[,..] forces a strategy of the registry where it fits; ext:<op>/<strategy> forces a strategy of a custom op of the public extension API)
 LUMA_SUBGROUPS	dev	W0	before-release	on
