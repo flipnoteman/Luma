@@ -133,8 +133,9 @@ fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, s
     // product unforced for the rules of tier 2).
     if tuning.lazy != LazyMode::Never || super::sites::wants_unforced(ctx.numerics_ref()) {
         // An eager call is `contraction::run`, which checks the operands itself: only a lazy one checks them here.
-        let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
-        if laziness == Laziness::Lazy {
+        // A recording makes every call eager (`Sites::decide`), asked only of a call that would be lazy: the lookup is not free.
+        let (laziness, slot) = ctx.jit().sites.decide(location, tuning, false, ctx.numerics_ref());
+        if laziness == Laziness::Lazy && !ctx.recording_here() {
             let view = ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
             match view.check() {
                 Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
@@ -164,8 +165,8 @@ pub(crate) fn batched(lhs: &Array<f32>, rhs: &Array<f32>, g: &bmm::Geometry, sha
     if tuning.lazy == LazyMode::Never && !super::sites::wants_unforced(ctx.numerics_ref()) {
         return None;
     }
-    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
-    if laziness == Laziness::Eager {
+    let (laziness, slot) = ctx.jit().sites.decide(location, tuning, false, ctx.numerics_ref());
+    if laziness == Laziness::Eager || ctx.recording_here() {
         return None;
     }
     let Ok(Some(launch)) = bmm::plan(lhs, rhs, g) else { return None };
