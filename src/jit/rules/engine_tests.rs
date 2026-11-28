@@ -419,7 +419,10 @@ fn a_producer_of_the_same_thread_is_in_the_scope_and_one_of_another_thread_or_a_
     let ctx = deferring();
     let x = volume(&ctx);
     let near = x.max_axis(1);
-    let root = (&near * 0.5f32).sum();
+    // A pending operand of the reduction's shape: a consumer with a scalar would be absorbed into the reduction's last pass (W3-U4 D1)
+    // and leave no expression for the sum to read, where this one is the node the scope is made of.
+    let weights = &Array::from_slice_on(&ctx, &vec![0.5f32; 300 * 2], [300, 1, 2]).unwrap() * 1.0f32;
+    let root = (&near * &weights).sum();
     let scope = Scope::of(&ctx, root.structured().unwrap()).unwrap();
     assert_eq!(scope.comps.iter().map(|c| c.role).collect::<Vec<_>>(), [ScopeRole::Root, ScopeRole::Producer]);
     assert_eq!(scope.edges.len(), 1);
@@ -428,7 +431,7 @@ fn a_producer_of_the_same_thread_is_in_the_scope_and_one_of_another_thread_or_a_
 
     let far = std::thread::scope(|threads| threads.spawn(|| x.max_axis(1)).join().unwrap());
     assert!(far.structured().is_some_and(|v| v.is_unforced()));
-    let root = (&far * 0.5f32).sum();
+    let root = (&far * &weights).sum();
     let scope = Scope::of(&ctx, root.structured().unwrap()).unwrap();
     assert!(scope.comps.iter().all(|c| c.role != ScopeRole::Producer), "a value another thread made is not planned here");
 

@@ -5291,7 +5291,8 @@ fn column_statistics_of_compact_integers_are_recorded_in_one_kernel() {
         let d = delta(before, ctx.jit().stats());
         // The widening cast is computed inside the kernel that reduces, and the two reductions share it: on the CPU
         // backend one kernel (a GPU backend may leave the variance's shifted operand to a kernel of its own).
-        assert_eq!(d.elementwise_launches, 2, "{dims:?} axis {axis}: only the two divisions: {d:?}");
+        // The mean's division is applied by the last pass of its reduction (W3-U4 D1); the variance's stays a kernel of its own.
+        assert_eq!(d.elementwise_launches, 1, "{dims:?} axis {axis}: only the variance's division: {d:?}");
         if ctx.is_cpu() {
             assert_eq!(d.reduce_launches, 1, "{dims:?} axis {axis}: {d:?}");
         } else {
