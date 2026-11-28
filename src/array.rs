@@ -730,7 +730,11 @@ impl<T: GpuType> Array<T> {
     /// itself (as opposed to failed operations) only show up at synchronization points.
     pub fn check(&self) -> Result<()> {
         match self.failed() {
-            None => Ok(()),
+            None => match self.recorded_storage().and_then(|storage| storage.segments.iter().find_map(|segment| segment.failure())) {
+                // A deferred step that failed when its schedule committed (see `jit::split`) leaves the failure on the segments it wrote.
+                Some(error) => Err(LumaError::clone(&error)),
+                None => Ok(()),
+            },
             Some(error) => Err(LumaError::clone(error)),
         }
     }

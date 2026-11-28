@@ -513,6 +513,11 @@ impl Segment {
         }
     }
 
+    /// The error of the step that was to write this segment, if it failed.
+    pub(crate) fn failure(&self) -> Option<Arc<LumaError>> {
+        self.failed.get().cloned()
+    }
+
     /// Whether a step that writes this segment is waiting in a schedule (or failed).
     pub(crate) fn is_planned(&self) -> bool {
         self.planned_flag.load(Ordering::Relaxed)
