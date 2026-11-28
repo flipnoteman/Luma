@@ -1351,8 +1351,8 @@ pub struct GemmSpec {
     pub lhs_transposed: bool,
     /// Whether `b` holds the transpose of the right matrix.
     pub rhs_transposed: bool,
-    /// `f32` multiply-adds instead of TF32 tensor cores.
-    pub exact: bool,
+    /// The matrix unit the kernel runs on.
+    pub unit: GemmUnit,
     /// How the kernel copies the operands, and so which shapes it takes.
     pub lanes: GemmLanes,
     /// A half-work product of a matrix with itself (see [`MatmulSpec::half`]): `rows == cols`, the grid `[T (T + 1) / 2, 1, 1]`,
@@ -1370,6 +1370,16 @@ pub struct GemmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HookId(pub u64);
 
+/// The unit a [`GemmSpec`] kernel multiplies on (the rows of the library's unit table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GemmUnit {
+    /// `f32` multiply-adds on the ordinary cores (the exact kernels).
+    Fma,
+    /// TF32 tensor cores: `f32` operands rounded to 10 mantissa bits, `f32` accumulation.
+    Tf32,
+}
+
 /// How a [`GemmSpec`] kernel copies its operands from global memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1385,9 +1395,9 @@ pub enum GemmLanes {
 
 impl GemmSpec {
     /// A product on tiles of `rows` x `cols`, `lhs_transposed` / `rhs_transposed` if the operand's buffer holds the matrix
-    /// transposed, in `f32` (`exact`) or TF32, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
-    pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, exact: bool) -> Self {
-        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact, lanes: GemmLanes::Vec4, half: false, hook: None }
+    /// transposed, on `unit`, on [`GemmLanes::Vec4`]. Build a spec with this, not with a struct literal: the struct grows fields.
+    pub const fn new(rows: u32, cols: u32, lhs_transposed: bool, rhs_transposed: bool, unit: GemmUnit) -> Self {
+        GemmSpec { rows, cols, lhs_transposed, rhs_transposed, unit, lanes: GemmLanes::Vec4, half: false, hook: None }
     }
 
     /// The same product copying its operands with `lanes`.
@@ -1647,9 +1657,8 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
         None
     }
     /// The output tiles (rows, columns) of the products ([`Backend::compile_gemm`]) the backend
-    /// runs, largest first, on tensor cores in TF32 or (with `exact`) in `f32`; empty if it has
-    /// none.
-    fn gemm_tiles(&self, _exact: bool) -> &[(u32, u32)] {
+    /// runs on `unit`, largest first; empty if it has none.
+    fn gemm_tiles(&self, _unit: GemmUnit) -> &[(u32, u32)] {
         &[]
     }
     /// Whether [`Backend::compile_gemm`] takes a [`GemmSpec::half`] product.
@@ -1667,7 +1676,7 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_gemm(&self, _spec: &GemmSpec, _hook: Option<&Arc<crate::kir::KernelModule>>) -> Option<RawKernel> {
         None
     }
-    /// Whether [`Backend::compile_gemm`] takes epilogue hooks for the products on the tensor-core tiles (`exact == false`).
+    /// Whether [`Backend::compile_gemm`] takes epilogue hooks for the products on the tensor-core tiles (`GemmUnit::Tf32`).
     fn gemm_hooks(&self) -> bool {
         false
     }

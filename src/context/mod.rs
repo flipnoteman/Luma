@@ -4,6 +4,7 @@ use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::caps::Caps;
+use crate::jit::comprehension::units::gemm_unit;
 use crate::numerics::Reduced;
 use crate::numerics::Numerics;
 use crate::error::{LumaError, Result};
@@ -1288,13 +1289,13 @@ impl Context {
                             Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t, half: true }))
                         }
                         Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
-                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes).with_half()))
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, gemm_unit(exact)).with_lanes(lanes).with_half()))
                         }
                         Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
-                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact)))
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, gemm_unit(exact))))
                         }
                         Builtin::Matmul { tile: crate::matmul::MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact, lanes }, .. } => {
-                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, exact).with_lanes(lanes)))
+                            Some(kernel::Native::Gemm(luma_core::GemmSpec::new(rows, cols, lhs_t, rhs_t, gemm_unit(exact)).with_lanes(lanes)))
                         }
                         Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
                         _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),

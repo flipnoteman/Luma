@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::time::{Duration, Instant};
 
-use luma_core::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmSpec, RawArg};
+use luma_core::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmSpec, GemmUnit, RawArg};
 use luma_cuda::CudaBackend;
 
 struct Rng(u64);
@@ -144,8 +144,8 @@ fn every_lane_matches_the_reference_on_ragged_shapes_leading_dimensions_and_offs
     let mut cache = HashMap::new();
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let shapes = [(1, 1, 1), (3, 5, 7), (17, 33, 31), (100, 31, 129), (65, 64, 33), (31, 130, 17), (129, 70, 200)];
-    for exact in [true, false] {
-        let tiles: Vec<(u32, u32)> = backend.gemm_tiles(exact).to_vec();
+    for unit in [GemmUnit::Fma, GemmUnit::Tf32] {
+        let tiles: Vec<(u32, u32)> = backend.gemm_tiles(unit).to_vec();
         for &(m, n, k) in &shapes {
             for (lhs_t, rhs_t) in [(false, false), (true, false), (false, true), (true, true)] {
                 // The stored shapes: `A` is `m x k` (or `k x m`), `B` is `k x n` (or `n x k`).
@@ -161,14 +161,14 @@ fn every_lane_matches_the_reference_on_ragged_shapes_leading_dimensions_and_offs
                     if m * n * k > 50_000 && index % 2 == 1 {
                         continue;
                     }
-                    let spec = GemmSpec::new(rows, cols, lhs_t, rhs_t, exact);
+                    let spec = GemmSpec::new(rows, cols, lhs_t, rhs_t, unit);
                     for kc in [k, 32usize.min(k)] {
                         let dims = (m, n, k);
                         let scalar = launch(&backend, &mut cache, &spec.with_lanes(GemmLanes::Scalar), dims, kc, &odd_a, &odd_b);
                         let tails = launch(&backend, &mut cache, &spec.with_lanes(GemmLanes::Vec4Tails), dims, kc, &even_a, &even_b);
                         let scalar_even = launch(&backend, &mut cache, &spec.with_lanes(GemmLanes::Scalar), dims, kc, &even_a, &even_b);
-                        let label = format!("{rows}x{cols} {m}x{n}x{k} kc={kc} lhs_t={lhs_t} rhs_t={rhs_t} exact={exact}");
-                        if exact {
+                        let label = format!("{rows}x{cols} {m}x{n}x{k} kc={kc} lhs_t={lhs_t} rhs_t={rhs_t} unit={unit:?}");
+                        if unit == GemmUnit::Fma {
                             let want_odd = reference(dims, kc, lhs_t, rhs_t, &odd_a, &odd_b);
                             let want_even = reference(dims, kc, lhs_t, rhs_t, &even_a, &even_b);
                             // The operands differ in their padding only: the values are the draws in order, so compare each lane to its own reference.

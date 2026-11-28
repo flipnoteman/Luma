@@ -39,6 +39,7 @@ mod recognition_tests;
 #[cfg(test)]
 mod reference;
 pub(crate) mod roles;
+pub(crate) mod units;
 #[cfg(test)]
 mod tests;
 

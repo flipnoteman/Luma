@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use luma_core::kir::{BuiltinVar, IrBinOp, KernelModule, KirType, ModuleBuilder, used_bindings};
-use luma_core::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmSpec, HookId, KernelTrust, RawArg};
+use luma_core::{Backend, BindingInfo, BindingKind, BufferUsage, CompiledKernel, Dispatch, GemmLanes, GemmSpec, GemmUnit, HookId, KernelTrust, RawArg};
 use luma_cuda::CudaBackend;
 
 fn backend() -> Option<CudaBackend> {
@@ -181,7 +181,7 @@ fn the_hooked_product_is_the_unhooked_one_then_the_elementwise_pass_bit_for_bit(
                 if lanes == GemmLanes::Vec4 && (m % 4 != 0 || n % 4 != 0 || k % 4 != 0) {
                     continue;
                 }
-                let spec = GemmSpec::new(rows, cols, false, false, false).with_lanes(lanes);
+                let spec = GemmSpec::new(rows, cols, false, false, GemmUnit::Tf32).with_lanes(lanes);
                 let b = bufs(&backend, (m, n, k));
                 let plain = gemm(&backend, &spec, None, 0);
                 launch_gemm(&backend, &plain, &spec, (m, n, k), &b, false, None);
@@ -225,7 +225,7 @@ fn cost_of_the_hook() {
     println!("tile      shape            unhooked   +ew      identity  relu+bias  G2(identity/U)  G3(relu/(U+ew))  bound(U/(U+ew))");
     for (m, n, k) in [(256, 512, 512), (256, 784, 512), (2048, 2048, 2048), (4096, 4096, 4096)] {
         for (rows, cols) in tf32_tiles() {
-            let spec = GemmSpec::new(rows, cols, false, false, false);
+            let spec = GemmSpec::new(rows, cols, false, false, GemmUnit::Tf32);
             let b = bufs(&backend, (m, n, k));
             let plain = gemm(&backend, &spec, None, 0);
             let id_spec = spec.with_hook(HookId(1));

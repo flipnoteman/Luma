@@ -25,7 +25,7 @@ use luma_core::hal::{copy_parallel, size_class};
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, MemoryNow, Dispatch, ExecGraph, Features, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
-    KernelTrust, NativeBuffer, NativeKernel, NativeStage, Profile, RawArg, RawKernel, GemmSpec, Stage, StageDir, Ticket, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, NativeStage, Profile, RawArg, RawKernel, GemmSpec, GemmUnit, Stage, StageDir, Ticket, TuningProfile,
 };
 use luma_core::hal::check_transfer;
 
@@ -347,7 +347,7 @@ const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64
 fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelModule>) -> Result<CudaKernel, BackendError> {
     let mut extra = (0u32, 0u32);
     let (source, threads, bytes) = if let Some(module) = hook {
-        if spec.exact {
+        if spec.unit == GemmUnit::Fma {
             return Err(BackendError::Unsupported("the exact product takes no epilogue hook".into()));
         }
         let started = Instant::now();
@@ -363,7 +363,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
         log::debug!("luma-cuda: epilogue hook of {spec:?}: NVVM and splice {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         extra = (operands, scalars);
         (hook.reconcile(&ptx), config.threads(), config.shared_bytes())
-    } else if spec.exact {
+    } else if spec.unit == GemmUnit::Fma {
         let config = crate::sgemm::Config::of(spec);
         (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
     } else {
@@ -378,7 +378,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
             luma_core::GemmLanes::Vec4Tails => "tails",
             _ => "scalar",
         };
-        let name = format!("{}-{}x{}-{}{}-{lanes}{}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.hook.map_or(String::new(), |id| format!("-hook{:08x}", id.0 as u32)));
+        let name = format!("{}-{}x{}-{}{}-{lanes}{}.ptx", if spec.unit == GemmUnit::Fma { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed), spec.hook.map_or(String::new(), |id| format!("-hook{:08x}", id.0 as u32)));
         let _ = std::fs::write(dir.join(name), &source);
     }
     shared.ctx.bind_to_thread().map_err(gpu)?;
@@ -392,7 +392,7 @@ fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec, hook: Option<&KernelMo
         let spilled = func.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES).unwrap_or(-1);
         eprintln!(
             "gemm-info {}{} {}x{} t{}{}: {} registers, {} bytes of local memory, {} bytes of shared memory, {:?} workgroups per multiprocessor",
-            if spec.exact { "f32" } else { "tf32" },
+            if spec.unit == GemmUnit::Fma { "f32" } else { "tf32" },
             if hook.is_some() { " hooked" } else { "" },
             spec.rows,
             spec.cols,
@@ -1590,11 +1590,12 @@ impl Backend for CudaBackend {
         compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
     }
 
-    fn gemm_tiles(&self, exact: bool) -> &[(u32, u32)] {
-        match (self.shared.cc.0 >= 8, exact) {
+    fn gemm_tiles(&self, unit: GemmUnit) -> &[(u32, u32)] {
+        match (self.shared.cc.0 >= 8, unit) {
             (false, _) => &[],
-            (true, false) => &TENSOR_TILES,
-            (true, true) => &crate::sgemm::TILES,
+            (true, GemmUnit::Tf32) => &TENSOR_TILES,
+            (true, GemmUnit::Fma) => &crate::sgemm::TILES,
+            (true, _) => &[],
         }
     }
 
@@ -1613,7 +1614,7 @@ impl Backend for CudaBackend {
 
     fn compile_gemm(&self, spec: &GemmSpec, hook: Option<&Arc<KernelModule>>) -> Option<RawKernel> {
         // A hooked product needs its module, and only the tensor-core kernels take one.
-        if spec.hook.is_some() && (hook.is_none() || spec.exact || spec.half || !self.gemm_hooks()) {
+        if spec.hook.is_some() && (hook.is_none() || spec.unit == GemmUnit::Fma || spec.half || !self.gemm_hooks()) {
             return None;
         }
         // Loaded on a worker thread (which binds the context in `compile_gemm_ptx`): a failure
@@ -2129,11 +2130,11 @@ mod tests {
                 return None;
             }
         };
-        let Some(&(rows, cols)) = backend.gemm_tiles(true).first() else {
+        let Some(&(rows, cols)) = backend.gemm_tiles(GemmUnit::Fma).first() else {
             println!("SKIPPED: the device has no native matrix product kernels");
             return None;
         };
-        Some((backend, GemmSpec::new(rows, cols, false, false, true)))
+        Some((backend, GemmSpec::new(rows, cols, false, false, GemmUnit::Fma)))
     }
 
     fn wait_ready(kernel: &RawKernel) {

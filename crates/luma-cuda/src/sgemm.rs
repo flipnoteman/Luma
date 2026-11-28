@@ -537,16 +537,17 @@ pub(crate) fn ptx(config: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luma_core::GemmUnit;
 
     #[test]
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in TILES.into_iter().chain([(128, 128)]) {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
                 for lanes in [luma_core::GemmLanes::Vec4, luma_core::GemmLanes::Vec4Tails, luma_core::GemmLanes::Scalar] {
-                    let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true).with_lanes(lanes));
+                    let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, GemmUnit::Fma).with_lanes(lanes));
                     let text = ptx(&config);
                     if rows == cols {
-                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, true).with_lanes(lanes).with_half()));
+                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, GemmUnit::Fma).with_lanes(lanes).with_half()));
                         assert!(half.contains("sqrt.rn.f32") && half.contains("st.global.f32 [%rd20]"), "{rows}x{cols}");
                         assert_eq!(half.matches("fma.rn.f32").count() as u32, config.tm * config.tn * config.bk + 1, "{rows}x{cols}");
                     }

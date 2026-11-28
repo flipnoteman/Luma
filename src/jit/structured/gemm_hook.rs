@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use luma_core::{BindingInfo, BindingKind, CompiledKernel, GemmSpec};
+use luma_core::{BindingInfo, BindingKind, CompiledKernel, GemmSpec, GemmUnit};
 
 use super::epilogue::EpiProgram;
 use crate::builtin::Builtin;
@@ -61,8 +61,8 @@ impl Table {
 /// The tensor-core spec of a tile, `None` for a tile that is not a TF32 product of the backend.
 fn spec_of(tile: MatmulTile) -> Option<GemmSpec> {
     match tile {
-        MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact: false } => Some(GemmSpec::new(rows, cols, lhs_t, rhs_t, false)),
-        MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact: false, lanes } => Some(GemmSpec::new(rows, cols, lhs_t, rhs_t, false).with_lanes(lanes)),
+        MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact: false } => Some(GemmSpec::new(rows, cols, lhs_t, rhs_t, GemmUnit::Tf32)),
+        MatmulTile::GemmRagged { rows, cols, lhs_t, rhs_t, exact: false, lanes } => Some(GemmSpec::new(rows, cols, lhs_t, rhs_t, GemmUnit::Tf32).with_lanes(lanes)),
         _ => None,
     }
 }

@@ -17,6 +17,7 @@ use crate::caps::Caps;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
+use crate::jit::comprehension::units::UnitDesc;
 use crate::jit::comprehension::Props;
 use crate::jit::structured::select;
 use crate::jit::program::Ref;
@@ -28,7 +29,7 @@ use crate::ops::{fold_grid, Outcome};
 use crate::shape::Shape;
 use crate::tuning::Tuning;
 use crate::view::PadMode;
-use luma_core::{CostModel, GemmLanes};
+use luma_core::{CostModel, GemmLanes, GemmUnit};
 
 // -- the value --
 
@@ -230,6 +231,11 @@ fn is_exact(by: StrategyId) -> bool {
     matches!(by, StrategyId::GEMM_F32 | StrategyId::GEMM_F32_RAGGED | StrategyId::GEMM_F32_PADDED)
 }
 
+/// The unit of the GEMM strategy `by`.
+fn gemm_unit(by: StrategyId) -> GemmUnit {
+    if is_exact(by) { GemmUnit::Fma } else { GemmUnit::Tf32 }
+}
+
 /// The operands of the strategy `by` that are copied before the product: those the padded kernels cannot read in place.
 fn copies(view: &ContractionView<'_>, by: StrategyId) -> [bool; 2] {
     [view.lhs, view.rhs].map(|array| is_padded(by) && !layout(array).vector_aligned())
@@ -266,8 +272,8 @@ fn plan_of(view: &ContractionView<'_>, ctx: &Context, params: &ContractionParams
         Some(lanes) => plan.map(|plan| with_lanes(plan, lanes)),
         None => plan,
     });
-    let tensor = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(false), transposed, false, groups, bytes), lanes);
-    let f32_tiles = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(true), transposed, true, groups, bytes), lanes);
+    let tensor = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(GemmUnit::Tf32), transposed, GemmUnit::Tf32, groups, bytes), lanes);
+    let f32_tiles = |lanes: Option<GemmLanes>| finish(gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, ctx.hal().gemm_tiles(GemmUnit::Fma), transposed, GemmUnit::Fma, groups, bytes), lanes);
     match params.by {
         StrategyId::GEMM_TF32 => tensor(None),
         StrategyId::GEMM_TF32_RAGGED => tensor(Some(GemmLanes::Scalar)),
@@ -336,7 +342,7 @@ fn tf32_here(view: &ContractionView<'_>, ctx: &Context) -> bool {
 
 /// The tensor-core tiles the product runs on in its aligned kernels, if it is one that does.
 fn tensor_tiles<'c>(view: &ContractionView<'_>, ctx: &'c Context) -> &'c [(u32, u32)] {
-    if tf32_here(view, ctx) && aligned_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(false) } else { &[] }
+    if tf32_here(view, ctx) && aligned_shape(view.lhs, view.rhs).is_some() { ctx.hal().gemm_tiles(GemmUnit::Tf32) } else { &[] }
 }
 
 /// Whether the operands' leading dimensions and offsets are multiples of 4: what the aligned kernels (and the 16-byte lanes) read.
@@ -549,7 +555,7 @@ fn fits_gemm_f32(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Optio
     if !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
         return None;
     }
-    if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() || ctx.hal().gemm_tiles(true).is_empty() {
+    if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() || ctx.hal().gemm_tiles(GemmUnit::Fma).is_empty() {
         return None;
     }
     if !aligned_operands(view) {
@@ -563,23 +569,15 @@ const RAGGED_MIN_FMAS: u64 = 1 << 20;
 /// Shortest K of a ragged or padded product: a short K is memory-bound and the shader kernels (and their skinny plans) do as well
 /// (`2001 x 37 x 2001` was 1.21x slower on the ragged kernel, 4096 x 33 x 4096 4 % faster).
 const RAGGED_MIN_K: usize = 64;
-/// Largest `f32` product (multiply-adds) that runs on a ragged or padded kernel: the padded kernel's copy launch and its masked
-/// copies lose what the 16-byte lanes gain on a big square (3001^3 1.05x, 4097^3 1.00x of the shader kernels, 1001^3 1.20x on an
-/// RTX 3090), so those keep the shader kernels until the kernel is faster (follow-up). TF32 has no such cap.
-const RAGGED_MAX_FMAS_F32: u64 = 4_000_000_000;
 /// What the 4-byte lanes of a ragged kernel reach of the rate of the 16-byte ones (to be set from the bench rows of the gate).
 const RAGGED_LANE_FACTOR: f64 = 0.6;
-/// Measured rates of the backend's own kernels at 4096^3 on an RTX 3090, in flops per nanosecond, scaled by the device's
-/// `f32_ops_per_ns` against the 3090's calibration.
-const GEMM_F32_FLOPS_PER_NS: f64 = 22_900.0;
-const GEMM_TF32_FLOPS_PER_NS: f64 = 27_900.0;
-
 /// The products of any shape (and leading dimension and offset) that the backend's own kernels take: `exact` in `f32`, else TF32.
 /// Not the skinny shapes (their shader kernels read the operands once), the products below [`GEMM_MIN_EXTENT`] on a side (a tile
 /// would be mostly padding: the same bounds as the aligned kernels, see [`aligned_shape`]), nor those below [`RAGGED_MIN_FMAS`].
 fn ragged_fits(subject: &Subject<'_>, ctx: &Context, by: StrategyId) -> Option<Params> {
     let view = view(subject)?;
-    let exact = is_exact(by);
+    let unit = gemm_unit(by);
+    let exact = unit == GemmUnit::Fma;
     if !ctx.hal().gemm_ragged() || ctx.tuning().native_gemm != 0 || *OWN_F32_KERNELS_OFF || tf32_here(view, ctx) == exact {
         return None;
     }
@@ -587,10 +585,10 @@ fn ragged_fits(subject: &Subject<'_>, ctx: &Context, by: StrategyId) -> Option<P
     let (m, n, k) = (geom.m as usize, geom.n as usize, geom.k as usize);
     let few_columns = if (SMALL_N_MIN_M..=SMALL_N_MAX_M).contains(&m) { SMALL_N_MIN } else { GEMM_MIN_EXTENT };
     let fmas = (m as u64) * (n as u64) * (k as u64);
-    if m < GEMM_MIN_EXTENT || n < few_columns || k < RAGGED_MIN_K || fmas < RAGGED_MIN_FMAS || (exact && fmas > RAGGED_MAX_FMAS_F32) {
+    if m < GEMM_MIN_EXTENT || n < few_columns || k < RAGGED_MIN_K || fmas < RAGGED_MIN_FMAS || fmas > UnitDesc::of(unit).ragged_max_fmas {
         return None;
     }
-    if ctx.hal().gemm_tiles(exact).is_empty() || !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
+    if ctx.hal().gemm_tiles(unit).is_empty() || !gemm_operand(ctx, view.lhs) || !gemm_operand(ctx, view.rhs) {
         return None;
     }
     if skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes()).is_some() {
@@ -629,7 +627,7 @@ fn cost_cut(subject: &Subject<'_>, params: &Params, ctx: &Context, _: &Residenci
         let tiles = f64::from(m.div_ceil(rows)) * f64::from(n.div_ceil(cols));
         let useful = f64::from(m) * f64::from(n) / (tiles * f64::from(rows * cols));
         let workgroups = plan.groups.iter().fold(1u32, |all, &g| all.saturating_mul(g));
-        let base = if is_exact(by) { GEMM_F32_FLOPS_PER_NS } else { GEMM_TF32_FLOPS_PER_NS };
+        let base = UnitDesc::of(gemm_unit(by)).rate;
         let rate = base * f32_tile_rate((rows, cols), workgroups, ctx.tuning().compute_units, useful) * model.f32_ops_per_ns / CostModel::NVIDIA.f32_ops_per_ns;
         let flops = 2.0 * f64::from(m) * f64::from(n) * f64::from(k);
         let lanes = if is_padded(by) { 1.0 } else { RAGGED_LANE_FACTOR };
@@ -794,13 +792,14 @@ fn syrk_plan(view: &ContractionView<'_>, ctx: &Context, geom: Geometry, transpos
     } else if base == StrategyId::CONTRACTION_TILED {
         return tiled_half_plan(ctx.tuning(), m, k, groups);
     } else {
-        let squares: Vec<(u32, u32)> = ctx.hal().gemm_tiles(!tf32).iter().copied().filter(|&(rows, cols)| rows == cols).collect();
+        let syrk_unit = if tf32 { GemmUnit::Tf32 } else { GemmUnit::Fma };
+        let squares: Vec<(u32, u32)> = ctx.hal().gemm_tiles(syrk_unit).iter().copied().filter(|&(rows, cols)| rows == cols).collect();
         let lanes = match base {
             StrategyId::GEMM_F32_RAGGED | StrategyId::GEMM_TF32_RAGGED => GemmLanes::Scalar,
             StrategyId::GEMM_F32_PADDED | StrategyId::GEMM_TF32_PADDED => GemmLanes::Vec4Tails,
             _ => GemmLanes::Vec4,
         };
-        gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, &squares, transposed, !tf32, groups, bytes).map(|plan| match plan.tile {
+        gemm_plan(m, n, k, ctx.tuning(), GEMM_HALF_TILES_PER_SM, &squares, transposed, syrk_unit, groups, bytes).map(|plan| match plan.tile {
             MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact } => Plan { tile: MatmulTile::GemmHalf { rows, cols, lhs_t, rhs_t, exact, lanes }, ..plan },
             _ => plan,
         })
@@ -1491,7 +1490,8 @@ fn f32_tile_rate(tile: (u32, u32), workgroups: u32, units: u32, useful: f64) -> 
 /// long K split K (see [`native_plan`]). `f32` tiles: the one with the best rate, K split as
 /// [`f32_split`] says (see [`f32_tile_rate`]).
 #[allow(clippy::too_many_arguments)]
-fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], exact: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], unit: GemmUnit, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let exact = unit == GemmUnit::Fma;
     let units = tuning.compute_units;
     let wanted = units.max(1).saturating_mul(half_per_sm).div_ceil(2);
     let count = |&(rows, cols): &(u32, u32)| m.div_ceil(rows).saturating_mul(n.div_ceil(cols));
@@ -1784,7 +1784,7 @@ mod tests {
     #[test]
     fn a_tensor_plan_picks_the_largest_tile_that_fills_the_device() {
         const TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
-        let plan = |m, n, k, transposed| gemm_plan(m, n, k, &Tuning::for_tests(), 4, &TILES, transposed, false, 65535, u64::MAX).unwrap();
+        let plan = |m, n, k, transposed| gemm_plan(m, n, k, &Tuning::for_tests(), 4, &TILES, transposed, GemmUnit::Tf32, 65535, u64::MAX).unwrap();
         let tensor = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: false };
         // Two tiles per multiprocessor, the largest tile that gets them.
         let p = plan(4096, 4096, 4096, [false; 2]);
@@ -1801,7 +1801,7 @@ mod tests {
         assert_eq!((p.tile, p.groups[..2].to_vec()), (tensor(64, 64), vec![1, 1]));
         assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 1 << 20 && (p.slices - 1) * p.kc < 1 << 20, "{p:?}");
         // The partial sums must fit a buffer.
-        assert_eq!(gemm_plan(64, 64, 1 << 20, &Tuning::for_tests(), 4, &TILES, [false; 2], false, 65535, 1000).unwrap().slices, 1);
+        assert_eq!(gemm_plan(64, 64, 1 << 20, &Tuning::for_tests(), 4, &TILES, [false; 2], GemmUnit::Tf32, 65535, 1000).unwrap().slices, 1);
         // The transposed operands are the tile's.
         let p = plan(4096, 4096, 4096, [true, false]);
         assert_eq!(p.tile, MatmulTile::Gemm { rows: 128, cols: 128, lhs_t: true, rhs_t: false, exact: false });
@@ -1810,7 +1810,7 @@ mod tests {
     #[test]
     fn an_f32_gemm_plan_picks_the_tile_with_the_best_predicted_rate() {
         const TILES: [(u32, u32); 6] = [(64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)];
-        let plan = |m, n, k, units: u32| gemm_plan(m, n, k, &Tuning { compute_units: units, ..Tuning::for_tests() }, GEMM_HALF_TILES_PER_SM, &TILES, [false; 2], true, 65535, u64::MAX).unwrap();
+        let plan = |m, n, k, units: u32| gemm_plan(m, n, k, &Tuning { compute_units: units, ..Tuning::for_tests() }, GEMM_HALF_TILES_PER_SM, &TILES, [false; 2], GemmUnit::Fma, 65535, u64::MAX).unwrap();
         let tile = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: true };
         assert_eq!(plan(4096, 4096, 4096, 82).tile, tile(64, 128));
         // 128 tiles of 64 x 128 fill 78 % of the device, 256 of 64 x 64 78 % at 95 % of the rate.

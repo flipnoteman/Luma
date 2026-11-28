@@ -4,7 +4,7 @@
 //! the tuning profile, the backend's opt-ins and the memory model. [`Tuning`](crate::tuning::Tuning)
 //! flags stay as they are: they are tuning, not capability.
 
-use luma_core::{Backend, DeviceInfo, Features, TuningProfile};
+use luma_core::{Backend, DeviceInfo, Features, GemmUnit, TuningProfile};
 
 use crate::tuning::Tuning;
 
@@ -94,11 +94,11 @@ impl Caps {
         set(backend.native_line_solve(), Caps::NATIVE_LINE_SOLVE);
         set(backend.native_matmul().is_some(), Caps::NATIVE_BMM);
         set(tuning.lookback_scan, Caps::LOOKBACK);
-        set(!backend.gemm_tiles(false).is_empty(), Caps::TF32);
+        set(!backend.gemm_tiles(GemmUnit::Tf32).is_empty(), Caps::TF32);
         set(info.zero_copy, Caps::UNIFIED_MEMORY);
         set(!info.cpu && info.zero_copy, Caps::HOST_PATH);
         set(backend.can_time_launches(), Caps::TELEMETRY);
-        set(!backend.gemm_tiles(false).is_empty() || !backend.gemm_tiles(true).is_empty(), Caps::GEMM_TILES);
+        set(!backend.gemm_tiles(GemmUnit::Tf32).is_empty() || !backend.gemm_tiles(GemmUnit::Fma).is_empty(), Caps::GEMM_TILES);
         caps
     }
 }

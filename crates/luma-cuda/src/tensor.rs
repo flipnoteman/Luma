@@ -533,17 +533,18 @@ pub(crate) fn ptx_hooked(config: &Config, hook: Option<&Hook>) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luma_core::GemmUnit;
 
     #[test]
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in [(128, 128), (128, 64), (64, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
                 for lanes in [luma_core::GemmLanes::Vec4, luma_core::GemmLanes::Vec4Tails, luma_core::GemmLanes::Scalar] {
-                    let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false).with_lanes(lanes));
+                    let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, GemmUnit::Tf32).with_lanes(lanes));
                     let text = ptx(&config);
                     assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
                     if rows == cols {
-                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false).with_lanes(lanes).with_half()));
+                        let half = ptx(&Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, GemmUnit::Tf32).with_lanes(lanes).with_half()));
                         assert!(half.contains("sqrt.rn.f32") && half.contains("st.global.f32 [%rd6]") && half.trim_end().ends_with('}'), "{rows}x{cols}");
                         assert_eq!(half.matches("mma.sync").count(), text.matches("mma.sync").count(), "{rows}x{cols}");
                     }
@@ -567,7 +568,7 @@ mod tests {
         };
         for (rows, cols) in [(128, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, true)] {
-                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, false));
+                let config = Config::of(&GemmSpec::new(rows, cols, lhs_transposed, rhs_transposed, GemmUnit::Tf32));
                 let (sa, sb) = (config.a_stride(), config.b_stride());
                 assert!(if lhs_transposed { banks(sa, 1, sa) } else { banks(sa, sa, 1) }, "A stride {sa}");
                 assert!(if rhs_transposed { banks(sb, sb, 1) } else { banks(sb, 1, sb) }, "B stride {sb}");

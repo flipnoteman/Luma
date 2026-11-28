@@ -600,7 +600,7 @@ fn caps_match_what_the_device_reports() {
     assert_eq!(caps.contains(Caps::SUBGROUP), info.features.contains(Features::SUBGROUP));
     assert_eq!(caps.contains(Caps::TEXTURE), ctx.hal().texture_caps().is_some());
     assert_eq!(caps.contains(Caps::TEXTURE_PROFITABLE), caps.contains(Caps::TEXTURE) && ctx.tuning().profile == TuningProfile::Nvidia);
-    assert_eq!(caps.contains(Caps::TF32), !ctx.hal().gemm_tiles(false).is_empty());
+    assert_eq!(caps.contains(Caps::TF32), !ctx.hal().gemm_tiles(luma_core::GemmUnit::Tf32).is_empty());
     assert_eq!(caps.contains(Caps::UNIFIED_MEMORY), info.zero_copy);
     assert_eq!(caps.contains(Caps::HOST_PATH), !info.cpu && info.zero_copy);
     assert_eq!(caps.contains(Caps::NATIVE_GEMM), ctx.hal().native_matmul().is_some());

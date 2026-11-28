@@ -56,7 +56,7 @@ pub(crate) enum MatmulTile {
     /// `lhs_t` / `rhs_t`; its shader is that of `T32` (the bindings), never run.
     Native { edge: u32, lhs_t: bool, rhs_t: bool },
     /// A tile of `rows` x `cols` a backend multiplies in its own kernels, on tensor cores in TF32
-    /// or with `exact` in `f32` on the ordinary cores (see [`gemm_plan`]), the buffer of an operand holding the matrix transposed if `lhs_t` /
+    /// or with `exact` (`GemmUnit::Fma`) in `f32` on the ordinary cores (see [`gemm_plan`]), the buffer of an operand holding the matrix transposed if `lhs_t` /
     /// `rhs_t`; its shader is that of `T32` (the bindings), never run.
     Gemm { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool },
     /// [`MatmulTile::Gemm`] for a product of any extents, leading dimensions and offsets, copying the operands with `lanes` (never
