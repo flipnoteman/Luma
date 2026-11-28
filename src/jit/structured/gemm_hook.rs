@@ -232,6 +232,43 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_the_expander_cannot_take_leaves_the_plain_product_running() {
+        let Some(ctx) = context() else { return };
+        let shape = (128, 128, 128);
+        let (m, n, _) = shape;
+        let [lhs, rhs] = operands(&ctx, shape);
+        // `sin` reduces its argument through a table in local memory: if the hook cannot be built the plain product runs for good,
+        // and if it can, it is the elementwise kernel's `sin` bit for bit.
+        let epi = program(vec![unary(UnOp::Sin, Ref::Acc)], &[], &[]);
+        let plain = Array::<f32>::from_storage(&ctx, [n, m, 1, 1].into(), product(&ctx, &lhs, &rhs, None).into_storage());
+        let expected = plain.sin().to_vec().unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            match product(&ctx, &lhs, &rhs, Some(&epi)) {
+                Output::Storage(_) => std::thread::sleep(Duration::from_millis(50)),
+                Output::Epilogued(storages) => {
+                    let got = read(&ctx, Output::Storage(Arc::clone(&storages[0])), m, n);
+                    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_product_takes_no_epilogue() {
+        let Some(ctx) = context() else { return };
+        // A long K on a small output is cut into slices of K, which the epilogue could not follow.
+        let shape = (64, 64, 32768);
+        let [lhs, rhs] = operands(&ctx, shape);
+        let epi = program(vec![unary(UnOp::Id, Ref::Acc)], &[], &[]);
+        for _ in 0..40 {
+            assert!(matches!(product(&ctx, &lhs, &rhs, Some(&epi)), Output::Storage(_)));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn a_hooked_tanh_is_the_elementwise_kernels_tanh() {
         let Some(ctx) = context() else { return };
         let shape = (128, 128, 128);

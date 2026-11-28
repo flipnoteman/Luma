@@ -216,6 +216,7 @@ fn cost_of_the_hook() {
     if !backend.can_time_launches() {
         return;
     }
+    println!("device: {}", backend.info().name);
     let ew_module = elementwise();
     let (declared, used) = used_bindings(&ew_module);
     let ew_raw = backend.compile_kernel(&ew_module, used.as_deref(), "ew", KernelTrust::Trusted).unwrap();

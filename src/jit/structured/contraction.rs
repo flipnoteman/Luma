@@ -1027,7 +1027,8 @@ fn launch_hooked(ctx: &Context, sides: &[MatmulSide; 2], plan: &Plan, geom: Geom
     }
     let plain = Builtin::Matmul { tile: plan.tile, aligned: plan.aligned, split: plan.split };
     let Some(core) = gemm_hook::kernel(ctx, plain, program)? else { return Ok(None) };
-    if !core.raw.is_ready() {
+    // Still compiling, or it did not (the table keeps the failure: the plain product and the pass stay): not waited for.
+    if !core.raw.is_ready() || core.raw.failed() {
         return Ok(None);
     }
     let mut operands: Vec<Arc<Storage>> = Vec::with_capacity(program.inputs.len());
