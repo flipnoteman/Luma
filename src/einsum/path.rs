@@ -129,7 +129,7 @@ fn subsets(problem: &Problem<'_>, costs: &Costs) -> Option<Path> {
             continue;
         }
         // Splits with the lowest operand in the left half, so each is seen once.
-        let low = set & set.wrapping_neg();
+        let low = set & (!set + 1);
         let mut part = (set - 1) & set;
         while part > 0 {
             if part & low != 0 {
@@ -168,12 +168,15 @@ fn subsets(problem: &Problem<'_>, costs: &Costs) -> Option<Path> {
     Some(path)
 }
 
+type Candidate = ((f64, f64), (usize, usize), u64);
+
 /// The pair with the smallest result, repeatedly (ties: the cheaper pair, then the lowest positions).
 fn greedy(problem: &Problem<'_>, costs: &Costs) -> Option<Path> {
     let mut terms = problem.inputs.to_vec();
     let mut path = Path::new();
     while terms.len() > 1 {
-        let mut best: Option<((f64, f64), (usize, usize), u64)> = None;
+        // The key (result size, cost), the positions and the labels of the best pair so far.
+        let mut best: Option<Candidate> = None;
         for i in 0..terms.len() {
             for j in i + 1..terms.len() {
                 let keep = problem.needed_besides(&terms, &[i, j]);
