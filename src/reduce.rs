@@ -695,6 +695,9 @@ impl<T: ScalarType> Array<T> {
     /// each of them is the value a reduction of its own gives (the same bits).
     pub(crate) fn defer_axis(&self, ops: &[ReduceOp], geom: AxisGeom, shape: Shape, name: &'static str, location: &'static Location<'static>) -> Option<Vec<Array<T>>> {
         let ctx = self.context();
+        // A product the rules of tier 2 may rewrite is left pending whatever its size (the cell and weight floors judge the cost of a
+        // pending reduction, not of one that spares a product).
+        let rules_want = self.is_unforced_product(ctx);
         if ElemTy::of::<T>().ok()? != ElemTy::F32
             || T::reduce_type() != "f32"
             || ctx.tuning().reduce_multi < 2
@@ -703,8 +706,7 @@ impl<T: ScalarType> Array<T> {
             || ctx.is_profiling()
             || self.error().is_some()
             || (ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS)
-            || self.len() < ctx.tuning().axis_defer_cells
-            || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)) && !self.is_unforced_product(ctx))
+            || (!rules_want && (self.len() < ctx.tuning().axis_defer_cells || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)))))
         {
             return None;
         }

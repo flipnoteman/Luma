@@ -19,7 +19,7 @@ const M: usize = 4;
 const N: usize = 3;
 
 fn options() -> ContextOptions {
-    ContextOptions::from_env().calibrate(false)
+    ContextOptions::from_env().calibrate(false).numerics(crate::numerics::Numerics::default())
 }
 
 fn context(mode: LazyMode) -> Context {
