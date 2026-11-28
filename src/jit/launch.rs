@@ -2667,8 +2667,8 @@ pub(crate) fn axis_reduce(
 ) -> Result<bool, Failure> {
     let ctx = emit.ctx();
     let Some(args) = node.operands() else { return Ok(false) };
-    let (fused, args) = flatten_bounded(node, args, Tail::AxisReduce(pass))?;
-    drop(args);
+    // Through `Emit::fused`: the plan cache keeps the program (with the pass's epilogue) of a value it replays.
+    let fused = emit.fused(node.len(), || flatten_bounded(node, args, Tail::AxisReduce(pass)).map(|(fused, _)| fused))?;
     if !fusable(ctx, &fused, outs.len() + reads.len()) {
         return Ok(false);
     }

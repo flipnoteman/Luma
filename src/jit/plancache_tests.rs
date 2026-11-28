@@ -652,6 +652,27 @@ fn a_loop_of_relu_of_a_product_plus_a_bias_hits_from_step_two() {
 }
 
 #[test]
+fn an_axis_reduction_with_an_absorbed_epilogue_hits_and_matches() {
+    // The mean's division and the `tanh` are absorbed into the axis reduction (W3-U4 D1): the key holds the epilogue and what it reads.
+    const M: usize = 64;
+    for ctx in [ctx(), lazy_ctx()] {
+        let step = move |u: &A, t: usize| {
+            let r = ((u.abs() + 0.1).mean_axis(0) * (1.0 + 0.01 * t as f32)).tanh();
+            (u * 0.5 + &r).clamp(-4.0, 4.0)
+        };
+        let start = data(M * M, 97);
+        let (want, _) = run_steps(&ctx, false, 10, &start, [M, M], &step);
+        let before = ctx.jit().plan_stats();
+        let (got, _) = run_steps(&ctx, true, 10, &start, [M, M], &step);
+        assert_eq!(got, want);
+        let after = ctx.jit().plan_stats();
+        if !ctx.can_run_on_host() && !ctx.caps().contains(crate::caps::Caps::HOST_PATH) {
+            assert!(after.hits - before.hits >= 7, "{before:?} -> {after:?}");
+        }
+    }
+}
+
+#[test]
 fn a_step_with_a_reduction_and_a_matmul_and_changing_scalars_matches_the_uncached_path() {
     let ctx = lazy_ctx();
     let w = A::from_slice_on(&ctx, &data(W * W, 51), [W, W]).unwrap();

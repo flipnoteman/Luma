@@ -298,7 +298,7 @@ impl Structured {
         comp.meta.ty.hash(hasher);
         comp.meta.len.hash(hasher);
         match &comp.run {
-            RunState::Reduce { operand, wgsl, buffer, finish, layout, .. } => {
+            RunState::Reduce { operand, wgsl, buffer, finish, layout, epi, .. } => {
                 if let Some(geom) = comp.meta.geom {
                     [geom.n, geom.stride, geom.lines].hash(hasher);
                 }
@@ -308,6 +308,21 @@ impl Structured {
                 finish.epilogue.is_empty().hash(hasher);
                 let mut sources = SmallVec::new();
                 sources.push(Src::Node(Arc::clone(operand)));
+                // The epilogue of an axis reduction (W3-U4 D1): its structure, what it reads (the arrays, as they are read) and its scalars (as classes).
+                epi.is_some().hash(hasher);
+                if let Some(program) = epi {
+                    program.instrs.hash(hasher);
+                    program.outputs.hash(hasher);
+                    for input in &program.inputs {
+                        input.map.hash(hasher);
+                        input.ty.hash(hasher);
+                        sources.push(input.src.clone());
+                    }
+                    for scalar in &program.scalars {
+                        scalar_class(*scalar).hash(hasher);
+                        sources.push(Src::Scalar(*scalar));
+                    }
+                }
                 Some(sources)
             }
             RunState::Contraction(run) => {
@@ -357,9 +372,12 @@ impl Structured {
     /// (the value is being recorded). For the walks that look for the buffers a pending value depends on.
     pub(crate) fn sources(&self) -> Option<SmallVec<[Src; 2]>> {
         match &self.comp().run {
-            RunState::Reduce { operand, .. } => {
+            RunState::Reduce { operand, epi, .. } => {
                 let mut sources = SmallVec::new();
                 sources.push(Src::Node(Arc::clone(operand)));
+                if let Some(program) = epi {
+                    sources.extend(program.inputs.iter().map(|input| input.src.clone()));
+                }
                 Some(sources)
             }
             RunState::Contraction(run) => {
