@@ -185,7 +185,7 @@ mod tests {
             match product(ctx, lhs, rhs, Some(program)) {
                 Output::Epilogued(storages) => return read(ctx, Output::Storage(Arc::clone(&storages[0])), m, n),
                 Output::Storage(_) => {
-                    assert!(start.elapsed() < Duration::from_secs(30), "the hooked kernel never became ready");
+                    assert!(start.elapsed() < Duration::from_secs(30), "the hooked kernel never became ready ({m}x{n})");
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
@@ -200,7 +200,7 @@ mod tests {
     fn a_hooked_relu_with_a_bias_is_the_plain_product_then_the_elementwise_pass_bit_for_bit() {
         let Some(ctx) = context() else { return };
         // Aligned, a ragged edge, and a shape that pads.
-        for shape in [(128, 256, 96), (100, 130, 70), (33, 65, 17)] {
+        for shape in [(96, 160, 64), (128, 256, 96), (100, 130, 70), (33, 65, 17)] {
             let (m, n, _) = shape;
             let [lhs, rhs] = operands(&ctx, shape);
             let bias = Array::from_slice_on(&ctx, &values(n, 3), [n]).unwrap();
