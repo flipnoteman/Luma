@@ -351,11 +351,47 @@ pub(crate) fn run(ctx: &Context, root: &Structured, planned: &Planned) -> Result
                     form.inputs[usize::from(access)].src = Src::Buffer(storage);
                 }
                 debug_assert!(form.validate().is_ok(), "a planned step is well formed: {:?}", form.validate());
-                select::execute(ctx, &Subject::Form(&form, root.location))
+                run_form(ctx, &form, root.location)
             }
         };
         let storage = output.map(crate::jit::structured::strategy::Output::into_storage).map_err(|failure| Arc::new(failure.into_error()))?;
         outputs.push(storage);
     }
     outputs.pop().ok_or_else(|| Arc::new(LumaError::Unsupported("an empty plan".into())))
+}
+
+/// One form of a plan: the strategies lower it without an epilogue that a rewrite moved into it (rule 8), which then runs over the
+/// output as one elementwise pass (the backend-neutral way of W3-U4 §A: the same operations, on the same combined values).
+fn run_form(ctx: &Context, form: &Comprehension, location: &'static std::panic::Location<'static>) -> Result<crate::jit::structured::strategy::Output, crate::array::Failure> {
+    use crate::jit::comprehension::lower::output_dims;
+    use crate::jit::comprehension::Epilogue;
+    use crate::jit::structured::epilogue::EpiMap;
+    use crate::jit::structured::strategy::Output;
+    let Epilogue::Program(program) = &form.epilogue else { return select::execute(ctx, &Subject::Form(form, location)) };
+    if !program.uses_acc() {
+        return select::execute(ctx, &Subject::Form(form, location));
+    }
+    let mut plain = form.clone();
+    plain.epilogue = Epilogue::None;
+    let storage = select::execute(ctx, &Subject::Form(&plain, location))?.into_storage();
+    let dims = output_dims(form);
+    let shape = crate::shape::Shape::from(dims);
+    let arrays: SmallVec<[crate::array::Array<f32>; 3]> = program
+        .inputs
+        .iter()
+        .map(|input| {
+            let own = crate::shape::Shape::from(match input.map {
+                EpiMap::Point => dims,
+                EpiMap::AlongCols => [dims[0], 1, 1, 1],
+                EpiMap::AlongRows => [1, dims[1], 1, 1],
+                EpiMap::Scalar => [1; 4],
+            });
+            match &input.src {
+                Src::Node(node) => crate::array::Array::from_node(ctx, own, Arc::clone(node)),
+                Src::Buffer(storage) => crate::array::Array::from_storage(ctx, own, Arc::clone(storage)),
+                Src::Scalar(_) => unreachable!("an epilogue input is an array"),
+            }
+        })
+        .collect();
+    crate::jit::structured::lazy::apply_separately(ctx, program, &arrays, Src::Buffer(storage), shape, location).map(Output::Storage)
 }

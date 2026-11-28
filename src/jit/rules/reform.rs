@@ -7,8 +7,11 @@
 //! * 9 `chain_order`, `Reassociating`: a chain of products `(a·b)·c` is multiplied in the order the matrix-chain program
 //!   ([`super::chain::best`]) finds cheapest. The rounding differs.
 //!
-//! Rule 8 (`factor_invariant`, a factor that does not depend on the reduce dim moves into the epilogue) needs W3-U4's epilogue
-//! inputs and is not here.
+//! * 8 `factor_invariant`, `Reformulating`: in a sum `Σ_k u·v` where `u` does not depend on the summed dim (`s(i)·Σ_k x(i,k)`), `u`
+//!   leaves the loop: the sum is over `v` and `u` multiplies the result, as the epilogue of the form (its operands are the epilogue's
+//!   inputs, read at the output element, [`EpiMap`]). The sum adds `v` and rounds once where the product of `u` rounded each term, and
+//!   a non-finite `u` meets a zero sum where it met the terms (the class). Over the `(+,·)` combiner only: the tropical `(max,+)` case
+//!   of 07 (exact: `fl(s + x)` is monotone in `x`) has no form that reaches this engine yet.
 //!
 //! Both need a producer that is an API product with the maps `contract` makes ([`super::index::api_product`]) read by one consumer,
 //! and both replace the root form and add forms whose operands are the outputs of earlier steps of the plan (feeds).
@@ -26,15 +29,21 @@ use crate::builtin::{ReduceOp, UnOp};
 use crate::context::Context;
 use crate::array::Storage;
 use crate::jit::comprehension::build::Bodies;
-use crate::jit::comprehension::{AffineMap, Combiner, CombineOp, CombinePart, Comprehension, Dim, Epilogue, MapRef, OpTag, Origin, OutMap, Props, Access};
+use crate::jit::comprehension::inline::{Budget, inline_sources};
+use crate::jit::program::{Instr, Ref};
+use crate::jit::structured::epilogue::{EpiInput, EpiMap, EpiProgram};
+use crate::jit::{BinOp, Op};
+use crate::jit::comprehension::{AffineMap, Combiner, CombineOp, CombinePart, Compensation, Comprehension, Dim, DimKind, Epilogue, MapRef, OpTag, Origin, OutMap, Props, Access};
+use crate::jit::comprehension::lower;
 use crate::jit::structured::contraction::{ContractionAttrs, Geometry, Tf32Request};
 use crate::jit::{Edge, ElemTy, OpKind, Src};
 use crate::numerics::Numerics;
 
-/// The rules of tier 2 of W3-R4R5 (rule 8 waits for W3-U4's epilogue inputs).
-pub(crate) static REFORM_RULES: [T2Rule; 2] = [
+/// The rules of tier 2 of W3-R4R5 (rule 4, `shared_operand`, is made by the partner search of W3-U4, not by the normaliser).
+pub(crate) static REFORM_RULES: [T2Rule; 3] = [
     T2Rule { info: &RULES[Rid::ChainOrder as usize], sites: SiteKind::Comp, single: false, apply: chain_order },
     T2Rule { info: &RULES[Rid::SumOfProduct as usize], sites: SiteKind::Comp, single: false, apply: sum_of_product },
+    T2Rule { info: &RULES[Rid::FactorInvariant as usize], sites: SiteKind::Comp, single: true, apply: factor_invariant },
 ];
 
 // -- shared pieces --
@@ -311,4 +320,276 @@ fn chain_order(scope: &Scope, site: Site, _: &Numerics) -> Option<Rewrite> {
     let mut builder = Builder { ctx: &ctx, leaves: &leaves, attrs: ContractionAttrs { tf32: attrs, half: false }, next: scope.next_id().0, add: SmallVec::new(), feeds: SmallVec::new() };
     let (_, form) = builder.build(&order, Some(root_id))?;
     Some(Rewrite { replace: smallvec![(root_id, form?)], add: builder.add, drop: producers.into_iter().collect(), feeds: builder.feeds })
+}
+
+// -- rule 8 --
+
+/// The accesses of `form` that read a pending view through a shape that differs from the view's output only by axes of extent 1 (the
+/// shapes the forms of reductions address: `[1, n, m]` for the `[n, m]` array of a sum along axis 0) are made to address the view's
+/// output, so that look-through can compose the view into the map.
+fn align_views(form: &Comprehension) -> Comprehension {
+    let mut aligned = form.clone();
+    for access in &mut aligned.inputs {
+        let Src::Node(node) = &access.src else { continue };
+        let OpKind::Shift(crate::jit::ShiftKind::View { map: view, .. }) = node.op().kind else { continue };
+        if !node.is_pending_view() || access.shape == view.out || access.edge != Edge::None || access.indirect.is_some() {
+            continue;
+        }
+        let (mine, wanted) = (access.shape.iter().enumerate().filter(|&(_, &e)| e > 1), view.out.iter().enumerate().filter(|&(_, &e)| e > 1));
+        let (mine, wanted): (Vec<_>, Vec<_>) = (mine.collect(), wanted.collect());
+        let unit_only = |a: usize| access.shape[a] != 1 || (access.map.rows[a].offset == 0 && access.map.rows[a].coeff.iter().enumerate().all(|(d, &c)| c == 0 || form.space.get(d).is_some_and(|dim| dim.extent == 1)));
+        if mine.len() != wanted.len() || mine.iter().zip(&wanted).any(|(a, b)| a.1 != b.1) || !(0..4).all(unit_only) {
+            continue;
+        }
+        let mut map = AffineMap::ZERO;
+        for (&(from, _), &(to, _)) in mine.iter().zip(&wanted) {
+            map.rows[to] = access.map.rows[from];
+        }
+        access.map = MapRef::owned(map);
+        access.shape = view.out;
+    }
+    aligned
+}
+
+/// The dims an instruction's value depends on, as a bit set: the dims the maps of the accesses it reads use.
+fn dependences(form: &Comprehension) -> Option<Vec<u8>> {
+    let mut input = Vec::with_capacity(form.inputs.len());
+    for access in &form.inputs {
+        if access.indirect.is_some() {
+            return None;
+        }
+        let mut mask = 0u8;
+        for row in &access.map.rows {
+            for (d, &c) in row.coeff.iter().enumerate() {
+                if c != 0 {
+                    mask |= 1 << d;
+                }
+            }
+        }
+        input.push(mask);
+    }
+    let mut deps: Vec<u8> = Vec::with_capacity(form.body.instrs.len());
+    for instr in form.body.instrs.iter() {
+        let mut mask = 0u8;
+        for arg in instr.args {
+            match arg {
+                Ref::Input(j) => mask |= *input.get(j as usize)?,
+                Ref::Tmp(t) => mask |= *deps.get(t as usize)?,
+                Ref::Scalar(_) | Ref::Unused => {}
+                Ref::Sub(_) | Ref::Acc => return None,
+            }
+        }
+        deps.push(mask);
+    }
+    Some(deps)
+}
+
+/// The instructions `root` needs, in program order.
+fn needed(instrs: &[Instr], root: Ref) -> Vec<usize> {
+    let mut keep = vec![false; instrs.len()];
+    let mut stack = vec![root];
+    while let Some(arg) = stack.pop() {
+        if let Ref::Tmp(at) = arg
+            && !std::mem::replace(&mut keep[at as usize], true)
+        {
+            stack.extend(instrs[at as usize].args);
+        }
+    }
+    keep.iter().enumerate().filter(|&(_, &keep)| keep).map(|(at, _)| at).collect()
+}
+
+/// How access `access` of `form` is read at an output element, if it is a function of the output element alone: the epilogue's map.
+fn epilogue_map(form: &Comprehension, access: &Access) -> Option<EpiMap> {
+    if access.edge != Edge::None || access.indirect.is_some() || access.fill.is_some() || access.ty != ElemTy::F32 {
+        return None;
+    }
+    let out = lower::output_dims(form);
+    let follows = |keep: [bool; 4]| {
+        (0..4).all(|axis| {
+            let row = &access.map.rows[axis];
+            let want = match form.output.dim_of_axis[axis] {
+                Some(d) if keep[axis] => Some(usize::from(d)),
+                _ => None,
+            };
+            // A dim of extent 1 is always at 0: its coefficient says nothing.
+            row.offset == 0 && row.coeff.iter().enumerate().all(|(d, &c)| c == i32::from(want == Some(d)) || form.space.get(d).is_none_or(|dim| dim.extent == 1))
+        })
+    };
+    let shape = |dims: [usize; 4]| access.shape.iter().map(|&e| e as usize).eq(dims);
+    if shape([1; 4]) && follows([false; 4]) {
+        Some(EpiMap::Scalar)
+    } else if shape(out) && follows([true; 4]) {
+        Some(EpiMap::Point)
+    } else if shape([out[0], 1, 1, 1]) && follows([true, false, false, false]) {
+        Some(EpiMap::AlongCols)
+    } else if shape([1, out[1], 1, 1]) && follows([false, true, false, false]) {
+        Some(EpiMap::AlongRows)
+    } else {
+        None
+    }
+}
+
+/// `Σ_k u·v` with `u` free of the summed dim: the sum of `v`, then `u` times it as the epilogue.
+fn factor_invariant(scope: &Scope, site: Site, _: &Numerics) -> Option<Rewrite> {
+    let Site::Comp(root_id) = site else { return None };
+    let root = scope.comp(root_id).filter(|comp| comp.role == ScopeRole::Root)?;
+    let original = &root.form;
+    let reduce_ok = matches!(&original.origin, Origin::Api(OpTag::Reduce(ops) | OpTag::ReduceAxis(ops)) if ops.as_slice() == [ReduceOp::Sum]);
+    if !reduce_ok || original.ty != ElemTy::F32 || !matches!(original.epilogue, Epilogue::None) || original.space.iter().any(|dim| matches!(dim.kind, DimKind::Segmented { .. })) {
+        return None;
+    }
+    let combiner = original.combiner.as_ref()?;
+    if !matches!(combiner.op, CombineOp::Single(CombinePart::Add)) || combiner.compensation != Compensation::None {
+        return None;
+    }
+    // The expression the reduction reads is taken apart, the views in it made to address their own shapes, and what they read taken apart.
+    let mut budget = Budget::default();
+    let mut base = original.clone();
+    rewritten(&mut base, Rid::FactorInvariant);
+    let form = inline_sources(&align_views(&inline_sources(&base, &mut budget)?), &mut budget)?;
+    let deps = dependences(&form)?;
+    let reduce: u8 = form.space.iter().enumerate().filter(|(_, dim)| dim.is_reduce()).fold(0, |mask, (d, _)| mask | 1 << d);
+    let [mut out] = form.body.outs[..] else { return None };
+    // The identities a builder leaves around the value are looked through.
+    while let Some(Instr { op, args: [Ref::Tmp(inner), ..] }) = form.body.instrs.get(out as usize)
+        && op.kind == OpKind::Unary(crate::builtin::UnOp::Id)
+    {
+        out = *inner;
+    }
+    let instr = form.body.instrs.get(out as usize)?;
+    if instr.op.kind != OpKind::Binary(BinOp::Mul) || instr.op.ty != ElemTy::F32 {
+        return None;
+    }
+    let depends = |arg: Ref| match arg {
+        Ref::Input(j) => dependences_of_input(&form, j),
+        Ref::Tmp(t) => deps.get(t as usize).copied(),
+        Ref::Scalar(_) => Some(0),
+        _ => None,
+    };
+    let [first, second, _] = instr.args;
+    let (u, v) = match (depends(first)?, depends(second)?) {
+        (a, b) if a & reduce == 0 && b & reduce != 0 => (first, second),
+        (a, b) if b & reduce == 0 && a & reduce != 0 => (second, first),
+        _ => return None,
+    };
+    // What the factor reads goes to the epilogue as inputs (each a function of the output element); what the sum reads stays.
+    let (u_instrs, v_instrs) = (u_needed(&form, u), u_needed(&form, v));
+    let mut inputs: smallvec::SmallVec<[EpiInput; 3]> = smallvec![];
+    let mut epi_of: Vec<Option<u32>> = vec![None; form.inputs.len()];
+    let mut scalars: smallvec::SmallVec<[crate::jit::Scalar; 2]> = smallvec![];
+    let mut scalar_of: Vec<Option<u32>> = vec![None; form.body.scalars.len()];
+    let mut tmp_of: Vec<u32> = vec![0; form.body.instrs.len()];
+    let mut program: Vec<Instr> = Vec::new();
+    let mut remap = |arg: Ref, program_len: usize, tmp_of: &[u32]| -> Option<Ref> {
+        let _ = program_len;
+        Some(match arg {
+            Ref::Input(j) => {
+                let slot = &mut epi_of[j as usize];
+                let at = match *slot {
+                    Some(at) => at,
+                    None => {
+                        let access = &form.inputs[j as usize];
+                        let map = epilogue_map(&form, access)?;
+                        inputs.push(EpiInput { src: access.src.clone(), map, ty: ElemTy::F32 });
+                        *slot = Some(inputs.len() as u32 - 1);
+                        inputs.len() as u32 - 1
+                    }
+                };
+                Ref::Input(at)
+            }
+            Ref::Scalar(k) => {
+                let slot = &mut scalar_of[k as usize];
+                let at = *slot.get_or_insert_with(|| {
+                    scalars.push(form.body.scalars[k as usize]);
+                    scalars.len() as u32 - 1
+                });
+                Ref::Scalar(at)
+            }
+            Ref::Tmp(t) => Ref::Tmp(tmp_of[t as usize]),
+            other => other,
+        })
+    };
+    for &at in &u_instrs {
+        let mut args = [Ref::Unused; 3];
+        for (slot, arg) in args.iter_mut().zip(form.body.instrs[at].args) {
+            *slot = remap(arg, program.len(), &tmp_of)?;
+        }
+        tmp_of[at] = program.len() as u32;
+        program.push(Instr { op: form.body.instrs[at].op, args });
+    }
+    let u_ref = remap(u, program.len(), &tmp_of)?;
+    program.push(Instr { op: instr.op, args: [u_ref, Ref::Acc, Ref::Unused] });
+    let epilogue = EpiProgram { instrs: Arc::new(program.clone()), inputs, scalars, outputs: smallvec![program.len() as u32 - 1] };
+    epilogue.validate(1).ok()?;
+    // The sum keeps `v` over the accesses it reads.
+    let mut kept: Vec<Access> = Vec::new();
+    let mut input_of: Vec<Option<u32>> = vec![None; form.inputs.len()];
+    let mut body_scalars: smallvec::SmallVec<[crate::jit::Scalar; 2]> = smallvec![];
+    let mut body_scalar_of: Vec<Option<u32>> = vec![None; form.body.scalars.len()];
+    let mut v_tmp: Vec<u32> = vec![0; form.body.instrs.len()];
+    let mut body: Vec<Instr> = Vec::new();
+    let mut take = |arg: Ref, v_tmp: &[u32]| -> Ref {
+        match arg {
+            Ref::Input(j) => {
+                let at = *input_of[j as usize].get_or_insert_with(|| {
+                    kept.push(form.inputs[j as usize].clone());
+                    kept.len() as u32 - 1
+                });
+                Ref::Input(at)
+            }
+            Ref::Scalar(k) => {
+                let at = *body_scalar_of[k as usize].get_or_insert_with(|| {
+                    body_scalars.push(form.body.scalars[k as usize]);
+                    body_scalars.len() as u32 - 1
+                });
+                Ref::Scalar(at)
+            }
+            Ref::Tmp(t) => Ref::Tmp(v_tmp[t as usize]),
+            other => other,
+        }
+    };
+    for &at in &v_instrs {
+        let mut args = [Ref::Unused; 3];
+        for (slot, arg) in args.iter_mut().zip(form.body.instrs[at].args) {
+            *slot = take(arg, &v_tmp);
+        }
+        v_tmp[at] = body.len() as u32;
+        body.push(Instr { op: form.body.instrs[at].op, args });
+    }
+    let last = match v {
+        Ref::Tmp(t) => v_tmp[t as usize],
+        // The sum is over an access as it is: the identity instruction reads it.
+        other => {
+            let arg = take(other, &v_tmp);
+            body.push(Instr { op: Op::new(OpKind::Unary(crate::builtin::UnOp::Id), ElemTy::F32), args: [arg, Ref::Unused, Ref::Unused] });
+            body.len() as u32 - 1
+        }
+    };
+    let mut next = form.clone();
+    next.inputs = kept.into_iter().collect();
+    next.body = crate::jit::comprehension::Body { instrs: Arc::new(body), scalars: body_scalars, outs: smallvec![last] };
+    next.epilogue = Epilogue::Program(Arc::new(epilogue));
+    next.origin = Origin::Rewritten(RULES[Rid::FactorInvariant as usize].id);
+    Some(Rewrite { replace: smallvec![(root_id, next)], ..Rewrite::default() })
+}
+
+fn dependences_of_input(form: &Comprehension, j: u32) -> Option<u8> {
+    let access = form.inputs.get(j as usize)?;
+    let mut mask = 0u8;
+    for row in &access.map.rows {
+        for (d, &c) in row.coeff.iter().enumerate() {
+            if c != 0 {
+                mask |= 1 << d;
+            }
+        }
+    }
+    Some(mask)
+}
+
+/// The instructions the argument `root` needs (none for an access or a scalar).
+fn u_needed(form: &Comprehension, root: Ref) -> Vec<usize> {
+    match root {
+        Ref::Tmp(_) => needed(&form.body.instrs, root),
+        _ => Vec::new(),
+    }
 }

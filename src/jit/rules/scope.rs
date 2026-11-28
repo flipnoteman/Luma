@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 use super::t2::Rewrite;
 use crate::context::Context;
 use crate::jit::comprehension::lower::{lowers, output_dims};
-use crate::jit::comprehension::{Comprehension, DimKind, Origin};
+use crate::jit::comprehension::{Comprehension, DimKind, Epilogue, Origin};
 use crate::jit::structured::Structured;
 use crate::jit::{Node, Scalar, Src};
 
@@ -281,7 +281,7 @@ impl Scope {
             if form.validate().is_err() {
                 return Err("invalid");
             }
-            if !lowers(form) {
+            if !lowers(&plain(form)) {
                 return Err("not lowerable");
             }
         }
@@ -318,7 +318,20 @@ impl Scope {
     /// Debug assertion: a rewrite reads no source the scope did not read, except through a feed.
     #[cfg(debug_assertions)]
     fn check_rewrite(&self, rewrite: &Rewrite) {
-        let known = |src: &Src| self.comps.iter().any(|comp| sources(&comp.form).any(|have| same_src(have, src)));
+        // An expression the scope read is looked through: what it reads is read by a form that took its operation into the body.
+        let mut had: Vec<Src> = self.comps.iter().flat_map(|comp| sources(&comp.form).cloned()).collect();
+        let mut at = 0;
+        while at < had.len() && had.len() < 256 {
+            if let Src::Node(node) = &had[at]
+                && node.is_pending()
+                && node.deferred_value().is_none()
+                && let Some(operands) = node.operands()
+            {
+                had.extend(operands.into_iter().filter(|src| !matches!(src, Src::Scalar(_))));
+            }
+            at += 1;
+        }
+        let known = |src: &Src| had.iter().any(|have| same_src(have, src));
         for (id, form) in &rewrite.replace {
             for src in sources(form) {
                 let fed = rewrite.feeds.iter().any(|feed| feed.consumer == *id);
@@ -350,6 +363,19 @@ impl Scope {
         }
         self.elementwise.hash(&mut h);
         h.finish()
+    }
+}
+
+/// The form without the epilogue a rewrite moved into it (a program over `Ref::Acc`): what the strategies lower, the epilogue then runs
+/// over its output as a separate pass ([`super::t2::run`]).
+pub(super) fn plain(form: &Comprehension) -> std::borrow::Cow<'_, Comprehension> {
+    match &form.epilogue {
+        Epilogue::Program(program) if program.uses_acc() => {
+            let mut plain = form.clone();
+            plain.epilogue = Epilogue::None;
+            std::borrow::Cow::Owned(plain)
+        }
+        _ => std::borrow::Cow::Borrowed(form),
     }
 }
 

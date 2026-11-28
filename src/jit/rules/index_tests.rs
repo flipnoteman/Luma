@@ -401,3 +401,30 @@ fn the_scale_pre_filter_is_only_asked_when_the_numerics_reassociate() {
         assert_eq!(needs_t1(&ctx, &a, &(&b * 3.0)), wants, "{numerics}: a scaled operand");
     }
 }
+
+#[test]
+fn a_factor_that_does_not_depend_on_the_summed_index_leaves_the_sum_under_reformulate() {
+    if Algebra::current() < Algebra::On {
+        return; // LUMA_ALGEBRA below `on`: no rule of the engine runs
+    }
+    // `out(i) = Σ_j s(i)·x(j, i)` with `s` an expensive function of a vector: s is read once per output after the rule.
+    let (cols, rows) = (1024, 2048);
+    let (hx, hv) = (finite(cols * rows, 3), finite(rows, 4));
+    let want: Vec<f64> = (0..rows).map(|i| { let s = f64::from(hv[i]).exp().sqrt().sin(); (0..cols).map(|j| f64::from(hx[j + cols * i]) * s).sum() }).collect();
+    for (numerics, rewritten) in [(Numerics::algebraic(), true), (Numerics::default(), false), (Numerics { reformulate: true, ..Numerics::strict() }, true), (Numerics { reassociate: true, ..Numerics::strict() }, false)] {
+        let ctx = open(LazyMode::Never, numerics);
+        let x = A::from_slice_on(&ctx, &hx, [cols, rows]).unwrap();
+        let v = A::from_slice_on(&ctx, &hv, [1, rows]).unwrap();
+        ctx.record_decisions(true);
+        let s = v.exp().sqrt().sin();
+        let got = (&x * &s).sum_axis(0);
+        assert_eq!(got.shape().dims(), [1, rows, 1, 1]);
+        close(&got.to_vec().unwrap(), &want, 1e-4);
+        let (_, fired) = rows_of(&ctx);
+        assert_eq!(fired.iter().any(|rule| rule == "factor_invariant"), rewritten, "{numerics}: {fired:?}");
+    }
+}
+
+fn rows_of(ctx: &Context) -> (Vec<DecisionSite>, Vec<String>) {
+    rows(ctx)
+}
