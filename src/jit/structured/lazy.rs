@@ -132,14 +132,13 @@ fn launch_product(lhs: &Array<f32>, rhs: &Array<f32>, attrs: ContractionAttrs, s
     // The default mode never reads the site: the eager path is what it was before sites existed (unless the numerics want the
     // product unforced for the rules of tier 2).
     if tuning.lazy != LazyMode::Never || super::sites::wants_unforced(ctx.numerics_ref()) {
-        let view = ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
-        match view.check() {
-            Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
-            Ok(geom) => {
-                let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
-                if laziness == Laziness::Lazy {
-                    return lazy_product(ctx, &view, geom, slot, shape);
-                }
+        // An eager call is `contraction::run`, which checks the operands itself: only a lazy one checks them here.
+        let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
+        if laziness == Laziness::Lazy {
+            let view = ContractionView { lhs, rhs, attrs, location, epilogue: None, partners: &[] };
+            match view.check() {
+                Err(failure) => return Array::resolve(ctx, shape, Err(failure), "matmul", location),
+                Ok(geom) => return lazy_product(ctx, &view, geom, slot, shape),
             }
         }
     }
@@ -165,11 +164,11 @@ pub(crate) fn batched(lhs: &Array<f32>, rhs: &Array<f32>, g: &bmm::Geometry, sha
     if tuning.lazy == LazyMode::Never && !super::sites::wants_unforced(ctx.numerics_ref()) {
         return None;
     }
-    let Ok(Some(launch)) = bmm::plan(lhs, rhs, g) else { return None };
     let (laziness, slot) = ctx.jit().sites.decide(location, tuning, ctx.recording_here(), ctx.numerics_ref());
     if laziness == Laziness::Eager {
         return None;
     }
+    let Ok(Some(launch)) = bmm::plan(lhs, rhs, g) else { return None };
     let fail = |failure: Failure| Some(Array::resolve(ctx, shape, Err(failure), "matmul_batched", location));
     // The errors `run` gives before it launches, in its order: an operand's own, a context mismatch, an array of several buffers.
     for array in [lhs, rhs] {
