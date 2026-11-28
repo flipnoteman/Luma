@@ -844,7 +844,6 @@ fn execute_half(ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>
     }
     Some(execute_ranked(entries, ctx, subject, forced, &Residencies::DEVICE))
 }
-}
 
 /// [`plain_without_tiles`] of every family's table, worked out once.
 static PLAIN_WITHOUT_TILES: [bool; FAMILY_COUNT] = [false, false, false, false, false, false, false, plain_without_tiles(&super::contraction::CONTRACTION_STRATEGIES), false, false, false, false, false, false, false, false];
