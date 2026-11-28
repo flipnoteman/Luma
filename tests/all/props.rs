@@ -662,7 +662,7 @@ fn gram_data(len: usize, salt: usize) -> Vec<f32> {
 #[test]
 fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products() {
     let ctx = ctx_with(Numerics::strict());
-    for (rows, cols) in [(40usize, 33usize), (300, 128), (700, 257), (200, 1000), (64, 96)] {
+    for (rows, cols) in [(40usize, 33usize), (300, 128), (700, 257), (200, 1000), (64, 96), (260, 1400), (256, 1536)] {
         let data = gram_data(rows * cols, cols);
         let x = on(&ctx, &data, [cols, rows]);
         let copy = on(&ctx, &data, [cols, rows]);
@@ -691,16 +691,18 @@ fn a_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products()
 #[test]
 fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
     let ctx = ctx_with(Numerics::strict());
-    let data = gram_data(1024 * 1024, 3);
-    let x = on(&ctx, &data, [1024, 1024]);
-    let other = on(&ctx, &data, [1024, 1024]);
+    // The shader kernels' half-work product starts at 64 tiles of 128 x 128 (see `TILED_HALF_MIN_TILES`).
+    let n = if matches!(ctx.backend(), luma::BackendKind::Cpu | luma::BackendKind::Cuda) { 1024 } else { 2048 };
+    let data = gram_data(n * n, 3);
+    let x = on(&ctx, &data, [n, n]);
+    let other = on(&ctx, &data, [n, n]);
     ctx.record_decisions(true);
     x.matmul_tn(&x).to_vec().unwrap();
     let gram = ctx.take_decisions();
     x.matmul_tn(&other).to_vec().unwrap();
     let plain = ctx.take_decisions();
     let syrk = |decisions: &[luma::Decision]| decisions.iter().any(|d| d.chosen.contains("syrk"));
-    if matches!(ctx.backend(), luma::BackendKind::Cpu | luma::BackendKind::Cuda) {
+    if !matches!(ctx.backend(), luma::BackendKind::Metal) {
         assert!(syrk(&gram), "{gram:?}");
     }
     assert!(!syrk(&plain), "{plain:?}");

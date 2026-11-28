@@ -68,6 +68,10 @@ pub(crate) enum MatmulTile {
     /// [`MatmulTile::GemmRagged`] for a half-work product, `rows == cols` (see [`MatmulTile::NativeHalf`]), copying the operands
     /// with `lanes` (any of them, `Vec4` included).
     GemmHalf { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool, exact: bool, lanes: GemmLanes },
+    /// [`MatmulTile::T128`] for a half-work product of a matrix with itself (see `SyrkTiled`), `M == N`: the workgroups are the lower
+    /// triangle of tiles (grid `[T (T + 1) / 2, 1, 1]`, folded over the grid as the full tiles are), each off-diagonal tile stored
+    /// with its transpose.
+    T128Half,
     /// A small output (see [`skinny_tile`]): each invocation of a workgroup of `width` computes
     /// `rows` x `cols` outputs straight from global memory, and the `groups` invocations that own
     /// the same outputs take the `k` in turn. With `along_k` neighbouring invocations take
@@ -79,7 +83,7 @@ impl MatmulTile {
     /// The rows and columns of the tile.
     pub(crate) fn edges(self) -> (u32, u32) {
         match self {
-            MatmulTile::T128 => (128, 128),
+            MatmulTile::T128 | MatmulTile::T128Half => (128, 128),
             MatmulTile::T128x32 => (128, 32),
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
@@ -422,7 +426,8 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
     };
     debug_assert!(form.is_default() || matches!(tile, MatmulTile::T32), "a generic contraction runs on the T32 tile");
     match tile {
-        MatmulTile::T128 => t128(aligned, split, &loads),
+        MatmulTile::T128 => t128(aligned, split, &loads, false),
+        MatmulTile::T128Half => t128(aligned, split, &loads, true),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
         MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::NativeHalf { .. } | MatmulTile::Gemm { .. } | MatmulTile::GemmRagged { .. } | MatmulTile::GemmHalf { .. } => t32(aligned, split, &loads, form),
@@ -471,6 +476,25 @@ struct Range {
     k_begin: &'static str,
     k_end: &'static str,
     out: &'static str,
+}
+
+/// The statements numbering the tile of a half-work kernel of tiles of `edge`: workgroup `w` of the lower triangle of tiles is
+/// `(ty, tx)`, `tx <= ty` (the float root is corrected in integers, see `luma_core::triangle_tile`); the groups past the triangle exit.
+fn half_tile(edge: u32) -> String {
+    format!(
+        "    let side = (p.m + {edge_1}u) / {edge}u;
+    let w = wid.x + wid.y * nwg.x;
+    if (w >= side * (side + 1u) / 2u) {{ return; }}
+    var ty = u32((sqrt(8.0 * f32(w) + 1.0) - 1.0) * 0.5);
+    if (ty * (ty + 1u) / 2u > w) {{ ty = ty - 1u; }}
+    if ((ty + 1u) * (ty + 2u) / 2u <= w) {{ ty = ty + 1u; }}
+    let tx = w - ty * (ty + 1u) / 2u;
+    let row0 = ty * {edge}u;
+    let col0 = tx * {edge}u;
+",
+        edge = edge,
+        edge_1 = edge - 1
+    )
 }
 
 fn range(aligned: bool, split: bool) -> Range {
@@ -527,7 +551,7 @@ fn t128_load(left: bool, aligned: bool, lanes: Lanes, load: &dyn Fn(&str) -> Str
     format!("fn {name}({base}: u32, k0: u32, e: u32{args}) -> vec4<f32> {{\n{body}\n}}")
 }
 
-fn t128(aligned: bool, split: bool, loads: &Loads) -> String {
+fn t128(aligned: bool, split: bool, loads: &Loads, half: bool) -> String {
     const LANES: [&str; 4] = ["x", "y", "z", "w"];
     let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
     let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
@@ -553,12 +577,21 @@ fn t128(aligned: bool, split: bool, loads: &Loads) -> String {
                     .collect();
                 format!("if (r < p.m) {{\n            let i = {out}r * p.n + col;\n            {}\n        }}", lanes.join("\n            "))
             };
+            // A half-work kernel stores an off-diagonal tile's transpose too.
+            let mirror = if !half {
+                String::new()
+            } else if aligned {
+                "\n        if (row0 != col0) {\n            c[col * p.n + r] = v.x; c[(col + 1u) * p.n + r] = v.y; c[(col + 2u) * p.n + r] = v.z; c[(col + 3u) * p.n + r] = v.w;\n        }".to_owned()
+            } else {
+                let lanes: Vec<String> = (0..4).map(|j| format!("if (col + {j}u < p.n) {{ c[(col + {j}u) * p.n + r] = v.{}; }}", LANES[j])).collect();
+                format!("\n        if (row0 != col0 && r < p.m) {{\n            {}\n        }}", lanes.join("\n            "))
+            };
             store += &format!(
                 "{{
         let r = row0 + {row} + lid.y * 4u;
         let col = col0 + {col} + lid.x * 4u;
         let v = c{};
-        {writes}
+        {writes}{mirror}
     }}\n    ",
                 i * 2 + h
             );
@@ -585,6 +618,17 @@ fn t128(aligned: bool, split: bool, loads: &Loads) -> String {
         update += "}\n            ";
     }
     let stage = loads.stage(end);
+    let numbering = if half {
+        half_tile(128)
+    } else {
+        "    let columns = (p.n + 127u) / 128u;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= columns * ((p.m + 127u) / 128u)) { return; }
+    let row0 = (tile / columns) * 128u;
+    let col0 = (tile % columns) * 128u;
+"
+        .to_owned()
+    };
     format!(
         "var<workgroup> at: array<vec4<f32>, 512>;
 var<workgroup> bt: array<vec4<f32>, 512>;
@@ -597,12 +641,7 @@ fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     // The output tiles are numbered along the folded grid (see `plan`).
-    let columns = (p.n + 127u) / 128u;
-    let tile = wid.x + wid.y * nwg.x;
-    if (tile >= columns * ((p.m + 127u) / 128u)) {{ return; }}
-    let row0 = (tile / columns) * 128u;
-    let col0 = (tile % columns) * 128u;
-    let t = lid.y * 16u + lid.x;
+{numbering}    let t = lid.y * 16u + lid.x;
 {declare}    {decl}
     for (var k0 = {k_begin}; k0 < {k_end}; k0 = k0 + 16u) {{
         {stage}

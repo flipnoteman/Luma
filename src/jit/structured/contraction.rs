@@ -612,8 +612,9 @@ fn padded_copy(array: &Array<f32>) -> Array<f32> {
 // -- half-work products --
 
 /// The strategies whose tiles a half-work product runs, in the order their `fits` are asked: the backend's own `f32` kernels, then
-/// the CPU's native product, then the tensor-core kernels (`tf32`: only those).
-const SYRK_BASES: [StrategyId; 7] = [
+/// the CPU's native product, then the tensor-core kernels (`tf32`: only those), then the shader kernels of the product that no
+/// other base takes.
+const SYRK_BASES: [StrategyId; 8] = [
     StrategyId::GEMM_F32,
     StrategyId::GEMM_F32_RAGGED,
     StrategyId::GEMM_F32_PADDED,
@@ -621,6 +622,7 @@ const SYRK_BASES: [StrategyId; 7] = [
     StrategyId::GEMM_TF32,
     StrategyId::GEMM_TF32_RAGGED,
     StrategyId::GEMM_TF32_PADDED,
+    StrategyId::CONTRACTION_TILED,
 ];
 
 /// The strategy whose tiles a half-work product runs: the first of [`SYRK_BASES`] that takes the product, for a Gram product
@@ -634,8 +636,13 @@ fn syrk_base(view: &ContractionView<'_>, ctx: &Context, tf32: bool) -> Option<St
         return None;
     }
     let subject = Subject::Contraction(view);
-    SYRK_BASES.into_iter().filter(|&by| (by == StrategyId::CONTRACTION_NATIVE_CPU || is_exact(by)) != tf32).find(|&by| {
+    SYRK_BASES.into_iter().filter(|&by| (by == StrategyId::CONTRACTION_NATIVE_CPU || by == StrategyId::CONTRACTION_TILED || is_exact(by)) != tf32).find(|&by| {
         let fits = match by {
+            // The shader kernels: the product the plain one runs on them (not a skinny one, not one the tensor cores take).
+            StrategyId::CONTRACTION_TILED => {
+                let skinny = skinny_plan(geom.m, geom.n, geom.k, along_k(view.lhs, geom), ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
+                return skinny.is_none() && syrk_base(view, ctx, true).is_none() && fits_tiled(&subject, ctx, &Residencies::DEVICE).is_some();
+            }
             StrategyId::GEMM_F32 => fits_gemm_f32(&subject, ctx, &Residencies::DEVICE),
             StrategyId::GEMM_F32_RAGGED => fits_gemm_f32_ragged(&subject, ctx, &Residencies::DEVICE),
             StrategyId::GEMM_F32_PADDED => fits_gemm_f32_padded(&subject, ctx, &Residencies::DEVICE),
@@ -656,6 +663,8 @@ fn syrk_plan(view: &ContractionView<'_>, ctx: &Context, geom: Geometry, transpos
     let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());
     let plan = if base == StrategyId::CONTRACTION_NATIVE_CPU {
         native_plan(m, n, k, ctx.tuning().native_gemm, transposed, groups, bytes)
+    } else if base == StrategyId::CONTRACTION_TILED {
+        return tiled_half_plan(ctx.tuning(), m, k, groups);
     } else {
         let squares: Vec<(u32, u32)> = ctx.hal().gemm_tiles(!tf32).iter().copied().filter(|&(rows, cols)| rows == cols).collect();
         let lanes = match base {
@@ -687,6 +696,25 @@ fn syrk_plan(view: &ContractionView<'_>, ctx: &Context, geom: Geometry, transpos
     Some(Ok(Plan { tile, aligned: false, split: false, slices: 1, kc: k, groups: [count as u32, 1, 1] }))
 }
 
+/// Half tiles (the lower triangle of 128 x 128 tiles) below which the shader kernels' half-work product is not used: the full
+/// product's tiles split a long K over the multiprocessors, which the mirrored triangle cannot, and a few big workgroups do not fill
+/// them. Like [`SPLIT_TILES`] a count for the 82 multiprocessors of an RTX 3090, raised for bigger devices.
+const TILED_HALF_MIN_TILES: u32 = 64;
+
+/// The plan of a half-work product on the shader kernels: [`MatmulTile::T128Half`] with `M == N` of at least
+/// [`TILED_HALF_MIN_TILES`] half tiles, `None` for a smaller one (or one whose grid is too large).
+fn tiled_half_plan(tuning: &Tuning, m: u32, k: u32, max_groups: u32) -> Option<Result<Plan, LumaError>> {
+    let side = m.div_ceil(128);
+    let count = u64::from(side) * (u64::from(side) + 1) / 2;
+    if m < 128 || count < u64::from(tuning.scaled_up(TILED_HALF_MIN_TILES)) {
+        return None;
+    }
+    let aligned = m.is_multiple_of(128) && k.is_multiple_of(SLICE);
+    // The tiles are numbered along the folded grid, as the full ones are.
+    let [x, y, _] = if count <= u64::from(max_groups) { [count as u32, 1, 1] } else { fold_grid(u32::try_from(count).ok()?, max_groups) };
+    Some(Ok(Plan { tile: MatmulTile::T128Half, aligned, split: false, slices: 1, kc: k, groups: [x, y, 1] }))
+}
+
 /// A Gram product on the tiles of the strategy it would otherwise run on, the lower triangle of tiles only.
 fn fits_syrk(subject: &Subject<'_>, ctx: &Context, _: &Residencies) -> Option<Params> {
     let view = view(subject)?;
@@ -710,6 +738,11 @@ fn lower_syrk(subject: &Subject<'_>, params: &Params, emit: &mut Emit<'_>) -> Re
     let ctx = emit.ctx();
     let Some((view, params)) = lowering(subject, params) else { return Ok(Lowered::Declined) };
     let Some(base) = syrk_base(view, ctx, params.by == StrategyId::SYRK_TILED_TF32) else { return Ok(Lowered::Declined) };
+    if base == StrategyId::CONTRACTION_TILED {
+        let Some(plan) = plan_or_decline(view, ctx, &params, [false; 2])? else { return Ok(Lowered::Declined) };
+        let sides = [side(ctx, view.lhs)?, side(view.rhs.context(), view.rhs)?];
+        return done(launch(ctx, sides, plan, params.geom, None)?);
+    }
     if is_padded(base) {
         let copied = copies(view, base);
         let (lhs_copy, rhs_copy) = (copied[0].then(|| padded_copy(view.lhs)), copied[1].then(|| padded_copy(view.rhs)));
@@ -1312,6 +1345,7 @@ fn side(ctx: &Context, array: &Array<f32>) -> Outcome<MatmulSide> {
 fn plan_label(plan: &Plan) -> String {
     let tile = match plan.tile {
         MatmulTile::T128 => "tiled 128x128".to_string(),
+        MatmulTile::T128Half => "syrk tiled 128x128".to_string(),
         MatmulTile::T128x32 => "tiled 128x32".to_string(),
         MatmulTile::T32x128 => "tiled 32x128".to_string(),
         MatmulTile::T32 => "tiled 32x32".to_string(),
@@ -1569,7 +1603,7 @@ mod tests {
             assert_eq!(group, if cut { 2 } else { 1 }, "{}", strategy.name);
         }
         let names: Vec<&str> = entries.iter().map(|strategy| strategy.name).collect();
-        assert_eq!(names, ["host", "syrk-tiled", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
+        assert_eq!(names, ["host", "syrk-tiled", "syrk-tiled-tf32", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
         let class = |name: &str| entries.iter().find(|strategy| strategy.name == name).unwrap().bits;
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-ragged"));
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-padded"));
