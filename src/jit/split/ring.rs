@@ -12,7 +12,7 @@ use super::run::{bind_all, launch_steps};
 use super::{Access, Open, Reach};
 use crate::context::Context;
 use crate::error::LumaError;
-use crate::gpu::pager::Place;
+use crate::gpu::pager::{Place, StreamRead};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Dir {
@@ -231,11 +231,17 @@ pub(super) fn run_slabs<'t>(ctx: &Context, open: &Open, stage: &Stage, choice: &
                 }
                 let segment = &open.arrays[ring.array as usize].segments[slab_q];
                 let bytes = word(segment.data_bytes());
-                if !segment.stream_read(&mut ring.hosts[slot_q].as_mut_slice()[..bytes as usize])? {
-                    return Err(LumaError::Gpu("a streamed input segment moved while its stage ran".into()));
-                }
                 let after: Vec<Ticket> = if q >= window { done[q - window].iter().cloned().collect() } else { Vec::new() };
-                let ticket = ctx.transfer_in(&ring.hosts[slot_q], &ring.bufs[slot_q], bytes, &after)?;
+                let ticket = match segment.stream_read(&mut ring.hosts[slot_q].as_mut_slice()[..bytes as usize])? {
+                    StreamRead::Moved => return Err(LumaError::Gpu("a streamed input segment moved while its stage ran".into())),
+                    StreamRead::Copied => ctx.transfer_in(&ring.hosts[slot_q], &ring.bufs[slot_q], bytes, &after)?,
+                    // The read of a file segment landed in a stage of the stage cache: upload from it, no copy into the ring's host memory.
+                    StreamRead::Staged(stage) => {
+                        let ticket = ctx.transfer_in(&stage, &ring.bufs[slot_q], bytes, &after)?;
+                        segment.ring_put(stage, ticket.clone());
+                        ticket
+                    }
+                };
                 segment.note_streamed_in(segment.data_bytes());
                 outstanding.tickets.push(ticket.clone());
                 up[q].push(ticket);

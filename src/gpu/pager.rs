@@ -1296,7 +1296,7 @@ impl Segment {
 
     /// Keeps a stage whose upload `ticket` may still be copying; the ring hands it to the context's
     /// stage cache once the ticket completed. A stage the backend kept (empty) is dropped.
-    fn ring_put(&self, stage: Stage, ticket: Ticket) {
+    pub(crate) fn ring_put(&self, stage: Stage, ticket: Ticket) {
         if stage.is_empty() {
             return;
         }
@@ -1482,20 +1482,19 @@ impl Segment {
     }
 
     /// Copies the segment's data into `dst` (`dst.len()` bytes, the rest past the data is zero) from host memory or the segment's file,
-    /// without pinning it, whatever is planned. `false` when the data is anywhere else.
-    pub(crate) fn stream_read(&self, dst: &mut [u8]) -> Result<bool> {
+    /// without pinning it, whatever is planned. A file segment is read ahead like a pin's (see [`Segment::read_ahead`]), and when its
+    /// read landed in a stage the caller can upload from, that stage is returned instead of copied into `dst`.
+    pub(crate) fn stream_read(&self, dst: &mut [u8]) -> Result<StreamRead> {
+        if self.streams_read_ahead() {
+            return self.stream_read_ahead(dst);
+        }
         match &*lock(&self.state) {
             State::Host(data) => {
-                let n = dst.len().min(data.len());
-                let (head, tail) = dst.split_at_mut(n);
-                // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the copy only writes initialized bytes.
-                let head = unsafe { std::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<MaybeUninit<u8>>(), n) };
-                copy_parallel_host(&data.as_slice()[..n], head);
-                tail.fill(0);
-                Ok(true)
+                copy_zero_tail(data.as_slice(), dst);
+                Ok(StreamRead::Copied)
             }
             State::Away => {
-                let Some(home) = self.home() else { return Ok(false) };
+                let Some(home) = self.home() else { return Ok(StreamRead::Moved) };
                 let n = dst.len().min(home.file_bytes as usize);
                 let (data, tail) = dst.split_at_mut(n);
                 // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the read only writes initialized bytes.
@@ -1503,9 +1502,57 @@ impl Segment {
                 home.store.read(home.offset, head)?;
                 tail.fill(0);
                 self.ctx.pager().io_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                Ok(true)
+                Ok(StreamRead::Copied)
             }
-            _ => Ok(false),
+            _ => Ok(StreamRead::Moved),
+        }
+    }
+
+    /// Whether [`Segment::stream_read`] reads this segment ahead: a file segment away from memory on a device context with read-ahead on.
+    fn streams_read_ahead(&self) -> bool {
+        self.ahead.is_some()
+            && !self.ctx.is_cpu()
+            && self.ctx.pager().readahead_depth.load(Ordering::Relaxed) > 0
+            && self.home().is_some()
+            && matches!(&*lock(&self.state), State::Away)
+    }
+
+    /// [`Segment::stream_read`] of an `Away` file segment through the read-ahead: this read (started by the walk before, or now) is
+    /// waited for outside the state lock, then the state is checked again.
+    fn stream_read_ahead(&self, dst: &mut [u8]) -> Result<StreamRead> {
+        let Some(home) = self.home() else { return Ok(StreamRead::Moved) };
+        let Some(ahead) = &self.ahead else { return Ok(StreamRead::Moved) };
+        self.read_ahead();
+        let taken = lock(&ahead.read).take();
+        let filled = match taken {
+            Some(mut taken) => taken.read.take().expect("a read is taken once").finish()?,
+            // The staging budget is used up: read into `dst` at once.
+            None => {
+                let n = dst.len().min(home.file_bytes as usize);
+                let (data, tail) = dst.split_at_mut(n);
+                // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the read only writes initialized bytes.
+                let head = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<MaybeUninit<u8>>(), data.len()) };
+                home.store.read(home.offset, head)?;
+                tail.fill(0);
+                self.ctx.pager().io_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                return Ok(if matches!(&*lock(&self.state), State::Away) { StreamRead::Copied } else { StreamRead::Moved });
+            }
+        };
+        self.ctx.pager().io_read_bytes.fetch_add(home.file_bytes, Ordering::Relaxed);
+        if !matches!(&*lock(&self.state), State::Away) {
+            return Ok(StreamRead::Moved);
+        }
+        match filled {
+            Filled::Stage(stage) if stage.len() as usize >= dst.len() => Ok(StreamRead::Staged(stage)),
+            Filled::Stage(stage) => {
+                copy_zero_tail(stage.as_slice(), dst);
+                self.ctx.stage_release(stage);
+                Ok(StreamRead::Copied)
+            }
+            Filled::Heap(data) => {
+                copy_zero_tail(data.as_slice(), dst);
+                Ok(StreamRead::Copied)
+            }
         }
     }
 
@@ -1534,6 +1581,27 @@ impl Segment {
     pub(crate) fn note_streamed_in(&self, bytes: u64) {
         self.ctx.pager().uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
+}
+
+/// What [`Segment::stream_read`] did.
+pub(crate) enum StreamRead {
+    /// The segment's data is not in host memory or its file any more.
+    Moved,
+    /// The data (zero-padded) is in the caller's buffer.
+    Copied,
+    /// The data (zero-padded, at least as long as the buffer) is in a stage the caller uploads from; [`Segment::ring_put`] keeps
+    /// it until the upload ran.
+    Staged(Stage),
+}
+
+/// Copies `src` into `dst` (up to its length) and zeroes the rest of `dst`.
+fn copy_zero_tail(src: &[u8], dst: &mut [u8]) {
+    let n = dst.len().min(src.len());
+    let (head, tail) = dst.split_at_mut(n);
+    // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; the copy only writes initialized bytes.
+    let head = unsafe { std::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<MaybeUninit<u8>>(), n) };
+    copy_parallel_host(&src[..n], head);
+    tail.fill(0);
 }
 
 impl Segment {
