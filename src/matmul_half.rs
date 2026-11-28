@@ -4,9 +4,9 @@
 //! runs the `f32` kernels.
 //!
 //! A product takes the unit only where the numerics allow it ([`Reduced::MATRIX_ACCUMULATE`]: `default`, `algebraic`, `fast`; not
-//! `strict`), the device has it (`Caps::F16_MMA` / `BF16_MMA`), the shape is one the kernels' lanes read (the leading dimensions
-//! multiples of 8) and the variant passed its reference verification (`Context::unit_verified`, the first use of a variant waits for
-//! it). Anything else returns `None` and the caller runs the widening path, so the answer of a call never depends on which of the
+//! `strict`), the device has it (`Caps::F16_MMA` / `BF16_MMA`), the product is not smaller than `MIN_EXTENT`
+//! (a leading dimension that is not a multiple of 8 is padded in a copy first) and the variant passed its reference verification
+//! (`Context::unit_verified`, the first use of a variant waits for it). Anything else returns `None` and the caller runs the widening path, so the answer of a call never depends on which of the
 //! two ran for a reason other than those.
 
 use std::panic::Location;
@@ -20,15 +20,16 @@ use crate::array::{Array, Storage};
 use crate::builtin::Builtin;
 use crate::caps::Caps;
 use crate::context::{Context, RawArg, Scratch};
-use crate::gpu_type::{ElemLayout, GpuType};
+use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::jit::comprehension::units::variant_label;
 use crate::jit::structured::contraction::{gemm_plan, GEMM_HALF_TILES_PER_SM};
 use crate::kernel::KernelCore;
 use crate::numerics::Reduced;
 use crate::shape::Shape;
+use crate::view::PadMode;
 
 /// A half-precision element type the units take.
-pub(crate) trait HalfKind: GpuType {
+pub(crate) trait HalfKind: ScalarType {
     const UNIT: GemmUnit;
     const OUT: GemmOut;
     const CAPS: Caps;
@@ -57,6 +58,13 @@ impl HalfKind for bf16 {
 /// The smallest extent of a product that is worth its own matrix-unit launch.
 const MIN_EXTENT: usize = 16;
 
+/// `array` with zero columns appended to its first axis up to a multiple of 8 (an expression, evaluated by `ready`), itself where it is one.
+fn padded<T: HalfKind>(array: &Array<T>) -> Array<T> {
+    let first = array.shape().dims()[0];
+    let extra = first.next_multiple_of(8) - first;
+    if extra == 0 { array.clone() } else { array.pad([(0, extra), (0, 0)], PadMode::Zero) }
+}
+
 /// `lhs * rhs` (`lhs_t` / `rhs_t`: the array holds the transpose, see `Array::matmul_nt` ...) on the matrix unit of `T`, `None` where
 /// the widening path runs instead.
 pub(crate) fn product<T: HalfKind>(lhs: &Array<T>, rhs: &Array<T>, lhs_t: bool, rhs_t: bool, location: &'static Location<'static>) -> Option<Array<T>> {
@@ -73,15 +81,11 @@ pub(crate) fn product<T: HalfKind>(lhs: &Array<T>, rhs: &Array<T>, lhs_t: bool, 
     if k != k2 || m.min(n).min(k) < MIN_EXTENT || [m, n, k, ld[0], rd[0]].iter().any(|&x| u32::try_from(x).is_err()) {
         return None;
     }
-    // The 16-byte copies read eight elements: the leading dimensions are multiples of 8, and the extents too for the lane without
-    // edge guards.
-    let lanes = if [m, n, k].iter().all(|x| x % 8 == 0) {
-        GemmLanes::Vec4
-    } else if ld[0] % 8 == 0 && rd[0] % 8 == 0 {
-        GemmLanes::Vec4Tails
-    } else {
-        return None;
-    };
+    // The 16-byte copies read eight elements: the leading dimensions are multiples of 8 (an operand that is not one is first copied
+    // with zero columns appended, the padded-copy variant), and the extents too for the lane without edge guards.
+    let lanes = if [m, n, k, ld[0], rd[0]].iter().all(|x| x % 8 == 0) { GemmLanes::Vec4 } else { GemmLanes::Vec4Tails };
+    let (lhs, rhs) = (padded(lhs), padded(rhs));
+    let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
     let (m32, n32, k32) = (m as u32, n as u32, k as u32);
     let tiles = ctx.hal().gemm_tiles(T::UNIT);
     let (groups, bytes) = (ctx.max_workgroups_per_dimension(), ctx.segment_bytes());

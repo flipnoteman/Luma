@@ -240,7 +240,8 @@ pub fn run(h: &mut Harness) {
         }
 
         // `f16` / `bf16` products (W3-R7): the half-precision matrix units where the numerics and the device allow, else the widening
-        // path. 1001 has leading dimensions the units' 16-byte copies do not read: the widening path.
+        // path. 1001 and the other ragged shapes have leading dimensions the units' 16-byte copies do not read: the operands are first copied
+        // into zero-padded buffers.
         if !cpu {
             let sizes: &[usize] = if h.quick { &[2048] } else { &[1001, 2048, 4096] };
             for &n in sizes {
@@ -248,6 +249,9 @@ pub fn run(h: &mut Harness) {
             }
             if !h.quick {
                 half_rows(h, (4096, 64, 4096));
+                for dims in [(1537, 513, 255), (3001, 3001, 3001), (4097, 1001, 1025)] {
+                    half_rows(h, dims);
+                }
             }
         }
 
