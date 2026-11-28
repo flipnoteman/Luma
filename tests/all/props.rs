@@ -713,6 +713,7 @@ fn a_gram_product_runs_the_half_work_strategy_and_a_plain_product_does_not() {
 #[test]
 fn a_tf32_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_products() {
     let ctx = ctx_with(Numerics::default());
+    let mut ran_once = false;
     for (rows, cols) in [(200usize, 133usize), (256, 1024), (2048, 640), (96, 64), (256, 4097)] {
         let data = gram_data(rows * cols, cols + 5);
         let x = on(&ctx, &data, [cols, rows]);
@@ -720,6 +721,7 @@ fn a_tf32_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_produ
         ctx.record_decisions(true);
         let (g, f) = (x.matmul_tn(&x).to_vec().unwrap(), x.matmul_tn(&copy).to_vec().unwrap());
         let ran = ctx.take_decisions().iter().any(|d| d.chosen.contains("syrk"));
+        ran_once |= ran;
         let n = cols;
         for r in 0..n {
             for c in 0..=r {
@@ -732,4 +734,5 @@ fn a_tf32_gram_product_is_bit_symmetric_and_its_lower_triangle_is_the_full_produ
             }
         }
     }
+    assert!(ran_once || matches!(ctx.backend(), luma::BackendKind::Metal), "no Gram product ran the half-work strategy");
 }
