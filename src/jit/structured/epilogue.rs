@@ -312,13 +312,13 @@ impl AxisEpiId {
 
 // -- Whole reductions (W3-U4 D2) --
 
-/// The most steps (instructions) a reduction of the whole array absorbs: the limit of the `Finish` this program form replaced.
+/// The most steps (instructions) a reduction of the whole array absorbs (the four of the epilogue this program form replaced).
 pub(crate) const MAX_REDUCE_STEPS: usize = 4;
 
 /// The epilogue of a whole reduction in a kernel's cache key: a program over `Ref::Acc` of unary and binary `f32` operations whose
 /// binary operands are scalars (the words of the scalars are uniforms of the last pass, not part of the key), by handle, so that a
 /// [`ReduceList`](crate::builtin::ReduceList) stays a small `Copy` value. Interned by structure (see [`EpiKey`]); the default is none.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct EpiId(Option<std::num::NonZeroU32>);
 
 #[derive(Default)]
@@ -328,6 +328,39 @@ struct WholeEpis {
 }
 
 static WHOLE_EPIS: std::sync::LazyLock<std::sync::Mutex<WholeEpis>> = std::sync::LazyLock::new(Default::default);
+
+/// Kernel labels and the decision log print a [`ReduceList`](crate::builtin::ReduceList), and so its epilogue: it prints as the steps
+/// of the epilogue type this one replaced did, so that the labels of the reduction kernels (and what compares them) do not change.
+impl std::fmt::Debug for EpiId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::builtin::{BinOp, UnOp};
+        #[allow(dead_code, reason = "printed by the derived Debug")]
+        #[derive(Debug)]
+        enum Step {
+            Unary(UnOp),
+            Binary { op: BinOp, scalar_left: bool },
+        }
+        #[allow(dead_code, reason = "printed by the derived Debug")]
+        #[derive(Debug)]
+        struct Epilogue {
+            steps: [Option<Step>; MAX_REDUCE_STEPS],
+            len: u8,
+        }
+        let mut steps: [Option<Step>; MAX_REDUCE_STEPS] = [None, None, None, None];
+        let mut len = 0;
+        if let Some(key) = self.key() {
+            for (slot, instr) in steps.iter_mut().zip(key.instrs.iter()) {
+                *slot = Some(match instr.op.kind {
+                    OpKind::Unary(op) => Step::Unary(op),
+                    OpKind::Binary(op) => Step::Binary { op, scalar_left: matches!(instr.args[0], Ref::Scalar(_)) },
+                    _ => unreachable!("a whole reduction's epilogue has unary and binary operations"),
+                });
+                len += 1;
+            }
+        }
+        std::fmt::Debug::fmt(&Epilogue { steps, len }, f)
+    }
+}
 
 impl EpiId {
     /// The handle of `program`, none for no program.

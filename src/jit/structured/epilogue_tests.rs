@@ -213,3 +213,23 @@ mod partners {
         drop(rest);
     }
 }
+
+/// W3-U4 D2: the epilogue of a reduction's kernel key prints as the steps type it replaced did (kernel labels carry it).
+#[test]
+fn a_reductions_epilogue_prints_as_its_steps_always_did() {
+    use super::epilogue::{EpiId, EpiProgram, StepOperand};
+    use crate::builtin::{BinOp, UnOp};
+    use crate::jit::{OpKind, Scalar};
+
+    assert_eq!(format!("{:?}", EpiId::default()), "Epilogue { steps: [None, None, None, None], len: 0 }");
+    let sqrt = EpiProgram::step(OpKind::Unary(UnOp::Sqrt), StepOperand::None);
+    let div = EpiProgram::step(OpKind::Binary(BinOp::Div), StepOperand::Scalar { value: Scalar::f32(8.0), scalar_left: true });
+    let program = sqrt.then(&div).unwrap();
+    assert_eq!(
+        format!("{:?}", EpiId::of(Some(&program))),
+        "Epilogue { steps: [Some(Unary(Sqrt)), Some(Binary { op: Div, scalar_left: true }), None, None], len: 2 }"
+    );
+    // The structure is the key: the same steps with another scalar are one handle.
+    let other = EpiProgram::step(OpKind::Binary(BinOp::Div), StepOperand::Scalar { value: Scalar::f32(3.0), scalar_left: true });
+    assert_eq!(EpiId::of(Some(&sqrt.then(&other).unwrap())), EpiId::of(Some(&program)));
+}
