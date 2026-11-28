@@ -195,6 +195,7 @@ mod setops;
 mod scalar;
 mod shape;
 mod sort;
+mod props;
 mod structure;
 mod stats;
 mod spectral;

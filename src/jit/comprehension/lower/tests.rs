@@ -65,7 +65,7 @@ pub(super) fn form(ctx: &Context, dims: &[(u64, bool)], out: &[usize], reads: &[
         for (slot, row) in map.rows.iter_mut().zip(&read.rows) {
             *slot = *row;
         }
-        inputs.push(Access { src, shape: read.shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: read.edge, fill: read.fill.map(Scalar::f32), indirect: None });
+        inputs.push(Access { src, shape: read.shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: read.edge, fill: read.fill.map(Scalar::f32), indirect: None, props: Props::NONE });
     }
     let mut axes = [None; 4];
     for (slot, &d) in axes.iter_mut().zip(out) {
@@ -402,7 +402,7 @@ fn a_compensated_dot_product_multiplies_exactly() {
     let dot = |c: Compensation| {
         let mut f = Comprehension::dot(Array::<f32>::from_slice_on(&ctx, &[0f32; 1], 1).unwrap().src().ok().unwrap(), 1, ElemTy::F32);
         // Two accesses over one reduce dim.
-        let access = |s: &Array<f32>| Access { src: s.src().ok().unwrap(), shape: [len as u32, 1, 1, 1], ty: ElemTy::F32, map: MapRef::owned(AffineMap::following([0])), edge: Edge::None, fill: None, indirect: None };
+        let access = |s: &Array<f32>| Access { src: s.src().ok().unwrap(), shape: [len as u32, 1, 1, 1], ty: ElemTy::F32, map: MapRef::owned(AffineMap::following([0])), edge: Edge::None, fill: None, indirect: None, props: Props::NONE };
         f.inputs = smallvec![access(&sa), access(&sb)];
         f.space[0].extent = len as u64;
         f.body = Body { instrs: std::sync::Arc::new(mul01()), scalars: smallvec![], outs: smallvec![0] };

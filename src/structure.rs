@@ -21,6 +21,7 @@ use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{Numeric, ScalarType};
 use crate::generate::constant;
+use crate::jit::comprehension::Props;
 use crate::jit::{Edge, ViewMap};
 use crate::ops::{run_select, Cond, Condition, Operand, Outcome, Rhs};
 use crate::shape::Shape;
@@ -140,7 +141,13 @@ impl<T: ScalarType> Array<T> {
         let side = n.saturating_add(k.unsigned_abs());
         let out = Shape::new([side, side, b2, b3]);
         let result = self.run_diag_matrix(k, out, location);
-        Array::resolve(self.context(), out, result, "diag_matrix", location)
+        // Element `i` of the column is at (dim 0, dim 1) = (i, i + k): a sub-diagonal (row below column) for `k > 0`.
+        let props = match k {
+            0 => Props::diagonal(true),
+            k if k > 0 => Props::banded(u32::try_from(k).unwrap_or(u32::MAX), 0),
+            k => Props::banded(0, u32::try_from(k.unsigned_abs()).unwrap_or(u32::MAX)),
+        };
+        Array::resolve(self.context(), out, result, "diag_matrix", location).with_props(props)
     }
 
     fn run_diag_matrix(&self, k: isize, out: Shape, location: &'static Location<'static>) -> Outcome<Array<T>> {
@@ -184,7 +191,11 @@ impl<T: ScalarType> Array<T> {
 
     fn triangle(&self, lower: bool, unit_diagonal: bool, name: &'static str, location: &'static Location<'static>) -> Array<T> {
         let result = self.run_triangle(lower, unit_diagonal, location);
-        Array::resolve(self.context(), self.shape(), result, name, location)
+        // This file counts the element (i, j) with `i` along dimension 0, the dense routines the other way (the row is dimension 1):
+        // the entries kept by `lower` (`j <= i`) are those of an upper triangle there, see `crate::props`.
+        let [cols, rows, ..] = self.shape().dims();
+        let props = Props::triangle(!lower, unit_diagonal, rows, cols);
+        Array::resolve(self.context(), self.shape(), result, name, location).with_props(props)
     }
 
     fn run_triangle(&self, lower: bool, unit_diagonal: bool, location: &'static Location<'static>) -> Outcome<Array<T>> {
@@ -253,7 +264,8 @@ impl<T: ScalarType> Array<T> {
         let rows = Array::<u32>::range_on(ctx, shape, 0)?;
         let cols = Array::<u32>::range_on(ctx, shape, 1)?;
         let on = cols.eq(&rows);
-        pick(&on, Rhs::Scalar(constant::<T>(1.0)?), Rhs::Scalar(T::zeroed()), location).map_err(Failure::into_error)
+        let identity = pick(&on, Rhs::Scalar(constant::<T>(1.0)?), Rhs::Scalar(T::zeroed()), location).map_err(Failure::into_error)?;
+        Ok(identity.with_props(Props::identity(shape.dims()[0] == shape.dims()[1])))
     }
 }
 

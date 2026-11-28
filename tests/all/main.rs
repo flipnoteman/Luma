@@ -90,6 +90,7 @@ mod views;
 mod image;
 mod small_math;
 mod structure;
+mod props;
 mod stats;
 mod vision;
 mod vision_corners;

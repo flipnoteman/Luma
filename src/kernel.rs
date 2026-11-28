@@ -469,6 +469,7 @@ impl<'a, T: GpuType> From<&'a Array<T>> for KernelArg<'a> {
 
 impl<'a, T: GpuType> From<&'a mut Array<T>> for KernelArg<'a> {
     fn from(array: &'a mut Array<T>) -> Self {
+        array.clear_props();
         storage_arg(array, true)
     }
 }

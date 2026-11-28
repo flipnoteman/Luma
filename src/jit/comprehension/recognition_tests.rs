@@ -75,7 +75,7 @@ fn form(ctx: &Context, dims: &[(u64, bool)], accesses: &[&[usize]], instrs: Vec<
                 map.rows[a] = AffineRow::dim(d);
             }
             let len: u32 = shape.iter().product();
-            Access { src: buffer(ctx, len as usize), shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: Edge::None, fill: None, indirect: None }
+            Access { src: buffer(ctx, len as usize), shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: Edge::None, fill: None, indirect: None, props: Props::NONE }
         })
         .collect();
     let parallel: Vec<usize> = (0..dims.len()).filter(|&d| !dims[d].1).collect();
@@ -310,7 +310,7 @@ fn identity(src: Src, shape: [u32; 4], reduce: Option<usize>) -> Comprehension {
     }
     Comprehension {
         space,
-        inputs: smallvec![Access { src, shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: Edge::None, fill: None, indirect: None }],
+        inputs: smallvec![Access { src, shape, ty: ElemTy::F32, map: MapRef::owned(map), edge: Edge::None, fill: None, indirect: None, props: Props::NONE }],
         body: Body { instrs: Bodies::x0(ElemTy::F32), scalars: SmallVec::new(), outs: smallvec![0] },
         combiner: reduce.map(|_| Combiner::of(CombineOp::Single(CombinePart::Add), ElemTy::F32)),
         epilogue: Epilogue::None,

@@ -13,6 +13,7 @@ use super::tri::{block_size, lower_left_factor, rhs_matrix};
 use super::{block, fail, launch, launch_unchecked, nth, product, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
+use crate::jit::comprehension::Props;
 use crate::jit::structured::boundary::FactorKind;
 use crate::jit::structured::families::factor::{boundary_of, chol_stage};
 use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
@@ -606,7 +607,8 @@ impl Array<f32> {
     /// The result is poisoned if the matrices are not square.
     #[track_caller]
     pub fn cholesky(&self) -> Array<f32> {
-        lower(self, Location::caller())
+        let n = self.shape().dims()[0];
+        lower(self, Location::caller()).with_props(Props::triangle(true, false, n, n))
     }
 
     /// The upper Cholesky factor `U`, `A = Uᵀ U`, reading the upper triangle of `A`: the
@@ -617,7 +619,8 @@ impl Array<f32> {
     /// As [`Array::cholesky`].
     #[track_caller]
     pub fn cholesky_upper(&self) -> Array<f32> {
-        lower(&self.transpose(), Location::caller()).transpose()
+        let n = self.shape().dims()[0];
+        lower(&self.transpose(), Location::caller()).transpose().with_props(Props::triangle(false, false, n, n))
     }
 
     /// Solves `A X = B` for a symmetric positive definite `A` (`self`, only its lower triangle is

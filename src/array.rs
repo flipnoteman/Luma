@@ -10,7 +10,9 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType};
 use crate::builtin::UnOp;
 use crate::jit::{ElemTy, Held, Node, Op, OpKind, Readers, Src};
+use crate::jit::comprehension::Props;
 use crate::jit::structured::Structured;
+use crate::props::{HandleProps, PropsCell};
 use crate::shape::Shape;
 use crate::view::ViewOf;
 
@@ -460,6 +462,9 @@ pub struct Array<T: GpuType> {
     /// Set on slices, flips and transposes (and reshapes of them) taken through `&self`: they
     /// read the array they came from but reject every write (see [`Array::slice_mut`]).
     read_view: bool,
+    /// What is known of the matrix this array holds, from the exact construction that made it (see [`crate::props`]). Only on
+    /// lazy and structured arrays, whose value is immutable; cleared by every write through the handle and not copied by `clone`.
+    props: PropsCell,
     _marker: PhantomData<T>,
 }
 
@@ -474,7 +479,10 @@ impl<T: GpuType> Clone for Array<T> {
             Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
             Repr::Structured(value, leaf) => Repr::Structured(Arc::clone(value), leaf.clone()),
         };
-        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, _marker: PhantomData }
+        // The data is shared from here on, and a write through either handle would leave the properties of the other stale: neither
+        // keeps them.
+        self.props.clear();
+        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, props: PropsCell::default(), _marker: PhantomData }
     }
 }
 
@@ -488,7 +496,40 @@ impl<T: GpuType> Array<T> {
     }
 
     fn new(ctx: &Context, shape: Shape, repr: Repr) -> Self {
-        Array { ctx: ctx.clone(), shape, repr, view: None, read_view: false, _marker: PhantomData }
+        Array { ctx: ctx.clone(), shape, repr, view: None, read_view: false, props: PropsCell::default(), _marker: PhantomData }
+    }
+
+    /// The properties this handle is known to have (`Props::NONE` for most).
+    #[inline(always)]
+    pub(crate) fn props(&self) -> Props {
+        self.props.get().props()
+    }
+
+    /// Whether any property is recorded; a bool test, so that operations that keep none pay nothing else.
+    #[inline(always)]
+    pub(crate) fn has_props(&self) -> bool {
+        !self.props.get().is_none()
+    }
+
+    /// This array with the properties `props` of its value. Ignored on a valid array (its buffer is shared with its clones, so a
+    /// write through one handle would leave the property of the other stale) and on a poisoned one.
+    pub(crate) fn with_props(self, props: Props) -> Self {
+        if matches!(self.repr, Repr::Lazy(_) | Repr::Structured(..)) {
+            self.props.set(HandleProps::of(&props));
+        }
+        self
+    }
+
+    /// Forgets the properties: the contents are about to change through this handle.
+    #[inline(always)]
+    pub(crate) fn clear_props(&mut self) {
+        self.props.clear();
+    }
+
+    /// The text of the properties of the value, for the decision log and the tests.
+    #[doc(hidden)]
+    pub fn properties_debug(&self) -> String {
+        self.props().describe()
     }
 
     pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Arc<Storage>) -> Self {
@@ -959,6 +1000,7 @@ impl<T: GpuType> Array<T> {
     /// elements. The upload is recorded in order with the operations before it and does not wait
     /// for the GPU: operations recorded earlier still see the old contents.
     pub fn write(&mut self, data: &[T]) -> Result<()> {
+        self.clear_props();
         if self.is_read_view() {
             self.check()?;
             return Err(LumaError::InvalidShape(
@@ -1047,6 +1089,8 @@ impl<T: GpuType> Array<T> {
             return Err(Failure::Inherited(Arc::clone(error)));
         }
         let len = shape.validate()?;
+        // The result shares the data: a write through it must not leave properties here stale.
+        self.props.clear();
         if len != self.len() {
             return Err(LumaError::InvalidShape(format!(
                 "Cannot reshape {} elements {} into {} elements {shape}",
@@ -1069,6 +1113,7 @@ impl<T: GpuType> Array<T> {
                 repr: Repr::Lazy(held.share()),
                 view: None,
                 read_view: self.read_view,
+                props: PropsCell::default(),
                 _marker: PhantomData,
             });
         }
@@ -1083,6 +1128,7 @@ impl<T: GpuType> Array<T> {
                 repr: Repr::Structured(Arc::clone(value), leaf.clone()),
                 view: None,
                 read_view: self.read_view,
+                props: PropsCell::default(),
                 _marker: PhantomData,
             });
         }
@@ -1094,6 +1140,7 @@ impl<T: GpuType> Array<T> {
             repr: Repr::Valid(Arc::clone(storage)),
             view: None,
             read_view: self.read_view,
+            props: PropsCell::default(),
             _marker: PhantomData,
         })
     }

@@ -459,6 +459,7 @@ impl<T: GpuType> Array<T> {
     #[track_caller]
     pub fn store(&self, target: &mut Array<T>) -> Result<()> {
         let location = std::panic::Location::caller();
+        target.clear_props();
         if !self.context().same_as(target.context()) {
             return Err(LumaError::ContextMismatch);
         }

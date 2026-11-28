@@ -271,7 +271,8 @@ fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: Option<bool>) -> Array<f32>
     };
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
-    lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location)
+    let product = lazy::product(lhs, rhs, ContractionAttrs { tf32 }, shape, location);
+    if lhs.has_props() || rhs.has_props() { product.with_props(lhs.props().product(rhs.props())) } else { product }
 }
 
 /// How a product is cut into workgroups.

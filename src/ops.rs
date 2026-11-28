@@ -15,6 +15,7 @@ use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
 use crate::complex::C32;
 use crate::gpu_type::{Df32, GpuType, ScalarType};
+use crate::jit::comprehension::Props;
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
@@ -269,7 +270,8 @@ impl<T: ScalarType> Array<T> {
     /// `-self` reporting failures at `location`.
     pub(crate) fn neg_at(&self, location: &'static Location<'static>) -> Array<T> {
         let result = self.run_unary(UnOp::Neg, location);
-        Array::resolve(self.context(), self.shape(), result, "neg", location)
+        let negated = Array::resolve(self.context(), self.shape(), result, "neg", location);
+        if self.has_props() { negated.with_props(self.props().scaled()) } else { negated }
     }
 
     /// A lazy copy of the array's current contents (not a shared handle), reporting failures at
@@ -413,8 +415,38 @@ impl<T: ScalarType> Array<T> {
         {
             return fused;
         }
+        // Matrix properties: a bool test on the operands (the check for `a + a.t()` is behind `is_read_view`).
+        let maybe_props = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+            && (self.has_props() || matches!(&rhs, Rhs::Array(other) if other.has_props() || other.is_read_view() || self.is_read_view()));
+        let props = if maybe_props { self.binary_props(&rhs, op, scalar_left) } else { Props::NONE };
         let result = self.run_binary(rhs, scalar_left, OpKind::Binary(op), name, location);
-        Array::resolve(self.context(), self.shape(), result, name, location)
+        let out = Array::resolve(self.context(), self.shape(), result, name, location);
+        if props.is_none() { out } else { out.with_props(props) }
+    }
+
+    /// The matrix properties of `self op rhs` (see `crate::props`); `NONE` for what the table does not list.
+    #[inline(never)]
+    fn binary_props(&self, rhs: &Rhs<'_, T>, op: BinOp, _scalar_left: bool) -> Props {
+        match rhs {
+            // A scalar multiplier keeps the pattern (`-a` is the same).
+            Rhs::Scalar(_) => if op == BinOp::Mul { self.props().scaled() } else { Props::NONE },
+            Rhs::Array(other) => {
+                if self.shape() != other.shape() {
+                    return Props::NONE;
+                }
+                let [m, n, ..] = self.shape().dims();
+                let mut props = Props::NONE;
+                if matches!(op, BinOp::Add | BinOp::Sub) && self.has_props() && other.has_props() {
+                    props = self.props().summed(other.props());
+                }
+                // `fl(x + y)` and `fl(y + x)` are bit-equal, and so are the two products: the sum or the elementwise product of an
+                // array and its own transpose is bit-symmetric.
+                if matches!(op, BinOp::Add | BinOp::Mul) && m == n && (other.is_transpose_of(self) || self.is_transpose_of(other)) {
+                    props.flags |= Props::SYMMETRIC;
+                }
+                props
+            }
+        }
     }
 
     #[track_caller]
@@ -454,6 +486,7 @@ impl<T: ScalarType> Array<T> {
 
     /// [`Array::assign_op`] reporting failures at `location`.
     pub(crate) fn assign_op_at(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str, location: &'static Location<'static>) {
+        self.clear_props();
         let result = if self.is_read_view() {
             self.src().and_then(|_| -> Outcome<()> {
                 Err(LumaError::InvalidShape("cannot mutate a read-only view; use slice_mut, flip_mut or transpose_mut".into()).into())

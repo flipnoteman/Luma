@@ -257,6 +257,7 @@ impl<T: ScalarType> Array<T> {
     /// (`w.slice_mut(0, 3..5)` for `w.slice(0, 2..).slice_mut(0, 1..3)`).
     #[track_caller]
     pub fn slice_mut(&mut self, axis: usize, range: impl RangeBounds<usize>) -> ViewMut<'_, Array<T>> {
+        self.clear_props();
         let inner = self.slice_at(axis, range, true, Location::caller());
         ViewMut { inner, owner: self }
     }
@@ -462,6 +463,7 @@ impl<T: ScalarType> Array<T> {
     /// [`Array::flip`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
     #[track_caller]
     pub fn flip_mut(&mut self, axis: usize) -> ViewMut<'_, Array<T>> {
+        self.clear_props();
         let inner = self.flip_at(axis, true, Location::caller());
         ViewMut { inner, owner: self }
     }
@@ -490,12 +492,31 @@ impl<T: ScalarType> Array<T> {
     /// ([`Array::transpose_mut`] writes through).
     #[track_caller]
     pub fn transpose(&self) -> Array<T> {
-        self.permute_at([1, 0, 2, 3], false, "transpose", Location::caller())
+        let transposed = self.permute_at([1, 0, 2, 3], false, "transpose", Location::caller());
+        if self.has_props() { transposed.with_props(self.props().transposed()) } else { transposed }
+    }
+
+    /// Whether this array is the transpose of `base` as a pending read of it (`base` itself, not a copy): conservative, false when
+    /// either has been evaluated since.
+    pub(crate) fn is_transpose_of(&self, base: &Array<T>) -> bool {
+        if !self.is_read_view() || self.shape() != base.shape() {
+            return false;
+        }
+        let (Some(node), Ok(base)) = (self.pending(), base.src()) else { return false };
+        let Some([operand, ..]) = node.operands() else { return false };
+        let same = match (&operand, &base) {
+            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = &node.op().kind else { return false };
+        same && map.src == map.out && map.axes.iter().enumerate().all(|(axis, m)| usize::from(m.from) == [1, 0, 2, 3][axis] && m.start == 0 && m.step == 1)
     }
 
     /// [`Array::transpose`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
     #[track_caller]
     pub fn transpose_mut(&mut self) -> ViewMut<'_, Array<T>> {
+        self.clear_props();
         let inner = self.permute_at([1, 0, 2, 3], true, "transpose", Location::caller());
         ViewMut { inner, owner: self }
     }
@@ -516,6 +537,7 @@ impl<T: ScalarType> Array<T> {
     /// [`Array::permute_axes`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
     #[track_caller]
     pub fn permute_axes_mut(&mut self, perm: [usize; 4]) -> ViewMut<'_, Array<T>> {
+        self.clear_props();
         let inner = self.permute_at(perm, true, "permute_axes", Location::caller());
         ViewMut { inner, owner: self }
     }
@@ -543,6 +565,7 @@ impl<T: ScalarType> Array<T> {
     /// [`Array::swap_axes`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
     #[track_caller]
     pub fn swap_axes_mut(&mut self, a: usize, b: usize) -> ViewMut<'_, Array<T>> {
+        self.clear_props();
         let inner = self.permute_at(swapped(a, b), true, "swap_axes", Location::caller());
         ViewMut { inner, owner: self }
     }
@@ -674,6 +697,7 @@ impl<T: ScalarType> Array<T> {
     /// [`LumaError::Chunked`] on arrays split over several buffers.
     #[track_caller]
     pub fn assign(&mut self, rhs: impl Operand<T>) -> Result<()> {
+        self.clear_props();
         self.assign_in(rhs, Location::caller())
     }
 
@@ -880,6 +904,7 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Result<()> {
+        self.clear_props();
         let ctx = self.context();
         // Only the host path applies at this site (on a device that has one); the kernel's tail is chosen where it is built
         // (`jit::assign::scatter`).

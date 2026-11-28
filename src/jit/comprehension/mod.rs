@@ -151,6 +151,8 @@ pub(crate) struct Access {
     /// The value of `Edge::Fill`.
     pub(crate) fill: Option<Scalar>,
     pub(crate) indirect: Option<Box<Indirect>>,
+    /// The property of the source at construction (R6); `Props::NONE` for everything that does not know one.
+    pub(crate) props: Props,
 }
 
 /// Source row `row` is `index[index_map(point)] + rows[row](point)`; the other rows are as in the access's `map`. `x[col[j]]` is one
@@ -227,6 +229,10 @@ impl Props {
     pub(crate) const LOWER: u16 = 1 << 3;
     pub(crate) const UPPER: u16 = 1 << 4;
     pub(crate) const SYMMETRIC: u16 = 1 << 5;
+    /// The diagonal entries are exactly one (a triangle taken with `unit_diagonal`, the `L` of an LU).
+    pub(crate) const UNIT_DIAG: u16 = 1 << 6;
+    /// `band` is known (a matrix with bands wider than 255 is not recorded on a handle, see `HandleProps`).
+    pub(crate) const BANDED: u16 = 1 << 7;
     pub(crate) const NONE: Props = Props { flags: 0, band: None, block: None, rank: None };
 
     /// What holds for the values of either of two alternatives (the facts both have; the weaker bound of each number).

@@ -19,6 +19,7 @@ use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::bmm::matmul_batched;
 use crate::error::LumaError;
+use crate::jit::comprehension::Props;
 use crate::jit::structured::boundary::FactorKind;
 use crate::jit::structured::families::factor::{boundary_of, qr_stage};
 use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
@@ -524,7 +525,7 @@ impl Qr {
         let [n, ..] = self.qr.shape().dims();
         let rows = self.qr.index(1);
         let cols = self.qr.index(0);
-        select(&cols.ge(&rows), self.qr.clone(), 0.0f32).slice(1, 0..n)
+        select(&cols.ge(&rows), self.qr.clone(), 0.0f32).slice(1, 0..n).with_props(Props::triangle(false, false, n, n))
     }
 
     /// The first `n` columns of `Q` (the thin factor, `[n, m]` or `[n, m, batch]`: `m x n` with

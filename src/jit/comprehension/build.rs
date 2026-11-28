@@ -89,7 +89,7 @@ fn word(extent: usize) -> u32 {
 }
 
 fn access(src: Src, shape: [u32; 4], ty: ElemTy, map: MapRef) -> Access {
-    Access { src, shape, ty, map, edge: Edge::None, fill: None, indirect: None }
+    Access { src, shape, ty, map, edge: Edge::None, fill: None, indirect: None, props: Props::NONE }
 }
 
 fn comprehension(space: SmallVec<[Dim; 4]>, inputs: SmallVec<[Access; 2]>, body: Body, combiner: Option<Combiner>, output: OutMap, origin: Origin, ty: ElemTy) -> Comprehension {

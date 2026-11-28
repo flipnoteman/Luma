@@ -140,7 +140,7 @@ fn step(form: &mut Comprehension, j: usize, budget: &mut Budget) -> Option<bool>
                         Ref::Scalar(scalars.len() as u32 - 1)
                     }
                     other => {
-                        form.inputs.push(Access { src: other.clone(), shape: template.shape, ty: node.op.operand_ty(i), map: template.map.clone(), edge: template.edge, fill: None, indirect: None });
+                        form.inputs.push(Access { src: other.clone(), shape: template.shape, ty: node.op.operand_ty(i), map: template.map.clone(), edge: template.edge, fill: None, indirect: None, props: super::Props::NONE });
                         Ref::Input(form.inputs.len() as u32 - 1)
                     }
                 };

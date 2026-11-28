@@ -24,6 +24,7 @@ use super::tri::{lower_left_factor, rhs_matrix};
 use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::error::LumaError;
+use crate::jit::comprehension::Props;
 use crate::jit::structured::boundary::FactorKind;
 use crate::jit::structured::families::factor::{boundary_of, lu_stage};
 use crate::jit::structured::strategy::{first_candidate_in, note_in, StrategyId};
@@ -1144,7 +1145,17 @@ impl Lu {
         let rows = self.lu.index(1);
         let cols = self.lu.index(0);
         let l = select(&cols.lt(&rows), self.lu.clone(), 0.0);
-        select(&cols.eq(&rows), 1.0f32, l).slice(0, 0..n.min(m))
+        let lower = select(&cols.eq(&rows), 1.0f32, l).slice(0, 0..n.min(m));
+        lower.with_props(Props::triangle(true, true, m, n.min(m)))
+    }
+
+    /// The permutation matrix `P` of `P A = L U`: row `i` has its one in column `perm[i]`, so that `P.matmul(a)` is `a` with its
+    /// rows reordered as `perm` says (`[n, n]` or `[n, n, batch]`).
+    pub fn permutation_matrix(&self) -> Array<f32> {
+        let [n, _, batch, _] = self.lu.shape().dims();
+        let rows = self.perm.reshape([1, n, batch]).broadcast_to(self.lu.shape());
+        let on = self.lu.index(0).eq(&rows);
+        select(&on, 1.0f32, 0.0f32).with_props(Props::permutation())
     }
 
     /// The upper triangular (trapezoidal, for a wide matrix) factor `U`: the first `min(m, n)` rows.
@@ -1152,7 +1163,8 @@ impl Lu {
         let [n, m, ..] = self.lu.shape().dims();
         let rows = self.lu.index(1);
         let cols = self.lu.index(0);
-        select(&cols.ge(&rows), self.lu.clone(), 0.0).slice(1, 0..n.min(m))
+        let upper = select(&cols.ge(&rows), self.lu.clone(), 0.0).slice(1, 0..n.min(m));
+        upper.with_props(Props::triangle(false, false, n.min(m), n))
     }
 
     /// Solves `A X = B` with this factorisation of the square `A`, as [`Array::solve`].
