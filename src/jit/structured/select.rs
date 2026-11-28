@@ -810,7 +810,25 @@ pub(crate) fn execute(ctx: &Context, subject: &Subject<'_>) -> Result<Output, Fa
     // A table that is a priority chain apart from kernels only a device with the backend's own tiles has (`needs` them, so their `fits`
     // never run elsewhere) is a plain chain on every other device.
     let plain = PLAIN[family.index()] || PLAIN_WITHOUT_TILES[family.index()] && !ctx.caps().contains(Caps::GEMM_TILES);
-    execute_with(table(family), plain, ctx, subject, ctx.strategy_override(family))
+    let forced = ctx.strategy_override(family);
+    if super::contraction::is_half(subject)
+        && let Some(done) = execute_half(ctx, subject, forced)
+    {
+        return done;
+    }
+    execute_with(table(family), plain, ctx, subject, forced)
+}
+
+/// A Gram product (`ContractionAttrs::half`): the half-work strategy, which is in a table of its own so that a plain product never
+/// asks its `fits`. `None` where it does not fit (or another strategy is forced): the product takes the main table.
+#[cold]
+#[inline(never)]
+fn execute_half(ctx: &Context, subject: &Subject<'_>, forced: Option<StrategyId>) -> Option<Result<Output, Failure>> {
+    let entries = &super::contraction::CONTRACTION_HALF;
+    if forced.is_some_and(|forced| forced != entries[0].id) || admit(&entries[0], subject, ctx, &Residencies::DEVICE).is_err() {
+        return None;
+    }
+    Some(execute_with(entries, true, ctx, subject, forced))
 }
 
 /// [`plain_without_tiles`] of every family's table, worked out once.

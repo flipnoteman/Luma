@@ -133,12 +133,12 @@ impl StrategyId {
 
     /// The name the table gives it (`host`, `single-pass`, ...), also its `LUMA_STRATEGY` spelling and its Decision label.
     pub(crate) fn name(self) -> &'static str {
-        table(self.0).iter().find(|strategy| strategy.id == self).map_or("?", |strategy| strategy.name)
+        table(self.0).iter().chain(extra(self.0)).find(|strategy| strategy.id == self).map_or("?", |strategy| strategy.name)
     }
 
     /// The strategy of `family` called `name` (`LUMA_STRATEGY`).
     pub(crate) fn parse(family: FamilyTag, name: &str) -> Option<StrategyId> {
-        table(family).iter().find(|strategy| strategy.name == name).map(|strategy| strategy.id)
+        table(family).iter().chain(extra(family)).find(|strategy| strategy.name == name).map(|strategy| strategy.id)
     }
 }
 
@@ -253,6 +253,12 @@ pub(crate) type LowerFn = fn(&Subject<'_>, &Params, &mut Emit<'_>) -> Result<Low
 /// The strategy table of `family`, in preference order.
 pub(crate) fn table(family: FamilyTag) -> &'static [Strategy] {
     TABLES[family.index()]
+}
+
+/// The strategies of `family` that are in a table of their own (`select::execute` consults it for the subjects that name it), not in
+/// the family's main order.
+pub(crate) fn extra(family: FamilyTag) -> &'static [Strategy] {
+    if family == FamilyTag::Contraction { &super::contraction::CONTRACTION_HALF } else { &[] }
 }
 
 /// One table per family; the shared edit of a new family is one line here.

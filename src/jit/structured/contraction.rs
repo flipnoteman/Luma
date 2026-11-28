@@ -303,29 +303,25 @@ fn aligned_operands(view: &ContractionView<'_>) -> bool {
 
 impl StrategyId {
     pub(crate) const CONTRACTION_HOST: StrategyId = StrategyId(FamilyTag::Contraction, 0);
-    pub(crate) const SYRK_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 1);
-    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 2);
-    pub(crate) const GEMM_TF32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 3);
-    pub(crate) const GEMM_TF32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 4);
-    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 5);
-    pub(crate) const GEMM_F32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
-    pub(crate) const GEMM_F32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 7);
-    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 8);
-    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 9);
-    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 10);
+    pub(crate) const GEMM_TF32: StrategyId = StrategyId(FamilyTag::Contraction, 1);
+    pub(crate) const GEMM_TF32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 2);
+    pub(crate) const GEMM_TF32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 3);
+    pub(crate) const GEMM_F32: StrategyId = StrategyId(FamilyTag::Contraction, 4);
+    pub(crate) const GEMM_F32_RAGGED: StrategyId = StrategyId(FamilyTag::Contraction, 5);
+    pub(crate) const GEMM_F32_PADDED: StrategyId = StrategyId(FamilyTag::Contraction, 6);
+    pub(crate) const CONTRACTION_NATIVE_CPU: StrategyId = StrategyId(FamilyTag::Contraction, 7);
+    pub(crate) const CONTRACTION_SKINNY: StrategyId = StrategyId(FamilyTag::Contraction, 8);
+    pub(crate) const CONTRACTION_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 9);
+    /// Not in [`CONTRACTION_STRATEGIES`]: the table of [`CONTRACTION_HALF`].
+    pub(crate) const SYRK_TILED: StrategyId = StrategyId(FamilyTag::Contraction, 10);
 }
 
 /// The products' table, in preference order.
-pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 11] = [
+pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 10] = [
     // The host's sums differ from the device's: its own bit class. The backend's own kernels and the skinny ones read the
     // operands' state (`FitsInputs::OPERANDS`); the others only the shape, the numerics and the device. The aligned, the ragged and
     // the padded kernels of one precision give the same bits for the same plan: one class each (3: TF32, 4: `f32`).
     entry(StrategyId::CONTRACTION_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST, NumClass::Exact, 1, 0, fits_host, lower_host),
-    // A Gram product (`ContractionAttrs::half`) computes the lower triangle of its tiles and mirrors it: the bits of the full
-    // product's lower triangle, bit-symmetric (the upper triangle of the full product may differ on tensor cores, hence its own class).
-    // On the tensor cores (the default numerics of a CUDA device) it is the TF32 kernel's lower triangle: it is admitted under any numerics
-    // like the `f32` one, and takes the TF32 tiles where the product would run them (`wants_tf32`).
-    entry(StrategyId::SYRK_TILED, "syrk-tiled", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 8, 9, fits_syrk, lower_syrk),
     entry(StrategyId::GEMM_TF32, "gemm-tf32", Caps::TF32, FitsInputs::OPERANDS, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 1, fits_gemm_tf32, lower_gemm),
     cut(StrategyId::GEMM_TF32_RAGGED, "gemm-tf32-ragged", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_ragged),
     cut(StrategyId::GEMM_TF32_PADDED, "gemm-tf32-padded", Caps::TF32, NumClass::Reduced(Reduced::TF32_MATMUL), 3, 2, fits_gemm_tf32_padded),
@@ -336,6 +332,21 @@ pub(crate) const CONTRACTION_STRATEGIES: [Strategy; 11] = [
     entry(StrategyId::CONTRACTION_SKINNY, "skinny", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 6, 6, fits_skinny, lower_skinny),
     entry(StrategyId::CONTRACTION_TILED, "tiled", Caps::empty(), FitsInputs::NONE, NumClass::Exact, 7, 7, fits_tiled, lower_tiled),
 ];
+
+/// The table a Gram product (`ContractionAttrs::half`) is tried against before [`CONTRACTION_STRATEGIES`]: `select::execute` consults
+/// it only for such a product, so a plain product pays one flag test (and never evaluates `fits_syrk`).
+/// A Gram product (`ContractionAttrs::half`) computes the lower triangle of its tiles and mirrors it: the bits of the full
+/// product's lower triangle, bit-symmetric (the upper triangle of the full product may differ on tensor cores, hence its own class).
+/// On the tensor cores (the default numerics of a CUDA device) it is the TF32 kernel's lower triangle: it is admitted under any numerics
+/// like the `f32` one, and takes the TF32 tiles where the product would run them (`wants_tf32`).
+pub(crate) const CONTRACTION_HALF: [Strategy; 1] =
+    [entry(StrategyId::SYRK_TILED, "syrk-tiled", Caps::empty(), FitsInputs::OPERANDS, NumClass::Exact, 8, 9, fits_syrk, lower_syrk)];
+
+/// Whether the product is a Gram product that may run the half-work strategy.
+#[inline(always)]
+pub(crate) fn is_half(subject: &Subject<'_>) -> bool {
+    matches!(subject, Subject::Contraction(view) if view.attrs.half)
+}
 
 /// A baseline entry: it exists at f0e5723 and is never refused by the variant budget or by "still compiling"; no cost, the
 /// first of the table that fits runs.
@@ -1638,7 +1649,7 @@ mod tests {
             assert_eq!(group, if cut { 2 } else { 1 }, "{}", strategy.name);
         }
         let names: Vec<&str> = entries.iter().map(|strategy| strategy.name).collect();
-        assert_eq!(names, ["host", "syrk-tiled", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
+        assert_eq!(names, ["host", "gemm-tf32", "gemm-tf32-ragged", "gemm-tf32-padded", "gemm-f32", "gemm-f32-ragged", "gemm-f32-padded", "native-cpu", "skinny", "tiled"]);
         let class = |name: &str| entries.iter().find(|strategy| strategy.name == name).unwrap().bits;
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-ragged"));
         assert_eq!(class("gemm-tf32"), class("gemm-tf32-padded"));
