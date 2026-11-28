@@ -788,6 +788,11 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         if let Tail::Matmul { form, .. } = key.tail {
             src.push_str(&epilogue_fields(&crate::jit::comprehension::lower::contract::form(form), key.scalar_tys.len()));
         }
+        if let Tail::AxisReduce(pass) = key.tail
+            && let Some(epi) = pass.epi
+        {
+            src.push_str(&epi.fields());
+        }
         if let Tail::Reduce(ops) = key.tail {
             src.push_str(&ops.epilogue_fields());
         }
@@ -894,6 +899,12 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         // The offsets of the segments, after the inputs.
         let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> offs: array<u32>;");
         binding += 1;
+    }
+    if let Tail::AxisReduce(pass) = key.tail
+        && let Some(epi) = pass.epi
+    {
+        // The inputs of the epilogues, after the others' (see `AxisEpiId::bindings`).
+        src.push_str(&epi.bindings(&mut binding));
     }
     if let Some(pass) = radix {
         pass.declare_reads(&mut src, &mut binding);

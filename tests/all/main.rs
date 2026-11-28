@@ -31,6 +31,7 @@ mod cpu;
 mod df32_library;
 mod elementwise_math;
 mod erased;
+mod epilogue_axis;
 mod errors;
 mod ext_fn;
 mod ext_op;

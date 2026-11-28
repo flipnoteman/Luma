@@ -11,13 +11,17 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
 use crate::jit::structured::emit::Emit;
+use crate::jit::structured::epilogue::{self, AxisEpiId, EpiInput, EpiMap, EpiProgram, MAX_EPILOGUE_INSTRS, MAX_EPI_INPUTS, MAX_EPI_SCALARS};
+use crate::profile::{Decision, DecisionSite};
+use smallvec::SmallVec;
 use crate::jit::structured::select;
 use crate::jit::structured::strategy::{Output, Params, PassMode, StrategyId, Subject};
 use crate::gpu::lock;
 use crate::jit::comprehension::{Algebra, Comprehension, OpTag};
 use crate::jit::rules;
 use crate::jit::structured::{Comp, Family, Launch, Meta, RunState, Structured};
-use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
+
+use crate::jit::{self, ElemTy, Instr, Node, Op, OpKind, Ref, Scalar, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
 use crate::shape::Shape;
 
@@ -34,6 +38,37 @@ use crate::shape::Shape;
 // pending (see `jit::multireduce`), or separately where that is not possible.
 //
 // The methods below are the reduce family's: the predicates and recording of a [`Structured`] whose payload is a [`Comp`].
+
+/// Most inputs of the epilogues of the axis reductions recorded in one kernel.
+const MAX_AXIS_EPI_INPUTS: usize = 4;
+
+/// The epilogues of the axis reductions `members` (in the order of the ops of their kernel) as the last pass launches them: `None`
+/// if none has one.
+fn axis_epilogue(members: &[&Structured]) -> std::result::Result<Option<crate::scan::AxisEpilogue>, Failure> {
+    if members.iter().all(|reduced| reduced.epi().is_none()) {
+        return Ok(None);
+    }
+    let id = AxisEpiId::intern(members.iter().map(|reduced| reduced.epi().map(|epi| epi.key())).collect());
+    let mut reads = Vec::new();
+    let mut words = Vec::new();
+    for program in members.iter().filter_map(|reduced| reduced.epi()) {
+        for input in &program.inputs {
+            let storage = match &input.src {
+                Src::Buffer(storage) => Arc::clone(storage),
+                // The reader the epilogue registered with the array: a copy if a write came first, else the array's own buffer.
+                Src::Node(reader) => match (reader.evaluated(), reader.operands()) {
+                    (Some(storage), _) => Arc::clone(storage),
+                    (None, Some([Src::Buffer(storage), ..])) => storage,
+                    _ => Arc::clone(reader.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?),
+                },
+                Src::Scalar(_) => unreachable!("an epilogue input is an array"),
+            };
+            reads.push((storage.pin_single_read()?, storage.byte_len()));
+        }
+        words.extend(program.scalars.iter().map(|scalar| scalar.bits as u32));
+    }
+    Ok(Some(crate::scan::AxisEpilogue { id, reads, words }))
+}
 
 /// Most kernels of reductions whose compile [`Structured::build_ahead`] starts at once.
 const AHEAD_KERNELS: usize = 8;
@@ -96,7 +131,7 @@ impl Structured {
 
     fn build_form(&self) -> Comprehension {
         let comp = self.comp();
-        let RunState::Reduce { operand, finish, .. } = &comp.run else { unreachable!("a reduction") };
+        let RunState::Reduce { operand, finish, epi, .. } = &comp.run else { unreachable!("a reduction") };
         let (src, len, ty) = (Src::Node(Arc::clone(operand)), comp.meta.len, comp.meta.ty);
         let form = match (&comp.meta.tag, comp.meta.geom) {
             (OpTag::Reduce(ops), None) => Comprehension::reduce(src, len, *ops, ty),
@@ -104,7 +139,11 @@ impl Structured {
             (OpTag::ReduceAxis(ops), Some(geom)) => Comprehension::reduce_axis(src, geom, ops.as_slice()[0], ty),
             (tag, geom) => unreachable!("a structured value is a reduction, not {tag:?} over {geom:?}"),
         };
-        let form = form.with_steps(*finish);
+        let mut form = form.with_steps(*finish);
+        if let Some(program) = epi {
+            // The epilogue of an axis reduction (`Ref::Acc` is the value of the line): a form with an epilogue is not lowered by the rules.
+            form.epilogue = crate::jit::comprehension::Epilogue::Program(Arc::clone(program));
+        }
         // The guarantee of 07 §4.1: an API form is well formed and of the class its tag says.
         debug_assert!(form.validate().is_ok(), "the form of {:?}: {:?}", comp.meta.tag, form.validate());
         form
@@ -119,6 +158,12 @@ impl Structured {
     pub(crate) fn wgsl(&self) -> &'static str {
         let RunState::Reduce { wgsl, .. } = &self.comp().run else { unreachable!("a reduction") };
         wgsl
+    }
+
+    /// The epilogue of an axis reduction (see [`RunState::Reduce`]).
+    pub(crate) fn epi(&self) -> Option<&Arc<EpiProgram>> {
+        let RunState::Reduce { epi, .. } = &self.comp().run else { return None };
+        epi.as_ref()
     }
 
     pub(crate) fn finish(&self) -> Finish {
@@ -406,12 +451,17 @@ impl Structured {
         let all: Vec<&Structured> = std::iter::once(self).chain(partners.iter().map(|partner| &**partner)).collect();
         let operands: Vec<&Arc<Node>> = all.iter().map(|reduced| reduced.operand()).collect();
         let Some(plan) = jit::axis_plan(ctx, &operands, all.len()) else { return Ok(None) };
+        // The epilogues' inputs are bindings of the kernel: more than a few are left to the members' own kernels.
+        if all.iter().filter_map(|reduced| reduced.epi()).map(|epi| epi.inputs.len()).sum::<usize>() > MAX_AXIS_EPI_INPUTS {
+            return Ok(None);
+        }
+        let epi = axis_epilogue(&all)?;
         let bytes = geom.lines as u64 * 4;
         let storages: Vec<Arc<Storage>> = all.iter().map(|reduced| Arc::new(Storage::new(ctx, geom.lines as usize, reduced.layout()))).collect();
         let pins = storages.iter().map(|storage| storage.pin(0)).collect::<Result<Vec<_>>>()?;
         let outs: Vec<crate::scan::Bound<'_>> = pins.iter().map(|pin| crate::scan::Bound { buffer: pin.buffer(), bytes }).collect();
         let ops: Vec<ReduceOp> = all.iter().map(|reduced| reduced.ops().as_slice()[0]).collect();
-        crate::scan::reduce_axis_planned(emit, &plan, geom, &ops, &outs)?;
+        crate::scan::reduce_axis_planned(emit, &plan, geom, &ops, &outs, epi)?;
         drop(outs);
         drop(pins);
         for (reduced, storage) in all.iter().zip(&storages).skip(1) {
@@ -426,7 +476,7 @@ impl Structured {
         let storage = Arc::new(Storage::new(ctx, geom.lines as usize, self.layout()));
         let pin = storage.pin(0)?;
         let out = crate::scan::Bound { buffer: pin.buffer(), bytes: geom.lines as u64 * 4 };
-        crate::scan::reduce_axis_node(emit, self.operand(), geom, self.ops().as_slice()[0], out)?;
+        crate::scan::reduce_axis_node(emit, self.operand(), geom, self.ops().as_slice()[0], out, axis_epilogue(&[self])?)?;
         drop(pin);
         Ok(storage)
     }
@@ -699,7 +749,7 @@ impl<T: ScalarType> Array<T> {
                 Family::Comprehension(Comp {
                     form: Mutex::new(None),
                     meta: Meta { ty, len, tag, geom: None, launch: Launch::Now },
-                    run: RunState::Reduce { operand: reader, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
+                    run: RunState::Reduce { operand: reader, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
                 }),
                 ctx.recording_here(),
                 name,
@@ -750,7 +800,7 @@ impl<T: ScalarType> Array<T> {
                 let comp = Comp {
                     form: Mutex::new(None),
                     meta: Meta { ty: ElemTy::F32, len: reader.len(), tag: OpTag::ReduceAxis(ops), geom: Some(geom), launch: Launch::Now },
-                    run: RunState::Reduce { operand: Arc::clone(&reader), wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, finish: Finish::default(), solo: AtomicBool::new(false), pack: OnceLock::new() },
+                    run: RunState::Reduce { operand: Arc::clone(&reader), wgsl: "f32", elem: 4, layout: T::LAYOUT, buffer: false, finish: Finish::default(), epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
                 };
                 let reduced = Arc::new(Structured::new(Family::Comprehension(comp), false, name, location));
                 ctx.jit().register_reduction(&reduced);
@@ -766,6 +816,12 @@ impl<T: ScalarType> Array<T> {
     /// `f32`, or it has run or failed, or it has [`MAX_EPILOGUE`] steps already.
     pub(crate) fn fuse_step<O: ScalarType>(&self, step: EpilogueStep, word: u32) -> Option<Array<O>> {
         let reduced = self.structured()?;
+        if reduced.is_axis() {
+            return match step {
+                EpilogueStep::Unary(op) => self.absorb_axis(reduced, OpKind::Unary(op), true, AxisRhs::None),
+                EpilogueStep::Binary { op, scalar_left } => self.absorb_axis(reduced, OpKind::Binary(op), !scalar_left, AxisRhs::Scalar(word)),
+            };
+        }
         let comp = reduced.comp();
         let RunState::Reduce { operand, wgsl, elem, layout, buffer, finish, .. } = &comp.run else { return None };
         if !comp.meta.tag.is_whole_reduce() || *wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
@@ -789,11 +845,135 @@ impl<T: ScalarType> Array<T> {
         let derived = Comp {
             form: Mutex::new(None),
             meta: Meta { ty: comp.meta.ty, len: comp.meta.len, tag: comp.meta.tag.clone(), geom: None, launch: Launch::Now },
-            run: RunState::Reduce { operand: Arc::clone(operand), wgsl, elem: *elem, layout: *layout, buffer: *buffer, finish, solo: AtomicBool::new(false), pack: OnceLock::new() },
+            run: RunState::Reduce { operand: Arc::clone(operand), wgsl, elem: *elem, layout: *layout, buffer: *buffer, finish, epi: None, solo: AtomicBool::new(false), pack: OnceLock::new() },
         };
         let derived = Arc::new(Structured::new(Family::Comprehension(derived), self.context().recording_here(), reduced.name, reduced.location));
         self.context().jit().register_reduction(&derived);
         Some(Array::from_structured(self.context(), self.shape(), derived))
+    }
+}
+
+/// The other operand of an elementwise operation absorbed into an axis reduction (see [`Array::absorb_axis`]).
+pub(crate) enum AxisRhs<'a, T: GpuType> {
+    /// A unary operation.
+    None,
+    /// A scalar of the same element type, as the bits of its `f32`.
+    Scalar(u32),
+    /// An evaluated array of the shape of the reduction's result.
+    Array(&'a Array<T>),
+}
+
+impl<T: ScalarType> Array<T> {
+    /// `self op rhs` where `self` is an axis reduction that has not been recorded (and `acc_left` says it is the left operand), as an
+    /// array of `O`: a derived reduction whose last pass applies the operation as it stores each line's value (W3-U4 D1, the
+    /// epilogue of an axis reduction). `None`, the operation then being an elementwise node of its own, if the reduction cannot take
+    /// it: it is not an `f32` reduction that is waiting, the operation or the operand does not fit the epilogue's limits, or the other
+    /// operand is not an evaluated array of the shape of the result. Decisions are logged as `DecisionSite::Epilogue`.
+    #[inline(never)]
+    pub(crate) fn absorb_axis<O: ScalarType>(&self, reduced: &Arc<Structured>, kind: OpKind, acc_left: bool, rhs: AxisRhs<'_, T>) -> Option<Array<O>> {
+        let ctx = self.context();
+        let comp = reduced.comp();
+        let RunState::Reduce { operand, wgsl, elem, layout, buffer, finish, epi, .. } = &comp.run else { return None };
+        if *wgsl != "f32"
+            || comp.meta.ty != ElemTy::F32
+            || !reduced.is_unforced()
+            || reduced.failure().is_some()
+            || reduced.in_recording
+            || ctx.recording_here()
+            || reduced.ops().as_slice().first().is_none_or(|op| op.is_arg())
+        {
+            return None;
+        }
+        if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || matches!(kind, OpKind::Unary(UnOp::Id)) {
+            return None;
+        }
+        let probe = Instr { op: Op::new(kind, ElemTy::F32), args: [Ref::Acc, Ref::Unused, Ref::Unused] };
+        if !epilogue::axis_instr_allowed(&probe) {
+            return None;
+        }
+        let refuse = |reason: &'static str| {
+            if ctx.jit().recording_decisions() {
+                ctx.jit().note_decision(Decision::new(reduced.name, reduced.location, DecisionSite::Epilogue, format!("separate: {reason}")));
+            }
+        };
+        let mut instrs: Vec<Instr> = epi.as_ref().map_or_else(Vec::new, |program| program.instrs.to_vec());
+        let mut inputs: SmallVec<[EpiInput; MAX_EPI_INPUTS]> = epi.as_ref().map_or_else(SmallVec::new, |program| program.inputs.clone());
+        let mut scalars = epi.as_ref().map_or_else(SmallVec::new, |program| program.scalars.clone());
+        if instrs.len() >= MAX_EPILOGUE_INSTRS {
+            refuse("limit");
+            return None;
+        }
+        let prev = if instrs.is_empty() { Ref::Acc } else { Ref::Tmp(instrs.len() as u32 - 1) };
+        let arg = match rhs {
+            AxisRhs::None => Ref::Unused,
+            AxisRhs::Scalar(word) => {
+                if scalars.len() >= MAX_EPI_SCALARS {
+                    refuse("limit");
+                    return None;
+                }
+                scalars.push(Scalar::f32(f32::from_bits(word)));
+                Ref::Scalar(scalars.len() as u32 - 1)
+            }
+            AxisRhs::Array(other) => {
+                if inputs.len() >= MAX_EPI_INPUTS {
+                    refuse("limit");
+                    return None;
+                }
+                // One value per line, in a buffer: anything else (a pending expression, a broadcast) is an elementwise node of its own.
+                let storage = match other.recorded_storage() {
+                    Some(storage) if other.shape() == self.shape() && other.len() == reduced.comp().meta.geom.map_or(0, |geom| geom.lines as usize) && other.view().is_none() && !other.is_read_view() => Arc::clone(storage),
+                    _ => {
+                        refuse("operand shape");
+                        return None;
+                    }
+                };
+                // Registered with the array like any reader: a write into it after this point evaluates the reader first, which keeps
+                // the values the epilogue reads.
+                let reader = jit::create(ctx, storage.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::F32), [Src::Buffer(storage), Src::unused(), Src::unused()], reduced.name, reduced.location).ok()?;
+                inputs.push(EpiInput { src: Src::Node(reader), map: EpiMap::Point, ty: ElemTy::F32 });
+                Ref::Input(inputs.len() as u32 - 1)
+            }
+        };
+        let args = match kind {
+            OpKind::Unary(_) => [prev, Ref::Unused, Ref::Unused],
+            _ if acc_left => [prev, arg, Ref::Unused],
+            _ => [arg, prev, Ref::Unused],
+        };
+        instrs.push(Instr { op: probe.op, args });
+        let absorbed = instrs.len();
+        let program = EpiProgram { instrs: Arc::new(instrs), inputs, scalars, outputs: SmallVec::from_elem(absorbed as u32 - 1, 1) };
+        debug_assert!(program.validate(0).is_ok(), "an axis epilogue: {:?}", program.validate(0));
+        let derived = Comp {
+            form: Mutex::new(None),
+            meta: Meta { ty: comp.meta.ty, len: comp.meta.len, tag: comp.meta.tag.clone(), geom: comp.meta.geom, launch: Launch::Now },
+            run: RunState::Reduce {
+                operand: Arc::clone(operand),
+                wgsl,
+                elem: *elem,
+                layout: *layout,
+                buffer: *buffer,
+                finish: *finish,
+                epi: Some(Arc::new(program)),
+                solo: AtomicBool::new(false),
+                pack: OnceLock::new(),
+            },
+        };
+        let derived = Arc::new(Structured::new(Family::Comprehension(derived), ctx.recording_here(), reduced.name, reduced.location));
+        ctx.jit().register_reduction(&derived);
+        if ctx.jit().recording_decisions() {
+            ctx.jit().note_decision(Decision::new(reduced.name, reduced.location, DecisionSite::Epilogue, format!("absorbed {absorbed} ops")));
+        }
+        Some(Array::from_structured(ctx, self.shape(), derived))
+    }
+
+    /// `self op other` of two arrays where one of them is an axis reduction that waits (see [`Array::absorb_axis`]): `None` if neither is.
+    #[inline(never)]
+    pub(crate) fn absorb_axis_binary(&self, other: &Array<T>, op: BinOp, scalar_left: bool) -> Option<Array<T>> {
+        if let Some(reduced) = self.structured().filter(|reduced| reduced.is_axis()) {
+            return self.absorb_axis(reduced, OpKind::Binary(op), !scalar_left, AxisRhs::Array(other));
+        }
+        let reduced = other.structured().filter(|reduced| reduced.is_axis())?;
+        other.absorb_axis(reduced, OpKind::Binary(op), scalar_left, AxisRhs::Array(self))
     }
 }
 

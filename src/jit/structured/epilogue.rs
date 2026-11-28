@@ -196,3 +196,116 @@ pub(crate) enum StepOperand {
     Scalar { value: Scalar, scalar_left: bool },
     Input(EpiInput),
 }
+
+// -- Axis reductions (W3-U4 D1) --
+
+/// Whether `instr` may be part of the epilogue of an axis reduction: an `f32` unary or binary operation that the generated WGSL
+/// writes as an expression (no helper function, no integers, no complex numbers).
+pub(crate) fn axis_instr_allowed(instr: &Instr) -> bool {
+    use crate::builtin::UnOp;
+    use crate::jit::OpKind;
+    instr.op.out_ty() == ElemTy::F32
+        && match instr.op.kind {
+            OpKind::Unary(op) => !op.needs_helper() && !op.is_bitwise() && op != UnOp::Conj,
+            OpKind::Binary(op) => !op.needs_helper() && !op.is_bitwise(),
+            _ => false,
+        }
+}
+
+/// The structure of the epilogues of the ops of one reducing pass, by handle: a pass is a kernel cache key and `Copy`, so it names
+/// its epilogues by a small id (the pattern of `builtin::ReduceList::merged`). Entry `j` is the epilogue of op `j`; only the last
+/// pass of an axis reduction has one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct AxisEpiId(u32);
+
+#[derive(Default)]
+struct AxisEpis {
+    specs: Vec<Arc<Vec<Option<EpiKey>>>>,
+    ids: crate::gpu::hash::FxMap<Vec<Option<EpiKey>>, u32>,
+}
+
+static AXIS_EPIS: std::sync::LazyLock<std::sync::Mutex<AxisEpis>> = std::sync::LazyLock::new(Default::default);
+
+impl AxisEpiId {
+    /// The handle of `ops`, the epilogue of every op of a pass (`None` for an op that has none).
+    pub(crate) fn intern(ops: Vec<Option<EpiKey>>) -> AxisEpiId {
+        let mut table = crate::gpu::lock(&AXIS_EPIS);
+        if let Some(&id) = table.ids.get(&ops) {
+            return AxisEpiId(id);
+        }
+        let id = table.specs.len() as u32;
+        table.specs.push(Arc::new(ops.clone()));
+        table.ids.insert(ops, id);
+        AxisEpiId(id)
+    }
+
+    fn spec(self) -> Arc<Vec<Option<EpiKey>>> {
+        Arc::clone(&crate::gpu::lock(&AXIS_EPIS).specs[self.0 as usize])
+    }
+
+    /// Whether op `j` has an epilogue.
+    pub(crate) fn has(self, j: usize) -> bool {
+        self.spec().get(j).is_some_and(Option::is_some)
+    }
+
+    /// The extra read bindings of the pass.
+    pub(crate) fn input_count(self) -> usize {
+        self.spec().iter().flatten().map(|key| key.inputs.len()).sum()
+    }
+
+    /// The fields of the `Params` uniform that hold the scalars, `es{j}_{k}: f32,`, in the order of the ops and their scalars.
+    pub(crate) fn fields(self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (j, key) in self.spec().iter().enumerate() {
+            for k in 0..key.as_ref().map_or(0, |key| key.scalars.len()) {
+                let _ = write!(out, "es{j}_{k}: f32, ");
+            }
+        }
+        out
+    }
+
+    /// The declarations of the extra inputs `epi{j}_{k}`, from binding `*binding` on.
+    pub(crate) fn bindings(self, binding: &mut usize) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (j, key) in self.spec().iter().enumerate() {
+            for k in 0..key.as_ref().map_or(0, |key| key.inputs.len()) {
+                let _ = writeln!(out, "@group(1) @binding({}) var<storage, read> epi{j}_{k}: array<f32>;", *binding);
+                *binding += 1;
+            }
+        }
+        out
+    }
+
+    /// `fn luma_epi{j}(at: u32, acc: f32) -> f32` for every op with an epilogue: the program on the value `acc` of line `at`.
+    pub(crate) fn functions(self) -> String {
+        use crate::jit::OpKind;
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (j, key) in self.spec().iter().enumerate() {
+            let Some(key) = key else { continue };
+            let _ = writeln!(out, "fn luma_epi{j}(at: u32, acc: f32) -> f32 {{");
+            let name = |arg: Ref| -> String {
+                match arg {
+                    Ref::Acc => "acc".to_owned(),
+                    Ref::Input(k) => format!("epi{j}_{k}[at]"),
+                    Ref::Scalar(k) => format!("p.es{j}_{k}"),
+                    Ref::Tmp(t) => format!("t{t}"),
+                    Ref::Unused | Ref::Sub(_) => unreachable!("an axis epilogue reads the value, inputs, scalars and temporaries"),
+                }
+            };
+            for (n, instr) in key.instrs.iter().enumerate() {
+                let expr = match instr.op.kind {
+                    OpKind::Unary(op) => crate::builtin::substitute(op.expr(), &name(instr.args[0]), ""),
+                    OpKind::Binary(op) => crate::builtin::substitute(op.expr(), &name(instr.args[0]), &name(instr.args[1])),
+                    _ => unreachable!("an axis epilogue has unary and binary operations"),
+                };
+                let _ = writeln!(out, "    let t{n}: f32 = {expr};");
+            }
+            let last = key.outputs.first().copied().unwrap_or(key.instrs.len() as u32 - 1);
+            let _ = writeln!(out, "    return t{last};\n}}");
+        }
+        out
+    }
+}

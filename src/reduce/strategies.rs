@@ -32,13 +32,18 @@ pub(crate) const REDUCE_STRATEGIES: [Strategy; 7] = [
     // operand's life (forced, failed, pending) and the reductions registered beside it: `LIVE`, so the family is never cached.
     entry(StrategyId::REDUCE_HOST, "host", Caps::HOST_PATH, FitsInputs::HOST.with(FitsInputs::LIVE), 1, 0, fits_host, lower_host),
     entry(StrategyId::REDUCE_MERGED, "merged", Caps::empty(), FitsInputs::HOST.with(FitsInputs::LIVE), 2, 1, fits_merged, lower_merged),
-    entry(StrategyId::REDUCE_AXIS_MERGED, "axis-merged", Caps::empty(), FitsInputs::HOST.with(FitsInputs::LIVE), 3, 2, fits_axis_merged, lower_axis_merged),
+    with_epilogue(entry(StrategyId::REDUCE_AXIS_MERGED, "axis-merged", Caps::empty(), FitsInputs::HOST.with(FitsInputs::LIVE), 3, 2, fits_axis_merged, lower_axis_merged)),
     entry(StrategyId::REDUCE_BITS, "bits", Caps::empty(), FitsInputs::NONE, 4, 3, fits_bits, lower_bits),
     // A first pass of several groups that finishes itself, or a second pass: different bits where the first pass has several groups.
     entry(StrategyId::REDUCE_SINGLE_PASS, "single-pass", Caps::empty(), FitsInputs::NONE, 5, 4, fits_single_pass, lower_single_pass),
     entry(StrategyId::REDUCE_TWO_PASS, "two-pass", Caps::empty(), FitsInputs::NONE, 6, 5, fits_two_pass, lower_two_pass),
-    entry(StrategyId::REDUCE_AXIS_LINES, "axis", Caps::empty(), FitsInputs::NONE, 3, 6, fits_axis_lines, lower_axis_lines),
+    with_epilogue(entry(StrategyId::REDUCE_AXIS_LINES, "axis", Caps::empty(), FitsInputs::NONE, 3, 6, fits_axis_lines, lower_axis_lines)),
 ];
+
+/// The strategy takes the epilogue an axis reduction absorbed (W3-U4 D1): its last pass applies it as it stores.
+const fn with_epilogue(strategy: Strategy) -> Strategy {
+    Strategy { epilogue: true, ..strategy }
+}
 
 #[allow(clippy::too_many_arguments)]
 const fn entry(

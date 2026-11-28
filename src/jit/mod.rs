@@ -218,8 +218,7 @@ use luma_core::kir::KernelModule;
 
 use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
-use program::Instr;
-pub(crate) use program::AtomicOp;
+pub(crate) use program::{AtomicOp, Instr, Ref};
 
 pub(crate) use codegen::{epilogue_bindings, epilogue_fields, epilogue_function};
 pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, matmul_epilogue, matmul_with, radix_pass, reduce_blocks_source, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, ManyMode, MatmulKernel, MatmulSide, Member, PartSide};

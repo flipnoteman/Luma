@@ -42,6 +42,7 @@ use crate::context::Context;
 use crate::error::LumaError;
 use crate::gpu_type::ElemLayout;
 use crate::reduce::{AxisGeom, PackRead};
+use epilogue::EpiProgram;
 
 /// A value that has not been recorded yet, one of a [`Family`]. Shared by the arrays that stand for it
 /// (see `Repr::Structured`) and by the leaves that stand for it in expressions.
@@ -121,6 +122,9 @@ pub(crate) enum RunState {
         buffer: bool,
         /// The operations applied to the reduction's values (none for a plain reduction); mirrored as the form's epilogue.
         finish: Finish,
+        /// The epilogue of an axis reduction (W3-U4 D1): the elementwise consumers of its values that its last pass applies as it
+        /// stores them. `None` for a plain reduction and for reductions of the whole array (their `finish` is the epilogue).
+        epi: Option<Arc<EpiProgram>>,
         /// Set when the group this reduction was recorded in was not recorded in one kernel because that was not due or ready (see
         /// `Tuning::reduce_multi_after`): it is recorded alone, so that the others do not form other groups.
         solo: AtomicBool,

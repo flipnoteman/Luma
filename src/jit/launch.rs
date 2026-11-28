@@ -2663,6 +2663,7 @@ pub(crate) fn axis_reduce(
     size: [u32; 3],
     outs: &[RawArg<'_>],
     reads: &[RawArg<'_>],
+    words: &[u32],
 ) -> Result<bool, Failure> {
     let ctx = emit.ctx();
     let Some(args) = node.operands() else { return Ok(false) };
@@ -2676,9 +2677,10 @@ pub(crate) fn axis_reduce(
     drop((fused_nodes, instr_nodes, sub_roots));
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
-    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len());
+    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len() + words.len());
     uniform.extend_from_slice(&geometry);
     uniform.extend_from_slice(&scalars);
+    uniform.extend_from_slice(words);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + reads.len() + 1);
     raw.extend_from_slice(outs);
     raw.extend(pins.iter().map(InPin::raw));
@@ -2738,6 +2740,7 @@ pub(crate) fn axis_plan(ctx: &crate::context::Context, operands: &[&Arc<Node>], 
         split: false,
         line_major: false,
         scan: false,
+        epi: None,
     };
     let fused = flatten_inner(&roots, Tail::AxisReduce(placeholder), &[]).ok()?;
     drop(roots);
@@ -2768,6 +2771,7 @@ pub(crate) fn axis_plan(ctx: &crate::context::Context, operands: &[&Arc<Node>], 
 
 /// Runs the reducing pass `pass` (its ops reduce the roots of `plan`, see [`ReduceList::merged`]) over the cells of the
 /// planned program, as [`axis_reduce`] does for one expression.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn axis_reduce_planned(
     emit: &mut Emit<'_>,
     plan: &AxisPlan,
@@ -2776,6 +2780,8 @@ pub(crate) fn axis_reduce_planned(
     workgroups: [u32; 3],
     size: [u32; 3],
     outs: &[RawArg<'_>],
+    reads: &[RawArg<'_>],
+    words: &[u32],
 ) -> Result<(), Failure> {
     let ctx = emit.ctx();
     let Some(fused) = plan.fused.borrow_mut().take() else {
@@ -2788,12 +2794,14 @@ pub(crate) fn axis_reduce_planned(
     key.tail = Tail::AxisReduce(pass);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
-    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len());
+    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len() + words.len());
     uniform.extend_from_slice(&geometry);
     uniform.extend_from_slice(&scalars);
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
+    uniform.extend_from_slice(words);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + reads.len() + 1);
     raw.extend_from_slice(outs);
     raw.extend(pins.iter().map(InPin::raw));
+    raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     emit.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);

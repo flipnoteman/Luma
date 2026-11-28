@@ -30,6 +30,7 @@ use luma_core::Buffer;
 
 use crate::jit::structured::boundary::{ScanAttrs, ScanOperand};
 use crate::jit::structured::emit::Emit;
+use crate::jit::structured::epilogue::AxisEpiId;
 use crate::jit::structured::strategy::{first_candidate, note, Boundary, BoundaryAttrs, FamilyTag, Params, StrategyId};
 
 use crate::array::{Array, Failure};
@@ -209,6 +210,9 @@ pub(crate) struct AxisPass {
     /// A scan, not a reduction: `pass` is one of the scan passes of [`Lines::scan`], reading its operand through `load` (the fused
     /// first read of a `cumsum`, see [`scan_body`]); `ops` is then the one sum that stands for the operator.
     pub(crate) scan: bool,
+    /// The epilogues of the ops (W3-U4 D1), applied as the pass stores its results: only the last pass of an axis reduction of `f32`
+    /// has them (and then no op is an arg reduction), see [`AxisEpiId`].
+    pub(crate) epi: Option<AxisEpiId>,
 }
 
 /// Whether the `Fold` of `nb` blocks per line writes line-major partial results: when one
@@ -268,9 +272,14 @@ fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
         return crate::arg::source(pass, ty, workgroup);
     }
     let outputs = pass.outputs();
-    let mut src = format!("struct Params {{ {AXIS_PARAMS}}}\n{}", pass.output_bindings(ty));
+    let fields = pass.epi.map_or_else(String::new, AxisEpiId::fields);
+    let mut src = format!("struct Params {{ {AXIS_PARAMS}{fields}}}\n{}", pass.output_bindings(ty));
     let _ = writeln!(src, "@group(1) @binding({outputs}) var<storage, read> a: array<{ty}>;");
-    let _ = writeln!(src, "@group(1) @binding({}) var<uniform> p: Params;", outputs + 1);
+    let mut binding = outputs + 1;
+    if let Some(epi) = pass.epi {
+        src.push_str(&epi.bindings(&mut binding));
+    }
+    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
     let _ = writeln!(src, "fn ld(q: u32) -> {ty} {{ return a[q]; }}");
     src.push_str(&reduce_body(pass, ty, "ld", workgroup));
     src
@@ -297,6 +306,10 @@ pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) 
     for (j, &op) in ops.iter().enumerate() {
         let _ = writeln!(src, "fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {}; }}", elem.combine(op));
     }
+    if let Some(epi) = pass.epi {
+        debug_assert_eq!(ty, "f32", "an axis epilogue is a program on f32");
+        src.push_str(&epi.functions());
+    }
     let cin = if pass.partial { "    let cin = p.n * p.lines;\n" } else { "" };
     // The statement binding the cell at `q`: `{name}` for all ops, or `{name}{j}` for op `j`.
     let read = |name: &str, q: &str| -> String {
@@ -317,6 +330,7 @@ pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) 
     let tiles = roots.as_ref().map_or(1, |_| root_count(&pass.ops) as usize);
     let mapped = |j: usize, cell: String| if ops[j] == ReduceOp::SumSquares { elem.square(&cell) } else { cell };
     let store = |j: usize, at: &str, count: &str, value: String| {
+        let value = if pass.epi.is_some_and(|epi| epi.has(j)) { format!("luma_epi{j}({at}, {value})") } else { value };
         if pass.split { format!("out{j}[{at}] = {value};") } else { format!("out[{j}u * {count} + {at}] = {value};") }
     };
     let w = WORKGROUP;
@@ -928,6 +942,17 @@ pub(crate) struct Lines<'a> {
     shared: bool,
     /// Where the passes launch.
     emit: Emit<'a>,
+    /// What the last pass of an axis reduction applies to its values (see [`Lines::reduce`]).
+    epi: Option<AxisEpilogue>,
+}
+
+/// The epilogues of the ops of an axis reduction (W3-U4 D1) as the last pass launches them: the structure the kernel is made for,
+/// the buffers its extra inputs are read from (in the order of their declarations, see [`AxisEpiId::bindings`]) and the values
+/// of its scalars (the words of the `es{j}_{k}` fields of the uniform).
+pub(crate) struct AxisEpilogue {
+    pub(crate) id: AxisEpiId,
+    pub(crate) reads: Vec<(crate::gpu::pager::Pin, u64)>,
+    pub(crate) words: Vec<u32>,
 }
 
 /// A pending operand evaluated into a buffer for the scans that read it more than once, or that cannot compute it.
@@ -1029,10 +1054,11 @@ fn no_operator() -> Operator {
 
 /// Reduces the lines `geom` of the `f32` expression `node` with `op` into `out`: the passes of [`Array::reduce_axis`] of one op,
 /// the first computing the expression where it can.
-pub(crate) fn reduce_axis_node(emit: &mut Emit<'_>, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>) -> Outcome<()> {
+pub(crate) fn reduce_axis_node(emit: &mut Emit<'_>, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>, epi: Option<AxisEpilogue>) -> Outcome<()> {
     let operator = no_operator();
     let mut run = Lines::new(emit.ctx(), &operator, "f32");
     run.emit = emit.clone();
+    run.epi = epi;
     let result = run.reduce(Input::Pending(node), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, ReduceList::new(&[op]), false, &[out]);
     emit.absorb(&run.emit);
     result
@@ -1041,10 +1067,11 @@ pub(crate) fn reduce_axis_node(emit: &mut Emit<'_>, node: &Arc<Node>, geom: crat
 /// Reduces the lines `geom` of the operands of `plan` in the passes of [`Array::reduce_axis`]: op `j` of `ops` reduces its own
 /// operand (see [`jit::AxisPlan::roots`]) into `outs[j]`, every op combining the cells of its lines in the order a reduction
 /// of that operand alone does, so the values are the same bits. One kernel computes the operands together (once what they share).
-pub(crate) fn reduce_axis_planned(emit: &mut Emit<'_>, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>]) -> Outcome<()> {
+pub(crate) fn reduce_axis_planned(emit: &mut Emit<'_>, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>], epi: Option<AxisEpilogue>) -> Outcome<()> {
     let operator = no_operator();
     let mut run = Lines::new(emit.ctx(), &operator, "f32");
     run.emit = emit.clone();
+    run.epi = epi;
     let list = ReduceList::merged(ops, plan.roots(), &vec![crate::builtin::Epilogue::default(); ops.len()]);
     let result = run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs);
     emit.absorb(&run.emit);
@@ -1075,7 +1102,7 @@ pub(crate) fn add_operator(ctx: &Context) -> Outcome<&'static Operator> {
 
 impl<'a> Lines<'a> {
     fn new(ctx: &'a Context, op: &'a Operator, ty: &'static str) -> Self {
-        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty, shared: false, emit: Emit::now(ctx) }
+        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty, shared: false, emit: Emit::now(ctx), epi: None }
     }
 
     /// The scan kernels of `op`, which must be [`add_operator`].
@@ -1201,10 +1228,10 @@ impl<'a> Lines<'a> {
     #[inline(never)]
     fn launch_pending(&mut self, pass: Pass, geometry: [u32; 5], out: Bound<'_>, node: &Arc<Node>, pre: Option<Bound<'_>>) -> Outcome<()> {
         let (workgroups, size) = self.grid(pass, geometry)?;
-        let scan = AxisPass { pass, ops: ReduceList::new(&[ReduceOp::Sum]), partial: false, split: false, line_major: false, scan: true };
+        let scan = AxisPass { pass, ops: ReduceList::new(&[ReduceOp::Sum]), partial: false, split: false, line_major: false, scan: true, epi: None };
         let writes = [RawArg::write(out.buffer, out.bytes)];
         let reads: Vec<RawArg<'_>> = pre.iter().map(|pre| if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) }).collect();
-        if jit::axis_reduce(&mut self.emit, node, scan, geometry, workgroups, size, &writes, &reads)? {
+        if jit::axis_reduce(&mut self.emit, node, scan, geometry, workgroups, size, &writes, &reads, &[])? {
             return Ok(());
         }
         let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
@@ -1214,6 +1241,7 @@ impl<'a> Lines<'a> {
 
     /// One reducing pass of `ops` over `input` into `outs`: a buffer for every op if there are
     /// several, else the one buffer that holds op `j` at `j * count` (see [`AxisPass::split`]).
+    #[allow(clippy::too_many_arguments)]
     fn launch_reduce(
         &mut self,
         pass: Pass,
@@ -1222,19 +1250,24 @@ impl<'a> Lines<'a> {
         geometry: [u32; 5],
         outs: &[Bound<'_>],
         input: Input<'_>,
+        finish: bool,
     ) -> Outcome<()> {
-        let pass = AxisPass { pass, ops, partial, split: outs.len() > 1, line_major: line_major(pass, geometry[3]), scan: false };
+        // The last pass, which writes the values the caller gets, applies the epilogues (once: the epilogue is taken).
+        let epi = if finish { self.epi.take() } else { None };
+        let pass = AxisPass { pass, ops, partial, split: outs.len() > 1, line_major: line_major(pass, geometry[3]), scan: false, epi: epi.as_ref().map(|epi| epi.id) };
         let (workgroups, size) = self.grid(pass.pass, geometry)?;
         let writes: Vec<RawArg<'_>> = outs.iter().map(|out| RawArg::write(out.buffer, out.bytes)).collect();
+        let reads: Vec<RawArg<'_>> = epi.iter().flat_map(|epi| epi.reads.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes))).collect();
+        let words: &[u32] = epi.as_ref().map_or(&[], |epi| &epi.words);
         let evaluated;
         let input = match input {
             Input::Buffer(input) => input,
             Input::Plan(plan) => {
-                jit::axis_reduce_planned(&mut self.emit, plan, pass, geometry, workgroups, size, &writes)?;
+                jit::axis_reduce_planned(&mut self.emit, plan, pass, geometry, workgroups, size, &writes, &reads, words)?;
                 return Ok(());
             }
             Input::Pending(node) => {
-                if jit::axis_reduce(&mut self.emit, node, pass, geometry, workgroups, size, &writes, &[])? {
+                if jit::axis_reduce(&mut self.emit, node, pass, geometry, workgroups, size, &writes, &reads, words)? {
                     return Ok(());
                 }
                 let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
@@ -1245,7 +1278,9 @@ impl<'a> Lines<'a> {
         let core = self.reduce_core(pass)?;
         let mut args = writes;
         args.push(RawArg::read(input.buffer, input.bytes));
-        args.push(RawArg::Uniform(bytemuck::cast_slice(&geometry)));
+        args.extend(reads);
+        let uniform = if words.is_empty() { geometry.to_vec() } else { [geometry.as_slice(), words].concat() };
+        args.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
         self.emit.launch(&core, workgroups, size, &args)?;
         Ok(())
     }
@@ -1323,7 +1358,7 @@ impl<'a> Lines<'a> {
     fn reduce(&mut self, input: Input<'_>, cells: Cells, ops: ReduceList, partial: bool, outs: &[Bound<'_>]) -> Outcome<()> {
         let Cells { n, stride, lines } = cells;
         if stride == 1 && n <= SHORT_LINE {
-            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n, root_count(&ops)), n], outs, input);
+            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n, root_count(&ops)), n], outs, input, true);
         }
         let (pass, geometry, nb) = if stride == 1 {
             let nb = n.div_ceil(REDUCE_CHUNK);
@@ -1334,11 +1369,11 @@ impl<'a> Lines<'a> {
             (Pass::Fold, [n, stride, lines, nb, k], nb)
         };
         if nb == 1 {
-            return self.launch_reduce(pass, ops, partial, geometry, outs, input);
+            return self.launch_reduce(pass, ops, partial, geometry, outs, input, true);
         }
         let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb) * ops.cell_words() as u64)?;
         let totals = Bound { buffer: &totals, bytes };
-        self.launch_reduce(pass, ops, partial, geometry, &[totals], input)?;
+        self.launch_reduce(pass, ops, partial, geometry, &[totals], input, false)?;
         // The partial results of contiguous lines (and line-major ones) are lines of `nb` cells,
         // those of strided ones `nb` rows of `lines` cells.
         let next = if line_major(pass, nb) {

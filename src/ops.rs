@@ -429,6 +429,13 @@ impl<T: ScalarType> Array<T> {
         {
             return fused;
         }
+        // An axis reduction that has not run takes the operation, with an array of its result's shape, into its last pass.
+        if let Rhs::Array(other) = &rhs
+            && (self.structured().is_some() || other.structured().is_some())
+            && let Some(fused) = self.absorb_axis_binary(other, op, scalar_left)
+        {
+            return fused;
+        }
         // Matrix properties: a bool test on the operands (the check for `a + a.t()` is behind `is_read_view`); the work is out of line.
         let other = if let Rhs::Array(other) = &rhs { Some(*other) } else { None };
         let maybe_props = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)

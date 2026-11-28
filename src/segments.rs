@@ -316,10 +316,10 @@ impl<T: AtomicElem> Array<T> {
         let geometry = [n, 1, rows, tiles, 0];
         let writes = [RawArg::write(out_pin.buffer(), out.byte_len()), RawArg::write(&sc, sc_bytes)];
         let reads = [RawArg::read(offs_pin.buffer(), offs_bytes)];
-        let pass = AxisPass { pass: Pass::Segments, ops: ReduceList::new(&[op]), partial: false, split: false, line_major: false, scan: false };
+        let pass = AxisPass { pass: Pass::Segments, ops: ReduceList::new(&[op]), partial: false, split: false, line_major: false, scan: false, epi: None };
         let groups = fold_workgroups(ctx, tiles)?;
         let fused = match self.pending() {
-            Some(node) => jit::axis_reduce(&mut crate::jit::structured::emit::Emit::now(ctx), node, pass, geometry, groups, [tiles, 1, 1], &writes, &reads)?,
+            Some(node) => jit::axis_reduce(&mut crate::jit::structured::emit::Emit::now(ctx), node, pass, geometry, groups, [tiles, 1, 1], &writes, &reads, &[])?,
             None => false,
         };
         if !fused {
