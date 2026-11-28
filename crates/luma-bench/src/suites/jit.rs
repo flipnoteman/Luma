@@ -28,7 +28,7 @@ use crate::harness::Harness;
 type Group = fn(&mut Harness);
 
 pub fn run(h: &mut Harness) {
-    let groups: [(&str, Group); 15] = [
+    let groups: [(&str, Group); 16] = [
         ("compile", compile::run),
         ("launch", launch::run),
         ("launchcost", launchcost::run),
