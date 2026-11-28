@@ -108,6 +108,7 @@ impl ReaderList {
 
     /// Takes the live entries `take` accepts, oldest first; the others stay registered. Dead
     /// entries are dropped.
+    #[inline]
     pub(super) fn take_if(&mut self, take: impl Fn(&Node) -> bool) -> Vec<Weak<Node>> {
         self.prune_at = 0;
         let (mut taken, mut kept) = (Vec::new(), Weaks::default());

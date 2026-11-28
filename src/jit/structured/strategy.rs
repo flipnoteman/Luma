@@ -462,7 +462,18 @@ pub(crate) enum Output {
 }
 
 impl Output {
+    #[inline]
     pub(crate) fn into_storage(self) -> Arc<Storage> {
+        match self {
+            Output::Storage(storage) => storage,
+            other => other.into_first(),
+        }
+    }
+
+    /// The first storage of an output that has several: the plain value.
+    #[cold]
+    #[inline(never)]
+    fn into_first(self) -> Arc<Storage> {
         match self {
             Output::Storage(storage) => storage,
             Output::Epilogued(mut storages) => storages.swap_remove(0),

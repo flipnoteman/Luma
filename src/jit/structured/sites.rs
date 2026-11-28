@@ -117,13 +117,12 @@ pub(crate) struct SiteKey {
 }
 
 impl SiteKey {
-    /// The key of a call site: `(file, line, column)` mixed, the slot from the high bits and the tag from the low ones.
+    /// The key of a call site: its `Location` (a static, so its address names the site), the slot from the high bits of the mixed address
+    /// and the tag from the address itself (distinct statics of one binary differ in it).
+    #[inline]
     pub(crate) fn of(location: &'static Location<'static>) -> SiteKey {
-        let file = location.file().as_ptr() as usize as u64;
-        let place = (u64::from(location.line()) << 12) ^ u64::from(location.column());
-        let mix = (file >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ place.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        let mix = (mix ^ (mix >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        SiteKey { slot: (mix >> 54) as u16, tag: mix as u32 }
+        let at = (std::ptr::from_ref(location) as usize as u64) >> 3;
+        SiteKey { slot: (at.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as u16, tag: at as u32 }
     }
 }
 
@@ -175,7 +174,7 @@ impl Sites {
         let seen = State(cell.load(Ordering::Relaxed));
         // A slot of another site is reset: collisions cost speed, not correctness.
         let state = if seen.tag() == key.tag { seen } else { State::fresh(key.tag) };
-        let probe = probe_every != 0 && u32::from(state.calls()) % probe_every == 0;
+        let probe = probe_every != 0 && u32::from(state.calls()) & (probe_every - 1) == 0;
         let lazy = state.attached() || probe;
         cell.store(state.with(State::CALLS, state.calls().wrapping_add(1)).0, Ordering::Relaxed);
         (if lazy { Laziness::Lazy } else { Laziness::Eager }, SiteSlot(key.slot))
