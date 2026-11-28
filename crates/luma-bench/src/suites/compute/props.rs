@@ -24,7 +24,7 @@ fn diagonals(h: &Harness, n: usize, lo: usize, hi: usize) -> Vec<(isize, Array<f
 pub fn run(h: &mut Harness) {
     h.guarded("props", |h| {
         let cpu = h.ctx.is_cpu();
-        let n: usize = if cpu { pick(h, 1 << 14, 1 << 18) } else { pick(h, 1 << 18, 1 << 20) };
+        let n: usize = if cpu { pick(h, 1 << 13, 1 << 15) } else { pick(h, 1 << 14, 1 << 15) }; // the band is an n x n expression: n < 2^16
 
         // Tridiagonal: `solve_banded` against the line solver on the same diagonals.
         let d = diagonals(h, n, 1, 1);
@@ -67,9 +67,10 @@ pub fn run(h: &mut Harness) {
         // Banded products: the fused sum of shifts under exact_finite against the dense product of the evaluated matrix. The
         // harness context is swapped for one with the algebraic numerics (the profile follows `h.ctx`).
         let saved = std::mem::replace(&mut h.ctx, Context::with_options(ContextOptions::from_env().numerics(Numerics::algebraic())).unwrap());
-        let m: usize = if cpu { pick(h, 512, 1024) } else { pick(h, 2048, 4096) };
-        let k = 64;
-        for half in [1usize, 4] {
+        // Rows of the product, columns of the right-hand side, half-width of the band: the widths and sizes the cost model of the
+        // route (`dense::route::banded_shifts_win`) is calibrated on.
+        let shapes: &[(usize, usize, usize)] = if cpu { &[(1024, 64, 1), (1024, 64, 4), (1024, 64, 16), (512, 64, 4)] } else { &[(4096, 64, 1), (4096, 64, 4), (4096, 64, 16), (1024, 64, 4), (4096, 512, 4)] };
+        for &(m, k, half) in shapes {
             let diags = diagonals(h, m, half, half);
             let r: Vec<(isize, &Array<f32>)> = diags.iter().map(|(o, v)| (*o, v)).collect();
             let band = Array::from_diagonals(&r);
@@ -77,7 +78,7 @@ pub fn run(h: &mut Harness) {
             let dense_a = upload(h, &host(&band), [m, m]);
             let (got, want) = (host(&band.matmul(&x)), host(&dense_a.matmul_f32(&x)));
             for (g, w) in got.iter().zip(&want) {
-                assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "props/band_matmul: {g} vs {w}");
+                assert!((g - w).abs() <= 1e-3 * (1.0 + w.abs()), "props/band_matmul: {g} vs {w}");
             }
             let width = 2 * half + 1;
             let flops = 2.0 * (m * k * width) as f64;

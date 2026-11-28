@@ -445,7 +445,7 @@ fn solve_banded_without_a_band_is_an_error_and_a_wide_band_is_the_dense_solve() 
 }
 
 #[test]
-fn triangular_and_diagonal_solves_route_only_under_reformulate() {
+fn triangular_solves_route_under_reformulate_and_diagonal_ones_under_exact_finite() {
     let n = 9;
     let off = ctx_with(Numerics::default());
     let on_ = ctx_with(Numerics::algebraic());
@@ -484,6 +484,14 @@ fn triangular_and_diagonal_solves_route_only_under_reformulate() {
             }
         }
     }
+    // The diagonal solve is exact for finite inputs, so it runs under `exact_finite` alone and not under `reformulate` alone.
+    let finite = ctx_with(Numerics::parse("default+exact-finite").unwrap());
+    let reformulating = ctx_with(Numerics::parse("default+reformulate").unwrap());
+    let wanted: Vec<f32> = (0..n * 3).map(|i| rhs[i] / v[i / 3]).collect();
+    let routed = on(&finite, &v, [n, 1]).diag_matrix(0).solve(&on(&finite, &rhs, [3, n]));
+    assert_eq!(bits(&routed), wanted.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "exact_finite: b / d");
+    let (a, b) = (on(&reformulating, &v, [n, 1]).diag_matrix(0), on(&reformulating, &rhs, [3, n]));
+    assert_eq!(bits(&a.solve(&b)), bits(&a.cache().solve(&b)), "reformulate alone: the dense path");
     // A vector right-hand side.
     let a = on(&on_, &v, [n, 1]).diag_matrix(0);
     let b = on(&on_, &v, n);
@@ -573,7 +581,8 @@ fn a_permutation_solves_and_multiplies_as_a_row_gather_under_exact_finite() {
 
 #[test]
 fn a_banded_product_is_a_sum_of_shifts_under_exact_finite() {
-    let n = 40;
+    // The sum of shifts is taken where it costs less than the GEMM: `60 * width < n` rows.
+    let n = 1100;
     // Integers keep every sum exact, so the fused sum and the GEMM agree bit for bit whatever their order.
     let whole = |ctx: &Context, len: usize, salt: usize| on(ctx, &(0..len).map(|i| ((i * 3 + salt) % 5) as f32 - 2.0).collect::<Vec<_>>(), [len, 1]);
     for (lo, hi) in [(0usize, 0usize), (1, 1), (1, 2), (2, 2), (8, 7), (8, 8)] {
@@ -593,11 +602,14 @@ fn a_banded_product_is_a_sum_of_shifts_under_exact_finite() {
         let x: Vec<f32> = (0..n * 6).map(|i| ((i * 5) % 9) as f32 - 4.0).collect();
         let a = build(&ctx);
         has(&a, &["BANDED"]);
+        ctx.record_decisions(true);
         let fused = a.matmul(&on(&ctx, &x, [6, n]));
+        let fused_values = fused.to_vec().unwrap();
+        assert!(ctx.take_decisions().iter().any(|d| d.chosen == "banded-shifts"), "band ({lo}, {hi}) takes the sum of shifts");
         let reference = on(&strict, &build(&strict).to_vec().unwrap(), [n, n]).matmul_f32(&on(&strict, &x, [6, n]));
-        assert_eq!(unsigned_bits(&fused), unsigned_bits(&reference), "band ({lo}, {hi})");
+        assert_eq!(fused_values.iter().map(|x| (x + 0.0).to_bits()).collect::<Vec<_>>(), unsigned_bits(&reference), "band ({lo}, {hi})");
     }
-    // Wider than 16 diagonals: the GEMM runs and gives the same (integers).
+    // Too wide for its size (19 diagonals of 1100 rows): the GEMM runs and gives the same (integers).
     let ctx = ctx_with(Numerics::algebraic());
     let mut diagonals = vec![(0isize, whole(&ctx, n, 0))];
     for k in 1..=9 {
@@ -609,4 +621,34 @@ fn a_banded_product_is_a_sum_of_shifts_under_exact_finite() {
     let x = on(&ctx, &(0..n * 2).map(|i| (i % 5) as f32).collect::<Vec<_>>(), [2, n]);
     let dense = on(&ctx, &wide.to_vec().unwrap(), [n, n]).matmul_f32(&x);
     assert_eq!(bits(&wide.matmul_f32(&x)), bits(&dense));
+}
+
+#[test]
+fn a_banded_matrix_can_be_used_more_than_once() {
+    let ctx = ctx_with(Numerics::algebraic());
+    let (a, _) = dominant_tridiagonal(&ctx, 16);
+    let b = on(&ctx, &[1.0; 32], [2, 16]);
+    let first = a.solve_banded(&b).to_vec().unwrap();
+    let second = a.solve_banded(&b).to_vec().unwrap();
+    assert_eq!(first, second, "a second solve_banded on the same handle still finds its band");
+    let _ = a.matmul(&on(&ctx, &[1.0; 32], [2, 16])).to_vec().unwrap();
+    assert!(a.solve_banded(&b).to_vec().is_ok());
+}
+
+/// `solve_banded` reads the diagonals back from the vectors `from_diagonals` was given: a write to a vector afterwards does not
+/// change the matrix, so it must not change the solve either.
+#[test]
+fn solve_banded_does_not_see_a_write_to_a_diagonal_made_after_the_matrix() {
+    let ctx = ctx_with(Numerics::default());
+    let (a, [mut main, _, _]) = dominant_tridiagonal(&ctx, 12);
+    let b = on(&ctx, &[1.0; 24], [2, 12]);
+    let before = a.solve_banded(&b).to_vec().unwrap();
+    // The matrix is still the pending expression (the solve above did not evaluate it).
+    main.write(&[100.0; 12]).unwrap();
+    let after = a.solve_banded(&b).to_vec().unwrap();
+    assert_eq!(before, after);
+    let dense = a.cache().solve(&b).to_vec().unwrap();
+    for (x, d) in after.iter().zip(&dense) {
+        assert!((x - d).abs() <= 1e-3 * (1.0 + d.abs()), "{x} vs {d}");
+    }
 }

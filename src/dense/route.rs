@@ -8,6 +8,9 @@
 //! opt-in for a band: its line solvers do not pivot across rows, so `solve` never routes a band by itself.
 
 use std::panic::Location;
+use std::sync::{Arc, Mutex, Weak};
+
+use crate::jit::Node;
 
 use super::tri::rhs_matrix;
 use super::{fail, Dims};
@@ -28,7 +31,21 @@ fn note_route(ctx: &Context, op: &'static str, location: &'static Location<'stat
     }
 }
 
+/// The diagonals each matrix made by [`Array::from_diagonals`] was given, by the expression that is the matrix (weakly: an
+/// entry dies with its matrix). `solve_banded` reads them back instead of recomputing them out of the expression for every column.
+static BANDS: Mutex<Vec<(Weak<Node>, Diagonals)>> = Mutex::new(Vec::new());
+
+/// `(offset, values)` pairs.
+type Diagonals = Vec<(isize, Array<f32>)>;
+
 impl Array<f32> {
+    /// The `(offset, values)` pairs `self` was made from by [`Array::from_diagonals`], while it is that pending expression.
+    fn remembered_diagonals(&self) -> Option<Diagonals> {
+        let node = self.lazy_node()?;
+        let bands = BANDS.lock().ok()?;
+        bands.iter().find(|(held, _)| std::ptr::eq(held.as_ptr(), Arc::as_ptr(node))).map(|(_, vectors)| vectors.clone())
+    }
+
     /// The matrix with the given diagonals: `diagonals` lists `(offset, values)` pairs, the values of the diagonal `offset` (above
     /// the main one for a positive offset, in the sense of [`Array::diag_matrix`]) as a column of `n - |offset|` elements, `n`
     /// being the same for every pair. Everything else is zero. Equal offsets add up.
@@ -62,7 +79,15 @@ impl Array<f32> {
                 Some(acc) => acc.binary_at(crate::ops::Rhs::Array(&term), crate::builtin::BinOp::Add, false, "from_diagonals", location),
             });
         }
-        sum.expect("at least one diagonal")
+        let sum = sum.expect("at least one diagonal");
+        if let (Some(node), Ok(mut bands)) = (sum.lazy_node(), BANDS.lock()) {
+            bands.retain(|(held, _)| held.strong_count() > 0);
+            // A vector in memory may be written through its handle later, which the matrix (an expression) is protected from; the
+            // copy kept here is not written by anyone. An expression is a value already.
+            let copy = |v: &Array<f32>| if v.lazy_node().is_some() { v.clone() } else { (v * 1.0f32).cache() };
+            bands.push((Arc::downgrade(node), diagonals.iter().map(|&(k, v)| (k, copy(v))).collect()));
+        }
+        sum
     }
 
     /// Solves `A X = B` for a matrix that carries a band (one made by [`Array::from_diagonals`], [`Array::diag_matrix`] and the
@@ -119,10 +144,21 @@ impl Array<f32> {
         let shape = Shape::from([k, n]);
         // Row `r` of the system: `lo[r] x[r-1] + diag[r] x[r] + up[r] x[r+1]`. In this crate's orientation the entry below the
         // diagonal of row `r` is `diag(1)[r - 1]` and the one above it `diag(-1)[r]` (see `crate::props`).
-        let column = |v: Array<f32>| v.reshape([1, n]).broadcast_to(shape);
-        let diag = column(self.diag_at(0, location));
-        let lower = column(self.diag_at(1, location).pad_at([(1, 0)], PadMode::Zero, location));
-        let upper = column(self.diag_at(-1, location).pad_at([(0, 1)], PadMode::Zero, location));
+        let (lower, diag, upper) = match self.remembered_diagonals() {
+            // Made by `from_diagonals`: the diagonals are the vectors it was given, read as the line solver reads its own.
+            Some(vectors) => {
+                let find = |offset: isize, len: usize| vectors.iter().filter(|(k, _)| *k == offset).map(|(_, v)| v.clone()).reduce(|a, b| &a + &b).unwrap_or_else(|| Array::<f32>::full_on(ctx, [len, 1], 0.0).expect("a small array"));
+                let column = |v: Array<f32>| v.reshape([1, n]).broadcast_to(shape);
+                (column(find(1, n - 1).pad_at([(1, 0)], PadMode::Zero, location)), column(find(0, n)), column(find(-1, n - 1).pad_at([(0, 1)], PadMode::Zero, location)))
+            }
+            // Any other banded matrix: the three diagonals are made once, in a pass over `3n` elements, and the solver reads them from
+            // memory; left as expressions of the matrix (a sum of selects) each would be recomputed for every right-hand side column.
+            None => {
+                let storage = self.band_storage((1, 1), n, location).cache();
+                let column = |w: usize| storage.slice(1, w..w + 1).reshape([1, n]).broadcast_to(shape);
+                (column(0), column(1), column(2))
+            }
+        };
         let x = crate::linalg::solve_tridiagonal(1, &lower, &diag, &upper, &rhs);
         if vector { x.reshape(b.shape()) } else { x }
     }
@@ -202,10 +238,11 @@ impl Array<f32> {
                 return Some(if vector { x.reshape(b.shape()) } else { x.reshape(rhs.shape()) });
             }
         }
-        if !ctx.numerics().reformulate {
-            return None;
-        }
         if props.has(Props::DIAGONAL) {
+            // `exact_finite`: LU of a diagonal matrix does not pivot and has zero multipliers, so for finite inputs it is `b / d`.
+            if !ctx.numerics().exact_finite {
+                return None;
+            }
             // `x[c, r] = b[c, r] / d[r]`: a division that fuses into whatever reads it.
             let (rhs, vector) = rhs_matrix(self, b);
             if rhs.shape().dims()[1..] != [n, a2, a3] {
@@ -215,6 +252,9 @@ impl Array<f32> {
             let d = self.diag_at(0, location).reshape([1, n, a2, a3]).broadcast_to(rhs.shape());
             let x = &rhs / &d;
             return Some(if vector { x.reshape(b.shape()) } else { x });
+        }
+        if !ctx.numerics().reformulate {
+            return None;
         }
         let triangle = if props.has(Props::LOWER) {
             Triangle::Lower
@@ -239,8 +279,27 @@ impl Array<f32> {
     }
 }
 
+/// Terms of the fused sum of shifts, whatever the cost model says: the expression has to stay one kernel (33 diagonals run as one
+/// on the GPUs, measured).
+const MAX_SHIFT_TERMS: usize = 33;
+
+/// Rows per diagonal at which the fused sum of shifts costs what the GEMM does: a term of the sum is an elementwise multiply-add
+/// with the diagonal's index arithmetic (about 60 times the time of a multiply-add of the GEMM on the CPU backend, `1024 x 64`: 9
+/// diagonals 0.108 ms against 0.183 dense, 33 equal; `512`: 9 diagonals 0.062 against 0.034), and on the GPUs 25 to 125 times (RTX 3090:
+/// 9 diagonals of `4096 x 64` in 0.032 ms against 0.32; the shader GEMM of wgpu: 33 diagonals 0.575 against 0.573). One figure for all
+/// of them, the CPU's, which is the highest of the backends the GEMM is fast on. The GEMM does `rows` multiply-adds per output, the sum
+/// `width`.
+const SHIFT_TERM_COST: usize = 60;
+
+/// Whether the fused sum of `width` shifted copies of the right-hand side of a product with a banded `rows x rows` matrix costs less than the
+/// GEMM of the dense matrix: `width * SHIFT_TERM_COST < rows` (the right-hand side's columns scale both alike).
+fn banded_shifts_win(width: usize, rows: usize) -> bool {
+    width <= MAX_SHIFT_TERMS && width.saturating_mul(SHIFT_TERM_COST) < rows
+}
+
 /// `lhs * rhs` for a left operand known to be a permutation or banded, under `Numerics::exact_finite` (the dropped terms are
-/// products with exact zeros): a row gather, or a sum of at most 16 shifted, scaled copies of `rhs` as one fused expression.
+/// products with exact zeros): a row gather, or a sum of shifted, scaled copies of `rhs` as one fused expression where that costs less than
+/// the GEMM ([`banded_shifts_win`]).
 /// `None` for every other product (the GEMM runs).
 pub(crate) fn route_product(lhs: &Array<f32>, rhs: &Array<f32>, location: &'static Location<'static>) -> Option<Array<f32>> {
     let ctx = lhs.context();
@@ -261,7 +320,7 @@ pub(crate) fn route_product(lhs: &Array<f32>, rhs: &Array<f32>, location: &'stat
     }
     let (lo, hi) = props.band?;
     let (lo, hi) = (lo as usize, hi as usize);
-    if lo + hi + 1 > 16 || lo >= k || hi >= k {
+    if lo >= k || hi >= k || !banded_shifts_win(lo + hi + 1, k) {
         return None;
     }
     note_route(ctx, "matmul", location, "banded-shifts");

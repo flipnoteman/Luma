@@ -806,6 +806,14 @@ impl<T: GpuType> Array<T> {
     }
 
     /// The expression behind this array if it has not been evaluated yet.
+    /// The expression this lazy array is, evaluated yet or not (its identity: a clone shares it).
+    pub(crate) fn lazy_node(&self) -> Option<&Arc<Node>> {
+        match &self.repr {
+            Repr::Lazy(held) => Some(held.latest()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn pending(&self) -> Option<&Arc<Node>> {
         match &self.repr {
             Repr::Lazy(held) => Some(held.latest()).filter(|node| node.is_pending()),
