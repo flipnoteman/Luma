@@ -558,20 +558,27 @@ struct State {
     stats: Option<Arc<Stats>>,
     kinds: Vec<StepKind>,
     clock: u64,
-    /// Steps of any kind recorded or followed in vain in a row, and the steps still to leave alone
-    /// because of them (a program whose steps are never the same, a new kind each time, would
-    /// otherwise never back off: each kind has its own backoff).
+    /// Steps of any kind recorded or followed in vain in a row; `QUIET` counts the steps still to leave alone because of
+    /// them (a program whose steps are never the same, a new kind each time, would otherwise never back off: each kind has
+    /// its own backoff).
     streak: u32,
-    quiet: u32,
-    // (a step kind's `cooldown` is not skipped at the end of an `eval` the way `quiet` is: the next step is not known to be of that kind)
+    // (a step kind's `cooldown` is not skipped at the end of an `eval` the way `QUIET` is: the next step is not known to be of that kind)
     phase: Phase,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, quiet: 0, phase: Phase::Idle }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { jit: 0, stats: None, kinds: Vec::new(), clock: 0, streak: 0, phase: Phase::Idle }) };
     /// Whether the calls of this thread need to be looked at: false while the step is neither
     /// recorded nor followed, which is all a call costs then.
     static GATE: Cell<bool> = const { Cell::new(true) };
+    /// Whether the step is recorded or followed (the phase is `Rec` or `Fol`): all that `interrupt_thread` and `eval_begin` ask of
+    /// the state at the end of the steps that are neither. A cell of its own, as the state's thread-local has a destructor to register.
+    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Steps the thread still leaves alone (see `State::streak`). A cell of its own: `eval_begin` counts it down at the end of
+    /// a skipped step without borrowing the state (whose thread-local has a destructor to register).
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// `State::jit`, for the same reason.
+    static STATE_JIT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Whether `create` has to ask [`begin`] about the call.
@@ -597,6 +604,7 @@ fn step_key(op: &Op, len: usize, args: &Args, arity: usize) -> u64 {
 impl State {
     fn set(&mut self, phase: Phase) {
         GATE.with(|gate| gate.set(!matches!(phase, Phase::Skip)));
+        ACTIVE.set(matches!(phase, Phase::Rec(_) | Phase::Fol(_)));
         self.phase = phase;
     }
 
@@ -642,7 +650,7 @@ impl State {
         kind.cooldown = if kind.fails >= 2 { (1u32 << (kind.fails - 1)).min(64) } else { 0 };
         self.streak = (self.streak + 1).min(9);
         if self.streak >= 4 {
-            self.quiet = 1 << (self.streak - 3);
+            QUIET.set(1 << (self.streak - 3));
         }
     }
 
@@ -653,7 +661,7 @@ impl State {
         kind.fails = 0;
         kind.cooldown = 0;
         self.streak = 0;
-        self.quiet = 0;
+        QUIET.set(0);
     }
 }
 
@@ -725,14 +733,19 @@ impl State {
             self.set(Phase::Idle);
             self.kinds.clear();
             self.jit = jit.id;
+            STATE_JIT.set(jit.id);
             self.stats = Some(Arc::clone(&jit.follow.stats));
         }
         if jit.follow.shared.load(Ordering::Relaxed) || rerun::active() || FUSION_LIMIT.with(Cell::get).is_some() {
             self.stop("following is not possible now");
             return Entered::Done(Begun::Go(Go::Skip));
         }
+        // `begin` runs while the gate is open: a `Skip` left over from a step that `eval_begin` ended is no step at all.
+        if matches!(self.phase, Phase::Skip) {
+            self.phase = Phase::Idle;
+        }
         match &mut self.phase {
-            Phase::Skip => return Entered::Done(Begun::Go(Go::Skip)),
+            Phase::Skip => unreachable!(),
             Phase::Rec(rec) => {
                 let begun = rec.begin(len, op, args, arity);
                 if let Some(why) = rec.poisoned {
@@ -748,8 +761,9 @@ impl State {
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
-        if self.quiet > 0 {
-            self.quiet -= 1;
+        let quiet = QUIET.get();
+        if quiet > 0 {
+            QUIET.set(quiet - 1);
             self.set(Phase::Skip);
             return Entered::Done(Begun::Go(Go::Skip));
         }
@@ -907,6 +921,7 @@ impl State {
             // The launches of the cut are made without the state borrowed (launching can create nodes).
             let Phase::Fol(fol) = std::mem::replace(&mut self.phase, Phase::Skip) else { unreachable!() };
             GATE.with(|gate| gate.set(false));
+            ACTIVE.set(false);
             return Entered::Cut(Box::new(CutJob { fol, op: *op, len, arity, rewritten: Some((fop, farity)), saved }));
         }
         self.make(ctx, len, fop, args, saved, farity, name, location)
@@ -1430,34 +1445,37 @@ pub(super) struct Recording {
 }
 
 /// Called by `plancache::evaluate` with the roots it is about to evaluate.
+#[inline]
 pub(super) fn eval_begin(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     jit.follow.foreign_use();
+    // The common end of an `eval`: the step was not recorded or followed (see `ACTIVE`), and it just ends. While the thread leaves steps alone
+    // (`QUIET`), the next one is left alone right here: that is what its first call would conclude (see `State::enter`),
+    // without `begin` running for it. The state itself is not looked at: the open gate stands for its `Idle`.
+    if !ACTIVE.get() {
+        if !gate() && !pending.is_empty() {
+            // A thread that went on to another context opens its gate: the steps it was leaving alone are not the ones to come.
+            match QUIET.get() {
+                quiet if quiet > 0 && STATE_JIT.get() == jit.id => QUIET.set(quiet - 1),
+                _ => GATE.set(true),
+            }
+        }
+        return Eval::Normal(None);
+    }
+    eval_begin_slow(jit, pending)
+}
+
+#[inline(never)]
+fn eval_begin_slow(jit: &JitState, pending: &[Arc<Node>]) -> Eval {
     let fol = STATE.with_borrow_mut(|state| {
         if pending.is_empty() {
             // Nothing to compute (an `eval` of arrays that are evaluated): not the end of a step.
             return Err(Eval::Normal(None));
         }
         if state.jit != jit.id {
-            // The thread left the context whose steps it was leaving alone (its `Skip` would stay: no call looks at the state while
-            // the gate is shut, and the evaluations of this context are not the state's).
-            if matches!(state.phase, Phase::Skip) {
-                state.set(Phase::Idle);
-            }
             return Err(Eval::Normal(None));
         }
-        // The common end of an `eval`: nothing is recorded or followed (a skipped step just ends). While the thread leaves steps
-        // alone (`quiet`), the next one is left alone right here: that is what its first call would conclude (see `State::enter`),
-        // without `begin` running for it.
         match &state.phase {
-            Phase::Idle => return Err(Eval::Normal(None)),
-            Phase::Skip => {
-                if state.quiet > 0 {
-                    state.quiet -= 1;
-                } else {
-                    state.set(Phase::Idle);
-                }
-                return Err(Eval::Normal(None));
-            }
+            Phase::Idle | Phase::Skip => return Err(Eval::Normal(None)),
             Phase::Rec(_) | Phase::Fol(_) => {}
         }
         match std::mem::replace(&mut state.phase, Phase::Idle) {
@@ -1753,10 +1771,15 @@ pub(super) fn interrupt(jit: &JitState) {
 }
 
 /// [`interrupt`] for a caller that has no context at hand (and so does not look whether following is on).
+#[inline]
 pub(super) fn interrupt_thread() {
-    if !gate() {
-        return;
+    if ACTIVE.get() {
+        interrupt_state();
     }
+}
+
+#[inline(never)]
+fn interrupt_state() {
     let _ = STATE.try_with(|state| {
         let Ok(mut state) = state.try_borrow_mut() else { return };
         if matches!(state.phase, Phase::Fol(_) | Phase::Rec(_)) {
