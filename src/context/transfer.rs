@@ -110,10 +110,18 @@ impl Context {
     }
 
     /// Host memory the backend uploads from without another copy (pinned memory), `bytes` bytes
-    /// the caller writes completely; `None` where the backend has none.
+    /// the caller writes completely; `None` where the backend has none. A stage of the cache
+    /// [`Context::stage_release`] fills is reused when the backend's own (not a heap stage) has the size.
     pub(crate) fn upload_stage(&self, bytes: u64) -> Option<luma_core::hal::Stage> {
         if !self.hal().pinned_staging() {
             return None;
+        }
+        {
+            let mut cache = self.inner.stages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = luma_core::hal::StageDir::ToDevice;
+            if let Some(at) = cache.iter().position(|stage| stage.dir() == dir && stage.len() == bytes && !stage.is_heap()) {
+                return Some(cache.swap_remove(at));
+            }
         }
         self.hal().stage_alloc_uninit(bytes, luma_core::hal::StageDir::ToDevice).ok()
     }
@@ -136,11 +144,6 @@ impl Context {
     /// waiting paths report the error).
     pub(crate) fn ticket_done(&self, ticket: &luma_core::Ticket) -> bool {
         self.hal().ticket_done(ticket).unwrap_or(true)
-    }
-
-    /// Waits for the copy `ticket` stands for.
-    pub(crate) fn ticket_wait(&self, ticket: &luma_core::Ticket) -> Result<()> {
-        Ok(self.hal().ticket_wait(ticket, Duration::ZERO)?)
     }
 
     /// Whether `from_slice` writes straight into mappable storage buffers (unified memory)

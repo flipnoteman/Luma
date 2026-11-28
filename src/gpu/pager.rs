@@ -147,15 +147,14 @@ struct Ahead {
     next: OnceLock<Weak<Segment>>,
 }
 
-/// The host stages file reads land in and uploads copy out of, recycled when the upload's ticket
-/// completes (no stage per segment). Holds the stages that no read uses: `idle` ones, and `flying`
-/// ones whose upload may still be copying; a stage a read holds is counted in `readahead_bytes`.
+/// The stages of file uploads whose copy may still be running. A completed upload's stage goes to the
+/// context's stage cache ([`Context::stage_release`]), where the next read (and the transfer rings of
+/// schedules) take it from, so this holds only what is in flight.
 #[derive(Debug, Default)]
 struct StageRing {
-    idle: Vec<Stage>,
     /// In the order of the uploads.
     flying: VecDeque<(Stage, Ticket)>,
-    /// Bytes of `idle` and `flying`.
+    /// Bytes of `flying`.
     bytes: u64,
 }
 
@@ -1264,10 +1263,10 @@ impl Segment {
         true
     }
 
-    /// A host stage of at least `self.bytes` bytes for a read of the home: an idle one of the
-    /// ring, a new one while the ring is within the staging budget (the reads under way plus two
-    /// segments of uploads), else the oldest upload's, after it completed. `None` where the
-    /// backend has no stages (the read then lands on the heap).
+    /// A host stage of `self.bytes` bytes for a read of the home: one the context's stage cache holds
+    /// (see [`Context::stage_release`]), a new one while the stages of uploads under way stay within
+    /// the staging budget (the reads under way plus two segments), else the oldest upload's, after it
+    /// completed. `None` where the backend has no stages (the read then lands on the heap).
     fn ring_stage(&self) -> Option<Stage> {
         let pager = self.ctx.pager();
         let mut ring = lock(&pager.ring);
@@ -1277,33 +1276,26 @@ impl Segment {
                     break;
                 }
                 if let Some((stage, _)) = ring.flying.pop_front() {
-                    ring.idle.push(stage);
+                    ring.bytes -= stage.len();
+                    self.ctx.stage_release(stage);
                 }
-            }
-            let fit = ring.idle.iter().enumerate().filter(|(_, stage)| stage.len() >= self.bytes).min_by_key(|(_, stage)| stage.len()).map(|(at, _)| at);
-            if let Some(at) = fit {
-                let stage = ring.idle.swap_remove(at);
-                ring.bytes -= stage.len();
-                return Some(stage);
             }
             let held = pager.readahead_bytes.load(Ordering::Relaxed) + ring.bytes;
             if held <= pager.readahead_budget(self.bytes) + 2 * self.bytes {
-                // Stages too small for this segment (a short tail's) are of no use any more.
-                let too_small = std::mem::take(&mut ring.idle);
-                ring.bytes -= too_small.iter().map(Stage::len).sum::<u64>();
-                drop(too_small);
+                drop(ring);
                 return self.ctx.upload_stage(self.bytes);
             }
             let (stage, ticket) = ring.flying.pop_front()?;
+            ring.bytes -= stage.len();
             if self.ctx.ticket_wait(&ticket).is_err() {
                 return None;
             }
-            ring.idle.push(stage);
+            self.ctx.stage_release(stage);
         }
     }
 
-    /// Gives a stage back to the ring once the upload `ticket` ran; a stage the backend kept
-    /// (empty) is dropped.
+    /// Keeps a stage whose upload `ticket` may still be copying; the ring hands it to the context's
+    /// stage cache once the ticket completed. A stage the backend kept (empty) is dropped.
     fn ring_put(&self, stage: Stage, ticket: Ticket) {
         if stage.is_empty() {
             return;

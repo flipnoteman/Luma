@@ -85,6 +85,12 @@ impl Stage {
         self.native.bytes_mut()
     }
 
+    /// Whether the stage is plain heap memory (the default of `Backend::stage_alloc`).
+    pub fn is_heap(&self) -> bool {
+        let native: &dyn Any = &*self.native;
+        native.is::<HeapStage>()
+    }
+
     /// The backend's own representation, `None` for another backend's (or the heap default).
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
         let native: &dyn Any = &*self.native;
