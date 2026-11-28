@@ -197,6 +197,7 @@ const fn test_entry(at: u8, name: &'static str, fits: crate::jit::structured::st
         prologue: false,
         epilogue: false,
         partners: false,
+        replayable: false,
         reads: FitsInputs::NONE,
         fits,
         cost: None,
